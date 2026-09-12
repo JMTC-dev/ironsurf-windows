@@ -1,0 +1,18 @@
+[package]
+name = "servfox-tab"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+servfox-common = { path = "../servfox-common" }
+servfox-storage = { path = "../servfox-storage" }
+servfox-sandbox = { path = "../servfox-sandbox" }
+url = { workspace = true }
+servo = { version = "0.5", default-features = false, features = ["baked-in-resources", "bundled_freetype"] }
+dpi = "0.1"
+libc = "0.2"
+rustls = "0.23"
+
+[dev-dependencies]
+tempfile = "3"

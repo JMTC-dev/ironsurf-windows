@@ -24,3 +24,5 @@ Landlock via landlock 0.4.7 BestEffort (v1 handled set; Refer dropped — v2 bit
 landlock 0.4.7 has NO KernelVersion::is_available(); probe syscall directly. sbox-probe bin:
 exit 42 enforced / 40 graceful; LIVE HERE — forbidden profile-B read EACCES, ro ok, writes ok.
 `cargo test -p servfox-sandbox` 7 green; workspace green. Next: #4 servfox-tab (Servo embed).
+## #4 done — servfox-tab Servo spike (headless, PPM proof)
+servo=0.5 default-features=false, features baked-in-resources+bundled_freetype (no `bundled-resources`; llvm-objdump needed for mozjs → apt llvm). Rendering context: **servo::SoftwareRenderingContext** (surfman software adapter/smitha GL, zero X/GPU); direct deps url+dpi required (not re-exported). Paint contract: must call WebView::paint() in notify_new_frame_ready or take_screenshot never completes — top gotcha in docs/SERVO_INTEGRATION.md. Spike: `servfox-tab --spike --url file://… --out out.ppm --size WxH`, self-pipe EventLoopWaker, 60s bound; `cargo test -p servfox-tab --test spike` green headless; workspace green. Next: #5 servfox-shell (Slint GUI).
