@@ -7,3 +7,4 @@
 - **Servo** (`servo` crate from crates.io, ≥0.1): docs.rs fails; authoritative API = the unpacked registry source (`~/.cargo/registry/src/*/servo-*`) or GitHub `main` (`components/servo/{lib.rs,webview.rs,webview_delegate.rs}`, `examples/winit_minimal.rs`). First build takes 30–45 min — build once, reuse `target/`, never bump the locked version.
 - **Handoff protocol**: read `TASKLOG.md` first; append a ≤5-line entry last; keep TASKLOG ≤30 lines. Commit your work (git) at task end.
 - Keep sessions shallow: touch only your task's files; `cargo test -p <crate>` (headless — never assume a display or network beyond localhost + example.com).
+- Do not git push; you do not have access to git remotes
