@@ -18,3 +18,9 @@ protected + slug dir move on rename), ContainerStore, RFC6265-subset CookieJar (
 https-only, domain-suffix w/ leading-dot host-only convention, RFC path-match, Max-Age>Expires,
 expiry pruning, cookies.json), in-mem LRU NetCache (&self, 256MB/1000 evict), history.jsonl,
 StoreError. 28 tests green (`cargo test -p servfox-storage`); workspace green. Next: #3 servfox-sandbox.
+## #3 done — servfox-sandbox
+prctl NO_NEW_PRIVS+PDEATHSIG, setrlimit NOFILE/NPROC/optional-AS (clamped to hard cap),
+Landlock via landlock 0.4.7 BestEffort (v1 handled set; Refer dropped — v2 bit broke add_rule).
+landlock 0.4.7 has NO KernelVersion::is_available(); probe syscall directly. sbox-probe bin:
+exit 42 enforced / 40 graceful; LIVE HERE — forbidden profile-B read EACCES, ro ok, writes ok.
+`cargo test -p servfox-sandbox` 7 green; workspace green. Next: #4 servfox-tab (Servo embed).
