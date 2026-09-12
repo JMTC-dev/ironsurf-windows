@@ -1,8 +1,17 @@
 # ServFox — Architecture & Crate Contracts
 
-ServFox is a Rust web browser using **Servo** (the `servo` crate from crates.io, v0.1+)
-as its engine and **Slint** for the GUI, with **multi-account containers**
-(Firefox-MultiAccountContainers-style isolated sessions) and **per-tab OS sandboxing**.
+ServFox is a Rust web browser using the **Blitz** stack — `blitz-dom`/`blitz-html`
+(DOM + Stylo CSS) with `blitz-paint` + `anyrender_vello_cpu` (pure-CPU 2D renderer,
+zero GPU) and **Boa** (`boa_engine`, pure-Rust JS) as its engine and **Slint** for the
+GUI, with **multi-account containers** (Firefox-MultiAccountContainers-style isolated
+sessions) and **per-tab OS sandboxing**.
+
+> **Engine pivot (2026-08):** Servo/mozjs was removed as an engine dependency — mozjs
+> embeds C++ SpiderMonkey (needs clang/libclang, llvm-objdump, 45-min builds), which does
+> not belong in a fully-Rust codebase. Servfox-tab now embeds Blitz (Stylo CSS + DOM,
+> `html5ever` parsing) rendered through `vello_cpu`, with `boa_engine` for JavaScript.
+> The `servfox-common` IPC contract (`ToTab`/`FromTab`) is **unchanged**; only the tab
+> crate's engine internals changed.
 
 This document is the single source of truth for crate APIs. Tasks implement against these
 contracts; extend, don't contradict. Keep all crates compiling and `cargo test --workspace` green.
@@ -18,11 +27,12 @@ contracts; extend, don't contradict. Keep all crates compiling and `cargo test -
 ┌──────▼──────────────────────────────┐        ┌──────────────────────────────┐
 │ servfox-tab (child process #1, …N)  │   …    │ servfox-tab (child process N)│
 │  - applies OS sandbox at startup    │        │  (different container ⇒       │
-│  - embeds Servo (Software rendering)│        │   different OS process ⇒      │
-│  - per-container network layer:     │        │   memory can't be shared)     │
+│  - embeds Blitz + Stylo + Boa       │        │   different OS process ⇒      │
+│  - renders via vello_cpu (software) │        │   memory can't be shared)     │
+│  - per-container network layer:     │        │                               │
 │    cookies/cache/HTTPS policy       │        │                               │
 └──────────────┬──────────────────────┘        └───────────────────────────────┘
-               │ profile dir (~/.local/share/servfox/profiles/<container>/) used as Servo data path
+               │ profile dir (~/.local/share/servfox/profiles/<container>/) used as tab data path
      servfox-storage: container registry + per-container cookie jar / cache / local storage
 ```
 
@@ -34,12 +44,15 @@ contracts; extend, don't contradict. Keep all crates compiling and `cargo test -
   containers* always run in distinct processes; the sandbox also makes reading another
   container's profile dir (cookies/cache/localStorage on disk) fail with `EACCES`.
 - *Containers* = named, colored, isolated sessions. Each container has a profile directory
-  on disk that is handed to Servo as its data path, so all engine state (cookies, cache,
-  DOM storage, history) is scoped to the container. Cross-restart cookie persistence and
-  HTTPS policy live in the tab's network layer (see §Network layer).
-- *Servo embedding*: `servo` crate, `WebView` + `RenderingContext`. Tab processes render
-  **offscreen/software** and ship RGBA frames to the shell — this keeps the GUI (Slint
-  software renderer) decoupled from the engine and is the only sane multi-process split.
+  on disk that holds all engine-adjacent state (cookies, cache, DOM storage, history), so
+  it is scoped to the container. Cross-restart cookie persistence and HTTPS policy live in
+  the tab's network layer (see §Network layer).
+- *Blitz embedding*: the tab process owns one Blitz `Document` (built with
+  `HtmlDocument::from_html` + `DocumentConfig`), drives it on its own single-threaded
+  event loop (`resolve(scale)` after every input/net/JS tick), paints it with
+  `blitz_paint::paint_scene` into `anyrender_vello_cpu::VelloCpuImageRenderer`, and ships
+  RGBA frames to the shell over the unchanged IPC. No GPU, no winit, no wgpu — `vello_cpu`
+  is a pure-Rust software rasterizer, which is exactly what a no-GPU fleet requires.
 
 ## Crate layout (cargo workspace at /workspace)
 
@@ -49,7 +62,7 @@ crates/
   servfox-common/     # types + IPC codec. NO heavy deps (serde, bincode, thiserror only)
   servfox-storage/    # container registry, profiles, cookie jar, cache, local storage
   servfox-sandbox/    # Landlock + rlimits + prctl sandbox application
-  servfox-tab/        # BIN: sandboxed per-tab Servo host speaking servfox-common IPC
+  servfox-tab/        # BIN: sandboxed per-tab Blitz+Boa host speaking servfox-common IPC
   servfox-shell/      # BIN: Slint GUI, tab/container management, frame compositor
 ```
 
@@ -140,7 +153,7 @@ Layout under a data root (`$SERVFOX_DATA_DIR` or `~/.local/share/servfox`):
 
 ```
 containers.json                       # registry (Vec<Container>), written atomically
-profiles/<container-name-slug>-<id>/  # handed to Servo as data path; owned by container
+profiles/<container-name-slug>-<id>/  # tab data path; owned by container
   cookies.json                        # our persistent jar (see below)
   net-cache/                          # bounded response cache (our layer)
   local-storage/                      # reserved for engine/localStorage persistence
@@ -228,67 +241,92 @@ binary or a test-only bin here) that applies the sandbox and exits 42 iff openin
 
 ---
 
-## servfox-tab (binary) — the Servo host
+## servfox-tab (binary) — the Blitz + Boa host
 
-CLI: `servfox-tab --tab-id N --container-id N --profile-dir PATH [--url URL] [--offline-fixtures DIR]`
+CLI: `servfox-tab --tab-id N --container-id N --profile-dir PATH [--url URL] [--offline-fixtures DIR] [--managed-net] [--no-sandbox]`
+
+Engine stack (pinned; all pure Rust — **no C/C++ toolchain, no mozjs, no wgpu/GPU**):
+
+```toml
+blitz-dom = "0.3.0-beta.2"        # Document/BaseDocument, UiEvent, resolve(), query_selector
+blitz-html = "0.3.0-beta.2"       # HtmlDocument::from_html(html, DocumentConfig)
+blitz-net = "0.3.0-beta.2"        # default Provider (images/fonts); we wrap/replace ours
+blitz-paint = "0.3.0-beta.2"      # paint_scene(scene, doc, scale, w, h, x, y)
+blitz-traits = "0.3.0-beta.2"     # net::NetProvider/NetHandler, shell::{Viewport, ColorScheme}
+anyrender = "0.13"                # PaintScene + render_to_buffer
+anyrender_vello_cpu = "0.17"      # VelloCpuImageRenderer — CPU rasterizer, RGBA8 output
+boa_engine = "0.22"               # JavaScript (pure Rust)
+```
+
+(`stylo 0.20` + `html5ever` + `parley` come in transitively. Reference: `DioxusLabs/blitz`
+`examples/screenshot.rs` on GitHub main — the canonical headless parse→resolve→paint flow;
+vendored sources live under `~/.cargo/registry/src/*/blitz-*-0.3.0-beta.2/`.)
 
 Lifecycle:
 1. Apply `servfox_sandbox::apply` with `writable_rw = [profile_dir]`,
-   `readable_ro = [/usr/share/fonts, /etc/ssl/certs, <exe dir>]`. Report `FromTab::Ready`
-   only after startup. (Sandbox failures degrade, never abort; `--no-sandbox` for debugging.)
-2. Install rustls crypto provider (`aws_lc_rs` — required by Servo, see winit_minimal example).
-3. Create **one** `Servo` per process with a **software/offscreen** `RenderingContext`
-   (`servo::SoftwareRenderingContext` or `OffscreenRenderingContext` — verify exact ctor in
-   `servo` source `paint_api/rendering_context.rs`), with engine data path =
-   `--profile-dir` (investigate `servo::Opts` / `servo_config::opts` builder + `Preferences`;
-   servoshell uses something like `--user-data-path`; if unavailable keep per-process default
-   dirs — process separation already isolates).
-4. One `WebView` (created via `WebViewBuilder`) whose `WebViewDelegate` forwards to IPC:
-   `notify_new_frame_ready` → capture frame (use `WebView::capture_screenshot`-style readback
-   — exact API name TBD from `components/servo/webview.rs`; fallback: read the software
-   context buffer) → send `FromTab::Frame`; `notify_page_title_changed`, `notify_url_changed`,
-   `notify_load_status_changed`, `notify_history_changed`, `notify_status_text_changed`,
-   `show_console_message`, `notify_closed`, `notify_crashed` → matching `FromTab::*`.
-5. Event loop: single-threaded. Sources: stdin pipe (deserialize `ToTab`), Servo's
-   `EventLoopWaker` (implemented to write 1 byte into a self-pipe; select()/poll over
-   [stdin, selfpipe]). Every wake → `Servo::spin_event_loop()`. Animate throttle: when
-   `webview.animating()`, poll-spin at ≤ 30 fps. Resize via `ToTab::Resize` →
-   `rendering_context.resize()`/`webview.resize()`.
-6. Input: `ToTab::Pointer/Key/Scroll` → map to `servo::InputEvent` variants
-   (`MouseEvent`, `KeyboardEvent` from `servo::keyboard_types`, `WheelEvent`) →
-   `webview.notify_input_event(..)`.
-7. On `Destroy`/EOF: persist cookie jar, flush, exit 0.
+   `readable_ro = [/usr/share/fonts, /usr/lib, /etc/ssl/certs, /etc/resolv.conf, <exe dir>]`.
+   Report `FromTab::Ready` only after startup. (Sandbox failures degrade, never abort;
+   `--no-sandbox` for debugging.)
+2. Own the event loop — **no winit/waker plumbing anymore**: a single thread blocks in
+   `poll()` over [non-blocking stdin, self-pipe for wakeups] with a timeout for animation /
+   pending-net ticks. There is no external engine thread; Blitz is a library you drive.
+3. One `Document` per navigation: fetch HTML (see Network layer), then
+   `HtmlDocument::from_html(&html, DocumentConfig { base_url, net_provider: Arc<ours>,
+   viewport: Some(Viewport::new(w*scale, h*scale, scale, ColorScheme::Light)), ..Default })`.
+   After every input event / net completion / JS tick call `document.resolve(scale)`; if the
+   doc reports changes (or a scripted/animation tick is pending), repaint and emit
+   `FromTab::Frame` (throttle ≤ 30 fps). Emit `TitleChanged`/`UrlChanged` on change (compare
+   against cached last values).
+4. Frames: `render_to_buffer::<VelloCpuImageRenderer, _>(|scene| { white bg fill;
+   paint_scene(scene, doc.as_mut(), scale, w, h, 0, 0); }, w, h)` → `FromTab::Frame`
+   (RGBA8 straight alpha; verify buffer layout against the anyrender_vello_cpu source — if it
+   ever emits premultiplied/BGR, convert; the spike test proves pixel sanity).
+5. Resize: `ToTab::Resize` → store new `Viewport`, rebuild/resize document viewport, resolve,
+   repaint.
+6. Input: `ToTab::Pointer/Key/Scroll` → `blitz_dom::events` `UiEvent` variants (pointer
+   press/release/move with `hit test` done internally, mouse wheel, keyboard key-press /
+   text-input — see `blitz-dom/src/events/{pointer,keyboard}.rs`) → `document.handle_ui_event(ev)`,
+   then resolve+repaint. Link clicks that request top-level navigation must round-trip: detect
+   the navigation request via the anchor handling in `blitz-dom/src/events/driver.rs`
+   (`EventDriver`); if Blitz only surfaces `DocumentEvent::NavigateIframe`, resolve the
+   clicked node's anchor href from the hover/target node id ourselves.
+7. On `Destroy`/EOF: persist cookie jar, flush, `_exit(0)` style shutdown is fine (no GPU
+   teardown hazard anymore, but staying consistent with the shell is harmless).
 
 ### Network layer (container sessions, HTTPS)
-Chokepoint: `WebViewDelegate::load_web_resource(load: WebResourceLoad)`.
-- Policy `NetPolicy::Passthrough` (default): just return (Servo's own rustls HTTPS applies).
-- Policy `NetPolicy::Managed` (enabled via `--managed-net`): intercept every http(s) load and
-  fetch via our own `reqwest` (rustls) client so that we control **Cookie header injection
-  from the container's `CookieJar`**, capture `Set-Cookie` responses into the jar, answer from
-  `NetCache` (with ETag/If-None-Match revalidation), and **enforce https-only upgrades**
-  (http: navigations → upgrade attempt to https, block with error page on failure) with an
-  "allow http" escape only for `about:`/local fixtures. Wire this in a submodule
-  `servfox-tab/src/netmod.rs`; verify `WebResourceResponse` supports passing status/headers
-  through (`status_code`, headers builder — check servo source `components/shared/embedder`
-  /`embedder_traits`).
-- Even in Passthrough mode: cookies are still fully container-isolated because the engine
-  process only ever holds one container's state and its disk state lives under that
-  container's sandbox-visible profile dir.
+Implement `blitz_traits::net::NetProvider` (`fn fetch(&self, doc_id, Request, Box<dyn NetHandler>)`)
+in `servfox-tab/src/netmod.rs` and pass `Arc<OurProvider>` as `DocumentConfig.net_provider`
+(keeps images/css/fonts flowing). Two policies, unchanged from before:
+- `Passthrough` (default): plain `reqwest` (rustls) fetch on a small worker thread, respond
+  via the `NetHandler` callbacks; cookies NOT injected for subresources.
+- `Managed` (`--managed-net`): same worker, but inject `Cookie` header from the container's
+  `CookieJar`, capture `Set-Cookie` into the jar, serve from `NetCache` with ETag/
+  If-None-Match revalidation, and enforce https-upgrade policy (http: → try https, block
+  page on failure; `about:`/`file://`/local fixtures exempt).
+- Main-document navigations always go through our own reqwest fetcher in the tab process
+  (not via NetProvider), so the managed policy always applies to top-level requests
+  regardless of provider mode.
+- Container isolation holds even in Passthrough: one process = one container; its on-disk
+  state lives under the sandbox-visible profile dir only.
+
+### JavaScript (Boa)
+After parse & resolve, extract `<script>` elements from the DOM (`document.root_element()`
+walk or `query_selector("script")`), fetch `src=` through our network layer, and execute in
+order in **one** `boa_engine::Context` per tab (per navigation: rebuild context). Bindings
+are a deliberately tiny surface (no engine-internal DOM mutation yet):
+- `window` (eventTarget-ish no-ops), `document.title` get/set (set → `FromTab::TitleChanged`
+  and repaint), `document.body.textContent` read-only snapshot,
+  `console.log/info/warn/error` → tab stderr + `FromTab::StatusText`.
+- Script exceptions must never kill the tab: catch, report via StatusText, continue.
+- `javascript:` URLs are refused (status text), matching the shell contract.
 
 ### Headless tests (must run with no X display)
-- `tests/e2e.rs`: launch the built tab binary with `--offline-fixtures` + a local file://
-  page (tempdir, `file:///…/index.html`), read `FromTab::{Ready, UrlChanged, Frame}`, assert
-  a frame of requested size arrives containing non-uniform pixels, then `Destroy`.
-- If a display exists (`$DISPLAY`), also test navigating to a `python3 -m http.server` URL.
-
-Servo dependency notes:
-- `servo = { version = "0.1", default-features = false, features = ["bundled", "clipboard", "js_jit"] }`
-  (verify published feature names via `cargo add servo --dry-run` / the crates.io manifest;
-  `multiprocess` stays OFF for v1). If a feature listed here isn't published, adapt.
-- Heavy build (~30+ min first time). Pin the resolved version in Cargo.lock and don't bump.
-- Key source references (fetch raw from GitHub main if the crate API drifted):
-  `components/servo/lib.rs`, `webview.rs`, `webview_delegate.rs`,
-  `examples/winit_minimal.rs`, `ports/servoshell/`.
+- `tests/spike.rs`: render a `file://` fixture (tempdir HTML with colored blocks) through
+  the full parse→resolve→paint path; assert buffer size `w*h*4` and non-uniform pixels.
+- `tests/e2e.rs`: launch the built binary with a `file://` page, read
+  `FromTab::{Ready, UrlChanged, Frame}` (non-uniform), then `Destroy` → exit 0.
+- Boa tests: inline `<script>document.title="js-set-title"</script>` → `TitleChanged` with
+  the JS-set title arrives over IPC; broken script → tab stays alive, frame still arrives.
 
 ---
 
@@ -326,7 +364,7 @@ Process/tab management (`src/tabs.rs`):
 
 Tests (headless CI-safe): tab-proc message pump logic + `FromTab` state reduction tested
 against a **fake tab process** (a small test bin that scripts `FromTab` sequences) so shell
-logic runs without Servo or X. GUI smoke test gated behind `$DISPLAY` + `SERVFOX_SMOKE=1`.
+logic runs without the engine (Blitz) or X. GUI smoke test gated behind `$DISPLAY` + `SERVFOX_SMOKE=1`.
 
 ---
 
@@ -334,8 +372,9 @@ logic runs without Servo or X. GUI smoke test gated behind `$DISPLAY` + `SERVFOX
 
 - `README.md`: features, screenshots note, build (`cargo build --release`), run
   (`target/release/servfox-shell`), sandbox & container explanation, limitations.
-- `docs/SERVO_INTEGRATION.md`: the embedding specifics discovered while implementing the tab
-  crate (exact rendering context used, readback path, prefs that mattered).
+- `docs/ENGINE_INTEGRATION.md`: the Blitz/Boa embedding specifics discovered while
+  implementing the tab crate (document lifecycle, paint/readback path, NetProvider quirks,
+  Boa binding surface). Renamed from `SERVO_INTEGRATION.md` at the engine pivot.
 - `scripts/demo.sh`: Xvfb/display screenshot of the running browser (if display available).
 - `.gitignore` for `target/`.
 
@@ -346,6 +385,7 @@ Each task MUST end with its own check passing:
 2. storage: `cargo test -p servfox-storage` (registry lifecycle, cookie RFC rules incl.
    Secure-over-HTTPS-only, cache LRU eviction, **container isolation of profiles**)
 3. sandbox: `cargo test -p servfox-sandbox` (probe child proves forbidden dir unreadable when Landlock is available; degrades gracefully otherwise)
-4. tab/servo: `cargo build -p servfox-tab && cargo test -p servfox-tab` (headless frame test)
+4. tab/blitz: `cargo build -p servfox-tab && cargo test -p servfox-tab` (headless frame test;
+   `cargo tree -p servfox-tab` must contain no `mozjs`/`wgpu`/`servo v` entries)
 5. shell: `cargo test -p servfox-shell` (+ smoke with fake tab proc; GUI check if display)
 6. end-to-end: shell driving two containers side-by-side (scripted), README + docs complete.
