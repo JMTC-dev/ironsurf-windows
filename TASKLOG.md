@@ -12,3 +12,9 @@ profile.release debug=false) + .gitignore. crates/servfox-common: full contract 
 FromTab/ToTab all variants, Pointer/Key/Scroll events, Modifiers u8-newtype w/ helpers,
 write_frame/read_frame u32-LE+bincode w/ MAX_FRAME_BYTES guard both directions, default_url).
 11 tests pass (`cargo test -p servfox-common`). Next: #2 servfox-storage.
+## #2 done — servfox-storage
+Registry (atomic containers.json, default personal, create/rename/recolor/delete w/ default-
+protected + slug dir move on rename), ContainerStore, RFC6265-subset CookieJar (Secure set+send
+https-only, domain-suffix w/ leading-dot host-only convention, RFC path-match, Max-Age>Expires,
+expiry pruning, cookies.json), in-mem LRU NetCache (&self, 256MB/1000 evict), history.jsonl,
+StoreError. 28 tests green (`cargo test -p servfox-storage`); workspace green. Next: #3 servfox-sandbox.
