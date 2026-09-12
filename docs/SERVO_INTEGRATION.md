@@ -97,8 +97,57 @@ servo = { version = "0.5", default-features = false,
   child env): fixture = white page + solid `#ff3200` box + blue `<h1>`; asserts PPM
   magic/dimensions and non-uniform pixels. Captured box pixel is exactly `(255,50,0)`.
 
-## Not yet done (follows in the IPC task)
+## Task 5 — full IPC runtime (`--tab-id/--container-id/--profile-dir/--url`) additions
 
-`present()` (not needed when reading back directly), `ToTab`/`FromTab` pipe loop,
-sandbox application, `--profile-dir` → Servo data path mapping, `netmod.rs`
-(`load_web_resource` interception), input event plumbing.
+* **Container data path knob found: `Opts.config_dir = Some(profile_dir)`.** No
+  `--user-data-path` exists, but `config_dir` binds the engine's whole on-disk
+  state there — verified: `clientstorage/default_v1/reg.sqlite` (cookie store),
+  `localstorage.json`, and `cachestorage/` are created inside the profile dir.
+  Keep `temporary_storage = false`.
+* **Streaming frame readback** (replaces `take_screenshot` for live frames):
+  in `notify_new_frame_ready` call `WebView::paint()` (same paint contract),
+  then `rendering_context.make_current()` +
+  `RenderingContext::read_to_image(DeviceIntRect::from_size(ctx.size()))` →
+  `RgbaImage` → `FromTab::Frame`. Works, and is synchronous + cheap.
+* **Resize trap (cost hours):** `Painter::resize_rendering_context`
+  **early-returns when the context already reports the new size**. Resizing the
+  `RenderingContext` ourselves before `WebView::resize()` therefore silently
+  swallows the viewport change — no reflow, no further frames, ever. Call only
+  `webview.resize(PhysicalSize)`; it resizes the context and repaints itself.
+* **Stdin must be non-blocking.** Reading a frame with blocking `read_exact`
+  after `poll()` fires deadlocks the loop until the *next* shell message (the
+  engine stops getting spins; resize/navigation hang). Runtime: `O_NONBLOCK`
+  stdin, pump bytes into a buffer, parse only complete length-prefixed frames.
+  Shell-side frames must be a single `write_frame` (they always are).
+* **Exit is `libc::_exit(code)`, not `std::process::exit`:** Mesa/glvnd
+  registered atexit/destructors + live engine threads = teardown SIGSEGV race
+  (observed flaky `exit -11`). stdout is flushed and the jar persisted first.
+* **Landlock needs extra read-only paths** beyond the spec list or the GL stack
+  dies at `dlopen` (already-loaded libs are fine, lazy ones not):
+  `/etc/ld.so.cache`, `/etc/glvnd`, `/usr/share/glvnd` (glvnd scans these for
+  EGL vendors — without them the *sandboxed* tab can't create a context),
+  `/usr/share/ca-certificates` (`/etc/ssl/certs/*` are symlinks to it — TLS
+  roots), `/etc/fonts` + `/usr/share/fontconfig`. Non-fatal denials left alone:
+  `/proc/self/{stat,cgroup}`, `$HOME/.cache/mesa_shader_cache*`, `/sys` cpuinfo.
+* **Input maps (0.5):** `MouseMove(MouseMoveEvent)`,
+  `MouseButton(MouseButtonEvent::new(Down|Up, embedder MouseButton, WebViewPoint))`,
+  `MouseLeftViewport` for Out; `Keyboard(servo::KeyboardEvent::new_without_event(
+  KeyState, keyboard_types Key/Code parsed via FromStr, Location::Standard,
+  Modifiers::CONTROL|SHIFT|ALT|META, repeat, false))`; scroll via
+  `WebView::notify_scroll_event(Scroll::Delta(WebViewVector::Page(..)), point)`.
+  `notify_history_changed(entries, current)` → `can_back = current > 0`,
+  `can_fwd = current + 1 < len`. `LoadStatus` is `Started/HeadParsed/Complete`.
+* **Managed net (`--managed-net`):** chokepoint `load_web_resource` →
+  `intercept(WebResourceResponse::new(url).status_code(..).headers(HeaderMap))`
+  (needs `http = "1"` dep to match servo-embedder-traits) +
+  `send_body_data(..)` + `finish()`. reqwest (rustls, blocking) fetches on the
+  main thread; `Set-Cookie` captured via `http::HeaderMap::get_all` into the
+  container jar; cache revalidation sends `If-None-Match`/`If-Modified-Since`.
+  Policy math is pure (`plan`/`upgrade_to_https`/`revalidate`/
+  `forwarded_response_headers`) and unit-tested in `src/netmod.rs` (bin crate:
+  `tests/` can't import modules, so pure-rule tests live in-module; `tests/e2e.rs`
+  holds the live-protocol tests).
+* e2e with the **sandbox ON**: the sandbox genuinely blocks reading the page,
+  so the `file://` fixture lives *inside* the profile dir (which is
+  writable+readable to the tab) — that's also the shape of future
+  `--offline-fixtures` layouts.

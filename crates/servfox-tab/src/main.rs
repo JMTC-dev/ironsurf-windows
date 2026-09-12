@@ -1,13 +1,17 @@
 //! servfox-tab — sandboxed per-tab Servo host process.
 //!
-//! Task 4 delivers the **Servo integration spike** (`--spike` mode): create one
-//! [`servo::Servo`] with a software (surfman-smitha) `RenderingContext`, load one
-//! page in a [`servo::WebView`], wait for load-complete + screenshot, write a PPM.
+//! Full IPC lifecycle (task 5): apply the OS sandbox, embed one
+//! [`servo::Servo`] with a software (surfman-smitha) `RenderingContext` whose
+//! data path is the container profile dir, drive one [`servo::WebView`], and
+//! speak the `servfox-common` `ToTab`/`FromTab` protocol over stdin/stdout.
 //!
-//! Full IPC lifecycle (sandbox + ToTab/FromTab pipe protocol) builds on this; see
-//! ARCHITECTURE.md §servfox-tab.
+//! `--spike` mode (task 4) is preserved for standalone render proofs; see
+//! [`spike`] and `docs/SERVO_INTEGRATION.md`.
 
+mod netmod;
+mod runtime;
 mod spike;
+mod wake;
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -20,11 +24,22 @@ fn main() {
             }
         }
     } else {
-        eprintln!(
-            "servfox-tab: full IPC lifecycle is not implemented yet (task 4 delivers --spike mode).\n\
-             usage: servfox-tab --spike --url <file:///...> --out <out.ppm> [--size WxH]"
-        );
-        2
+        match runtime::TabArgs::parse(&args) {
+            Ok(tab_args) => runtime::run(tab_args),
+            Err(err) => {
+                eprintln!(
+                    "servfox-tab: {err}\n\
+                     usage: servfox-tab --tab-id N --container-id N --profile-dir PATH \
+                     [--url URL] [--managed-net] [--no-sandbox]\n\
+                     \x20      servfox-tab --spike --url <file:///...> --out <out.ppm> [--size WxH]"
+                );
+                2
+            }
+        }
     };
-    std::process::exit(code);
+    // `_exit`, not `exit`: Mesa/GL and the engine's threads are still live,
+    // and running libc atexit handlers under them races into SIGSEGV. All
+    // IPC output is already flushed and the cookie jar persisted.
+    // SAFETY: nothing else needs to run; descriptors are flushed.
+    unsafe { libc::_exit(code) }
 }

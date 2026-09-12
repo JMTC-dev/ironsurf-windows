@@ -44,6 +44,18 @@ impl ContainerStore {
         }
     }
 
+    /// Bind directly to an existing profile directory (used by `servfox-tab`,
+    /// which receives the profile path from the shell and does not need the
+    /// full registry).
+    pub fn from_profile_dir(container: ContainerId, profile_dir: &std::path::Path) -> Self {
+        let profile_dir = profile_dir.to_path_buf();
+        let _ = std::fs::create_dir_all(&profile_dir);
+        Self {
+            container,
+            profile_dir,
+        }
+    }
+
     pub fn container(&self) -> ContainerId {
         self.container
     }

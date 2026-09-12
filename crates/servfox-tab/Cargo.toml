@@ -13,6 +13,9 @@ servo = { version = "0.5", default-features = false, features = ["baked-in-resou
 dpi = "0.1"
 libc = "0.2"
 rustls = "0.23"
+http = "1"
+euclid = "0.22"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "blocking"] }
 
 [dev-dependencies]
 tempfile = "3"

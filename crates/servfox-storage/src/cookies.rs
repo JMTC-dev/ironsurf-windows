@@ -26,6 +26,7 @@ pub struct Cookie {
 }
 
 #[derive(Default)]
+#[derive(Clone)]
 pub struct CookieJar {
     path: Option<PathBuf>,
     cookies: Vec<Cookie>,
