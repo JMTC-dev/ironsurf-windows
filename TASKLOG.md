@@ -28,3 +28,7 @@ Cargo.toml -servo/-dpi, +blitz-{dom,html,net,paint,traits}@0.3.0-beta.2 +anyrend
 Viewport::new(w*s,h*s,s,Light),blitz_net})→resolve→render_to_buffer::<VelloCpuImageRenderer>
 +paint_scene, buf==w*h*4, PPM proof; main.rs=CLI stub exit0, runtime/wake deleted, netmod+8 tests
 kept, e2e #[ignore]; spike green headless, tree free of mozjs/wgpu/servo. Next: #7 Blitz IPC runtime.
+## #7/#8 pre-flight audit
+Correction: repo is still at post-#6 state (main.rs = task-6 stub, e2e #[ignore]) —
+task 7 runtime NOT yet on disk. Queue owns: 7a–7e rebuild → tab cleanup → #8 Boa JS
+layer → verify → #9 shell/workspace green. Sessions must follow queue order.
