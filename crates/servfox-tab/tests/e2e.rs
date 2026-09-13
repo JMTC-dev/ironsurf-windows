@@ -31,6 +31,26 @@ const FIXTURE: &str = r#"<!doctype html>
 </html>
 "#;
 
+/// Link-navigation fixture (task 7d): page one holds a single fixed-layout
+/// anchor — `margin:0`, 200×40 CSS px at the top-left, so its centre is at
+/// (100, 20) in shell coordinates. Clicking it must round-trip through the
+/// `NavigationProvider` hook into a real top-level navigation.
+const LINK_PAGE1: &str = r#"<!doctype html>
+<html>
+  <head><title>Page One</title></head>
+  <body style="margin: 0; background: #ffffff">
+    <a href="page2.html" style="display: block; width: 200px; height: 40px; font-family: monospace; color: #000064">next</a>
+  </body>
+</html>
+"#;
+
+const LINK_PAGE2: &str = r#"<!doctype html>
+<html>
+  <head><title>Page Two</title></head>
+  <body style="margin: 0; background: #00ff00"></body>
+</html>
+"#;
+
 const DEADLINE: Duration = Duration::from_secs(60);
 
 struct TabChild {
@@ -50,6 +70,24 @@ impl Drop for TabChild {
 impl TabChild {
     fn send(&mut self, msg: ToTab) {
         write_frame(&mut self.stdin, &msg).expect("write ToTab frame to tab stdin");
+    }
+
+    /// Drain everything the tab emits during `window` into a fresh vec
+    /// (messages already consumed by `wait_for` are not re-delivered).
+    fn collect(&mut self, window: Duration) -> Vec<FromTab> {
+        let mut msgs = Vec::new();
+        let until = Instant::now() + window;
+        loop {
+            let step = until.saturating_duration_since(Instant::now());
+            if step.is_zero() || Instant::now() >= until {
+                return msgs;
+            }
+            match self.events.recv_timeout(step.min(Duration::from_millis(200))) {
+                Ok(msg) => msgs.push(msg),
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => return msgs,
+            }
+        }
     }
 
     /// Wait until *any* message seen so far (including ones consumed by
@@ -319,6 +357,186 @@ fn tab_exits_cleanly_on_stdin_eof() {
         assert!(
             started.elapsed() < DEADLINE,
             "tab did not exit within {DEADLINE:?} of stdin EOF"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// Task 7d: a left-button click on an `<a>` must round-trip through the
+/// `NavigationProvider` hook into a real top-level navigation — the tab
+/// fetches page two and reports `UrlChanged` (plus its title) without the
+/// shell ever sending a `Navigate`.
+#[test]
+fn tab_link_click_navigates() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let profile = dir.path().join("profile");
+    std::fs::create_dir_all(&profile).expect("profile dir");
+    let page1 = profile.join("page1.html");
+    std::fs::write(&page1, LINK_PAGE1).expect("write page1");
+    std::fs::write(&profile.join("page2.html"), LINK_PAGE2).expect("write page2");
+
+    let deadline = Instant::now() + DEADLINE;
+    let mut tab = spawn_tab(&page1, &profile);
+    let mut seen = Vec::new();
+
+    // Land on page one first (rendered, so layout — and hit-testing — is real).
+    tab.wait_for(
+        "UrlChanged(page1.html)",
+        |m| matches!(m, FromTab::UrlChanged { url: Some(u) } if u.ends_with("/page1.html")),
+        deadline,
+        &mut seen,
+    );
+    tab.wait_for(
+        "rendered Frame(1024x768) on page1",
+        |m| {
+            matches!(m, FromTab::Frame { width, height, rgba, .. }
+                if *width == 1024 && *height == 768 && !rgba_is_uniform(rgba))
+        },
+        deadline,
+        &mut seen,
+    );
+
+    // Click the centre of the 200x40 anchor at the top-left (margin:0 body,
+    // default 1024x768 scale-1 viewport): CSS px == shell px (100, 20).
+    let click = |kind| ToTab::Pointer(servfox_common::PointerEvent {
+        x: 100.0,
+        y: 20.0,
+        kind,
+        button: servfox_common::MouseButton::Left,
+    });
+    tab.send(click(servfox_common::PointerKind::Move));
+    tab.send(click(servfox_common::PointerKind::Down));
+    tab.send(click(servfox_common::PointerKind::Up));
+
+    // The href ("page2.html", resolved against page1's base URL) arrives as a
+    // fresh top-level navigation reported by the tab itself.
+    tab.wait_for(
+        "UrlChanged(page2.html) from the link click",
+        |m| matches!(m, FromTab::UrlChanged { url: Some(u) } if u.ends_with("/page2.html")),
+        deadline,
+        &mut seen,
+    );
+    tab.wait_for(
+        "TitleChanged(\"Page Two\")",
+        |m| matches!(m, FromTab::TitleChanged { title: Some(t) } if t == "Page Two"),
+        deadline,
+        &mut seen,
+    );
+
+    // And back returns to page one (history is exercised by the click nav).
+    tab.send(ToTab::Back);
+    tab.wait_for(
+        "UrlChanged(page1.html) after Back",
+        |m| matches!(m, FromTab::UrlChanged { url: Some(u) } if u.ends_with("/page1.html")),
+        deadline,
+        &mut seen,
+    );
+}
+
+/// Task 7d: pointer / keyboard / scroll events flow into blitz without
+/// harming the tab — frames keep arriving afterwards, and the process stays
+/// alive (headless; no display, localhost/file fixtures only).
+#[test]
+fn tab_survives_input_events() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let profile = dir.path().join("profile");
+    std::fs::create_dir_all(&profile).expect("profile dir");
+    let fixture = profile.join("index.html");
+    std::fs::write(&fixture, FIXTURE).expect("write fixture");
+
+    let deadline = Instant::now() + DEADLINE;
+    let mut tab = spawn_tab(&fixture, &profile);
+    let mut seen = Vec::new();
+
+    tab.wait_for(
+        "rendered Frame(1024x768)",
+        |m| {
+            matches!(m, FromTab::Frame { width, height, rgba, .. }
+                if *width == 1024 && *height == 768 && !rgba_is_uniform(rgba))
+        },
+        deadline,
+        &mut seen,
+    );
+
+    // Pointer motion + press/release over the red box, a Tab key press
+    // (blitz's focus default action) with a Shift-Tab back, and wheel scrolls
+    // in both delta flavours (lines and pixels).
+    let pointer = |kind, x, y| {
+        ToTab::Pointer(servfox_common::PointerEvent {
+            x,
+            y,
+            kind,
+            button: servfox_common::MouseButton::Left,
+        })
+    };
+    use servfox_common::PointerKind;
+    tab.send(pointer(PointerKind::Move, 60.0, 60.0));
+    tab.send(pointer(PointerKind::Down, 60.0, 60.0));
+    tab.send(pointer(PointerKind::Move, 70.0, 62.0));
+    tab.send(pointer(PointerKind::Up, 70.0, 62.0));
+    tab.send(ToTab::Key(servfox_common::KeyEvent {
+        key: "Tab".into(),
+        code: "Tab".into(),
+        text: None,
+        repeat: false,
+        mods: servfox_common::Modifiers::NONE,
+    }));
+    tab.send(ToTab::Key(servfox_common::KeyEvent {
+        key: "Tab".into(),
+        code: "Tab".into(),
+        text: None,
+        repeat: false,
+        mods: servfox_common::Modifiers::NONE.with_shift(),
+    }));
+    // Printable text input (rides on KeyDown.text in blitz beta.2).
+    tab.send(ToTab::Key(servfox_common::KeyEvent {
+        key: "h".into(),
+        code: "KeyH".into(),
+        text: Some("h".into()),
+        repeat: false,
+        mods: servfox_common::Modifiers::NONE,
+    }));
+    tab.send(ToTab::Scroll(servfox_common::ScrollEvent {
+        x: 100.0,
+        y: 100.0,
+        delta_x: 0.0,
+        delta_y: 1.0,
+    }));
+    tab.send(ToTab::Scroll(servfox_common::ScrollEvent {
+        x: 100.0,
+        y: 100.0,
+        delta_x: 0.0,
+        delta_y: -60.0,
+    }));
+
+    // Everything above must be processed without killing the tab, and paint
+    // requests they raise keep producing frames.
+    let after = tab.collect(Duration::from_millis(1500));
+    let frames = after
+        .iter()
+        .filter(|m| matches!(m, FromTab::Frame { width, height, .. } if *width == 1024 && *height == 768))
+        .count();
+    assert!(
+        frames >= 1,
+        "no frames arrived after input events ({frames}); messages: {after:?}"
+    );
+    assert!(
+        tab.child.try_wait().expect("try_wait").is_none(),
+        "tab process died handling input events"
+    );
+
+    // It still responds to the rest of the protocol.
+    tab.send(ToTab::Destroy);
+    let started = Instant::now();
+    loop {
+        if let Some(status) = tab.child.try_wait().expect("try_wait") {
+            assert!(status.success(), "tab exited with {status:?} after Destroy");
+            assert!(started.elapsed() < DEADLINE);
+            return;
+        }
+        assert!(
+            started.elapsed() < DEADLINE,
+            "tab did not exit within {DEADLINE:?} of Destroy"
         );
         std::thread::sleep(Duration::from_millis(50));
     }

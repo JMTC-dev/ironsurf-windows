@@ -25,6 +25,9 @@ anyrender_vello_cpu = "0.17"
 # anyrender 0.13 uses (kurbo 0.13.1 / peniko 0.6).
 kurbo = "0.13"
 peniko = "0.6"
+# Input event types (task 7d): same versions blitz 0.3.0-beta.2 uses.
+keyboard-types = "0.7"
+atomic_refcell = "0.1"
 
 [dev-dependencies]
 tempfile = "3"

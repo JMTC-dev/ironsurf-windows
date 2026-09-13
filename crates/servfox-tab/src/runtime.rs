@@ -28,14 +28,23 @@ use std::time::{Duration, Instant};
 
 use anyrender::{render_to_buffer, PaintScene};
 use anyrender_vello_cpu::VelloCpuImageRenderer;
-use blitz_dom::DocumentConfig;
+use blitz_dom::{Document as _, DocumentConfig};
 use blitz_html::HtmlDocument;
 use blitz_paint::paint_scene;
+use blitz_traits::events::{
+    BlitzKeyEvent, BlitzPointerEvent, BlitzPointerId, BlitzWheelDelta, BlitzWheelEvent,
+    KeyState, MouseEventButton, MouseEventButtons, PointerCoords, PointerDetails, Point,
+    UiEvent,
+};
 use blitz_traits::navigation::{NavigationOptions, NavigationProvider};
 use blitz_traits::shell::{ColorScheme, ShellProvider, Viewport};
+use keyboard_types::{Code, Key, Location, Modifiers as KMods};
 use kurbo::{Affine, Rect, Size};
 use peniko::{Color, Fill};
-use servfox_common::{read_frame, write_frame, ContainerId, FromTab, TabId, ToTab};
+use servfox_common::{
+    read_frame, write_frame, ContainerId, FromTab, KeyEvent, Modifiers, PointerEvent,
+    PointerKind, ScrollEvent, TabId, ToTab,
+};
 use servfox_sandbox::SandboxPolicy;
 use servfox_storage::{ContainerStore, CookieJar, NetCache};
 use url::Url;
@@ -317,9 +326,13 @@ pub struct Tab {
     needs_paint: bool,
     last_paint: Option<Instant>,
     offline_fixtures: Option<PathBuf>,
-    /// Shared wake pipe (owned alongside the hooks; kept for 7d input work).
+    /// Shared wake pipe (owned alongside the hooks; poked by ShellProvider /
+    /// NetWaker worker threads).
     #[allow(dead_code)]
     pipe: Arc<SelfPipe>,
+    /// Which mouse buttons are currently held (servfox `PointerKind::Down/Up`
+    /// track the transitions); carried in every `BlitzPointerEvent.buttons`.
+    mouse_buttons: MouseEventButtons,
 }
 
 /// stdout side of the IPC: one persistent BufWriter, flushed per frame.
@@ -383,6 +396,7 @@ impl Tab {
             last_paint: None,
             offline_fixtures: args.offline_fixtures.clone(),
             pipe,
+            mouse_buttons: MouseEventButtons::None,
         }
     }
 
@@ -736,14 +750,174 @@ impl Tab {
         None
     }
 
-    /// Input extension point (task 7d): map `ToTab::Pointer/Key/Scroll` onto
-    /// `blitz_traits::events::UiEvent` (`PointerMove/Down/Up`, `KeyDown`,
-    /// `Wheel` — see `docs/BLITZ_API_NOTES.md` §4), feed
-    /// `doc.handle_ui_event(ev)`, then `resolve_and_maybe_paint()`. Link
-    /// clicks already round-trip via the wired `NavHook` (§5): once real
-    /// pointer events arrive, the loop drains pending navigations for free.
-    fn handle_input(&mut self, _ev: &ToTab) {
-        // TODO(task 7d): translate and route the UiEvent here.
+    /// Input entry point (task 7d): map `ToTab::Pointer/Key/Scroll` onto
+    /// `blitz_traits::events::UiEvent` and feed `document.handle_ui_event`,
+    /// then `resolve` + coalesced repaint (`docs/BLITZ_API_NOTES.md` §4).
+    ///
+    /// Coordinate space: servfox shell coordinates are logical px (the same
+    /// space as `ToTab::Resize`'s `width`/`height`); blitz hit-tests and
+    /// default actions run in **CSS px**, which for `Viewport::new(w*scale,
+    /// h*scale, scale, …)` equals those logical px. `screen`/`client` are the
+    /// unscrolled viewport position, `page` adds the document scroll offset
+    /// (what blitz's hover/click hit-testing consumes, events/driver.rs).
+    fn handle_input(&mut self, ev: &ToTab) {
+        match ev {
+            ToTab::Pointer(pointer) => self.handle_pointer(pointer),
+            ToTab::Key(key) => self.handle_key(key),
+            ToTab::Scroll(scroll) => self.handle_scroll(scroll),
+            _ => {}
+        }
+        // Every handled input wants fresh pixels (contract §servfox-tab.3);
+        // still coalesced by the ≤30 fps throttle in `maybe_repaint`.
+        self.needs_paint = true;
+        // A link click filled the NavigationProvider hook inline; skip painting
+        // the outgoing page — the loop's `drain_nav_hook` replaces the
+        // document (and paints the incoming one) right after this returns.
+        if self.nav.pending.lock().expect("nav mutex").is_none() {
+            self.resolve_and_maybe_paint();
+        }
+    }
+
+    /// Pointer coordinates (logical px) → blitz `PointerCoords` (CSS px,
+    /// with the document scroll added into the page axes).
+    fn pointer_coords(&mut self, x: f32, y: f32) -> PointerCoords {
+        // `viewport_scroll` is a `blitz_dom::util::Point<f64>` (no Default impl).
+        let (scroll_x, scroll_y) = self
+            .doc
+            .as_ref()
+            .map(|doc| {
+                let s = doc.viewport_scroll();
+                (s.x as f32, s.y as f32)
+            })
+            .unwrap_or((0.0, 0.0));
+        PointerCoords {
+            page_x: x + scroll_x,
+            page_y: y + scroll_y,
+            screen_x: x,
+            screen_y: y,
+            client_x: x,
+            client_y: y,
+        }
+    }
+
+    fn handle_pointer(&mut self, ev: &PointerEvent) {
+        use servfox_common::MouseButton;
+
+        let button = match ev.button {
+            MouseButton::Left => MouseEventButton::Main,
+            MouseButton::Right => MouseEventButton::Secondary,
+            MouseButton::Middle => MouseEventButton::Auxiliary,
+        };
+        // Track the held-button set the way the DOM does: Down adds this
+        // button, Up clears it (blitz reads `buttons` for drag/caret state,
+        // events/mod.rs `may_move_text_input_caret`).
+        match ev.kind {
+            PointerKind::Down => self.mouse_buttons |= MouseEventButtons::from(button),
+            PointerKind::Up => self.mouse_buttons = MouseEventButtons::None,
+            _ => {}
+        }
+
+        // blitz synthesises enter/over/out/leave *DOM events* from
+        // `PointerMove` (events/driver.rs::handle_pointer_move); there is no
+        // Over/Out UiEvent, so servfox hover transitions arrive as moves.
+        let ui = match ev.kind {
+            PointerKind::Move | PointerKind::Over | PointerKind::Out => {
+                // Hover transitions carry the currently-held buttons (none for
+                // a plain move), not the `button` field of the frame.
+                UiEvent::PointerMove(self.pointer_event(ev, self.mouse_buttons))
+            }
+            PointerKind::Down => UiEvent::PointerDown(self.pointer_event(ev, self.mouse_buttons)),
+            // On release `buttons` must already have the button cleared.
+            PointerKind::Up => UiEvent::PointerUp(self.pointer_event(ev, MouseEventButtons::None)),
+        };
+        self.feed_ui_event(ui);
+    }
+
+    fn pointer_event(&mut self, ev: &PointerEvent, buttons: MouseEventButtons) -> BlitzPointerEvent {
+        BlitzPointerEvent {
+            id: BlitzPointerId::Mouse,
+            is_primary: true,
+            coords: self.pointer_coords(ev.x, ev.y),
+            button: match ev.button {
+                servfox_common::MouseButton::Left => MouseEventButton::Main,
+                servfox_common::MouseButton::Right => MouseEventButton::Secondary,
+                servfox_common::MouseButton::Middle => MouseEventButton::Auxiliary,
+            },
+            buttons,
+            mods: KMods::empty(), // servfox PointerEvent carries no modifiers
+            details: PointerDetails::default(),
+            // The event driver overwrites `element` from the target's
+            // bounding rect (driver.rs::adjust_element_coords).
+            element: Point::default(),
+            // Mouse input: the shared active-pointer (multi-touch) list stays empty.
+            active_pointers: Default::default(),
+        }
+    }
+
+    /// Keyboard input: `ToTab::Key` is a key *press* (the contract has no
+    /// release direction). blitz beta.2 has no separate `UnicodeInput`
+    /// variant — printable text rides on `BlitzKeyEvent.text` and the whole
+    /// default action (Tab focus moves, Ctrl+C, text-input edits) consumes
+    /// `UiEvent::KeyDown` (events/mod.rs:211). We emit the matching
+    /// `KeyUp` afterwards purely for DOM-fidelity (its default action is a
+    /// no-op, events/mod.rs:222); there is no release in the contract to
+    /// model beyond that.
+    fn handle_key(&mut self, ev: &KeyEvent) {
+        let key = ev.key.parse::<Key>().unwrap_or(Key::Unidentified);
+        let code = ev.code.parse::<Code>().unwrap_or(Code::Unidentified);
+        let text = ev
+            .text
+            .as_deref()
+            .filter(|t| !t.is_empty())
+            .map(blitz_traits::SmolStr::from);
+        let base = BlitzKeyEvent {
+            key,
+            code,
+            modifiers: to_blitz_mods(ev.mods),
+            location: Location::Standard,
+            is_auto_repeating: ev.repeat,
+            is_composing: false,
+            state: KeyState::Pressed,
+            text,
+        };
+        self.feed_ui_event(UiEvent::KeyDown(base.clone()));
+        let release = BlitzKeyEvent {
+            state: KeyState::Released,
+            is_auto_repeating: false,
+            // The release carries no committed text (DOM semantics).
+            text: None,
+            ..base
+        };
+        self.feed_ui_event(UiEvent::KeyUp(release));
+    }
+
+    /// Wheel/scroll: blitz's default action scrolls by `Lines(x, y) * 20`
+    /// CSS px or `Pixels(x, y)` verbatim (events/pointer.rs::handle_wheel;
+    /// positive delta = down/right). The contract doesn't pin units, so: deltas
+    /// with magnitude ≤ 3 are treated as wheel notches (lines), everything
+    /// else as CSS-px pixel deltas.
+    fn handle_scroll(&mut self, ev: &ScrollEvent) {
+        let delta = if ev.delta_x.abs().max(ev.delta_y.abs()) <= 3.0 {
+            BlitzWheelDelta::Lines(ev.delta_x as f64, ev.delta_y as f64)
+        } else {
+            BlitzWheelDelta::Pixels(ev.delta_x as f64, ev.delta_y as f64)
+        };
+        let ui = UiEvent::Wheel(BlitzWheelEvent {
+            delta,
+            coords: self.pointer_coords(ev.x, ev.y),
+            buttons: self.mouse_buttons,
+            mods: KMods::empty(),
+            element: Point::default(),
+        });
+        self.feed_ui_event(ui);
+    }
+
+    /// The single document-input funnel: everything below (7e Boa scripting,
+    /// synthetic events) should reach blitz through here.
+    fn feed_ui_event(&mut self, ui: UiEvent) {
+        if let Some(doc) = self.doc.as_mut() {
+            doc.handle_ui_event(ui);
+        }
     }
 
     /// Drain a pending `NavigationProvider` request (link click / form POST).
@@ -767,6 +941,26 @@ impl Tab {
     fn flush_stdout(&mut self) {
         let _ = self.out.writer.flush();
     }
+}
+
+/// Translate the servfox modifier bits (`servfox_common::Modifiers`, its own
+/// `u8` layout) into `keyboard_types::Modifiers` — the two bit layouts differ,
+/// so this must never be a cast (`docs/BLITZ_API_NOTES.md` §4).
+fn to_blitz_mods(m: Modifiers) -> KMods {
+    let mut k = KMods::empty();
+    if m.ctrl() {
+        k |= KMods::CONTROL;
+    }
+    if m.shift() {
+        k |= KMods::SHIFT;
+    }
+    if m.alt() {
+        k |= KMods::ALT;
+    }
+    if m.meta() {
+        k |= KMods::META;
+    }
+    k
 }
 
 /// Net policy is fixed at startup; read it back from the provider so the
