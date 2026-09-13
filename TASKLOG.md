@@ -7,7 +7,7 @@ u8, u32-LE+bincode frames, default_url). 11 green.
 LRU NetCache (256MB/1000), history.jsonl. 28 green.
 ## #3 servfox-sandbox — prctl NO_NEW_PRIVS+PDEATHSIG, setrlimits, Landlock 0.4.7 BestEffort (probe the
 syscall directly). sbox-probe LIVE HERE. 7 green.
-## #4+#5 Servo spike+runtime — SUPERSEDED by #6; gotchas in docs/SERVO_INTEGRATION.md
+## #4+#5 Servo spike+runtime — SUPERSEDED by #6; legacy appendix in docs/ENGINE_INTEGRATION.md
 ## #6 pivot Servo→Blitz+vello_cpu — blitz@0.3.0-beta.2 + anyrender 0.13 + anyrender_vello_cpu 0.17;
 spike.rs headless parse→resolve→render_to_buffer proof; e2e #[ignore].
 ## #7a docs/BLITZ_API_NOTES.md — vendor-verified cheat-sheet: NetHandler=1 fn; nav via NavigationProvider
@@ -27,3 +27,8 @@ fetch_document ⇒ same net policy; module/JSON/unfetchable skipped w/ notes); O
 navigation; 5 natives + trusted JS glue (global IS window): title get/set→TitleChanged+repaint, body
 textContent snapshot, console→stderr+StatusText, every eval caught, timers counted-only (TODO), javascript:
 refused at navigate(). 48 tab tests green (17 new js unit + 4 new e2e); no mozjs/spidermonkey/wgpu; workspace green ex-#9.
+## #9 DONE — workspace green on Blitz stack; shell tabs are REAL — fixed slint 1.17 drift
+(Color channels u8, Image::size()), pump test→tests/pump.rs (no CARGO_BIN_EXE in lib tests); fixed tab
+history Fresh index (Back was dead; e2e wait_for vacuously re-matched old msgs→added wait_for_new); NEW
+tests/real_tab.rs: real servfox-tab in shell — nav/back/fwd/frames/input headless (+SERVFOX_ONLINE=1→
+example.com live); apt libxkbcommon-x11-0 for winit X11; docs SERVO→ENGINE_INTEGRATION.md (Blitz/Boa §A–D).

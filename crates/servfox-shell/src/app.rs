@@ -138,7 +138,7 @@ impl Core {
     }
 
     fn ui(&self) -> Option<AppWindow> {
-        self.shell.borrow().as_ref().and_then(|w| w.upgrade().ok())
+        self.shell.borrow().as_ref().and_then(|w| w.upgrade())
     }
 
     fn active_proc_index(&self) -> Option<usize> {
@@ -640,7 +640,7 @@ impl Core {
                 active: i == active,
             })
             .collect();
-        ui.set_tabs(&ModelRc::from(Rc::new(VecModel::from(tabs))));
+        ui.set_tabs(ModelRc::from(Rc::new(VecModel::from(tabs))));
 
         let conts: Vec<ContainerInfo> = store
             .containers()
@@ -651,7 +651,7 @@ impl Core {
                 isDefault: c.is_default,
             })
             .collect();
-        ui.set_containers(&ModelRc::from(Rc::new(VecModel::from(conts))));
+        ui.set_containers(ModelRc::from(Rc::new(VecModel::from(conts))));
 
         if let Some(p) = procs.get(active) {
             ui.set_can_back(p.state.can_back);
@@ -667,7 +667,7 @@ impl Core {
             ui.set_status_text(status.into());
             let (glyph, color) = p.state.security().render();
             ui.set_sec_glyph(glyph.into());
-            ui.set_sec_color(color.into());
+            ui.set_sec_color(color_hex(color));
             if let Some(c) = store.container(p.tab.container) {
                 ui.set_container_label(c.name.clone().into());
             }
@@ -688,15 +688,15 @@ impl Core {
             }};
         }
         bind0!(on_go_back, |c: &Rc<Core>| c.send_active(ToTab::Back));
-        bind0!(on_go_forward, |c| c.send_active(ToTab::Forward));
-        bind0!(on_reload, |c| c.send_active(ToTab::Reload));
-        bind0!(on_new_tab, |c| {
+        bind0!(on_go_forward, |c: &Rc<Core>| c.send_active(ToTab::Forward));
+        bind0!(on_reload, |c: &Rc<Core>| c.send_active(ToTab::Reload));
+        bind0!(on_new_tab, |c: &Rc<Core>| {
             let cid = c.new_tab_container();
             c.open_tab(cid, Some(&default_url()));
         });
-        bind0!(on_open_manager, |c| c.manager_open(true));
-        bind0!(on_close_manager, |c| c.manager_open(false));
-        bind0!(on_mgr_add, |c| c.mgr_add());
+        bind0!(on_open_manager, |c: &Rc<Core>| c.manager_open(true));
+        bind0!(on_close_manager, |c: &Rc<Core>| c.manager_open(false));
+        bind0!(on_mgr_add, |c: &Rc<Core>| c.mgr_add());
 
         {
             let c = self.clone();

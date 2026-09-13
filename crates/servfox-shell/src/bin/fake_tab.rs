@@ -1,5 +1,5 @@
 //! fake_tab — a scripted stand-in for `servfox-tab` used by the shell's
-//! headless pump tests (and as an escape hatch when the Servo build is not
+//! headless pump tests (and as an escape hatch when the engine build is not
 //! available). Speaks the same framing: `FromTab` on stdout, `ToTab` on
 //! stdin; exits 0 on `Destroy` or EOF.
 
@@ -47,6 +47,7 @@ fn main() {
 
     emit(FromTab::Ready { tab_id });
     announce(&mut emit, &url, false);
+    emit(frame(size)); // like the real tab: a first frame without any Resize
 
     let stdin = std::io::stdin();
     let mut reader = BufReader::new(stdin.lock());

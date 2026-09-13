@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 
 use servfox_shell::app::App;
 use servfox_shell::AppWindow;
-use slint::{ComponentHandle, Model};
+use slint::Model;
 
 /// Drive the pump manually (the drain timer needs a running event loop,
 /// which the testing backend does not spin) until `cond` holds.
@@ -79,7 +79,8 @@ fn window_model_and_fake_tab_pump() {
     let conts = ui.get_containers();
     assert_eq!(conts.row_count(), 1);
     let c0 = conts.row_data(0).unwrap();
-    assert!(c0.color.green() > 0.6 && c0.color.green() > c0.color.red());
+    // slint 1.x Color channels are u8: palette #6aa84f → g=168 > r=106.
+    assert!(c0.color.green() > 150 && c0.color.green() > c0.color.red());
 
     ui.set_container_edit_text("work".into());
     ui.invoke_mgr_add();

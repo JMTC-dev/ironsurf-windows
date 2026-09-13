@@ -170,6 +170,48 @@ impl TabChild {
     }
 }
 
+/// Like `wait_for` but only messages that arrive *from now on* can satisfy
+/// the predicate — old traffic cannot accidentally re-match (the plain
+/// `wait_for` re-scans every message ever seen).
+impl TabChild {
+    fn wait_for_new(
+        &mut self,
+        what: &str,
+        pred: impl Fn(&FromTab) -> bool,
+        deadline: Instant,
+        seen: &mut Vec<FromTab>,
+    ) -> FromTab {
+        loop {
+            if Instant::now() >= deadline {
+                let status = self.child.try_wait().ok().flatten();
+                panic!(
+                    "timed out waiting for new {what} (child status: {status:?})\n\
+                     messages seen ({}): {seen:#?}",
+                    seen.len()
+                );
+            }
+            match self.events.recv_timeout(Duration::from_millis(500)) {
+                Ok(msg) => {
+                    let matched = pred(&msg);
+                    seen.push(msg.clone());
+                    if matched {
+                        return msg;
+                    }
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    let status = self.child.wait().ok();
+                    panic!(
+                        "stdout closed while waiting for new {what} (child status: {status:?})\n\
+                         messages seen ({}): {seen:#?}",
+                        seen.len()
+                    );
+                }
+            }
+        }
+    }
+}
+
 fn spawn_tab(fixture: &std::path::Path, profile_dir: &std::path::Path) -> TabChild {
     let exe = env!("CARGO_BIN_EXE_servfox-tab");
     let mut child = Command::new(exe)
@@ -460,11 +502,20 @@ fn tab_link_click_navigates() {
         &mut seen,
     );
 
-    // And back returns to page one (history is exercised by the click nav).
+    // And back returns to page one — the message must arrive *after* Back
+    // (the plain wait_for would re-match the page-1 UrlChanged from spawn).
     tab.send(ToTab::Back);
-    tab.wait_for(
+    tab.wait_for_new(
         "UrlChanged(page1.html) after Back",
         |m| matches!(m, FromTab::UrlChanged { url: Some(u) } if u.ends_with("/page1.html")),
+        deadline,
+        &mut seen,
+    );
+    // Forward reaches page two again, and history flags say so.
+    tab.send(ToTab::Forward);
+    tab.wait_for_new(
+        "UrlChanged(page2.html) after Forward",
+        |m| matches!(m, FromTab::UrlChanged { url: Some(u) } if u.ends_with("/page2.html")),
         deadline,
         &mut seen,
     );

@@ -1,4 +1,90 @@
-# Servo 0.5 integration notes (servfox-tab spike, task 4)
+# Engine integration notes (servfox-tab)
+
+The engine is **Blitz + vello_cpu + Boa** (pivot in task 6). Sections A–D below are
+the live contract discovered implementing tasks 6–9. The legacy Servo 0.5 spike
+notes are kept at the bottom as an appendix: their **OS/process-level** gotchas
+still apply to the tab process today; their API specifics are obsolete.
+
+## A. Paint path (Blitz 0.3.0-beta.2 + anyrender 0.13 + anyrender_vello_cpu 0.17)
+
+* One `HtmlDocument::from_html(html, DocumentConfig)` **per navigation**, rebuilt on
+  every nav/reload; `Document` is **neither `Send` nor `Sync`** → the whole engine
+  lives on one dedicated thread; the IPC loop talks to it via a self-pipe wake.
+* Layout/paint cycle: `document.resolve(scale)` after every input/net/JS tick, then
+  `blitz_paint::paint_scene` → `VelloCpuImageRenderer::render_to_buffer` → RGBA8.
+  **vello_cpu emits premultiplied RGBA**; `FromTab::Frame` is straight alpha → the
+  tab un-premultiplies before shipping (and Slint's `Rgba8Pixel` is straight alpha).
+* `Document::has_changes()` semantics are **inverted** from what the name suggests
+  (see `BLITZ_API_NOTES.md`); the tab tracks its own `needs_paint` and throttles to
+  ≤30 fps, but force-bypasses the throttle right after load/resize (`last_paint = None`).
+* Resize: `set_viewport(Viewport)` is **the** resize entry point (`resize()` does not
+  reflow). Until the shell sends `ToTab::Resize` the tab paints at `DEFAULT_SIZE`
+  (1024×768) — a fresh tab produces its first frame with **no** Resize, which is what
+  lets the shell composite before the window lays out.
+* Headless by construction: no winit, no wgpu, no display server for the tab; only
+  the shell needs X (Slint software renderer via softbuffer — force
+  `renderer_name("software")` before the first window; runtime dep
+  `libxkbcommon-x11-0` for winit's X11 keyboard backend).
+
+## B. NetProvider (`src/netmod.rs`)
+
+* `NetHandler` is **one function**; `BlitzNetProvider` implements the
+  `blitz_traits::net::NetProvider` trait and delivers `(status, headers, body)`
+  to that handler. Subtle failure mode: on the error path the handler must be
+  **dropped** (not called with a bogus response) or Blitz stalls the request queue.
+* Fetching: `reqwest 0.12` (rustls) on worker threads; per-container cookie jar +
+  LRU cache live behind a `Mutex` inside the provider (Blitz may call from any thread).
+* Policy (per §Network layer): navigations are upgraded `http→https`, an upgrade
+  failure renders a block page naming both URLs; `Secure` cookies are sent on https
+  only; ETag/`If-None-Match` revalidation serves the cached body only on a matching
+  validator. `--managed-net` toggles Managed vs Passthrough (default: Passthrough).
+* `fetch_document` (shared by navigations and `<script src>`) is the single network
+  entry point, so scripts obey exactly the same cookie/cache/upgrade policy.
+
+## C. Boa JS surface (boa 0.22, `src/js.rs`)
+
+* **One `boa::Context` per navigation** (fresh realm = correct location/title state).
+  `<script>` blocks run in document order; `src=` scripts go through
+  `fetch_document` (same net policy); `type=module`/JSON/unfetchable are skipped with notes.
+* The binding surface is 5 natives + a trusted JS glue script; the glue makes the
+  global object *be* `window` (self-referential), provides `document.title` get/set
+  (set ⇒ `FromTab::TitleChanged` + repaint), `document.body.textContent` snapshot,
+  and `console.*` ⇒ tab stderr + `FromTab::StatusText`.
+* Every `eval` is caught: a throwing script is reported (`ConsoleLog`/`Error`) and
+  the **next** script still runs (asserted in `tests/e2e.rs`).
+* Timers (`setTimeout`/`setInterval`) are counted-only today (scheduled = TODO);
+  `javascript:` URLs are refused at `navigate()` time.
+
+## D. History & shell-side lessons (task 9)
+
+* `NavHistory::Fresh` in `runtime.rs` once computed the target index **before**
+  pushing the new URL, so `history_index` never advanced → Back was dead after any
+  shell-driven navigation. The tab's own e2e missed it because its `wait_for`
+  matches *any message ever seen* (a Back assertion re-matched the page-1
+  `UrlChanged` from spawn). Now: Fresh ⇒ `position(url)` or push-and-point-at-HEAD,
+  plus a `wait_for_new` helper that only accepts fresh messages.
+* **Cargo gotcha:** `CARGO_BIN_EXE_<name>` is *not* defined for the lib's unit-test
+  target — any test that spawns a sibling bin must live under `tests/` (the shell's
+  fake-tab pump test moved to `tests/pump.rs`). Integration tests can locate
+  workspace sibling bins via `current_exe()/../../servfox-tab`.
+* **Slint 1.17 drift:** `Color` channels are `u8` (`color.green() > 150`, not `> 0.6`);
+  `Image` exposes `size() -> IntSize`, not `width()/height()` methods.
+* End-to-end proof lives in `crates/servfox-shell/tests/real_tab.rs`: the real Slint
+  window + real `servfox-tab` binary + Blitz frames, headless on file fixtures in the
+  container profile dir; the live `https://example.com` leg runs with `SERVFOX_ONLINE=1`.
+
+---
+
+# Appendix — legacy Servo 0.5 spike notes (superseded by the Blitz pivot)
+
+Everything below was discovered against the **published `servo = "0.5.0"` crate**
+(`~/.cargo/registry/src/*/servo-0.5.0/`, unpacked), headless on this box (no GPU,
+no X for the spike — `unset DISPLAY`). API-level notes are historical; the **still
+valid OS/process gotchas** are: non-blocking stdin for the IPC loop, `libc::_exit`
+(not `process::exit`) to dodge atexit/teardown races, Landlock's extra read-only
+paths (`/etc/ld.so.cache`, `/etc/fonts`, `/usr/share/fontconfig`,
+`/usr/share/ca-certificates`, …), fixtures must live *inside* the profile dir
+because the sandbox blocks other reads, and benign `XDG_RUNTIME_DIR` noise.
 
 Everything below was discovered against the **published `servo = "0.5.0"` crate**
 (`~/.cargo/registry/src/*/servo-0.5.0/`, unpacked), headless on this box (no GPU,

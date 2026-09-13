@@ -561,15 +561,16 @@ impl Tab {
 
         match history {
             NavHistory::Fresh => {
-                let target = self
-                    .history
-                    .iter()
-                    .position(|h| h == url)
-                    .unwrap_or(self.history.len().saturating_sub(1));
-                if self.history.get(target) != Some(url) {
-                    self.history.push(url.clone());
+                // Re-visiting an entry jumps to it; a new URL is pushed and
+                // becomes current (previously the index stayed behind, which
+                // left Back dead after shell-driven navigations).
+                match self.history.iter().position(|h| h == url) {
+                    Some(pos) => self.history_index = pos,
+                    None => {
+                        self.history.push(url.clone());
+                        self.history_index = self.history.len() - 1;
+                    }
                 }
-                self.history_index = target;
             }
             NavHistory::Session(session) => {
                 self.history_index = session;

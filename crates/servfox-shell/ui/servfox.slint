@@ -25,7 +25,7 @@ export struct ContainerInfo {
 }
 
 /// A tiny borderless toolbar button (cheaper than styled Buttons in rows).
-MiniButton := Rectangle {
+component MiniButton inherits Rectangle {
     in property <string> label: "";
     in property <bool> enabled: true;
     in property <color> tint: #262626;
@@ -34,7 +34,7 @@ MiniButton := Rectangle {
     height: 24px;
     bg := Rectangle {
         background: ta.has-hover ? (root.enabled ? #3d3d3d : #2c2c2c) : root.tint;
-        radius: 4px;
+        border-radius: 4px;
     }
     lbl := Text {
         text: root.label;
@@ -51,14 +51,13 @@ MiniButton := Rectangle {
 }
 
 /// URL bar wrapper: bumps `focus-token` (from Rust / Ctrl-L) to grab focus.
-UrlBar := Rectangle {
+component UrlBar inherits Rectangle {
     in property <int> focus-token: 0;
-    in-out property <string> text;
-    out callback submitted(text: string);
+    in-out property<string> text <=> edit.text;
+    callback submitted(text: string);
     edit := LineEdit {
         width: parent.width;
         height: parent.height;
-        text <-> root.text;
         placeholder-text: "Search or enter address — Ctrl-L to focus";
         accepted(txt) => { root.submitted(txt); }
     }
@@ -72,9 +71,9 @@ UrlBar := Rectangle {
 /// The page's keyboard focus holder. Every key press is forwarded to Rust
 /// (consumed so Slint never beeps); Rust either acts on a browser chord or
 /// relays a ToTab::Key to the active tab process.
-PageSurface := FocusScope {
+component PageSurface inherits FocusScope {
     in property <int> focus-token: 0;
-    out callback key(pressed: bool, text: string, ctrl: bool, shift: bool, alt: bool, meta: bool, repeat: bool);
+    callback key(pressed: bool, text: string, ctrl: bool, shift: bool, alt: bool, meta: bool, repeat: bool);
     changed focus-token => {
         if (root.focus-token > 0) { self.focus(); }
     }
@@ -100,51 +99,52 @@ export component AppWindow inherits Window {
     in property <[TabInfo]> tabs;
     in property <[ContainerInfo]> containers;
     in property <image> page-image;
-    in property <string> url-text;
+    // two-way alias: Rust pushes URLs here and they propagate to the URL bar
+    in-out property<string> url-text <=> url-bar.text;
     in property <string> status-text;
     in property <string> sec-glyph: "";
-    in property <string> sec-color: "#888888";
+    in property <color> sec-color: #888888;
     in property <string> spinner: " ";
     in property <string> container-label: "";
     in property <bool> can-back: false;
     in property <bool> can-fwd: false;
     in property <bool> manager-open: false;
     in property <int> editing-index: -1;
-    in property <string> container-edit-text;
+    in-out property <string> container-edit-text;
     in property <int> selected-container: 0;
     in property <int> active-index: 0;
     // bumped by Rust to move focus programmatically (Ctrl-L / Esc / startup)
     in property <int> focus-url-token: 0;
-    in property <int> focus-page-token: 0;
+    in-out property <int> focus-page-token: 0;
     // page area size, read by Rust to send ToTab::Resize
-    out property <length> page-width: page-area.width;
-    out property <length> page-height: page-area.height;
+    out property <length> page-width: page.width;
+    out property <length> page-height: page.height;
 
     // ------------------------------------------------------------------
     // intents surfaced to Rust
     // ------------------------------------------------------------------
-    out callback go-back();
-    out callback go-forward();
-    out callback reload();
-    out callback new-tab();
-    out callback navigate(url: string);
-    out callback activate-tab(idx: int);
-    out callback close-tab(idx: int);
-    out callback open-manager();
-    out callback close-manager();
-    out callback mgr-new-tab-in(idx: int);
-    out callback mgr-move-tab-to(idx: int);
-    out callback mgr-delete(idx: int);
-    out callback mgr-start-rename(idx: int);
-    out callback mgr-rename(idx: int);
-    out callback mgr-add();
-    out callback mgr-recolor(idx: int, palette: int);
-    out callback mgr-select(idx: int);
+    callback go-back();
+    callback go-forward();
+    callback reload();
+    callback new-tab();
+    callback navigate(url: string);
+    callback activate-tab(idx: int);
+    callback close-tab(idx: int);
+    callback open-manager();
+    callback close-manager();
+    callback mgr-new-tab-in(idx: int);
+    callback mgr-move-tab-to(idx: int);
+    callback mgr-delete(idx: int);
+    callback mgr-start-rename(idx: int);
+    callback mgr-rename(idx: int);
+    callback mgr-add();
+    callback mgr-recolor(idx: int, palette: int);
+    callback mgr-select(idx: int);
     // raw keyboard/pointer events from the page; Rust decides chords
-    out callback page-key(pressed: bool, text: string, ctrl: bool, shift: bool, alt: bool, meta: bool, repeat: bool);
+    callback page-key(pressed: bool, text: string, ctrl: bool, shift: bool, alt: bool, meta: bool, repeat: bool);
     // kind: 0 move, 1 down, 2 up, 4 out — button: 0 left, 1 right, 2 middle
-    out callback page-pointer(x: length, y: length, kind: int, button: int);
-    out callback page-wheel(x: length, y: length, delta-x: length, delta-y: length);
+    callback page-pointer(x: length, y: length, kind: int, button: int);
+    callback page-wheel(x: length, y: length, delta-x: length, delta-y: length);
 
     // fixed palette; index also addresses `palette-color` for add/rename
     function palette-color(idx: int) -> color {
@@ -167,10 +167,10 @@ export component AppWindow inherits Window {
             height: 38px;
             background: #2b2b2b;
 
-            Row {
+            HorizontalLayout {
                 x: 8px;
                 height: parent.height;
-                vertical-alignment: center;
+                cross-axis-alignment: center;
                 spacing: 6px;
 
                 MiniButton { label: "←"; enabled: root.can-back; clicked => { root.go-back(); } }
@@ -180,7 +180,6 @@ export component AppWindow inherits Window {
                 url-bar := UrlBar {
                     min-width: 160px;
                     horizontal-stretch: 1;
-                    text <-> root.url-text;
                     focus-token: root.focus-url-token;
                     submitted(txt) => { root.navigate(txt); }
                 }
@@ -192,7 +191,7 @@ export component AppWindow inherits Window {
                 Rectangle {
                     height: 24px;
                     width: Math.max(80px, cont-lbl.preferred-width + 34px);
-                    bgr := Rectangle { background: cb.has-hover ? #3d3d3d : #262626; radius: 4px; }
+                    bgr := Rectangle { background: cb.has-hover ? #3d3d3d : #262626; border-radius: 4px; }
                     cont-lbl := Text {
                         text: root.container-label;
                         color: #dddddd;
@@ -221,9 +220,10 @@ export component AppWindow inherits Window {
                 width: parent.width;
                 height: parent.height;
                 horizontal-stretch: 1000;
-                viewport-width: Math.max(width, tab-row.width + 16px);
+                viewport-width: Math.max(self.width, tab-row.width + 16px);
 
                 tab-row := HorizontalLayout {
+                    width: self.preferred-width;
                     spacing: 4px;
                     padding-left: 6px;
                     padding-top: 3px;
@@ -231,9 +231,9 @@ export component AppWindow inherits Window {
                     for tab[idx] in tabs: Rectangle {
                         height: 24px;
                         width: Math.min(220px, Math.max(90px, tt.preferred-width + 44px));
-                        bgr := Rectangle {
+                        tbgr := Rectangle {
                             background: tab.active ? #3a3a3a : #2e2e2e;
-                            radius: 4px;
+                            border-radius: 4px;
                         }
                         // container-colored stripe
                         stripe := Rectangle {
@@ -241,7 +241,7 @@ export component AppWindow inherits Window {
                             width: 5px;
                             y: 4px;
                             height: parent.height - 8px;
-                            radius: 2px;
+                            border-radius: 2px;
                             background: tab.color;
                         }
                         tt := Text {
@@ -250,7 +250,7 @@ export component AppWindow inherits Window {
                             x: 16px;
                             vertical-alignment: center;
                             max-width: parent.width - 40px;
-                            elide: middle;
+                            overflow: elide;
                         }
                         xbtn := Text {
                             text: "✕";
@@ -293,23 +293,19 @@ export component AppWindow inherits Window {
 
                 ta := TouchArea {
                     // clicking the page returns keyboard focus to it
-                    pressed => { root.focus-page-token += 1; }
+                    changed pressed => { if (ta.pressed) { root.focus-page-token += 1; } }
                     pointer-event(ev) => {
-                        // kind: 0 move, 1 down, 2 up, 4 out; Slint `:=` is the
-                        // imperative assignment inside handlers
-                        kind := 0;
-                        if (ev.kind == PointerEventKind.down) { kind := 1; }
-                        if (ev.kind == PointerEventKind.up) { kind := 2; }
-                        if (ev.kind == PointerEventKind.cancel) { kind := 4; }
-                        btn := 0;
-                        if (ev.button == PointerEventButton.right) { btn := 1; }
-                        if (ev.button == PointerEventButton.middle) { btn := 2; }
-                        root.page-pointer(ev.x, ev.y, kind, btn);
+                        // kind: 0 move, 1 down, 2 up, 4 out (`let` is immutable:
+                        // derive with ternaries; coords come from the TouchArea)
+                        let kind = ev.kind == PointerEventKind.down ? 1 : ev.kind == PointerEventKind.up ? 2 : ev.kind == PointerEventKind.cancel ? 4 : 0;
+                        let btn = ev.button == PointerEventButton.right ? 1 : ev.button == PointerEventButton.middle ? 2 : 0;
+                        root.page-pointer(ta.mouse-x, ta.mouse-y, kind, btn);
                     }
                     // Slint: a positive wheel delta reveals content toward the
                     // top/left; the tab expects positive == reveal down/right.
-                    scroll(dv, dh) => {
-                        root.page-wheel(ta.mouse-x, ta.mouse-y, -dh, -dv);
+                    scroll-event(ev) => {
+                        root.page-wheel(ta.mouse-x, ta.mouse-y, -ev.delta-x, -ev.delta-y);
+                        return EventResult.accept;
                     }
                 }
             }
@@ -320,10 +316,10 @@ export component AppWindow inherits Window {
             height: 24px;
             background: #2b2b2b;
 
-            Row {
+            HorizontalLayout {
                 x: 10px;
                 height: parent.height;
-                vertical-alignment: center;
+                cross-axis-alignment: center;
                 spacing: 8px;
 
                 Text { text: root.spinner; color: #bbbbbb; }
@@ -333,7 +329,7 @@ export component AppWindow inherits Window {
                     color: #aaaaaa;
                     vertical-alignment: center;
                     max-width: Math.max(0px, root.width - 220px);
-                    elide: middle;
+                    overflow: elide;
                 }
             }
         }
@@ -351,7 +347,7 @@ export component AppWindow inherits Window {
 
         panel := Rectangle {
             TouchArea {} // swallow clicks over the panel
-            x: root.width - width;
+            x: root.width - self.width;
             width: Math.min(380px, root.width);
             height: root.height;
             background: #1e1e1e;
@@ -371,7 +367,7 @@ export component AppWindow inherits Window {
                 for c[i] in containers: Rectangle {
                     height: 54px;
                     width: parent.width;
-                    sel := Rectangle { background: i == root.selected-container ? #383838 : #262626; radius: 4px; }
+                    sel := Rectangle { background: i == root.selected-container ? #383838 : #262626; border-radius: 4px; }
                     VerticalLayout {
                         x: 6px; y: 3px;
                         width: parent.width - 12px;
@@ -379,10 +375,11 @@ export component AppWindow inherits Window {
                         HorizontalLayout {
                             height: 22px;
                             spacing: 6px;
-                            Rectangle { width: 12px; height: 12px; radius: 3px; background: c.color; }
+                            Rectangle { width: 12px; height: 12px; border-radius: 3px; background: c.color; }
                             if i == root.editing-index: LineEdit {
                                 horizontal-stretch: 1;
-                                text <-> root.container-edit-text;
+                                text: root.container-edit-text;
+                                edited(t) => { root.container-edit-text = t; }
                                 accepted => { root.mgr-rename(i); }
                             }
                             Text {
@@ -417,7 +414,8 @@ export component AppWindow inherits Window {
                     spacing: 6px;
                     LineEdit {
                         horizontal-stretch: 1;
-                        text <-> root.container-edit-text;
+                        text: root.container-edit-text;
+                        edited(t) => { root.container-edit-text = t; }
                         placeholder-text: "name";
                         accepted => { root.mgr-add(); }
                     }
@@ -426,8 +424,8 @@ export component AppWindow inherits Window {
                 HorizontalLayout {
                     height: 20px;
                     spacing: 6px;
-                    for p[7] in [0, 1, 2, 3, 4, 5, 6]: Rectangle {
-                        width: 18px; height: 18px; radius: 4px;
+                    for p in [0, 1, 2, 3, 4, 5, 6]: Rectangle {
+                        width: 18px; height: 18px; border-radius: 4px;
                         background: root.palette-color(p);
                         pt := TouchArea { clicked => { root.mgr-recolor(root.selected-container, p); } }
                     }

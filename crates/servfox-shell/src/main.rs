@@ -66,10 +66,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     if smoke {
         // Smoke contract: window is up, about:blank loaded, exit 0 after 3s
-        // regardless of whether a frame arrived (CI boxes can lack Servo
-        // deps; spawn failure is reported in the status bar, not fatal).
+        // regardless of whether a frame arrived (CI boxes can lack engine
+        // runtime deps; spawn failure is reported in the status bar, not fatal).
         let timer = slint::Timer::default();
-        timer.start(slint::TimerMode::Singleshot, Duration::from_millis(3000), move || {
+        timer.start(slint::TimerMode::SingleShot, Duration::from_millis(3000), move || {
             let _ = slint::quit_event_loop();
         });
     }
