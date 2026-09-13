@@ -18,9 +18,12 @@ handler) + fetch_document: https-upgrade+block page, cookies, ETag. 16 green.
 aborts), 1-thread poll[stdin,self-pipe], nav/back/fwd/reload/resize(set_viewport)/SetVisible, HtmlDocument
 per nav→settle→vello ≤30fps, Title/Url/History dedupe, Shell+Nav hooks, jars saved on Destroy/EOF. NOTE:
 servfox-shell fails PRE-EXISTING at HEAD (slint 1.x drift) — task #9 owns it.
-## #7d done — inputs + link-click navigation (ACHIEVED, no limits hit)
-handle_input LIVE: Pointer Move/Down/Up/Over/Out→UiEvent (CSS-px page coords, held-buttons tracked),
-Key→KeyDown(text rides input)+KeyUp, Scroll→Wheel (≤3 notch=Lines×20px else Pixels); each input→
-handle_ui_event+resolve+repaint (≤30fps, SetVisible). Link nav via the wired NavigationProvider hook
-(no fallback needed): e2e click fixture <a>→UrlChanged page2+title+Back; +input-survival test (Tab/
-Shift-Tab/print/scroll, frames keep coming). Tab 27 green; shell still #9. Next: #7e final validation.
+## #7d inputs + link-click navigation — handle_input LIVE: Pointer→UiEvent (CSS-px page coords,
+held buttons tracked), Key→KeyDown(text rides input)+KeyUp, Scroll→Wheel (≤3 notch=Lines×20px else
+Pixels), each→resolve+repaint ≤30fps; link nav via the wired NavigationProvider hook (e2e click
+<a>→page2+title+Back) + input-survival test. Tab 27 green; shell still #9.
+## #8 Boa JS layer (servfox-tab) — NEW src/js.rs: <script>s in document order (src= via
+fetch_document ⇒ same net policy; module/JSON/unfetchable skipped w/ notes); ONE boa-0.22 Context per
+navigation; 5 natives + trusted JS glue (global IS window): title get/set→TitleChanged+repaint, body
+textContent snapshot, console→stderr+StatusText, every eval caught, timers counted-only (TODO), javascript:
+refused at navigate(). 48 tab tests green (17 new js unit + 4 new e2e); no mozjs/spidermonkey/wgpu; workspace green ex-#9.

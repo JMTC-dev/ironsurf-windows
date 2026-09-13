@@ -51,6 +51,43 @@ const LINK_PAGE2: &str = r#"<!doctype html>
 </html>
 "#;
 
+/// Task 8: a page whose inline `<script>` rewrites the title and logs to the
+/// console. `document.title = …` must arrive over IPC as `TitleChanged`,
+/// overriding the parsed `<title>`.
+const JS_TITLE_PAGE: &str = r#"<!doctype html>
+<html>
+  <head><title>Base Title</title></head>
+  <body style="margin: 0; background: #ffffff">
+    <div style="width: 120px; height: 120px; background: #0032ff"></div>
+    <script>console.log("hello-from-js"); document.title = "js-set-title";</script>
+  </body>
+</html>
+"#;
+
+/// Task 8: an external script body, fetched through the tab's own fetcher.
+const JS_EXTERNAL_PAGE: &str = r#"<!doctype html>
+<html>
+  <head><title>Base Title</title><script src="title-setter.js"></script></head>
+  <body style="margin: 0; background: #ffffff">
+    <div style="width: 120px; height: 120px; background: #3200ff"></div>
+  </body>
+</html>
+"#;
+const JS_EXTERNAL_BODY: &str = "document.title = 'external-title';\n";
+
+/// Task 8: a page with a syntax error in the first script and a live script
+/// after it — the tab must still paint and report the title.
+const JS_BROKEN_PAGE: &str = r#"<!doctype html>
+<html>
+  <head><title>Broken JS</title></head>
+  <body style="margin: 0; background: #ffffff">
+    <div style="width: 120px; height: 120px; background: #00ff32"></div>
+    <script>function broken( {</script>
+    <script>console.warn("second-script-ran");</script>
+  </body>
+</html>
+"#;
+
 const DEADLINE: Duration = Duration::from_secs(60);
 
 struct TabChild {
@@ -540,4 +577,205 @@ fn tab_survives_input_events() {
         );
         std::thread::sleep(Duration::from_millis(50));
     }
+}
+
+/// Send `Destroy` and require a clean exit 0 (used by the task 8 JS tests).
+fn exit_cleanly(tab: &mut TabChild) {
+    tab.send(ToTab::Destroy);
+    let started = Instant::now();
+    loop {
+        if let Some(status) = tab.child.try_wait().expect("try_wait") {
+            assert!(status.success(), "tab exited with {status:?} after Destroy");
+            assert!(
+                started.elapsed() < DEADLINE,
+                "tab did not exit within {DEADLINE:?} of Destroy"
+            );
+            return;
+        }
+        assert!(
+            started.elapsed() < DEADLINE,
+            "tab did not exit within {DEADLINE:?} of Destroy"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// Task 8: `console.log` + `document.title = "js-set-title"` in an inline
+/// `<script>` must surface over the IPC channel as
+/// `TitleChanged("js-set-title")` (beating the parsed `<title>`) and a
+/// `StatusText` carrying the console line — with the page still painting.
+#[test]
+fn tab_script_sets_title_over_ipc() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let profile = dir.path().join("profile");
+    std::fs::create_dir_all(&profile).expect("profile dir");
+    let fixture = profile.join("index.html");
+    std::fs::write(&fixture, JS_TITLE_PAGE).expect("write fixture");
+
+    let deadline = Instant::now() + DEADLINE;
+    let mut tab = spawn_tab(&fixture, &profile);
+    let mut seen = Vec::new();
+
+    let title = tab.wait_for(
+        "TitleChanged(\"js-set-title\") from the inline script",
+        |m| matches!(m, FromTab::TitleChanged { title: Some(t) } if t == "js-set-title"),
+        deadline,
+        &mut seen,
+    );
+    assert_eq!(
+        title,
+        FromTab::TitleChanged {
+            title: Some("js-set-title".into())
+        }
+    );
+    assert!(
+        !seen.iter().any(|m| matches!(m, FromTab::TitleChanged { title: Some(t) } if t == "Base Title")),
+        "a script-assigned title must win over the parsed <title>: {seen:?}"
+    );
+
+    tab.wait_for(
+        "StatusText carrying the console.log output",
+        |m| matches!(m, FromTab::StatusText { text: Some(t) } if t.contains("hello-from-js")),
+        deadline,
+        &mut seen,
+    );
+
+    tab.wait_for(
+        "rendered Frame(1024x768) for the scripted page",
+        |m| {
+            matches!(m, FromTab::Frame { width, height, rgba, .. }
+                if *width == 1024 && *height == 768 && !rgba_is_uniform(rgba))
+        },
+        deadline,
+        &mut seen,
+    );
+
+    exit_cleanly(&mut tab);
+}
+
+/// Task 8: `<script src="…">` bodies are fetched through the tab's own fetcher
+/// (same policy as the document) and executed — here, from a sibling file.
+#[test]
+fn tab_runs_external_script() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let profile = dir.path().join("profile");
+    std::fs::create_dir_all(&profile).expect("profile dir");
+    let fixture = profile.join("index.html");
+    std::fs::write(&fixture, JS_EXTERNAL_PAGE).expect("write fixture");
+    std::fs::write(profile.join("title-setter.js"), JS_EXTERNAL_BODY).expect("write script");
+
+    let deadline = Instant::now() + DEADLINE;
+    let mut tab = spawn_tab(&fixture, &profile);
+    let mut seen = Vec::new();
+
+    tab.wait_for(
+        "TitleChanged(\"external-title\") from title-setter.js",
+        |m| matches!(m, FromTab::TitleChanged { title: Some(t) } if t == "external-title"),
+        deadline,
+        &mut seen,
+    );
+    tab.wait_for(
+        "rendered Frame(1024x768) for the external-script page",
+        |m| {
+            matches!(m, FromTab::Frame { width, height, rgba, .. }
+                if *width == 1024 && *height == 768 && !rgba_is_uniform(rgba))
+        },
+        deadline,
+        &mut seen,
+    );
+
+    exit_cleanly(&mut tab);
+}
+
+/// Task 8: a `<script>` that does not even parse must not take the tab down —
+/// the frame still arrives, the title still arrives, the error is reported as a
+/// status text, and the protocol keeps working.
+#[test]
+fn tab_survives_script_syntax_error() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let profile = dir.path().join("profile");
+    std::fs::create_dir_all(&profile).expect("profile dir");
+    let fixture = profile.join("index.html");
+    std::fs::write(&fixture, JS_BROKEN_PAGE).expect("write fixture");
+
+    let deadline = Instant::now() + DEADLINE;
+    let mut tab = spawn_tab(&fixture, &profile);
+    let mut seen = Vec::new();
+
+    tab.wait_for(
+        "a Frame despite the broken script",
+        |m| {
+            matches!(m, FromTab::Frame { width, height, rgba, .. }
+                if *width == 1024 && *height == 768 && !rgba_is_uniform(rgba))
+        },
+        deadline,
+        &mut seen,
+    );
+    tab.wait_for(
+        "TitleChanged(\"Broken JS\") despite the broken script",
+        |m| matches!(m, FromTab::TitleChanged { title: Some(t) } if t == "Broken JS"),
+        deadline,
+        &mut seen,
+    );
+    tab.wait_for(
+        "StatusText reporting the JavaScript error",
+        |m| matches!(m, FromTab::StatusText { text: Some(t) } if t.contains("JavaScript error")),
+        deadline,
+        &mut seen,
+    );
+
+    assert!(
+        tab.child.try_wait().expect("try_wait").is_none(),
+        "a syntax error in a page script killed the tab"
+    );
+    exit_cleanly(&mut tab);
+}
+
+/// Task 8 / shell contract: `javascript:` URLs are refused at the navigation
+/// entry point with a status text — never executed, never navigated to.
+#[test]
+fn tab_refuses_javascript_url_navigation() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let profile = dir.path().join("profile");
+    std::fs::create_dir_all(&profile).expect("profile dir");
+    let fixture = profile.join("index.html");
+    std::fs::write(&fixture, FIXTURE).expect("write fixture");
+
+    let deadline = Instant::now() + DEADLINE;
+    let mut tab = spawn_tab(&fixture, &profile);
+    let mut seen = Vec::new();
+
+    tab.wait_for(
+        "UrlChanged(index.html) before the refusal",
+        |m| matches!(m, FromTab::UrlChanged { url: Some(u) } if u.ends_with("/index.html")),
+        deadline,
+        &mut seen,
+    );
+
+    tab.send(ToTab::Navigate {
+        url: "javascript:document.title='pwned'".to_string(),
+    });
+    let after = tab.collect(Duration::from_millis(1500));
+    assert!(
+        after
+            .iter()
+            .any(|m| matches!(m, FromTab::StatusText { text: Some(t) } if t.contains("refused javascript:"))),
+        "no refusal status text for a javascript: URL: {after:?}"
+    );
+    assert!(
+        !after.iter().any(|m| matches!(m, FromTab::UrlChanged { url: Some(u) } if u.starts_with("javascript:"))),
+        "the tab navigated to a javascript: URL: {after:?}"
+    );
+    assert!(
+        !after
+            .iter()
+            .any(|m| matches!(m, FromTab::TitleChanged { title: Some(t) } if t == "pwned")),
+        "the javascript: URL was executed, not refused: {after:?}"
+    );
+    assert!(
+        tab.child.try_wait().expect("try_wait").is_none(),
+        "a refused javascript: URL killed the tab"
+    );
+
+    exit_cleanly(&mut tab);
 }

@@ -19,6 +19,8 @@ blitz-html = "0.3.0-beta.2"
 blitz-net = "0.3.0-beta.2"
 blitz-paint = "0.3.0-beta.2"
 blitz-traits = "0.3.0-beta.2"
+# JavaScript (task 8): pure Rust, no mozjs/spidermonkey in the tree.
+boa_engine = "0.22"
 anyrender = "0.13"
 anyrender_vello_cpu = "0.17"
 # Geometry/brush types named directly in the paint callback; same versions

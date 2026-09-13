@@ -17,7 +17,16 @@
 //! INPUT/LINK-CLICKS (task 7d): `ToTab::Pointer/Key/Scroll` route through the
 //! single [`handle_input`] extension point; link clicks round-trip via the
 //! `NavigationProvider` hook ([`NavHook`]) already wired into every document.
+//!
+//! JAVASCRIPT (task 8): after parse + resolve, every navigation runs the
+//! document's `<script>`s in one fresh Boa context (`crate::js` — tiny binding
+//! surface, `src=` through our own fetcher, exceptions caught). A script's
+//! `document.title = …` becomes `FromTab::TitleChanged` + a repaint; script
+//! errors, refused `location` writes and `console.*` output become
+//! `FromTab::StatusText`. `javascript:` URLs are refused at [`Tab::navigate`],
+//! the single navigation entry point.
 
+use std::cell::RefCell;
 use std::error::Error;
 use std::io::{self, BufWriter, Read, StdoutLock, Write};
 use std::os::fd::AsRawFd;
@@ -49,6 +58,7 @@ use servfox_sandbox::SandboxPolicy;
 use servfox_storage::{ContainerStore, CookieJar, NetCache};
 use url::Url;
 
+use crate::js::{self, HostRef};
 use crate::netmod::{self, BlitzNetProvider, NetPolicy};
 
 /// Default page size until the shell sends `ToTab::Resize` (physical px).
@@ -321,6 +331,12 @@ pub struct Tab {
     history_index: usize,
     last_url: Option<String>,
     last_title: Option<Option<String>>,
+    /// `document.title` as last assigned by page JavaScript (task 8). Wins over
+    /// the `ShellProvider`/`<title>` node sources while the document is live.
+    js_title: Option<String>,
+    /// Status text raised by the script run (errors, refused `location` writes,
+    /// `console.*`), emitted once per navigation after the load-finished clear.
+    js_status: Option<String>,
     /// Paint state: set when a resolve produced (or may have produced) new
     /// pixels; coalesced into at most ~30 fps of `FromTab::Frame`.
     needs_paint: bool,
@@ -392,6 +408,8 @@ impl Tab {
             history_index: 0,
             last_title: None,
             last_url: None,
+            js_title: None,
+            js_status: None,
             needs_paint: false,
             last_paint: None,
             offline_fixtures: args.offline_fixtures.clone(),
@@ -464,6 +482,8 @@ impl Tab {
                 self.load_html(&doc_fetch.url, &doc_fetch.body_text(), history);
                 self.emit(FromTab::LoadingChanged { loading: false });
                 self.emit(FromTab::StatusText { text: None });
+                // Script output outranks the "load finished" clear (task 8).
+                self.emit_js_status();
                 true
             }
             Err(err) => {
@@ -474,6 +494,7 @@ impl Tab {
                     // requested URL (it stays in history as the user typed it).
                     self.load_html(&url, &page, history);
                     self.emit(FromTab::LoadingChanged { loading: false });
+                    self.emit_js_status();
                     false
                 } else {
                     self.emit(FromTab::Error {
@@ -514,11 +535,14 @@ impl Tab {
         }
     }
 
-    /// Build a fresh `HtmlDocument` for an already-fetched document and drive
-    /// it to a first paint; then emit the metadata deltas (url/title/history).
+    /// Build a fresh `HtmlDocument` for an already-fetched document, run its
+    /// scripts, drive it to a first paint; then emit the metadata deltas
+    /// (url/title/history).
     fn load_html(&mut self, url: &Url, html: &str, history: NavHistory) {
         // A fresh doc must not inherit the previous doc's flushed title.
         *self.shell.title.lock().expect("title mutex") = None;
+        self.js_title = None;
+        self.js_status = None;
         let config = DocumentConfig {
             base_url: Some(url.as_str().to_owned()),
             viewport: Some(self.viewport()),
@@ -532,6 +556,8 @@ impl Tab {
         let document = HtmlDocument::from_html(html, config);
         self.doc = Some(document);
         self.settle();
+        // JavaScript runs on the settled DOM (ARCHITECTURE §JavaScript (Boa)).
+        self.run_scripts(url);
 
         match history {
             NavHistory::Fresh => {
@@ -582,6 +608,88 @@ impl Tab {
         self.settle();
         self.maybe_repaint();
         self.check_meta();
+    }
+
+    // -- javascript ---------------------------------------------------------
+
+    /// Run the freshly parsed document's `<script>`s (task 8).
+    ///
+    /// Scripts are collected in document order; `src=` bodies go through the
+    /// tab's own document fetcher, so the container net policy (cookies, cache,
+    /// https-upgrade) applies to them too. One `boa` context is built per
+    /// navigation and thrown away with the host afterwards. Nothing here can
+    /// kill the tab: extraction failures degrade to "no scripts", and every
+    /// `eval` is caught inside [`js::run_scripts`].
+    fn run_scripts(&mut self, url: &Url) {
+        let policy = self_provider_policy(&self.provider);
+        let mut extraction = js::Extraction::default();
+        let mut body_text = None;
+        if let Some(doc) = self.doc.as_ref() {
+            // Disjoint field borrows: `doc` stays immutable while the fetcher
+            // mutably borrows the jar (subresources may also flow through the
+            // Blitz provider, which owns its own handle to the same state).
+            let mut fetch = |script_url: &Url| -> Result<String, String> {
+                netmod::fetch_document(
+                    script_url,
+                    policy,
+                    &mut self.jar,
+                    &self.cache,
+                    netmod::now_unix(),
+                )
+                .map(|script| script.body_text())
+                .map_err(|err| err.to_string())
+            };
+            extraction = js::extract_scripts(doc, url, &mut fetch);
+            body_text = js::body_text_snapshot(doc);
+        }
+
+        // The title JS starts from is the one blitz parsed for this document.
+        let parsed_title = self
+            .shell
+            .title
+            .lock()
+            .expect("title mutex")
+            .clone()
+            .or_else(|| {
+                self.doc
+                    .as_ref()
+                    .and_then(|doc| doc.find_title_node())
+                    .map(|node| node.text_content())
+            });
+        let host: HostRef = HostRef::new(RefCell::new(js::HostState::new(
+            url.as_str(),
+            parsed_title.as_deref(),
+            body_text,
+        )));
+        let errors = js::run_scripts(&extraction.scripts, &host);
+
+        // Script side effects -> IPC. The title wins over `<title>` polling
+        // (`check_meta` prefers `js_title`), and needs a fresh frame.
+        if let Some(title) = host.borrow().title_assigned.clone() {
+            self.js_title = Some(title);
+            self.needs_paint = true;
+        }
+        // One status text per navigation: script errors outrank `console.*`
+        // output, which outranks the "skipped script / not implemented" notes.
+        let console_last = host
+            .borrow()
+            .console
+            .last()
+            .map(|(level, text)| format!("js console {level}: {text}"));
+        let note = host.borrow().latest_note().map(str::to_owned).or_else(|| {
+            extraction.notes.first().map(String::to_owned)
+        });
+        self.js_status = js::status_text_for_errors(&errors)
+            .or(console_last)
+            .or(note);
+    }
+
+    /// Flush the status text the last script run raised. Called after the
+    /// load-finished `StatusText(None)` so the shell actually gets to show it.
+    fn emit_js_status(&mut self) {
+        if let Some(text) = self.js_status.take() {
+            self.emit(FromTab::StatusText { text: Some(text) });
+        }
     }
 
     // -- painting -----------------------------------------------------------
@@ -663,13 +771,14 @@ impl Tab {
             self.emit(FromTab::UrlChanged { url });
         }
 
+        let js = self.js_title.clone();
         let hooked = self.shell.title.lock().expect("title mutex").clone();
         let polled = self
             .doc
             .as_ref()
             .and_then(|doc| doc.find_title_node())
             .map(|node| node.text_content());
-        let title = hooked.or(polled);
+        let title = js.or(hooked).or(polled);
         if Some(&title) != self.last_title.as_ref() {
             self.last_title = Some(title.clone());
             self.emit(FromTab::TitleChanged { title });
