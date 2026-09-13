@@ -9,13 +9,22 @@ servfox-common = { path = "../servfox-common" }
 servfox-storage = { path = "../servfox-storage" }
 servfox-sandbox = { path = "../servfox-sandbox" }
 url = { workspace = true }
-servo = { version = "0.5", default-features = false, features = ["baked-in-resources", "bundled_freetype"] }
-dpi = "0.1"
 libc = "0.2"
-rustls = "0.23"
-http = "1"
 euclid = "0.22"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "blocking"] }
+
+# Engine stack (ARCHITECTURE.md, pinned; pure Rust — no mozjs, no wgpu/GPU)
+blitz-dom = "0.3.0-beta.2"
+blitz-html = "0.3.0-beta.2"
+blitz-net = "0.3.0-beta.2"
+blitz-paint = "0.3.0-beta.2"
+blitz-traits = "0.3.0-beta.2"
+anyrender = "0.13"
+anyrender_vello_cpu = "0.17"
+# Geometry/brush types named directly in the paint callback; same versions
+# anyrender 0.13 uses (kurbo 0.13.1 / peniko 0.6).
+kurbo = "0.13"
+peniko = "0.6"
 
 [dev-dependencies]
 tempfile = "3"

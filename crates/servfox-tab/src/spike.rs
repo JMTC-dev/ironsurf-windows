@@ -1,31 +1,34 @@
-//! Servo integration spike (task 4).
+//! Blitz integration spike (task 6 — engine pivot from Servo).
 //!
-//! `servfox-tab --spike --url file:///… --out /tmp/spike.ppm --size 1024x768`
+//! `servfox-tab --spike --url file:///… --out /tmp/spike.ppm [--size 1024x768] [--out-rgba out.rgba]`
 //!
-//! Renders a page fully offscreen with `servo::SoftwareRenderingContext`
-//! (surfman software adapter — smitha software GL, no X / no GPU) and writes the
-//! captured framebuffer to a PPM file. Proves: Servo 0.5 embeds, spins its event
-//! loop via an `EventLoopWaker` self-pipe, loads `file://` URLs, and yields
-//! readable pixels headless.
+//! Canonical headless parse→resolve→paint flow (reference: `DioxusLabs/blitz`
+//! `examples/screenshot.rs`, vendored under `~/.cargo/registry/src/*/blitz-*-0.3.0-beta.2/`):
+//!
+//! 1. fetch the HTML (local `file://` read; `http(s)://` via blocking reqwest/rustls);
+//! 2. [`HtmlDocument::from_html`] with a [`DocumentConfig`] carrying `base_url`,
+//!    a physical [`Viewport`] (`w*scale`, `h*scale`, `scale`, `ColorScheme::Light`)
+//!    and a [`blitz_net`] provider for sub-resources;
+//! 3. `resolve(0.)` (Stylo styles + taffy layout);
+//! 4. [`anyrender::render_to_buffer`] with [`VelloCpuImageRenderer`] (pure CPU
+//!    rasterizer — no X, no GPU, no wgpu): white background fill, then
+//!    [`blitz_paint::paint_scene`], producing an RGBA8 buffer of `w*h*4` bytes.
+//!
+//! The buffer is written as a P6 PPM for eyeballing (and optionally as raw RGBA
+//! so tests can assert the exact buffer length).
 
-use std::cell::{Cell, RefCell};
 use std::error::Error;
-use std::fmt;
 use std::fs::File;
 use std::io::Write;
-use std::rc::Rc;
-use std::time::{Duration, Instant};
 
-use dpi::PhysicalSize;
-use servo::{
-    LoadStatus, Opts, RenderingContext, RgbaImage, ScreenshotCaptureError, ServoBuilder,
-    SoftwareRenderingContext, WebView, WebViewBuilder, WebViewDelegate,
-};
-
-use crate::wake::make_self_pipe;
-
-/// Hard bound on the whole render+capture sequence.
-const SPIKE_TIMEOUT: Duration = Duration::from_secs(60);
+use anyrender::{render_to_buffer, PaintScene};
+use anyrender_vello_cpu::VelloCpuImageRenderer;
+use blitz_dom::DocumentConfig;
+use blitz_html::HtmlDocument;
+use blitz_paint::paint_scene;
+use blitz_traits::shell::{ColorScheme, Viewport};
+use kurbo::{Affine, Rect, Size};
+use peniko::{Color, Fill};
 
 // ---------------------------------------------------------------------------
 // CLI
@@ -33,6 +36,7 @@ const SPIKE_TIMEOUT: Duration = Duration::from_secs(60);
 pub struct SpikeArgs {
     pub url: String,
     pub out: String,
+    pub out_rgba: Option<String>,
     pub width: u32,
     pub height: u32,
 }
@@ -41,6 +45,7 @@ impl SpikeArgs {
     fn parse(args: &[String]) -> Result<Self, Box<dyn Error>> {
         let mut url = None;
         let mut out = None;
+        let mut out_rgba = None;
         let mut size = (1024u32, 768u32);
         let mut it = args.iter().skip(1);
         while let Some(arg) = it.next() {
@@ -53,6 +58,7 @@ impl SpikeArgs {
                 "--spike" => {} // selected by main()
                 "--url" => url = Some(value("url")?),
                 "--out" => out = Some(value("out")?),
+                "--out-rgba" => out_rgba = Some(value("out-rgba")?),
                 "--size" => {
                     let v = value("size")?;
                     let (w, h) = v
@@ -71,6 +77,7 @@ impl SpikeArgs {
         Ok(SpikeArgs {
             url: url.ok_or("--url is required")?,
             out: out.ok_or("--out is required")?,
+            out_rgba,
             width: size.0,
             height: size.1,
         })
@@ -78,76 +85,26 @@ impl SpikeArgs {
 }
 
 // ---------------------------------------------------------------------------
-// WebViewDelegate — records what the engine tells us
+// Page fetch (spike-local; the managed container net layer is task 7)
 
-#[derive(Default)]
-struct SpikeDelegate {
-    load_complete: Cell<bool>,
-    frames_ready: Cell<u32>,
-    crash: RefCell<Option<String>>,
-    closed: Cell<bool>,
-    last_url: RefCell<Option<String>>,
-    title: RefCell<Option<String>>,
-}
-
-impl fmt::Debug for SpikeDelegate {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("SpikeDelegate")
-            .field("load_complete", &self.load_complete.get())
-            .field("frames_ready", &self.frames_ready.get())
-            .field("crash", &self.crash.borrow())
-            .field("closed", &self.closed.get())
-            .finish()
-    }
-}
-
-impl WebViewDelegate for SpikeDelegate {
-    fn notify_load_status_changed(&self, _webview: WebView, status: LoadStatus) {
-        if matches!(status, LoadStatus::Complete) {
-            self.load_complete.set(true);
+fn fetch_html(raw_url: &str) -> Result<(url::Url, String), Box<dyn Error>> {
+    let url = url::Url::parse(raw_url)?;
+    match url.scheme() {
+        "file" => {
+            let path = url
+                .to_file_path()
+                .map_err(|_| format!("not a usable file path: {url}"))?;
+            let html = std::fs::read_to_string(path)?;
+            Ok((url, html))
         }
+        "http" | "https" => {
+            let body = reqwest::blocking::get(url.clone())?
+                .error_for_status()?
+                .text()?;
+            Ok((url, body))
+        }
+        other => Err(format!("spike does not fetch {other}: URLs").into()),
     }
-
-    fn notify_new_frame_ready(&self, webview: WebView) {
-        // Documented Servo 0.5 contract: composite the new WebRender output into
-        // the RenderingContext. `take_screenshot`'s read-back runs at the end of
-        // this same composite step, so skipping paint() deadlocks screenshots.
-        self.frames_ready.set(self.frames_ready.get() + 1);
-        webview.paint();
-    }
-
-    fn notify_url_changed(&self, _webview: WebView, url: url::Url) {
-        *self.last_url.borrow_mut() = Some(url.as_str().to_owned());
-    }
-
-    fn notify_page_title_changed(&self, _webview: WebView, title: Option<String>) {
-        *self.title.borrow_mut() = title;
-    }
-
-    fn notify_crashed(&self, _webview: WebView, reason: String, _backtrace: Option<String>) {
-        *self.crash.borrow_mut() = Some(reason);
-    }
-
-    fn notify_closed(&self, _webview: WebView) {
-        self.closed.set(true);
-    }
-}
-
-// ---------------------------------------------------------------------------
-// PPM output
-
-fn write_ppm(path: &str, image: &RgbaImage) -> Result<(), Box<dyn Error>> {
-    let (width, height) = image.dimensions();
-    let mut file = File::create(path)?;
-    write!(file, "P6\n{width} {height}\n255\n")?;
-    // RGBA -> RGB
-    let mut rgb = Vec::with_capacity((width * height * 3) as usize);
-    for chunk in image.as_raw().chunks_exact(4) {
-        rgb.extend_from_slice(&chunk[..3]);
-    }
-    file.write_all(&rgb)?;
-    file.flush()?;
-    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -157,112 +114,82 @@ pub fn run(args: &[String]) -> Result<(), Box<dyn Error>> {
     let args = SpikeArgs::parse(args)?;
     eprintln!(
         "servfox-tab spike: url={} out={} size={}",
-        args.url, args.out,
+        args.url,
+        args.out,
         format_args!("{}x{}", args.width, args.height)
     );
 
-    // Servo's network stack requires a process-wide rustls crypto provider.
-    if rustls::crypto::aws_lc_rs::default_provider()
-        .install_default()
-        .is_err()
-    {
-        eprintln!("servfox-tab spike: a rustls crypto provider was already installed");
-    }
+    let (url, html) = fetch_html(&args.url)?;
 
-    let url = url::Url::parse(&args.url)?;
+    let scale = 1.0f32;
+    let width = args.width;
+    let height = args.height;
 
-    // Fully software, offscreen rendering context (surfman software adapter).
-    let size = PhysicalSize::new(args.width, args.height);
-    let rendering_context = Rc::new(
-        SoftwareRenderingContext::new(size)
-            .map_err(|e| format!("SoftwareRenderingContext::new failed: {e:?}"))?,
-    );
-    rendering_context
-        .make_current()
-        .map_err(|e| format!("RenderingContext::make_current failed: {e:?}"))?;
-
-    let (waker, wake_reader) = make_self_pipe()?;
-
-    let mut opts = Opts::default();
-    // The spike is transient; don't persist engine data.
-    opts.temporary_storage = true;
-    opts.sandbox = false;
-
-    let servo = ServoBuilder::default()
-        .opts(opts)
-        .event_loop_waker(Box::new(waker))
-        .build();
-    // Respect RUST_LOG for diagnosing the spike.
-    servo.setup_logging();
-
-    let delegate = Rc::new(SpikeDelegate::default());
-    let shot: Rc<RefCell<Option<Result<RgbaImage, ScreenshotCaptureError>>>> =
-        Rc::new(RefCell::new(None));
-
-    let webview = WebViewBuilder::new(&servo, rendering_context.clone())
-        .url(url)
-        .delegate(delegate.clone())
-        .build();
-    webview.show();
-
-    let deadline = Instant::now() + SPIKE_TIMEOUT;
-    let mut screenshot_requested = false;
-    let result: Result<RgbaImage, Box<dyn Error>> = loop {
-        servo.spin_event_loop();
-
-        if let Some(crash) = delegate.crash.borrow().as_ref() {
-            break Err(format!("webview crashed: {crash}").into());
-        }
-        if delegate.closed.get() {
-            break Err("webview closed before screenshot".into());
-        }
-
-        if !screenshot_requested && delegate.load_complete.get() {
-            screenshot_requested = true;
-            let slot = shot.clone();
-            // `take_screenshot` waits for document-complete + render up-to-date,
-            // then calls us back from the event loop.
-            webview.take_screenshot(None, move |r| *slot.borrow_mut() = Some(r));
-        }
-
-        if let Some(result) = shot.borrow_mut().as_mut() {
-            match result {
-                Ok(image) => {
-                    break Ok(std::mem::replace(image, RgbaImage::new(0, 0)));
-                }
-                Err(e) => break Err(format!("screenshot capture failed: {e:?}").into()),
-            }
-        }
-
-        if Instant::now() >= deadline {
-            break Err(
-                format!("timed out after {SPIKE_TIMEOUT:?}; delegate state: {delegate:?}").into(),
-            );
-        }
-
-        // Keep the loop turning even without engine wakeups (timer-paced render
-        // progress + screenshot completion).
-        wake_reader.wait_and_drain(Duration::from_millis(10));
+    let config = DocumentConfig {
+        base_url: Some(url.as_str().to_owned()),
+        viewport: Some(Viewport::new(
+            (width as f32 * scale) as u32,
+            (height as f32 * scale) as u32,
+            scale,
+            ColorScheme::Light,
+        )),
+        net_provider: Some(blitz_net::Provider::shared(None)),
+        ..Default::default()
     };
 
-    let image = result?;
-    if image.width() != args.width || image.height() != args.height {
-        eprintln!(
-            "servfox-tab spike: note: captured {}x{} (requested {}x{})",
-            image.width(),
-            image.height(),
-            args.width,
-            args.height
-        );
-    }
-    write_ppm(&args.out, &image)?;
-    eprintln!(
-        "servfox-tab spike: wrote {} ({}x{}), frames_seen={}, title={:?}",
-        args.out,
-        image.width(),
-        image.height(),
-        delegate.frames_ready.get(),
-        delegate.title.borrow()
+    let mut document = HtmlDocument::from_html(&html, config);
+    document.resolve(0.);
+    // Give any (inline/no-network) document messages a chance to settle, then
+    // re-resolve so late style/layout invalidations are painted.
+    document.handle_messages();
+    document.resolve(0.);
+
+    let buffer = render_to_buffer::<VelloCpuImageRenderer, _>(
+        |scene| {
+            scene.fill(
+                Fill::NonZero,
+                Affine::IDENTITY,
+                Color::from_rgb8(255, 255, 255),
+                None,
+                &Rect::from_origin_size((0.0, 0.0), Size::new(f64::from(width), f64::from(height))),
+            );
+            paint_scene(scene, &mut document, scale as f64, width, height, 0, 0);
+        },
+        width,
+        height,
     );
+    assert_eq!(
+        buffer.len(),
+        (width as usize) * (height as usize) * 4,
+        "VelloCpuImageRenderer buffer must be w*h*4 RGBA8 bytes"
+    );
+
+    write_ppm(&args.out, width, height, &buffer)?;
+    if let Some(path) = &args.out_rgba {
+        let mut file = File::create(path)?;
+        file.write_all(&buffer)?;
+        file.flush()?;
+        eprintln!("servfox-tab spike: wrote {path} ({} bytes raw RGBA8)", buffer.len());
+    }
+    eprintln!(
+        "servfox-tab spike: wrote {} ({}x{}, {} bytes RGBA8)",
+        args.out,
+        width,
+        height,
+        buffer.len()
+    );
+    Ok(())
+}
+
+/// Write the RGBA8 buffer as a P6 (binary RGB) PPM.
+fn write_ppm(path: &str, width: u32, height: u32, rgba: &[u8]) -> Result<(), Box<dyn Error>> {
+    let mut file = File::create(path)?;
+    write!(file, "P6\n{width} {height}\n255\n")?;
+    let mut rgb = Vec::with_capacity((width * height * 3) as usize);
+    for chunk in rgba.chunks_exact(4) {
+        rgb.extend_from_slice(&chunk[..3]);
+    }
+    file.write_all(&rgb)?;
+    file.flush()?;
     Ok(())
 }
