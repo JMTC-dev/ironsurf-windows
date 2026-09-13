@@ -1,4 +1,4 @@
-//! End-to-end test for the tab runtime (task 5, written against Servo).
+//! End-to-end test for the tab runtime (Blitz IPC runtime, task 7c).
 //!
 //! Headless (no `$DISPLAY`): spawns the built `servfox-tab` binary against a
 //! local `file://` fixture and drives the full `ToTab`/`FromTab` protocol —
@@ -7,10 +7,9 @@
 //!
 //! Run with: `cargo test -p servfox-tab --test e2e`
 //!
-//! TODO(task 7): IGNORED during the engine pivot — the shell-contract
-//! expectations below stay untouched, but the servo runtime they were written
-//! for is removed. The Blitz IPC runtime (ARCHITECTURE.md §servfox-tab) must
-//! make this pass again unchanged; then remove the `#[ignore]`.
+//! These are the Servo-era (task 5) shell-contract expectations, restored
+//! unchanged on the Blitz runtime (task 7c): every assertion is
+//! engine-agnostic IPC protocol behaviour.
 
 use std::io::BufReader;
 use std::process::{Child, ChildStdin, Command, Stdio};
@@ -183,7 +182,6 @@ fn assert_rendered(msg: &FromTab, want_w: u32, want_h: u32) {
 }
 
 #[test]
-#[ignore = "TODO(task 7): servo runtime removed; restore once the Blitz IPC runtime lands"]
 fn tab_lifecycle_file_fixture() {
     let dir = tempfile::tempdir().expect("tempdir");
     let profile = dir.path().join("profile");
@@ -284,7 +282,6 @@ fn tab_lifecycle_file_fixture() {
 }
 
 #[test]
-#[ignore = "TODO(task 7): servo runtime removed; restore once the Blitz IPC runtime lands"]
 fn tab_exits_cleanly_on_stdin_eof() {
     let dir = tempfile::tempdir().expect("tempdir");
     let profile = dir.path().join("profile");

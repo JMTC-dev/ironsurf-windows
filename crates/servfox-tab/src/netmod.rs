@@ -166,6 +166,8 @@ pub fn validators(headers: &[(String, String)]) -> (Option<String>, Option<Strin
 
 /// Response headers that may be forwarded as-is (hop-by-hop headers and
 /// body-transform headers — reqwest already decoded them — never).
+// Kept for the shell/interception paths; exercised by the unit tests.
+#[allow(dead_code)]
 pub fn forwarded_response_headers(headers: &[(String, String)]) -> Vec<(String, String)> {
     const DROP: &[&str] = &[
         "content-encoding",
@@ -578,6 +580,7 @@ impl BlitzNetProvider {
     }
 
     /// Ready-to-share (`Arc<dyn NetProvider>`) form for `DocumentConfig`.
+    #[allow(dead_code)] // convenience constructor (used by tests/embedders)
     pub fn shared(policy: NetPolicy, jar: CookieJar, cache: NetCache) -> Arc<Self> {
         Arc::new(Self::new(policy, jar, cache))
     }
@@ -592,6 +595,7 @@ impl BlitzNetProvider {
 
     /// Builder: share one [`FetchWorker`] (and its client) with the runtime.
     #[must_use]
+    #[allow(dead_code)] // worker sharing is wired when fetch_document moves in-process
     pub fn with_worker(mut self, worker: Arc<FetchWorker>) -> Self {
         self.worker = worker;
         self
@@ -606,6 +610,7 @@ impl BlitzNetProvider {
         self.jar.lock().expect("jar mutex poisoned").save()
     }
 
+    #[allow(dead_code)] // waker fires via the NetWaker installed by with_waker
     fn wake(&self, doc_id: usize) {
         let guard = self.waker.lock().expect("waker mutex poisoned");
         if let Some(waker) = guard.as_ref() {
