@@ -32,3 +32,8 @@ kept, e2e #[ignore]; spike green headless, tree free of mozjs/wgpu/servo. Next: 
 Correction: repo is still at post-#6 state (main.rs = task-6 stub, e2e #[ignore]) —
 task 7 runtime NOT yet on disk. Queue owns: 7a–7e rebuild → tab cleanup → #8 Boa JS
 layer → verify → #9 shell/workspace green. Sessions must follow queue order.
+## #7a done — BLITZ_API_NOTES.md written (docs/BLITZ_API_NOTES.md)
+Verified-vs-vendor API cheat-sheet for blitz-*-0.3.0-beta.2: NetHandler=1 fn (bytes), NO
+ResourceType/Response; nav via NavigationProvider hook (not DocumentEvent); no resize()
+(use set_viewport); has_changes() inverted; Doc/Send-less→drive on one thread; vello buf=
+premultiplied RGBA8. No crate code touched; servfox-tab build+spike green. Next: #7b netmod NetProvider.
