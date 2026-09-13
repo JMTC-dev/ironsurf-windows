@@ -1,4 +1,4 @@
-# Engine integration notes (servfox-tab)
+# Engine integration notes (ironsurf-tab)
 
 The engine is **Blitz + vello_cpu + Boa** (pivot in task 6). Sections A–D below are
 the live contract discovered implementing tasks 6–9. The legacy Servo 0.5 spike
@@ -66,12 +66,12 @@ still apply to the tab process today; their API specifics are obsolete.
 * **Cargo gotcha:** `CARGO_BIN_EXE_<name>` is *not* defined for the lib's unit-test
   target — any test that spawns a sibling bin must live under `tests/` (the shell's
   fake-tab pump test moved to `tests/pump.rs`). Integration tests can locate
-  workspace sibling bins via `current_exe()/../../servfox-tab`.
+  workspace sibling bins via `current_exe()/../../ironsurf-tab`.
 * **Slint 1.17 drift:** `Color` channels are `u8` (`color.green() > 150`, not `> 0.6`);
   `Image` exposes `size() -> IntSize`, not `width()/height()` methods.
-* End-to-end proof lives in `crates/servfox-shell/tests/real_tab.rs`: the real Slint
-  window + real `servfox-tab` binary + Blitz frames, headless on file fixtures in the
-  container profile dir; the live `https://example.com` leg runs with `SERVFOX_ONLINE=1`.
+* End-to-end proof lives in `crates/ironsurf-shell/tests/real_tab.rs`: the real Slint
+  window + real `ironsurf-tab` binary + Blitz frames, headless on file fixtures in the
+  container profile dir; the live `https://example.com` leg runs with `IRONSURF_ONLINE=1`.
 
 ---
 
@@ -173,13 +173,13 @@ servo = { version = "0.5", default-features = false,
 
 ## Spike behaviour (proof)
 
-`servfox-tab --spike --url file:///… --out out.ppm --size 800x600`
+`ironsurf-tab --spike --url file:///… --out out.ppm --size 800x600`
 
 * loads, fires `notify_url_changed` / `notify_page_title_changed` (title captured),
   reaches `LoadStatus::Complete`, captures after render-up-to-date
   (~0.2 s warm), writes binary PPM; bounded by a 60 s deadline that dumps delegate
   state on timeout.
-* `cargo test -p servfox-tab --test spike` (headless, `DISPLAY` removed from the
+* `cargo test -p ironsurf-tab --test spike` (headless, `DISPLAY` removed from the
   child env): fixture = white page + solid `#ff3200` box + blue `<h1>`; asserts PPM
   magic/dimensions and non-uniform pixels. Captured box pixel is exactly `(255,50,0)`.
 

@@ -1,6 +1,6 @@
 # BLITZ_API_NOTES.md — authoritative Blitz 0.3.0-beta.2 API cheat-sheet (task 7a)
 
-For the servfox-tab Blitz+Boa runtime rebuild (#7b+). Everything below was read from the
+For the ironsurf-tab Blitz+Boa runtime rebuild (#7b+). Everything below was read from the
 **vendored crates.io sources** (authoritative — do NOT trust docs.rs or GitHub main; the API
 changed a lot between the older `blitz-dom 0.599`-era tutorials and `0.3.0-beta.2`):
 
@@ -12,9 +12,9 @@ $REG/blitz-paint-0.3.0-beta.2      $REG/anyrender-0.13.0
 $REG/anyrender_vello_cpu-0.17.0    (vello_cpu 0.1.0)
 ```
 
-Workspace pins (`crates/servfox-tab/Cargo.toml`): `blitz-{dom,html,net,paint,traits} = 0.3.0-beta.2`,
+Workspace pins (`crates/ironsurf-tab/Cargo.toml`): `blitz-{dom,html,net,paint,traits} = 0.3.0-beta.2`,
 `anyrender = 0.13`, `anyrender_vello_cpu = 0.17`, `kurbo 0.13`, `peniko 0.6`.
-Working end-to-end headless example: `/workspace/crates/servfox-tab/src/spike.rs`.
+Working end-to-end headless example: `/workspace/crates/ironsurf-tab/src/spike.rs`.
 
 ### ⚠ Corrections vs the task-7a brief (and older Blitz lore)
 
@@ -323,20 +323,20 @@ copies selection (:31-52), focused text inputs get edits via `apply_keypress_eve
 only `KeyDown`** (dom `KeyDown` data is what the default action consumes; `DomEventData::KeyPress`
 has *no* default action, events/mod.rs:219). IME: `events/ime.rs` (only affects focused inputs).
 
-### Modifiers — type & mapping from servfox-common
+### Modifiers — type & mapping from ironsurf-common
 
 `keyboard_types::Modifiers` is a bitflags set with (keyboard-types 0.7.0,
 `src/modifiers.rs:16-29`): `ALT=0x01, ALT_GRAPH=0x02, CAPS_LOCK=0x04, CONTROL=0x08, FN=0x10,
 FN_LOCK=0x20, META=0x40, NUM_LOCK=0x80, SCROLL_LOCK=0x100, SHIFT=0x200, SYMBOL=0x400,
 SYMBOL_LOCK=0x800, HYPER=0x1000, SUPER=0x2000`.
 
-`servfox_common::Modifiers(pub u8)` (`/workspace/crates/servfox-common/src/lib.rs:136-177`) uses
+`ironsurf_common::Modifiers(pub u8)` (`/workspace/crates/ironsurf-common/src/lib.rs:136-177`) uses
 its **own bits**: `CTRL_BIT=1<<0, SHIFT_BIT=1<<1, ALT_BIT=1<<2, META_BIT=1<<3` — **do not cast**,
 translate:
 
 ```rust
 use keyboard_types::Modifiers as KMods;
-fn to_blitz_mods(m: servfox_common::Modifiers) -> KMods {
+fn to_blitz_mods(m: ironsurf_common::Modifiers) -> KMods {
     let mut k = KMods::empty();
     if m.ctrl() { k |= KMods::CONTROL; }
     if m.shift() { k |= KMods::SHIFT; }
@@ -605,7 +605,7 @@ drained if we ever keep renderer state (see blitz-shell upstream habit).
 style::device::servo::FontMetricsProvider)` / `dyn HtmlParserProvider` are not Send/Sync; only
 `node/node.rs:127-128` has `unsafe impl Send+Sync for Node`). The `Document` trait is just
 `Any + 'static` (`document.rs:130`) — **no Send bound anywhere**. ⇒ Drive the whole document on
-**one dedicated thread** (in servfox-tab: the main/poll() thread; the IPC reader can stay on the
+**one dedicated thread** (in ironsurf-tab: the main/poll() thread; the IPC reader can stay on the
 same thread since stdin is polled, no separate engine thread needed). `NetProvider`,
 `NetHandler`, `NetWaker`, `ShellProvider`, `NavigationProvider` are all `Send + Sync + 'static`
 because they're called from worker threads — our impls must be thread-safe (`Mutex` etc.).
@@ -667,5 +667,5 @@ Title check per frame: compare `find_title_node().map(text_content)` (or push fr
 - blitz-net default `Provider` uses **reqwest 0.13 + native-tls** (separate from our reqwest 0.12
   rustls — both in lock). Our netmod replaces it entirely; sandbox needs `/etc/ssl/certs` ro for us.
 
-*Verified against the workspace's exact dependency graph (`cargo build -p servfox-tab` green at
+*Verified against the workspace's exact dependency graph (`cargo build -p ironsurf-tab` green at
 task 7a time). Line numbers refer to the vendored files above.*

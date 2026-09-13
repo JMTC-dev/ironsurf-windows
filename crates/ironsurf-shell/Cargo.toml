@@ -1,0 +1,30 @@
+[package]
+name = "ironsurf-shell"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+ironsurf-common = { path = "../ironsurf-common" }
+ironsurf-storage = { path = "../ironsurf-storage" }
+slint = { workspace = true }
+serde = { workspace = true }
+serde_json = "1"
+url = { workspace = true }
+
+[build-dependencies]
+slint-build = "1"
+
+[dev-dependencies]
+i-slint-backend-testing = "1.17.1"
+tempfile = "3"
+
+[[bin]]
+name = "ironsurf-shell"
+path = "src/main.rs"
+
+# A scripted stand-in for ironsurf-tab used by the headless pump tests
+# (see ARCHITECTURE.md §ironsurf-shell "Tests"). It also doubles as an
+# escape hatch when the real (Servo) binary is not built yet.
+[[bin]]
+name = "fake_tab"
+path = "src/bin/fake_tab.rs"

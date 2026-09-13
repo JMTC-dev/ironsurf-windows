@@ -1,6 +1,6 @@
-# ServFox — Architecture & Crate Contracts
+# IronSurf — Architecture & Crate Contracts
 
-ServFox is a Rust web browser using the **Blitz** stack — `blitz-dom`/`blitz-html`
+IronSurf is a Rust web browser using the **Blitz** stack — `blitz-dom`/`blitz-html`
 (DOM + Stylo CSS) with `blitz-paint` + `anyrender_vello_cpu` (pure-CPU 2D renderer,
 zero GPU) and **Boa** (`boa_engine`, pure-Rust JS) as its engine and **Slint** for the
 GUI, with **multi-account containers** (Firefox-MultiAccountContainers-style isolated
@@ -8,9 +8,9 @@ sessions) and **per-tab OS sandboxing**.
 
 > **Engine pivot (2026-08):** Servo/mozjs was removed as an engine dependency — mozjs
 > embeds C++ SpiderMonkey (needs clang/libclang, llvm-objdump, 45-min builds), which does
-> not belong in a fully-Rust codebase. Servfox-tab now embeds Blitz (Stylo CSS + DOM,
+> not belong in a fully-Rust codebase. IronSurf-tab now embeds Blitz (Stylo CSS + DOM,
 > `html5ever` parsing) rendered through `vello_cpu`, with `boa_engine` for JavaScript.
-> The `servfox-common` IPC contract (`ToTab`/`FromTab`) is **unchanged**; only the tab
+> The `ironsurf-common` IPC contract (`ToTab`/`FromTab`) is **unchanged**; only the tab
 > crate's engine internals changed.
 
 This document is the single source of truth for crate APIs. Tasks implement against these
@@ -19,21 +19,21 @@ contracts; extend, don't contradict. Keep all crates compiling and `cargo test -
 ## Design overview
 
 ```
-┌────────────────────────── servfox-shell (Slint GUI, main process) ─────────────────────────┐
+┌────────────────────────── ironsurf-shell (Slint GUI, main process) ─────────────────────────┐
 │  tab bar (container-colored) · URL bar · container manager · frame compositor · input       │
 │      │ spawn child process per tab (stdio pipes)                                            │
 └──────┼───────────────────────────────────────────────────────────────────────────────────── ┘
        │ ToTab / FromTab (length-prefixed bincode over stdin/stdout)
 ┌──────▼──────────────────────────────┐        ┌──────────────────────────────┐
-│ servfox-tab (child process #1, …N)  │   …    │ servfox-tab (child process N)│
+│ ironsurf-tab (child process #1, …N)  │   …    │ ironsurf-tab (child process N)│
 │  - applies OS sandbox at startup    │        │  (different container ⇒       │
 │  - embeds Blitz + Stylo + Boa       │        │   different OS process ⇒      │
 │  - renders via vello_cpu (software) │        │   memory can't be shared)     │
 │  - per-container network layer:     │        │                               │
 │    cookies/cache/HTTPS policy       │        │                               │
 └──────────────┬──────────────────────┘        └───────────────────────────────┘
-               │ profile dir (~/.local/share/servfox/profiles/<container>/) used as tab data path
-     servfox-storage: container registry + per-container cookie jar / cache / local storage
+               │ profile dir (~/.local/share/ironsurf/profiles/<container>/) used as tab data path
+     ironsurf-storage: container registry + per-container cookie jar / cache / local storage
 ```
 
 **Why this shape**
@@ -59,18 +59,18 @@ contracts; extend, don't contradict. Keep all crates compiling and `cargo test -
 ```
 Cargo.toml            # [workspace] members = crates/*, shared deps, profile.release
 crates/
-  servfox-common/     # types + IPC codec. NO heavy deps (serde, bincode, thiserror only)
-  servfox-storage/    # container registry, profiles, cookie jar, cache, local storage
-  servfox-sandbox/    # Landlock + rlimits + prctl sandbox application
-  servfox-tab/        # BIN: sandboxed per-tab Blitz+Boa host speaking servfox-common IPC
-  servfox-shell/      # BIN: Slint GUI, tab/container management, frame compositor
+  ironsurf-common/     # types + IPC codec. NO heavy deps (serde, bincode, thiserror only)
+  ironsurf-storage/    # container registry, profiles, cookie jar, cache, local storage
+  ironsurf-sandbox/    # Landlock + rlimits + prctl sandbox application
+  ironsurf-tab/        # BIN: sandboxed per-tab Blitz+Boa host speaking ironsurf-common IPC
+  ironsurf-shell/      # BIN: Slint GUI, tab/container management, frame compositor
 ```
 
 MSRV: latest stable. Edition 2021. `resolver = "2"`.
 
 ---
 
-## servfox-common
+## ironsurf-common
 
 Types must be `serde::{Serialize, Deserialize}` (+ `Clone, Debug, PartialEq` where sensible).
 
@@ -145,11 +145,11 @@ unnecessary; shell maps Slint key events → `KeyEvent`.
 
 ---
 
-## servfox-storage
+## ironsurf-storage
 
 Pure disk layer; no engine dependency. `thiserror` error type `StoreError`.
 
-Layout under a data root (`$SERVFOX_DATA_DIR` or `~/.local/share/servfox`):
+Layout under a data root (`$IRONSURF_DATA_DIR` or `~/.local/share/ironsurf`):
 
 ```
 containers.json                       # registry (Vec<Container>), written atomically
@@ -210,7 +210,7 @@ impl NetCache {
 
 ---
 
-## servfox-sandbox
+## ironsurf-sandbox
 
 Linux-only core, compiles everywhere with a no-op fallback (`available() == false`).
 
@@ -218,7 +218,7 @@ Linux-only core, compiles everywhere with a no-op fallback (`available() == fals
 pub struct SandboxPolicy {
     pub readable_ro: Vec<PathBuf>, // e.g. /usr/share/fonts, /etc/ssl/certs, /nix?, binary dir
     pub writable_rw: Vec<PathBuf>, // exactly ONE: the container profile dir (+ /tmp? NO)
-    pub exec_ro:     Vec<PathBuf>, // the servfox-tab executable path
+    pub exec_ro:     Vec<PathBuf>, // the ironsurf-tab executable path
     pub max_open_files: u64,       // default 1024
     pub max_processes:  u64,       // default 128
     pub address_space_mb: Option<u64>,
@@ -241,9 +241,9 @@ binary or a test-only bin here) that applies the sandbox and exits 42 iff openin
 
 ---
 
-## servfox-tab (binary) — the Blitz + Boa host
+## ironsurf-tab (binary) — the Blitz + Boa host
 
-CLI: `servfox-tab --tab-id N --container-id N --profile-dir PATH [--url URL] [--offline-fixtures DIR] [--managed-net] [--no-sandbox]`
+CLI: `ironsurf-tab --tab-id N --container-id N --profile-dir PATH [--url URL] [--offline-fixtures DIR] [--managed-net] [--no-sandbox]`
 
 Engine stack (pinned; all pure Rust — **no C/C++ toolchain, no mozjs, no wgpu/GPU**):
 
@@ -263,7 +263,7 @@ boa_engine = "0.22"               # JavaScript (pure Rust)
 vendored sources live under `~/.cargo/registry/src/*/blitz-*-0.3.0-beta.2/`.)
 
 Lifecycle:
-1. Apply `servfox_sandbox::apply` with `writable_rw = [profile_dir]`,
+1. Apply `ironsurf_sandbox::apply` with `writable_rw = [profile_dir]`,
    `readable_ro = [/usr/share/fonts, /usr/lib, /etc/ssl/certs, /etc/resolv.conf, <exe dir>]`.
    Report `FromTab::Ready` only after startup. (Sandbox failures degrade, never abort;
    `--no-sandbox` for debugging.)
@@ -295,7 +295,7 @@ Lifecycle:
 
 ### Network layer (container sessions, HTTPS)
 Implement `blitz_traits::net::NetProvider` (`fn fetch(&self, doc_id, Request, Box<dyn NetHandler>)`)
-in `servfox-tab/src/netmod.rs` and pass `Arc<OurProvider>` as `DocumentConfig.net_provider`
+in `ironsurf-tab/src/netmod.rs` and pass `Arc<OurProvider>` as `DocumentConfig.net_provider`
 (keeps images/css/fonts flowing). Two policies, unchanged from before:
 - `Passthrough` (default): plain `reqwest` (rustls) fetch on a small worker thread, respond
   via the `NetHandler` callbacks; cookies NOT injected for subresources.
@@ -330,13 +330,13 @@ are a deliberately tiny surface (no engine-internal DOM mutation yet):
 
 ---
 
-## servfox-shell (binary) — Slint GUI
+## ironsurf-shell (binary) — Slint GUI
 
 Slint `1.x` (default features OK; force the **software renderer** so it composites on
 headless X11 without GL: build with `slint` default + set software-softbuffer path;
 runtime env `SLINTSoftwareRenderer`… verify flag in Slint docs, `SLINT_SCALE_FACTOR` respected).
 
-UI (`crates/servfox-shell/ui/servfox.slint`):
+UI (`crates/ironsurf-shell/ui/ironsurf.slint`):
 - `AppWindow` with: toolbar row [back, forward, reload, URL `LineEdit`, "New tab",
   container dropdown], tab bar (horizontal scroll; each tab = container-colored stripe +
   title + ✕), page area (`Image` fed by active tab frame, `TouchArea`/`PointerAreaHandler`
@@ -351,7 +351,7 @@ UI (`crates/servfox-shell/ui/servfox.slint`):
 
 Process/tab management (`src/tabs.rs`):
 - `struct TabProc { id, container, child: Child, stdin, stdout, title, url, loading, can_back, can_fwd, frame: slint::Image, last_frame_age }`
-- Spawn `servfox-tab` (resolve sibling of current exe; `--tab-id`…) with piped stdio;
+- Spawn `ironsurf-tab` (resolve sibling of current exe; `--tab-id`…) with piped stdio;
   reader thread per tab → `mpsc::UnboundedSender<FromTab>` drained by Slint timer (UI updates
   via `slint::Weak<AppWindow>` invoke; throttle Frame messages: coalesce to newest).
 - `Frame` → `slint::Image` from raw RGBA buffer (`slint::Image::from_rgba8_slab`/PixelBuffer API — verify name).
@@ -360,18 +360,18 @@ Process/tab management (`src/tabs.rs`):
 - Default start page: `about:blank` then URL bar typing does search-or-navigate: contains dot
   → `https://host` (upgrading typed `host/path` to HTTPS), else → `https://duckduckgo.com/?q=`.
 - Container default from registry; per-container "remember last chosen container for new tabs"
-  in `~/.local/share/servfox/ui.json` (best-effort).
+  in `~/.local/share/ironsurf/ui.json` (best-effort).
 
 Tests (headless CI-safe): tab-proc message pump logic + `FromTab` state reduction tested
 against a **fake tab process** (a small test bin that scripts `FromTab` sequences) so shell
-logic runs without the engine (Blitz) or X. GUI smoke test gated behind `$DISPLAY` + `SERVFOX_SMOKE=1`.
+logic runs without the engine (Blitz) or X. GUI smoke test gated behind `$DISPLAY` + `IRONSURF_SMOKE=1`.
 
 ---
 
 ## Root-level deliverables
 
 - `README.md`: features, screenshots note, build (`cargo build --release`), run
-  (`target/release/servfox-shell`), sandbox & container explanation, limitations.
+  (`target/release/ironsurf-shell`), sandbox & container explanation, limitations.
 - `docs/ENGINE_INTEGRATION.md`: the Blitz/Boa embedding specifics discovered while
   implementing the tab crate (document lifecycle, paint/readback path, NetProvider quirks,
   Boa binding surface). Renamed from `SERVO_INTEGRATION.md` at the engine pivot.
@@ -381,11 +381,11 @@ logic runs without the engine (Blitz) or X. GUI smoke test gated behind `$DISPLA
 ## Verification gates per task
 
 Each task MUST end with its own check passing:
-1. common: `cargo test -p servfox-common`
-2. storage: `cargo test -p servfox-storage` (registry lifecycle, cookie RFC rules incl.
+1. common: `cargo test -p ironsurf-common`
+2. storage: `cargo test -p ironsurf-storage` (registry lifecycle, cookie RFC rules incl.
    Secure-over-HTTPS-only, cache LRU eviction, **container isolation of profiles**)
-3. sandbox: `cargo test -p servfox-sandbox` (probe child proves forbidden dir unreadable when Landlock is available; degrades gracefully otherwise)
-4. tab/blitz: `cargo build -p servfox-tab && cargo test -p servfox-tab` (headless frame test;
-   `cargo tree -p servfox-tab` must contain no `mozjs`/`wgpu`/`servo v` entries)
-5. shell: `cargo test -p servfox-shell` (+ smoke with fake tab proc; GUI check if display)
+3. sandbox: `cargo test -p ironsurf-sandbox` (probe child proves forbidden dir unreadable when Landlock is available; degrades gracefully otherwise)
+4. tab/blitz: `cargo build -p ironsurf-tab && cargo test -p ironsurf-tab` (headless frame test;
+   `cargo tree -p ironsurf-tab` must contain no `mozjs`/`wgpu`/`servo v` entries)
+5. shell: `cargo test -p ironsurf-shell` (+ smoke with fake tab proc; GUI check if display)
 6. end-to-end: shell driving two containers side-by-side (scripted), README + docs complete.

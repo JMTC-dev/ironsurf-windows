@@ -1,0 +1,302 @@
+//! Container registry (`containers.json`) and the top-level [`Store`].
+
+use ironsurf_common::{Container, ContainerId};
+use std::fs;
+use std::io;
+use std::path::{Path, PathBuf};
+
+#[derive(Debug, thiserror::Error)]
+pub enum StoreError {
+    #[error("io error at {path}: {source}")]
+    Io {
+        path: String,
+        #[source]
+        source: io::Error,
+    },
+    #[error("invalid data in {path}: {source}")]
+    Json {
+        path: String,
+        #[source]
+        source: serde_json::Error,
+    },
+    #[error("no such container: {0:?}")]
+    NoSuchContainer(ContainerId),
+    #[error("cannot delete the default container")]
+    CannotDeleteDefault,
+    #[error("container name must not be empty")]
+    EmptyName,
+}
+
+impl StoreError {
+    pub(crate) fn io(path: impl AsRef<Path>, source: io::Error) -> Self {
+        StoreError::Io {
+            path: path.as_ref().display().to_string(),
+            source,
+        }
+    }
+    fn json(path: impl AsRef<Path>, source: serde_json::Error) -> Self {
+        StoreError::Json {
+            path: path.as_ref().display().to_string(),
+            source,
+        }
+    }
+}
+
+/// Open (and initialize if needed) the IronSurf data root.
+pub struct Store {
+    root: PathBuf,
+    containers: Vec<Container>,
+    next_id: u32,
+    default_id: ContainerId,
+}
+
+const DEFAULT_NAME: &str = "personal";
+const DEFAULT_COLOR: &str = "#9d9ba4";
+
+impl Store {
+    /// Create root/registry/profiles dirs; seed the default `personal`
+    /// container on first run.
+    pub fn open(root: impl Into<PathBuf>) -> Result<Self, StoreError> {
+        let root = root.into();
+        Self::open_with(root, true)
+    }
+
+    fn open_with(root: PathBuf, create: bool) -> Result<Self, StoreError> {
+        let registry_path = root.join("containers.json");
+        let mut containers: Vec<Container> = Vec::new();
+        if registry_path.exists() {
+            let text =
+                fs::read_to_string(&registry_path).map_err(|e| StoreError::io(&registry_path, e))?;
+            containers =
+                serde_json::from_str(&text).map_err(|e| StoreError::json(&registry_path, e))?;
+        }
+        let default_id = containers
+            .iter()
+            .find(|c| c.is_default)
+            .map(|c| c.id)
+            .unwrap_or(ContainerId(1));
+        let mut store = Store {
+            root,
+            containers,
+            next_id: 0,
+            default_id,
+        };
+        if create && store.containers.is_empty() {
+            // First run: seed the default `personal` container.
+            let id = store.new_id();
+            store.containers.push(Container {
+                id,
+                name: DEFAULT_NAME.to_string(),
+                color: DEFAULT_COLOR.to_string(),
+                is_default: true,
+            });
+            store.default_id = id;
+            store.save()?;
+        } else if create && !store.containers.iter().any(|c| c.is_default) {
+            // Registry without a default (hand-edited): promote the first.
+            store.containers[0].is_default = true;
+            store.default_id = store.containers[0].id;
+            store.save()?;
+        }
+        if create {
+            let profiles = store.root.join("profiles");
+            fs::create_dir_all(&profiles).map_err(|e| StoreError::io(profiles, e))?;
+            for c in &store.containers {
+                // Best-effort: make sure every registered container has a dir.
+                let _ = store.ensure_profile_dir(c.id);
+            }
+        }
+        Ok(store)
+    }
+
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
+    pub fn containers(&self) -> &[Container] {
+        &self.containers
+    }
+
+    pub fn container(&self, id: ContainerId) -> Option<&Container> {
+        self.containers.iter().find(|c| c.id == id)
+    }
+
+    pub fn default_container_id(&self) -> ContainerId {
+        self.default_id
+    }
+
+    /// Create a container (and its profile dir). Returns the new id.
+    pub fn create_container(&mut self, name: &str, color: &str) -> Result<ContainerId, StoreError> {
+        let name = sanitize_name(name)?;
+        let color = normalize_color(color);
+        let id = self.new_id();
+        self.ensure_profile_dir(id)?;
+        self.containers.push(Container {
+            id,
+            name,
+            color,
+            is_default: false,
+        });
+        self.save()?;
+        Ok(id)
+    }
+
+    pub fn rename_container(&mut self, id: ContainerId, name: &str) -> Result<(), StoreError> {
+        let name = sanitize_name(name)?;
+        let old_dir = self.profile_dir_path(id);
+        let container = self
+            .containers
+            .iter_mut()
+            .find(|c| c.id == id)
+            .ok_or(StoreError::NoSuchContainer(id))?;
+        container.name = name;
+        self.save()?;
+        // The profile dir is named `<slug>-<id>`: carry the data across.
+        let new_dir = self.profile_dir_path(id);
+        if old_dir != new_dir && old_dir.exists() {
+            if let Some(parent) = new_dir.parent() {
+                let _ = fs::create_dir_all(parent);
+            }
+            let _ = fs::remove_dir_all(&new_dir);
+            let _ = fs::rename(&old_dir, &new_dir);
+        }
+        self.ensure_profile_dir(id)
+    }
+
+    pub fn set_container_color(&mut self, id: ContainerId, color: &str) -> Result<(), StoreError> {
+        let color = normalize_color(color);
+        let container = self
+            .containers
+            .iter_mut()
+            .find(|c| c.id == id)
+            .ok_or(StoreError::NoSuchContainer(id))?;
+        container.color = color;
+        self.save()
+    }
+
+    /// Delete a container and remove its profile dir recursively.
+    /// Refuses to delete the default container.
+    pub fn delete_container(&mut self, id: ContainerId) -> Result<(), StoreError> {
+        if id == self.default_id {
+            return Err(StoreError::CannotDeleteDefault);
+        }
+        let pos = self
+            .containers
+            .iter()
+            .position(|c| c.id == id)
+            .ok_or(StoreError::NoSuchContainer(id))?;
+        // Resolve the dir while the name is still in the registry.
+        let dir = self.profile_dir_path(id);
+        self.containers.remove(pos);
+        self.save()?;
+        if dir.exists() {
+            fs::remove_dir_all(&dir).map_err(|e| StoreError::io(dir, e))?;
+        }
+        Ok(())
+    }
+
+    /// Profile dir for `id`; guarantees the directory (and the reserved
+    /// subdirs) exist.
+    pub fn profile_dir(&self, id: ContainerId) -> PathBuf {
+        let dir = self.profile_dir_path(id);
+        let _ = self.ensure_profile_dir(id);
+        dir
+    }
+
+    fn profile_dir_path(&self, id: ContainerId) -> PathBuf {
+        let name = self
+            .container(id)
+            .map(|c| c.name.as_str())
+            .unwrap_or("unknown");
+        self.root
+            .join("profiles")
+            .join(format!("{}-{}", slug(name), id.0))
+    }
+
+    fn ensure_profile_dir(&self, id: ContainerId) -> Result<(), StoreError> {
+        let dir = self.profile_dir_path(id);
+        fs::create_dir_all(&dir).map_err(|e| StoreError::io(&dir, e))?;
+        for sub in ["net-cache", "local-storage"] {
+            let s = dir.join(sub);
+            fs::create_dir_all(&s).map_err(|e| StoreError::io(&s, e))?;
+        }
+        Ok(())
+    }
+
+    fn new_id(&mut self) -> ContainerId {
+        self.next_id += 1;
+        while self.containers.iter().any(|c| c.id.0 == self.next_id) {
+            self.next_id += 1;
+        }
+        ContainerId(self.next_id)
+    }
+
+    /// Atomically rewrite `containers.json` (temp file + rename).
+    fn save(&self) -> Result<(), StoreError> {
+        write_atomic(&self.root.join("containers.json"), &self.containers)
+    }
+}
+
+/// `[{...}]` written atomically via temp-file + rename.
+pub(crate) fn write_atomic<T: serde::Serialize>(path: &Path, value: &T) -> Result<(), StoreError> {
+    if let Some(parent) = path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    let json = serde_json::to_string_pretty(value).map_err(|e| StoreError::json(path, e))?;
+    let tmp = path.with_extension("json.tmp");
+    fs::write(&tmp, json.as_bytes()).map_err(|e| StoreError::io(&tmp, e))?;
+    fs::rename(&tmp, path).map_err(|e| StoreError::io(path, e))?;
+    Ok(())
+}
+
+/// Strip/refuse junk: trim, reject empty, strip control/path characters.
+fn sanitize_name(name: &str) -> Result<String, StoreError> {
+    let trimmed = name.trim();
+    if trimmed.is_empty() {
+        return Err(StoreError::EmptyName);
+    }
+    Ok(trimed_chars(trimmed))
+}
+
+fn trimed_chars(name: &str) -> String {
+    name.chars()
+        .filter(|c| !c.is_control())
+        .filter(|c| *c != '/' && *c != '\\' && *c != '\0')
+        .collect::<String>()
+        .trim()
+        .to_string()
+}
+
+/// Lowercase hex `#rrggbb`; anything else falls back to the neutral gray.
+fn normalize_color(color: &str) -> String {
+    let c = color.trim().to_ascii_lowercase();
+    let hex = c.strip_prefix('#').unwrap_or(&c);
+    if hex.len() == 6 && hex.chars().all(|ch| ch.is_ascii_hexdigit()) {
+        format!("#{hex}")
+    } else {
+        DEFAULT_COLOR.to_string()
+    }
+}
+
+/// Filesystem-safe slug: `[a-z0-9]+` joined with `-`, `unnamed` fallback.
+pub(crate) fn slug(name: &str) -> String {
+    let mut out = String::new();
+    let mut last_dash = true; // suppress leading dashes
+    for c in name.chars() {
+        if c.is_ascii_alphanumeric() {
+            out.push(c.to_ascii_lowercase());
+            last_dash = false;
+        } else if matches!(c, '-' | '_' | ' ') && !last_dash {
+            out.push('-');
+            last_dash = true;
+        }
+    }
+    while out.ends_with('-') {
+        out.pop();
+    }
+    if out.is_empty() {
+        "unnamed".to_string()
+    } else {
+        out
+    }
+}
