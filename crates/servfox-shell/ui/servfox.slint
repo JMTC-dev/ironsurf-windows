@@ -1,0 +1,445 @@
+// ServFox shell UI — single component, all state driven from Rust.
+//
+// The Rust side (src/app.rs) owns the real state (tabs, containers, IPC);
+// this file renders snapshots pushed through `in` properties and forwards
+// user intents through `out` callbacks. Keyboard chords are decided in
+// Rust (see `keymap::shortcut_for`), so this file stays dumb.
+//
+// Note: Slint ids are only visible to descendants, and built-in elements
+// cannot declare custom properties — so the two focus() watchers live in
+// the small custom components `UrlBar` and `PageSurface` instead.
+
+import { LineEdit } from "std-widgets.slint";
+
+export struct TabInfo {
+    id: int,
+    title: string,
+    color: color,
+    active: bool,
+}
+
+export struct ContainerInfo {
+    name: string,
+    color: color,
+    isDefault: bool,
+}
+
+/// A tiny borderless toolbar button (cheaper than styled Buttons in rows).
+MiniButton := Rectangle {
+    in property <string> label: "";
+    in property <bool> enabled: true;
+    in property <color> tint: #262626;
+    callback clicked();
+    width: Math.max(22px, lbl.preferred-width + 12px);
+    height: 24px;
+    bg := Rectangle {
+        background: ta.has-hover ? (root.enabled ? #3d3d3d : #2c2c2c) : root.tint;
+        radius: 4px;
+    }
+    lbl := Text {
+        text: root.label;
+        color: root.enabled ? #e8e8e8 : #6a6a6a;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+        width: parent.width;
+        height: parent.height;
+    }
+    ta := TouchArea {
+        enabled: root.enabled;
+        clicked => { root.clicked(); }
+    }
+}
+
+/// URL bar wrapper: bumps `focus-token` (from Rust / Ctrl-L) to grab focus.
+UrlBar := Rectangle {
+    in property <int> focus-token: 0;
+    in-out property <string> text;
+    out callback submitted(text: string);
+    edit := LineEdit {
+        width: parent.width;
+        height: parent.height;
+        text <-> root.text;
+        placeholder-text: "Search or enter address — Ctrl-L to focus";
+        accepted(txt) => { root.submitted(txt); }
+    }
+    // armed on token bumps only (> 0), so clicking out of the bar does not
+    // yank focus back
+    changed focus-token => {
+        if (root.focus-token > 0) { edit.focus(); }
+    }
+}
+
+/// The page's keyboard focus holder. Every key press is forwarded to Rust
+/// (consumed so Slint never beeps); Rust either acts on a browser chord or
+/// relays a ToTab::Key to the active tab process.
+PageSurface := FocusScope {
+    in property <int> focus-token: 0;
+    out callback key(pressed: bool, text: string, ctrl: bool, shift: bool, alt: bool, meta: bool, repeat: bool);
+    changed focus-token => {
+        if (root.focus-token > 0) { self.focus(); }
+    }
+    key-pressed(ev) => {
+        root.key(true, ev.text, ev.modifiers.control, ev.modifiers.shift, ev.modifiers.alt, ev.modifiers.meta, ev.repeat);
+        return EventResult.accept;
+    }
+    key-released(ev) => {
+        root.key(false, ev.text, ev.modifiers.control, ev.modifiers.shift, ev.modifiers.alt, ev.modifiers.meta, ev.repeat);
+        return EventResult.accept;
+    }
+}
+
+export component AppWindow inherits Window {
+    title: "ServFox";
+    background: #1f1f1f;
+    min-width: 640px;
+    min-height: 480px;
+
+    // ------------------------------------------------------------------
+    // state pushed from Rust
+    // ------------------------------------------------------------------
+    in property <[TabInfo]> tabs;
+    in property <[ContainerInfo]> containers;
+    in property <image> page-image;
+    in property <string> url-text;
+    in property <string> status-text;
+    in property <string> sec-glyph: "";
+    in property <string> sec-color: "#888888";
+    in property <string> spinner: " ";
+    in property <string> container-label: "";
+    in property <bool> can-back: false;
+    in property <bool> can-fwd: false;
+    in property <bool> manager-open: false;
+    in property <int> editing-index: -1;
+    in property <string> container-edit-text;
+    in property <int> selected-container: 0;
+    in property <int> active-index: 0;
+    // bumped by Rust to move focus programmatically (Ctrl-L / Esc / startup)
+    in property <int> focus-url-token: 0;
+    in property <int> focus-page-token: 0;
+    // page area size, read by Rust to send ToTab::Resize
+    out property <length> page-width: page-area.width;
+    out property <length> page-height: page-area.height;
+
+    // ------------------------------------------------------------------
+    // intents surfaced to Rust
+    // ------------------------------------------------------------------
+    out callback go-back();
+    out callback go-forward();
+    out callback reload();
+    out callback new-tab();
+    out callback navigate(url: string);
+    out callback activate-tab(idx: int);
+    out callback close-tab(idx: int);
+    out callback open-manager();
+    out callback close-manager();
+    out callback mgr-new-tab-in(idx: int);
+    out callback mgr-move-tab-to(idx: int);
+    out callback mgr-delete(idx: int);
+    out callback mgr-start-rename(idx: int);
+    out callback mgr-rename(idx: int);
+    out callback mgr-add();
+    out callback mgr-recolor(idx: int, palette: int);
+    out callback mgr-select(idx: int);
+    // raw keyboard/pointer events from the page; Rust decides chords
+    out callback page-key(pressed: bool, text: string, ctrl: bool, shift: bool, alt: bool, meta: bool, repeat: bool);
+    // kind: 0 move, 1 down, 2 up, 4 out — button: 0 left, 1 right, 2 middle
+    out callback page-pointer(x: length, y: length, kind: int, button: int);
+    out callback page-wheel(x: length, y: length, delta-x: length, delta-y: length);
+
+    // fixed palette; index also addresses `palette-color` for add/rename
+    function palette-color(idx: int) -> color {
+        if (idx == 0) { return #4a90d9; }
+        if (idx == 1) { return #e06666; }
+        if (idx == 2) { return #6aa84f; }
+        if (idx == 3) { return #f6b26b; }
+        if (idx == 4) { return #8e7cc3; }
+        if (idx == 5) { return #6d4c41; }
+        if (idx == 6) { return #0097a7; }
+        return #9e9e9e;
+    }
+
+    VerticalLayout {
+        width: parent.width;
+        height: parent.height;
+
+        // ---- toolbar -----------------------------------------------------
+        Rectangle {
+            height: 38px;
+            background: #2b2b2b;
+
+            Row {
+                x: 8px;
+                height: parent.height;
+                vertical-alignment: center;
+                spacing: 6px;
+
+                MiniButton { label: "←"; enabled: root.can-back; clicked => { root.go-back(); } }
+                MiniButton { label: "→"; enabled: root.can-fwd; clicked => { root.go-forward(); } }
+                MiniButton { label: "⟳"; clicked => { root.reload(); } }
+
+                url-bar := UrlBar {
+                    min-width: 160px;
+                    horizontal-stretch: 1;
+                    text <-> root.url-text;
+                    focus-token: root.focus-url-token;
+                    submitted(txt) => { root.navigate(txt); }
+                }
+
+                MiniButton { label: "＋"; clicked => { root.new-tab(); } }
+
+                // container dropdown: shows the active tab's container,
+                // opens the manager on click
+                Rectangle {
+                    height: 24px;
+                    width: Math.max(80px, cont-lbl.preferred-width + 34px);
+                    bgr := Rectangle { background: cb.has-hover ? #3d3d3d : #262626; radius: 4px; }
+                    cont-lbl := Text {
+                        text: root.container-label;
+                        color: #dddddd;
+                        x: 8px;
+                        vertical-alignment: center;
+                        height: parent.height;
+                    }
+                    arrow := Text {
+                        text: "▾";
+                        color: #999999;
+                        x: parent.width - 18px;
+                        vertical-alignment: center;
+                        height: parent.height;
+                    }
+                    cb := TouchArea { clicked => { root.open-manager(); } }
+                }
+            }
+        }
+
+        // ---- tab strip ----------------------------------------------------
+        Rectangle {
+            height: 30px;
+            background: #252525;
+
+            Flickable {
+                width: parent.width;
+                height: parent.height;
+                horizontal-stretch: 1000;
+                viewport-width: Math.max(width, tab-row.width + 16px);
+
+                tab-row := HorizontalLayout {
+                    spacing: 4px;
+                    padding-left: 6px;
+                    padding-top: 3px;
+
+                    for tab[idx] in tabs: Rectangle {
+                        height: 24px;
+                        width: Math.min(220px, Math.max(90px, tt.preferred-width + 44px));
+                        bgr := Rectangle {
+                            background: tab.active ? #3a3a3a : #2e2e2e;
+                            radius: 4px;
+                        }
+                        // container-colored stripe
+                        stripe := Rectangle {
+                            x: 6px;
+                            width: 5px;
+                            y: 4px;
+                            height: parent.height - 8px;
+                            radius: 2px;
+                            background: tab.color;
+                        }
+                        tt := Text {
+                            text: tab.title == "" ? "New Tab" : tab.title;
+                            color: tab.active ? #f0f0f0 : #999999;
+                            x: 16px;
+                            vertical-alignment: center;
+                            max-width: parent.width - 40px;
+                            elide: middle;
+                        }
+                        xbtn := Text {
+                            text: "✕";
+                            color: xt.has-hover ? #ffffff : #888888;
+                            x: parent.width - 20px;
+                            vertical-alignment: center;
+                        }
+                        xt := TouchArea {
+                            clicked => { root.close-tab(idx); }
+                        }
+                        // declared first ⇒ bottom z-order; ✕ wins on top
+                        tabta := TouchArea {
+                            clicked => { root.activate-tab(idx); }
+                        }
+                    }
+                }
+            }
+        }
+
+        // ---- page ----------------------------------------------------------
+        page := PageSurface {
+            horizontal-stretch: 1;
+            vertical-stretch: 1;
+            focus-token: root.focus-page-token;
+            key(pressed, txt, ctrl, shift, alt, meta, repeat) => {
+                root.page-key(pressed, txt, ctrl, shift, alt, meta, repeat);
+            }
+
+            Rectangle {
+                x: 0; y: 0;
+                width: parent.width; height: parent.height;
+                background: #ffffff;
+
+                Image {
+                    source: root.page-image;
+                    width: parent.width;
+                    height: parent.height;
+                    image-fit: fill;
+                }
+
+                ta := TouchArea {
+                    // clicking the page returns keyboard focus to it
+                    pressed => { root.focus-page-token += 1; }
+                    pointer-event(ev) => {
+                        // kind: 0 move, 1 down, 2 up, 4 out; Slint `:=` is the
+                        // imperative assignment inside handlers
+                        kind := 0;
+                        if (ev.kind == PointerEventKind.down) { kind := 1; }
+                        if (ev.kind == PointerEventKind.up) { kind := 2; }
+                        if (ev.kind == PointerEventKind.cancel) { kind := 4; }
+                        btn := 0;
+                        if (ev.button == PointerEventButton.right) { btn := 1; }
+                        if (ev.button == PointerEventButton.middle) { btn := 2; }
+                        root.page-pointer(ev.x, ev.y, kind, btn);
+                    }
+                    // Slint: a positive wheel delta reveals content toward the
+                    // top/left; the tab expects positive == reveal down/right.
+                    scroll(dv, dh) => {
+                        root.page-wheel(ta.mouse-x, ta.mouse-y, -dh, -dv);
+                    }
+                }
+            }
+        }
+
+        // ---- status bar ------------------------------------------------------
+        Rectangle {
+            height: 24px;
+            background: #2b2b2b;
+
+            Row {
+                x: 10px;
+                height: parent.height;
+                vertical-alignment: center;
+                spacing: 8px;
+
+                Text { text: root.spinner; color: #bbbbbb; }
+                Text { text: root.sec-glyph; color: root.sec-color; }
+                st := Text {
+                    text: root.status-text;
+                    color: #aaaaaa;
+                    vertical-alignment: center;
+                    max-width: Math.max(0px, root.width - 220px);
+                    elide: middle;
+                }
+            }
+        }
+    }
+
+    // ------------------------------------------------------------------------
+    // container manager overlay
+    // ------------------------------------------------------------------------
+    Rectangle {
+        x: 0; y: 0;
+        width: root.width; height: root.height;
+        visible: root.manager-open;
+        background: #00000099;
+        scrim := TouchArea { clicked => { root.close-manager(); } }
+
+        panel := Rectangle {
+            TouchArea {} // swallow clicks over the panel
+            x: root.width - width;
+            width: Math.min(380px, root.width);
+            height: root.height;
+            background: #1e1e1e;
+
+            VerticalLayout {
+                padding: 12px;
+                spacing: 6px;
+
+                HorizontalLayout {
+                    spacing: 8px;
+                    height: 26px;
+                    Text { text: "Containers"; color: #f0f0f0; font-weight: 600; vertical-alignment: center; }
+                    Rectangle { horizontal-stretch: 1; }
+                    MiniButton { label: "✕"; clicked => { root.close-manager(); } }
+                }
+
+                for c[i] in containers: Rectangle {
+                    height: 54px;
+                    width: parent.width;
+                    sel := Rectangle { background: i == root.selected-container ? #383838 : #262626; radius: 4px; }
+                    VerticalLayout {
+                        x: 6px; y: 3px;
+                        width: parent.width - 12px;
+                        spacing: 2px;
+                        HorizontalLayout {
+                            height: 22px;
+                            spacing: 6px;
+                            Rectangle { width: 12px; height: 12px; radius: 3px; background: c.color; }
+                            if i == root.editing-index: LineEdit {
+                                horizontal-stretch: 1;
+                                text <-> root.container-edit-text;
+                                accepted => { root.mgr-rename(i); }
+                            }
+                            Text {
+                                visible: i != root.editing-index;
+                                text: c.name + (c.isDefault ? " ★" : "");
+                                color: #e8e8e8;
+                                vertical-alignment: center;
+                                horizontal-stretch: 1;
+                            }
+                            MiniButton { visible: i != root.editing-index; label: "Ren"; clicked => { root.mgr-start-rename(i); } }
+                            MiniButton { visible: i == root.editing-index; label: "OK"; clicked => { root.mgr-rename(i); } }
+                        }
+                        HorizontalLayout {
+                            height: 22px;
+                            spacing: 6px;
+                            MiniButton { label: "New"; clicked => { root.mgr-new-tab-in(i); } }
+                            MiniButton { label: "Move tab"; clicked => { root.mgr-move-tab-to(i); } }
+                            MiniButton {
+                                label: "Delete";
+                                enabled: !c.isDefault;
+                                clicked => { root.mgr-delete(i); }
+                            }
+                            Rectangle { horizontal-stretch: 1; }
+                        }
+                    }
+                    selta := TouchArea { clicked => { root.mgr-select(i); } }
+                }
+
+                Text { text: "Add container"; color: #f0f0f0; }
+                HorizontalLayout {
+                    height: 26px;
+                    spacing: 6px;
+                    LineEdit {
+                        horizontal-stretch: 1;
+                        text <-> root.container-edit-text;
+                        placeholder-text: "name";
+                        accepted => { root.mgr-add(); }
+                    }
+                    MiniButton { label: "Add"; clicked => { root.mgr-add(); } }
+                }
+                HorizontalLayout {
+                    height: 20px;
+                    spacing: 6px;
+                    for p[7] in [0, 1, 2, 3, 4, 5, 6]: Rectangle {
+                        width: 18px; height: 18px; radius: 4px;
+                        background: root.palette-color(p);
+                        pt := TouchArea { clicked => { root.mgr-recolor(root.selected-container, p); } }
+                    }
+                }
+
+                Rectangle { vertical-stretch: 1; }
+                Text {
+                    text: "Move tab re-spawns the active tab in the selected container (keeping its URL). Delete wipes that container's data. The palette recolors the selected container.";
+                    color: #888888;
+                    wrap: word-wrap;
+                }
+            }
+        }
+    }
+}

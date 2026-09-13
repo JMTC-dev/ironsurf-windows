@@ -37,3 +37,8 @@ Verified-vs-vendor API cheat-sheet for blitz-*-0.3.0-beta.2: NetHandler=1 fn (by
 ResourceType/Response; nav via NavigationProvider hook (not DocumentEvent); no resize()
 (use set_viewport); has_changes() inverted; Doc/Send-less→drive on one thread; vello buf=
 premultiplied RGBA8. No crate code touched; servfox-tab build+spike green. Next: #7b netmod NetProvider.
+## #7b done — netmod Blitz NetProvider + managed fetch_document
+BlitzNetProvider (Send+Sync, jar/cache behind Mutex; worker=own reqwest-0.12-rustls
+blocking Client on spawned threads; error⇒drop handler like upstream). file:/data:/
+about: local; fetch_document() = https-upgrade+block, cookie inject/capture, NetCache
+ETag. 16 unit tests green (+8 new); build clean. Next: #7c runtime core.
