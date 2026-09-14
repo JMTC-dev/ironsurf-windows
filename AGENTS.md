@@ -2,7 +2,7 @@
 
 - **Contracts**: implement exactly per `/workspace/ARCHITECTURE.md` (single source of truth). Extend, never contradict.
 - **Rust**: `export PATH="$HOME/.cargo/bin:$PATH"` (cargo 1.98 stable). Workspace at `/workspace`, crates under `crates/`.
-- **System deps**: Debian trixie, root. `apt` log at `/tmp/apt.log` — wait for `APT_EXIT=0` before building `ironsurf-tab`. Servo needs glib/gstreamer/mesa/fonts (installed there).
+- **System deps**: Debian trixie, root — full list + rationale in `docs/BUILD_DEBIAN.md`. Build-time: `apt install -y build-essential pkg-config git curl ca-certificates libssl-dev libfontconfig-dev` (OpenSSL via `blitz-net`'s reqwest, fontconfig via `usvg`/`fontique`). `apt` log at `/tmp/apt.log` — wait for `APT_EXIT=0` before building `ironsurf-tab`. Servo-era deps (glib/gstreamer/mesa/llvm/libx11-dev) are no longer needed.
 - **Display**: X session at `DISPLAY=:2.0` (Xvfb-ish env; no GPU — prefer software rendering, never require GL). GUI screenshots: `xwd`/`import`.
 - **Servo** (`servo` crate from crates.io, ≥0.1): docs.rs fails; authoritative API = the unpacked registry source (`~/.cargo/registry/src/*/servo-*`) or GitHub `main` (`components/servo/{lib.rs,webview.rs,webview_delegate.rs}`, `examples/winit_minimal.rs`). First build takes 30–45 min — build once, reuse `target/`, never bump the locked version.
 - **Handoff protocol**: read `TASKLOG.md` first; append a ≤5-line entry last; keep TASKLOG ≤30 lines. Commit your work (git) at task end.

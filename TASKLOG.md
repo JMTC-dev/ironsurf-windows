@@ -1,8 +1,8 @@
 # Task log
-## #0–#5 prehistory — contracts; common IPC 11✓; storage (registry/containers/RFC6265 jar/LRU/history) 28✓;
-sandbox (prctl/setrlimits/Landlock BestEffort, sbox-probe LIVE HERE) 7✓; Servo spike+runtime SUPERSEDED by #6.
+## #0–#5 prehistory — IPC 11✓; storage (registry/containers/RFC6265 jar/LRU/history) 28✓; sandbox
+(prctl/setrlimits/Landlock BestEffort, sbox-probe LIVE HERE) 7✓; Servo spike SUPERSEDED by #6.
 ## #6 pivot Servo→Blitz+vello_cpu — blitz@0.3.0-beta.2 + anyrender 0.13 + anyrender_vello_cpu 0.17;
-spike.rs headless parse→resolve→render_to_buffer proof; e2e #[ignore].
+spike.rs headless parse→render_to_buffer proof; e2e #[ignore].
 ## #7a docs/BLITZ_API_NOTES.md — vendor-verified cheat-sheet: NetHandler=1 fn; nav via NavigationProvider
 hook; set_viewport not resize(); has_changes() INVERTED; Doc not Send/Sync→one thread; vello=premul RGBA8.
 ## #7b netmod — BlitzNetProvider (jar/cache behind Mutex; reqwest-0.12-rustls workers; error⇒drop
@@ -28,3 +28,8 @@ stdin batch + no repaint when get_hover_node_id() unchanged (60-move flood→cli
 hover <a href> ⇒ StatusText(target) / None on leave. shell: move_due 33 ms move gate (newest flushed per tick),
 LoadingChanged(true) clears sticky Error (old errors shadowed every new status = "appends the old logs"), spinner
 refreshes at load start + "Loading …". live human-click 11.5s→1.5s (3 trials); 121 tests green; docs §E.
+## #12 docs/BUILD_DEBIAN.md — apt prerequisites proven from cargo tree/build.rs/objdump: build-time =
+build-essential, pkg-config, git/curl/ca-certs, libssl-dev (openssl-sys←native-tls←reqwest0.13←blitz-net),
+libfontconfig-dev (yeslogic-fontconfig-sys←usvg/fontique); X11/Wayland/GL are dlopen'd so NO -dev headers.
+Runtime = libx11-6/-xcb1/libxcb1/libxcb-xkb1/libxkbcommon{,-x11}-0/libxi6/libxrender1/libxcursor1/
+libfontconfig1/fonts-dejavu-core; Servo-era deps (glib/gstreamer/mesa/llvm/libx11-dev) dropped in README+AGENTS.
