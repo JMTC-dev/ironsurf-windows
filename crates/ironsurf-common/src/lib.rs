@@ -67,6 +67,11 @@ pub enum FromTab {
     StatusText {
         text: Option<String>,
     },
+    /// Middle-click on a link: the shell must open `url` in a **new tab**
+    /// (same container as the requesting tab) without navigating this tab.
+    OpenLinkInNewTab {
+        url: String,
+    },
     ConsoleLog {
         level: String,
         message: String,
@@ -357,6 +362,9 @@ mod tests {
         frame_round_trip(FromTab::HistoryChanged { can_go_back: true, can_go_forward: false });
         frame_round_trip(FromTab::StatusText { text: Some("s".into()) });
         frame_round_trip(FromTab::StatusText { text: None });
+        frame_round_trip(FromTab::OpenLinkInNewTab {
+            url: "https://example.com/link".into()
+        });
         frame_round_trip(FromTab::ConsoleLog { level: "warn".into(), message: "m".into() });
         frame_round_trip(FromTab::Closed);
         frame_round_trip(FromTab::Error { message: "boom".into() });

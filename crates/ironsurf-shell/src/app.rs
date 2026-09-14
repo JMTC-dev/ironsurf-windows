@@ -633,6 +633,9 @@ impl Core {
                     if *loading { "started" } else { "finished" }
                 ),
                 FromTab::Closed => info!("tab {tid} says it is closed"),
+                FromTab::OpenLinkInNewTab { url } => {
+                    info!("tab {tid} middle-click: opening {url} in a new tab")
+                }
                 other => debug!("tab {tid} → {other:?}"),
             }
             if let FromTab::Frame { width, height, ref rgba, .. } = msg {
@@ -669,6 +672,21 @@ impl Core {
                     } else {
                         debug!("history: recorded {url} in container {}", container.0);
                     }
+                }
+            }
+            // Middle-click "open link in new tab": spawn a sibling tab in the
+            // requesting tab's container; the requester itself never navigates
+            // (its runtime swallows the middle-click release).
+            if let FromTab::OpenLinkInNewTab { url } = &msg {
+                let container = {
+                    let procs = self.procs.borrow();
+                    procs
+                        .iter()
+                        .find(|p| p.tab.id == tid)
+                        .map(|p| p.tab.container)
+                };
+                if let Some(container) = container {
+                    self.open_tab(container, Some(url));
                 }
             }
         }

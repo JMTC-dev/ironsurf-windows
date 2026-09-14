@@ -1199,6 +1199,17 @@ impl Tab {
             _ => {}
         }
 
+        // Middle-click release over a link → "open in new tab": the Up event
+        // is deliberately *not* fed to blitz, so no DOM `click` fires, the
+        // NavigationProvider stays empty, and this tab keeps its document.
+        // The shell spawns the sibling tab (same container) on this message.
+        if matches!(ev.kind, PointerKind::Up) && ev.button == MouseButton::Middle {
+            if let Some(url) = self.hover_link() {
+                self.emit(FromTab::OpenLinkInNewTab { url });
+                return true;
+            }
+        }
+
         // blitz synthesises enter/over/out/leave *DOM events* from
         // `PointerMove` (events/driver.rs::handle_pointer_move); there is no
         // Over/Out UiEvent, so ironsurf hover transitions arrive as moves.

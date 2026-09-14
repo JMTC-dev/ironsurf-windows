@@ -96,6 +96,7 @@ pub enum FromTab {
     LoadingChanged   { loading: bool },
     HistoryChanged   { can_go_back: bool, can_go_forward: bool },
     StatusText       { text: Option<String> },
+    OpenLinkInNewTab { url: String },      // middle-click a link → shell opens url in a new tab (same container)
     ConsoleLog       { level: String, message: String },
     Closed,
     Error            { message: String },

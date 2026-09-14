@@ -36,3 +36,7 @@ both RFC 2397 forms; data:text/javascript;base64,… typed/navigated to renders 
 by media type (render_document, between fetch and HtmlDocument::from_html) instead of being parsed as HTML —
 executing it would be a javascript: URL by another name; markup (html/xhtml/svg/xml) parses as before, and
 <script src="data:…"> still runs. Shell: scheme match case-insensitive + javascript: passed to the tab.
+## #13 middle-click = open link in new tab — common: FromTab::OpenLinkInNewTab{url} (+round-trip, ARCH updated);
+tab: middle Up over <a href> swallowed (no DOM click/nav hook), emits OpenLinkInNewTab; shell drain: spawns
+sibling tab in same container via open_tab; state.reduce treats it as an action (no state change). UI already
+forwarded button=2 (middle). cargo test --workspace green.

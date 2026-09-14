@@ -77,6 +77,8 @@ impl TabState {
                 }
             }
             FromTab::ConsoleLog { .. } => false,
+            // An action for the pump (spawn a new tab), not per-tab state.
+            FromTab::OpenLinkInNewTab { .. } => false,
             FromTab::Frame { .. } => false,
             FromTab::Closed => {
                 if self.closed {
