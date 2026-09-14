@@ -36,6 +36,9 @@ const SPINNER_FRAMES: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '�
 struct Proc {
     tab: TabProc,
     state: TabState,
+    /// Page zoom factor (Ctrl-`+`/`-`/`0`, shell-owned policy; see
+    /// `keymap::zoom_in`/`zoom_out`). Sent to the tab as `ToTab::SetZoom`.
+    zoom: f32,
 }
 
 /// Shared runtime core (one per window; kept in an `Rc`).
@@ -230,7 +233,7 @@ impl Core {
                 let (w, h) = self.page_size();
                 {
                     let mut procs = self.procs.borrow_mut();
-                    procs.push(Proc { tab, state: TabState::default() });
+                    procs.push(Proc { tab, state: TabState::default(), zoom: 1.0 });
                     self.active.set(procs.len() - 1);
                 }
                 if w > 0.0 && h > 0.0 {
@@ -369,6 +372,18 @@ impl Core {
                 self.cycle_tab();
                 return;
             }
+            Some(Shortcut::ZoomIn) => {
+                self.step_zoom(keymap::zoom_in);
+                return;
+            }
+            Some(Shortcut::ZoomOut) => {
+                self.step_zoom(keymap::zoom_out);
+                return;
+            }
+            Some(Shortcut::ZoomReset) => {
+                self.apply_zoom(1.0);
+                return;
+            }
             Some(Shortcut::PageFocus) => {
                 if let Some(ui) = self.ui() {
                     let t = ui.get_focus_page_token() + 1;
@@ -380,6 +395,37 @@ impl Core {
         }
         let ev = keymap::to_ipc_key(text, ctrl, shift, alt, meta, repeat);
         self.send_active(ToTab::Key(ev));
+    }
+
+    /// One zoom step (in/out) from the active tab's current factor.
+    fn step_zoom(&self, step: impl Fn(f32) -> f32) {
+        let zoom = self
+            .active_proc_index()
+            .map(|i| step(self.procs.borrow()[i].zoom))
+            .unwrap_or(1.0);
+        self.apply_zoom(zoom);
+    }
+
+    /// Push a new zoom factor to the active tab (Ctrl-`+`/`-`/`0` chords);
+    /// the tab rescales its document viewport and reports back with fresh
+    /// frames. The status bar says "Zoom N%" until the page next speaks.
+    fn apply_zoom(&self, zoom: f32) {
+        let Some(i) = self.active_proc_index() else {
+            debug!("zoom {zoom:.0}% dropped: no active tab");
+            return;
+        };
+        let label = format!("Zoom {:.0}%", zoom * 100.0);
+        info!("{label} (active tab)");
+        {
+            let mut procs = self.procs.borrow_mut();
+            let p = &mut procs[i];
+            p.zoom = zoom;
+            p.state.status = Some(label);
+            if let Err(err) = p.tab.send(ToTab::SetZoom { zoom }) {
+                warn!("tab {} could not set zoom: {err}", p.tab.id);
+            }
+        }
+        self.sync_ui();
     }
 
     fn page_pointer(&self, x: f32, y: f32, kind: i32, button: i32) {
@@ -498,7 +544,11 @@ impl Core {
         if let Ok(tab) = replacement {
             let old = {
                 let mut procs = self.procs.borrow_mut();
-                std::mem::replace(&mut procs[at], Proc { tab, state: TabState::default() })
+                let zoom = procs[at].zoom;
+                std::mem::replace(
+                    &mut procs[at],
+                    Proc { tab, state: TabState::default(), zoom },
+                )
             };
             if w > 0.0 && h > 0.0 {
                 let _ = old.tab.send(ToTab::Resize { width: w as u32, height: h as u32, scale: 1.0 });

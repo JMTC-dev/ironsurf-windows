@@ -98,6 +98,13 @@ pub enum ToTab {
         height: u32,
         scale: f32,
     },
+    /// Page zoom factor (`1.0` = 100%). The shell owns the chord steps and
+    /// clamping (Ctrl-`+` / Ctrl-`-` / Ctrl-`0`); the tab applies the factor
+    /// to the document viewport and maps pointer/scroll coordinates through
+    /// it. The factor persists across navigations for the tab's lifetime.
+    SetZoom {
+        zoom: f32,
+    },
     /// Throttle background rendering.
     SetVisible {
         visible: bool,
@@ -383,6 +390,9 @@ mod tests {
         frame_round_trip(ToTab::Back);
         frame_round_trip(ToTab::Forward);
         frame_round_trip(ToTab::Resize { width: 800, height: 600, scale: 2.0 });
+        frame_round_trip(ToTab::SetZoom { zoom: 1.0 });
+        frame_round_trip(ToTab::SetZoom { zoom: 1.33 });
+        frame_round_trip(ToTab::SetZoom { zoom: 0.5 });
         frame_round_trip(ToTab::SetVisible { visible: false });
         for kind in [
             PointerKind::Move,

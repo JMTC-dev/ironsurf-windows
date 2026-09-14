@@ -111,6 +111,7 @@ pub enum ToTab {
     Back,
     Forward,
     Resize       { width: u32, height: u32, scale: f32 },
+    SetZoom      { zoom: f32 },           // page zoom, 1.0 = 100% (Ctrl-+/Ctrl--/Ctrl-0)
     SetVisible   { visible: bool },        // throttle background rendering
     Pointer      (PointerEvent),
     Key          (KeyEvent),
@@ -286,7 +287,13 @@ Lifecycle:
    (RGBA8 straight alpha; verify buffer layout against the anyrender_vello_cpu source — if it
    ever emits premultiplied/BGR, convert; the spike test proves pixel sanity).
 5. Resize: `ToTab::Resize` → store new `Viewport`, rebuild/resize document viewport, resolve,
-   repaint.
+   repaint. Zoom: `ToTab::SetZoom { zoom }` → store the factor, `document.set_viewport` with
+   `Viewport::zoom = zoom` (blitz multiplies hidpi × zoom into its total scale), resolve,
+   repaint; the tab divides incoming pointer coordinates and pixel scroll deltas by the zoom
+   (logical px → CSS px), keeps the factor across navigations (fresh documents inherit it),
+   and clamps nonsense values. The shell owns the chord policy — Ctrl-`+`/`=`, Ctrl-`-`,
+   Ctrl-`0` step the per-tab factor (×÷1.1, clamped 30–500%, whole-percent levels) and show
+   “Zoom N%” in the status bar.
 6. Input: `ToTab::Pointer/Key/Scroll` → `blitz_dom::events` `UiEvent` variants (pointer
    press/release/move with `hit test` done internally, mouse wheel, keyboard key-press /
    text-input — see `blitz-dom/src/events/{pointer,keyboard}.rs`) → `document.handle_ui_event(ev)`,

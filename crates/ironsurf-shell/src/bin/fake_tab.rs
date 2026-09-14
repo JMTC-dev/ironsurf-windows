@@ -70,6 +70,7 @@ fn main() {
                 emit(FromTab::HistoryChanged { can_go_back: false, can_go_forward: false });
             }
             ToTab::Pointer(_) | ToTab::Key(_) | ToTab::Scroll(_) | ToTab::SetVisible { .. } => {}
+            ToTab::SetZoom { .. } => {} // no real layout to rescale
             ToTab::Destroy => break,
         }
     }

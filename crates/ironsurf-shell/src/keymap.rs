@@ -4,8 +4,8 @@
 //! characters for special keys, e.g. `Tab` is `"\t"`, arrows are the
 //! private-use code points from the Slint key table). We map those to the
 //! DOM `key`/`code` strings the tab hands to Servo, and we detect browser
-//! chords (Ctrl-L / Ctrl-W / Ctrl-R / Ctrl-T / Ctrl-Tab / Esc) here so the
-//! logic stays pure and testable.
+//! chords (Ctrl-L / Ctrl-W / Ctrl-R / Ctrl-T / Ctrl-Tab / Esc / Ctrl-+ / Ctrl--
+//! / Ctrl-0) here so the logic stays pure and testable.
 
 use ironsurf_common::{KeyEvent, Modifiers};
 
@@ -22,8 +22,38 @@ pub enum Shortcut {
     NewTab,
     /// Ctrl-Tab: cycle to the next tab.
     CycleTab,
+    /// Ctrl-`+` (Ctrl-`=`, Ctrl-`+`): zoom the page in one step.
+    ZoomIn,
+    /// Ctrl-`-`: zoom the page out one step.
+    ZoomOut,
+    /// Ctrl-`0`: reset zoom to 100%.
+    ZoomReset,
     /// Esc: return keyboard focus to the page.
     PageFocus,
+}
+
+/// Browser zoom policy (shell-owned): multiplicative steps, clamped range.
+pub const ZOOM_STEP: f32 = 1.1;
+pub const ZOOM_MIN: f32 = 0.3;
+pub const ZOOM_MAX: f32 = 5.0;
+
+/// Round to whole percent to keep the discrete zoom levels exact under
+/// repeated stepping (`1.1 * 1.1` drift would otherwise compound).
+#[inline]
+fn round_zoom(z: f32) -> f32 {
+    (z * 100.0).round() / 100.0
+}
+
+/// One zoom-in step (`Ctrl`+`+`), clamped to [`ZOOM_MAX`].
+pub fn zoom_in(zoom: f32) -> f32 {
+    let base = if zoom.is_finite() && zoom > 0.0 { zoom } else { 1.0 };
+    round_zoom(base * ZOOM_STEP).clamp(ZOOM_MIN, ZOOM_MAX)
+}
+
+/// One zoom-out step (`Ctrl`+`-`), clamped to [`ZOOM_MIN`].
+pub fn zoom_out(zoom: f32) -> f32 {
+    let base = if zoom.is_finite() && zoom > 0.0 { zoom } else { 1.0 };
+    round_zoom(base / ZOOM_STEP).clamp(ZOOM_MIN, ZOOM_MAX)
 }
 
 #[inline]
@@ -57,6 +87,11 @@ pub fn shortcut_for(text: &str, ctrl: bool, alt: bool, meta: bool) -> Option<Sho
         'r' | 'R' | '\u{12}' => Some(Shortcut::Reload),
         't' | 'T' | '\u{14}' => Some(Shortcut::NewTab),
         '\t' => Some(Shortcut::CycleTab),
+        // Ctrl+= and Ctrl+shift+= (i.e. Ctrl-`+`) both zoom in; control-char
+        // forms: Ctrl-= = 0x1D (GS), Ctrl-- = 0x1F (US).
+        '=' | '+' | '\u{1d}' => Some(Shortcut::ZoomIn),
+        '-' | '_' | '\u{1f}' => Some(Shortcut::ZoomOut),
+        '0' => Some(Shortcut::ZoomReset),
         _ => None,
     }
 }
@@ -166,6 +201,55 @@ mod tests {
             shortcut_for("\u{1b}", false, false, false),
             Some(Shortcut::PageFocus)
         );
+    }
+
+    #[test]
+    fn zoom_chords_are_detected() {
+        // Ctrl-= (the usual unshifted form of Ctrl-+) and Ctrl-+ both zoom in.
+        assert_eq!(shortcut_for("=", true, false, false), Some(Shortcut::ZoomIn));
+        assert_eq!(shortcut_for("+", true, false, false), Some(Shortcut::ZoomIn));
+        assert_eq!(
+            shortcut_for("\u{1d}", true, false, false),
+            Some(Shortcut::ZoomIn)
+        );
+        assert_eq!(shortcut_for("-", true, false, false), Some(Shortcut::ZoomOut));
+        assert_eq!(shortcut_for("_", true, false, false), Some(Shortcut::ZoomOut));
+        assert_eq!(
+            shortcut_for("\u{1f}", true, false, false),
+            Some(Shortcut::ZoomOut)
+        );
+        assert_eq!(shortcut_for("0", true, false, false), Some(Shortcut::ZoomReset));
+    }
+
+    #[test]
+    fn plain_zoom_characters_are_not_chords() {
+        assert_eq!(shortcut_for("=", false, false, false), None);
+        assert_eq!(shortcut_for("-", false, false, false), None);
+        assert_eq!(shortcut_for("0", false, false, false), None);
+        // Alt/Meta combinations are window-manager territory, not zoom.
+        assert_eq!(shortcut_for("=", true, true, false), None);
+        assert_eq!(shortcut_for("-", true, false, true), None);
+    }
+
+    #[test]
+    fn zoom_steps_are_multiplicative_clamped_whole_percent() {
+        assert_eq!(zoom_in(1.0), 1.1);
+        assert_eq!(zoom_in(1.1), 1.21);
+        assert_eq!(zoom_out(1.0), 0.91); // 1/1.1 = 0.909… → whole percent
+        assert_eq!(zoom_out(zoom_in(1.0)).min(1.0), zoom_out(zoom_in(1.0)));
+        // Repeated stepping clamps at both ends…
+        let mut z = 1.0;
+        for _ in 0..40 {
+            z = zoom_in(z);
+        }
+        assert_eq!(z, ZOOM_MAX);
+        for _ in 0..80 {
+            z = zoom_out(z);
+        }
+        assert_eq!(z, ZOOM_MIN);
+        // …and nonsense input restarts from 100%.
+        assert_eq!(zoom_in(f32::NAN), 1.1);
+        assert_eq!(zoom_out(0.0), 0.91);
     }
 
     #[test]

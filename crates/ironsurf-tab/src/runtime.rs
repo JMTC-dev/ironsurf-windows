@@ -435,6 +435,10 @@ pub struct Tab {
     width: u32,
     height: u32,
     scale: f32,
+    /// Page zoom factor from the shell (`ToTab::SetZoom`, Ctrl-+/Ctrl--/Ctrl-0
+    /// chords). CSS layout px map to logical window px through this factor,
+    /// so pointer/wheel coordinates are divided by it on the way in.
+    zoom: f32,
     visible: bool,
     doc: Option<HtmlDocument>,
     jar: CookieJar,
@@ -544,6 +548,7 @@ impl Tab {
             width: DEFAULT_SIZE.0,
             height: DEFAULT_SIZE.1,
             scale: 1.0,
+            zoom: 1.0,
             visible: true,
             doc: None,
             jar: store.cookie_jar(),
@@ -607,12 +612,25 @@ impl Tab {
     }
 
     fn viewport(&self) -> Viewport {
-        Viewport::new(
+        let mut viewport = Viewport::new(
             (self.width as f32 * self.scale) as u32,
             (self.height as f32 * self.scale) as u32,
             self.scale,
             ColorScheme::Light,
-        )
+        );
+        // blitz multiplies hidpi × zoom into its total scale; every new
+        // document (and every resize) inherits the tab's current zoom.
+        viewport.set_zoom(self.zoom.max(0.0).max(f32::EPSILON));
+        viewport
+    }
+
+    /// The zoom factor in a safe form for coordinate math (never 0/NaN).
+    fn zoom(&self) -> f32 {
+        if self.zoom.is_finite() && self.zoom > 0.0 {
+            self.zoom
+        } else {
+            1.0
+        }
     }
 
     fn emit_history_changed(&mut self) {
@@ -1230,6 +1248,27 @@ impl Tab {
                 self.last_paint = None; // force a frame at the new size
                 self.resolve_and_maybe_paint();
             }
+            ToTab::SetZoom { zoom } => {
+                // The shell owns the step/clamp policy; the tab only rejects
+                // nonsense values and keeps the frame honest.
+                let zoom = if zoom.is_finite() && zoom > 0.0 {
+                    zoom.clamp(0.1, 16.0)
+                } else {
+                    self.zoom
+                };
+                info!("zoom → {:.0}%", zoom * 100.0);
+                self.zoom = zoom;
+                let viewport = self.viewport();
+                if let Some(doc) = self.doc.as_mut() {
+                    // `set_viewport` rebuilds the Stylo device (zoom feeds
+                    // root font sizes), clamps scroll, and invalidates
+                    // inline contexts — exactly the zoom restyle entry.
+                    doc.set_viewport(viewport);
+                }
+                self.needs_paint = true;
+                self.last_paint = None; // force a frame at the new zoom
+                self.resolve_and_maybe_paint();
+            }
             ToTab::SetVisible { visible } => {
                 self.visible = visible;
                 if visible {
@@ -1332,6 +1371,11 @@ impl Tab {
     /// Pointer coordinates (logical px) → blitz `PointerCoords` (CSS px,
     /// with the document scroll added into the page axes).
     fn pointer_coords(&mut self, x: f32, y: f32) -> PointerCoords {
+        // Logical px map to CSS layout px through the zoom factor (a page at
+        // 200% is half as wide in CSS px, and the point at logical x sits at
+        // CSS x/zoom).
+        let z = self.zoom();
+        let (x, y) = (x / z, y / z);
         // `viewport_scroll` is a `blitz_dom::util::Point<f64>` (no Default impl).
         let (scroll_x, scroll_y) = self
             .doc
@@ -1606,10 +1650,14 @@ impl Tab {
     /// with magnitude ≤ 3 are treated as wheel notches (lines), everything
     /// else as CSS-px pixel deltas.
     fn handle_scroll(&mut self, ev: &ScrollEvent) {
+        let z = self.zoom() as f64;
         let delta = if ev.delta_x.abs().max(ev.delta_y.abs()) <= 3.0 {
+            // Wheel notches scroll one line of content whatever the zoom.
             BlitzWheelDelta::Lines(ev.delta_x as f64, ev.delta_y as f64)
         } else {
-            BlitzWheelDelta::Pixels(ev.delta_x as f64, ev.delta_y as f64)
+            // Pixel deltas are logical px; the page moves the same visual
+            // distance, which is delta/zoom in CSS px.
+            BlitzWheelDelta::Pixels(ev.delta_x as f64 / z, ev.delta_y as f64 / z)
         };
         let ui = UiEvent::Wheel(BlitzWheelEvent {
             delta,
@@ -2482,6 +2530,45 @@ mod tests {
             repeat: false,
             mods: Modifiers::NONE,
         })
+    }
+
+    // -- page zoom (Ctrl-+ / Ctrl-- / Ctrl-0) --------------------------------
+
+    /// `ToTab::SetZoom` drives the document viewport, survives resize, is
+    /// inherited by fresh documents, and rescales pointer coordinates.
+    #[test]
+    fn zoom_rescales_viewport_frames_and_pointer_space() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut tab = form_tab(dir.path());
+        tab.handle_to_tab(ToTab::Resize { width: 800, height: 600, scale: 1.0 });
+        tab.navigate("about:blank", NavHistory::Fresh);
+        assert!(tab.document_mut().is_some(), "about:blank must load a document");
+        assert_eq!(tab.document_mut().expect("doc").viewport().zoom(), 1.0);
+
+        // 150%: viewport zoom follows, the document is told, frames keep
+        // their physical size (the zoom is CSS-side, not a resize).
+        tab.handle_to_tab(ToTab::SetZoom { zoom: 1.5 });
+        assert!((tab.viewport().zoom() - 1.5).abs() < 1e-6);
+        assert!((tab.document_mut().expect("doc").viewport().zoom() - 1.5).abs() < 1e-6);
+
+        // Resize keeps the zoom (both directions through viewport()).
+        tab.handle_to_tab(ToTab::Resize { width: 640, height: 480, scale: 1.0 });
+        assert!((tab.viewport().zoom() - 1.5).abs() < 1e-6);
+
+        // Pointer coordinates: logical px ÷ zoom = CSS px (at scroll 0 the
+        // page axes equal the client axes).
+        let coords = tab.pointer_coords(300.0, 150.0);
+        assert!((coords.client_x - 200.0).abs() < 1e-3, "client_x = {}", coords.client_x);
+        assert!((coords.page_x - coords.client_x).abs() < 1e-3);
+
+        // Nonsense values are rejected (zoom stays at the last good factor).
+        tab.handle_to_tab(ToTab::SetZoom { zoom: f32::NAN });
+        tab.handle_to_tab(ToTab::SetZoom { zoom: -2.0 });
+        assert!((tab.viewport().zoom() - 1.5).abs() < 1e-6);
+
+        // A fresh document (new navigation) is built with the current zoom.
+        tab.navigate("about:blank", NavHistory::Fresh);
+        assert!((tab.document_mut().expect("doc").viewport().zoom() - 1.5).abs() < 1e-6);
     }
 
     /// Click the <input>, type "hi", click the <button>; the page's click

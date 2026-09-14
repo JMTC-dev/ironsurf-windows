@@ -26,7 +26,6 @@ protocol errors; netmod req/resp/cache/Set-Cookie/https-upgrade; shell spawn/des
 address bar, shortcuts. stdout stays IPC-only ⇒ frames+input are TRACE-only (volume contract: nobody reads a tab's
 stderr pipe) and a child inherits stderr only when debug+a-terminal (TabStderr, --tab-stderr, IRONSURF_TAB_STDERR).
 docs §F + README; 133 tests green.
-## #13 added debug and info messages to stderr of the process for debugging, for example when URL is changed, page is loading, console error messages etc.
 ## #14 FIX: tab panic on real desktops — RLIMIT_NPROC is per-UID on Linux; absolute 128 < uid's live
 tasks ⇒ every pthread_create EAGAIN ⇒ reqwest tokio build panicked (netmod.rs). Now NPROC = current
 task count (from /proc Threads: for our euid) + max_processes headroom, never below live usage;
@@ -91,3 +90,8 @@ netmod::fetch_document_post/MainDocPost (real POST, never cached); GET works for
 (blitz drops), POST to local schemes = honest status; JS events replay via __ironsurfFire
 (mousedown/up/click, keydown/up) + .value/.checked bindings (live editor); welcome page is a
 working form demo echoing its query. 88u + all integration suites green; ARCH §HTML forms.
+## #21 page zoom — common: +ToTab::SetZoom{zoom} (+round-trips, ARCH §5); tab: zoom state feeds
+Viewport::zoom (blitz hidpi×zoom), SetZoom → set_viewport restyle + forced frame, logical→CSS px
+for pointer coords + pixel wheel deltas (÷zoom), zoom survives navigation (fresh docs inherit) and
+NaN/negative rejected; shell keymap: Ctrl-=/+/−/0 chords, ×÷1.1 whole-percent steps clamped 30–500%,
+per-tab factor + "Zoom N%" status. Live xdotool 100→133% repaints (98.9k px differ); workspace green.
