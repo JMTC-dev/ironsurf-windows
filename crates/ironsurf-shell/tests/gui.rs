@@ -70,7 +70,7 @@ fn window_model_and_fake_tab_pump() {
     ui.invoke_navigate("rustlang news".into());
     wait_for("search round-trip", || {
         pump();
-        snap()[0].url.as_deref() == Some("https://duckduckgo.com/?q=rustlang+news")
+        snap()[0].url.as_deref() == Some("https://html.duckduckgo.com/html/?q=rustlang+news")
     });
 
     // Container manager: recolor the default container, add a new one.
@@ -92,7 +92,7 @@ fn window_model_and_fake_tab_pump() {
     wait_for("moved tab ready", || {
         pump();
         snap()[0].ready
-            && snap()[0].url.as_deref() == Some("https://duckduckgo.com/?q=rustlang+news")
+            && snap()[0].url.as_deref() == Some("https://html.duckduckgo.com/html/?q=rustlang+news")
     });
     assert_eq!(ui.get_container_label().as_str(), "work");
 

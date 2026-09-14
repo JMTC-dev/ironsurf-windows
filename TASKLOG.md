@@ -1,4 +1,6 @@
 # Task log
+## #24 search engine → https://html.duckduckgo.com/html/?q= (was duckduckgo.com/?q=) — classify::search_url +
+all test expectations + gui.rs + ARCH §URL-bar updated; ironsurf-shell suite green (26u + gui/e2e).
 ## #23 cookies actually returned to sites — navigations are never cookie-less: plan_document (old plan dropped)
 routes every top-level http(s) load through managed_http_fetch EVEN under default Passthrough (Passthrough now skips
 only https-upgrade+cache); redirects followed hop-by-hop on a Policy::none() client (FetchWorker::managed_client):

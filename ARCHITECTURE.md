@@ -443,7 +443,7 @@ Process/tab management (`src/tabs.rs`):
   Esc unfocuses.
 - Default start page: `ironsurf://welcome` (the tab-rendered built-in welcome page —
   `default_url()`), then URL bar typing does search-or-navigate: contains dot
-  → `https://host` (upgrading typed `host/path` to HTTPS), else → `https://duckduckgo.com/?q=`.
+  → `https://host` (upgrading typed `host/path` to HTTPS), else → `https://html.duckduckgo.com/html/?q=`.
   Explicit-scheme pass-through is case-insensitive and covers `http(s)://`, `about:`, `file://`,
   `data:` (whose base64 payloads never look like a host, e.g. `data:text/javascript;base64,…`),
   `ironsurf://` (the internal pages — the host has no dot, so without the scheme match

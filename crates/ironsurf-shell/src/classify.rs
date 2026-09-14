@@ -54,7 +54,7 @@ pub fn classify_input(input: &str) -> Option<String> {
 
 fn search_url(query: &str) -> String {
     format!(
-        "https://duckduckgo.com/?q={}",
+        "https://html.duckduckgo.com/html/?q={}",
         url::form_urlencoded::byte_serialize(query.as_bytes()).collect::<String>()
     )
 }
@@ -158,7 +158,7 @@ mod tests {
         // Words that merely start with the scheme are still searches.
         assert_eq!(
             classify_input("javascript tutorial").as_deref(),
-            Some("https://duckduckgo.com/?q=javascript+tutorial")
+            Some("https://html.duckduckgo.com/html/?q=javascript+tutorial")
         );
     }
 
@@ -167,15 +167,15 @@ mod tests {
         // the dot is in the path/query, not the host → not a host
         assert_eq!(
             classify_input("what is a dot?.com-ish thing").as_deref(),
-            Some("https://duckduckgo.com/?q=what+is+a+dot%3F.com-ish+thing")
+            Some("https://html.duckduckgo.com/html/?q=what+is+a+dot%3F.com-ish+thing")
         );
         assert_eq!(
             classify_input("no dots here").as_deref(),
-            Some("https://duckduckgo.com/?q=no+dots+here")
+            Some("https://html.duckduckgo.com/html/?q=no+dots+here")
         );
         assert_eq!(
             classify_input("rust").as_deref(),
-            Some("https://duckduckgo.com/?q=rust")
+            Some("https://html.duckduckgo.com/html/?q=rust")
         );
     }
 
@@ -183,11 +183,11 @@ mod tests {
     fn localhost_without_dot_is_a_search() {
         assert_eq!(
             classify_input("localhost").as_deref(),
-            Some("https://duckduckgo.com/?q=localhost")
+            Some("https://html.duckduckgo.com/html/?q=localhost")
         );
         assert_eq!(
             classify_input("localhost:8080").as_deref(),
-            Some("https://duckduckgo.com/?q=localhost%3A8080")
+            Some("https://html.duckduckgo.com/html/?q=localhost%3A8080")
         );
     }
 
@@ -199,7 +199,7 @@ mod tests {
     #[test]
     fn search_query_is_percent_encoded() {
         let got = classify_input("hello & goodbye").unwrap();
-        assert_eq!(got, "https://duckduckgo.com/?q=hello+%26+goodbye");
+        assert_eq!(got, "https://html.duckduckgo.com/html/?q=hello+%26+goodbye");
         // the produced URL parses and round-trips the query losslessly
         let u = url::Url::parse(&got).unwrap();
         let q: Vec<(String, String)> = u.query_pairs().into_owned().collect();
