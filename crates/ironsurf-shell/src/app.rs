@@ -8,6 +8,7 @@
 use std::cell::{Cell, RefCell};
 use std::path::PathBuf;
 use std::rc::Rc;
+use std::time::{Duration, Instant};
 use std::sync::mpsc::{channel, Receiver, Sender};
 
 use ironsurf_common::{default_url, ContainerId, FromTab, TabId, ToTab};
@@ -52,6 +53,12 @@ pub struct Core {
     spawn_error: RefCell<Option<String>>,
     spinner: Cell<usize>,
     last_page: Cell<(f32, f32)>,
+    /// Pointer-move rate limiting (see [`move_due`]): when the last move was
+    /// forwarded, and the newest move that was dropped because it was sent too
+    /// soon after it (flushed by the drain tick so the final position is lost
+    /// for at most one tick).
+    last_move_at: Cell<Option<Instant>>,
+    pending_move: Cell<Option<(f32, f32)>>,
 }
 
 /// The assembled application: core + the timers that drive it (owned so
@@ -88,6 +95,8 @@ impl App {
             spawn_error: RefCell::new(None),
             spinner: Cell::new(0),
             last_page: Cell::new((0.0, 0.0)),
+            last_move_at: Cell::new(None),
+            pending_move: Cell::new(None),
         });
 
         core.attach_callbacks(ui);
@@ -365,7 +374,42 @@ impl Core {
             2 => MouseButton::Middle,
             _ => MouseButton::Left,
         };
+        // Hover moves are rate limited: a moving mouse produces far more of
+        // them than the tab can hit-test, and every stale one delays the click
+        // that follows. Presses, releases and buttons never wait.
+        if matches!(kind, PointerKind::Move) {
+            let now = Instant::now();
+            if !move_due(now, self.last_move_at.get()) {
+                self.pending_move.set(Some((x, y)));
+                return;
+            }
+            self.last_move_at.set(Some(now));
+            self.pending_move.set(None);
+        } else {
+            // A press makes the current position authoritative.
+            self.pending_move.set(None);
+            self.last_move_at.set(Some(Instant::now()));
+        }
         self.send_active(ToTab::Pointer(ironsurf_common::PointerEvent { x, y, kind, button }));
+    }
+
+    /// Forward the newest hover move that was dropped as too soon after the
+    /// previous one (called from the 33 Hz drain tick, so the cursor position
+    /// the tab is showing lags by at most one tick).
+    fn flush_pending_move(&self) {
+        let Some((x, y)) = self.pending_move.take() else { return };
+        let now = Instant::now();
+        if !move_due(now, self.last_move_at.get()) {
+            self.pending_move.set(Some((x, y)));
+            return;
+        }
+        self.last_move_at.set(Some(now));
+        self.send_active(ToTab::Pointer(ironsurf_common::PointerEvent {
+            x,
+            y,
+            kind: ironsurf_common::PointerKind::Move,
+            button: ironsurf_common::MouseButton::Left,
+        }));
     }
 
     fn page_wheel(&self, x: f32, y: f32, delta_x: f32, delta_y: f32) {
@@ -529,6 +573,8 @@ impl Core {
     /// Drain every queued `FromTab` message: reduce per-tab state, keep only
     /// the newest frame for the active tab, reap closed tabs, sync the UI.
     pub fn drain(&self) {
+        // Superseded hover moves go out here, one per tick at the latest.
+        self.flush_pending_move();
         let msgs: Vec<PumpedMessage> = self.rx.borrow_mut().try_iter().collect();
         if msgs.is_empty() {
             self.check_resize();
@@ -657,12 +703,18 @@ impl Core {
             ui.set_can_back(p.state.can_back);
             ui.set_can_fwd(p.state.can_forward);
             ui.set_url_text(p.state.url.clone().unwrap_or_default().into());
+            // The status line is *one* message, always the newest: an error is
+            // dropped when the next load starts (TabState::reduce), a load
+            // with nothing reported yet still says so instead of going blank.
             let status = p
                 .state
                 .error
                 .clone()
                 .or_else(|| p.state.status.clone())
                 .or_else(|| self.spawn_error.borrow().clone())
+                .or_else(|| {
+                    p.state.loading.then(|| "Loading \u{2026}".to_string())
+                })
                 .unwrap_or_default();
             ui.set_status_text(status.into());
             let (glyph, color) = p.state.security().render();
@@ -676,6 +728,10 @@ impl Core {
             ui.set_status_text(status.into());
         }
         ui.set_active_index(active as i32);
+        // The spinner must react to LoadingChanged immediately, not on the next
+        // tick of the spinner timer — a click on a link should start turning
+        // the moment the tab says it is loading.
+        self.tick_spinner();
     }
 
     // ---- wiring --------------------------------------------------------------------
@@ -803,6 +859,21 @@ pub fn image_from_rgba(width: u32, height: u32, rgba: &[u8]) -> Option<Image> {
     Some(Image::from_rgba8(buffer))
 }
 
+/// Rate limit for forwarded hover moves: one per UI frame at most. A 1000 Hz
+/// gaming mouse or a fast hand across the page otherwise floods the tab with
+/// positions it cannot hit-test in time, and the click at the end of the swipe
+/// waits behind all of them.
+pub const MOVE_INTERVAL: Duration = Duration::from_millis(33);
+
+/// May a hover move be forwarded now? `last` is when the previous one went out
+/// (`None` = none sent yet, so the first always passes).
+pub fn move_due(now: Instant, last: Option<Instant>) -> bool {
+    match last {
+        Some(t) => now.duration_since(t) >= MOVE_INTERVAL,
+        None => true,
+    }
+}
+
 /// `#rrggbb` → Color, tolerant of bad input.
 pub fn color_hex(hex: &str) -> Color {
     let h = hex.strip_prefix('#').unwrap_or(hex);
@@ -816,4 +887,42 @@ pub fn color_hex(hex: &str) -> Color {
         }
     }
     Color::from_rgb_u8(158, 158, 158)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_first_move_always_passes() {
+        let now = Instant::now();
+        assert!(move_due(now, None));
+    }
+
+    #[test]
+    fn moves_inside_one_frame_are_dropped_until_the_interval_passes() {
+        let t0 = Instant::now();
+        assert!(move_due(t0, None));
+        // A burst inside the same UI frame: nothing more goes out…
+        for i in 1..10 {
+            assert!(
+                !move_due(t0 + Duration::from_millis(i * 3), Some(t0)),
+                "move {i} must be dropped (superseded positions cost the tab a repaint each)"
+            );
+        }
+        // …until the next frame's worth of time has elapsed.
+        assert!(move_due(t0 + MOVE_INTERVAL, Some(t0)));
+        assert!(move_due(t0 + MOVE_INTERVAL * 4, Some(t0)));
+    }
+
+    #[test]
+    fn a_press_never_waits() {
+        // `page_pointer` only consults the gate for Move; every other kind is
+        // sent straight away. Assert the gate itself is the only thing that can
+        // hold a pointer event back, i.e. presses do not call it with a recent
+        // timestamp and get denied.
+        let t0 = Instant::now();
+        assert!(move_due(t0, None), "gate opens for the first move");
+        assert!(!move_due(t0, Some(t0)), "gate closes again inside a frame");
+    }
 }

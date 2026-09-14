@@ -52,12 +52,14 @@ impl TabState {
                 }
             }
             FromTab::LoadingChanged { loading } => {
-                if *loading == self.loading {
-                    false
-                } else {
-                    self.loading = *loading;
-                    true
-                }
+                // A load that starts replaces the last thing the bar had to
+                // say: an error from the previous attempt must never shadow the
+                // new one (the UI shows `error` ahead of `status`).
+                let started = *loading && !self.loading;
+                let was_error = started.then(|| self.error.take()).flatten();
+                let changed = *loading != self.loading;
+                self.loading = *loading;
+                changed || was_error.is_some()
             }
             FromTab::HistoryChanged { can_go_back, can_go_forward } => {
                 let changed = *can_go_back != self.can_back
@@ -165,6 +167,26 @@ mod tests {
         assert!(s.reduce(&FromTab::Closed));
         assert!(s.closed);
         assert!(!s.reduce(&FromTab::Closed));
+    }
+
+    #[test]
+    fn starting_a_load_drops_the_stale_error_so_status_text_shows() {
+        let mut s = TabState::default();
+        s.reduce(&FromTab::Error { message: "dns failed".into() });
+        assert_eq!(s.error.as_deref(), Some("dns failed"));
+        // The user clicks a link / retries: the new load must clear the bar of
+        // the old failure, or "Waiting for …" is invisible behind it forever.
+        assert!(s.reduce(&FromTab::LoadingChanged { loading: true }));
+        assert_eq!(s.error, None, "a superseded error must not shadow the new status");
+        assert!(s.loading);
+        assert!(s.reduce(&FromTab::StatusText {
+            text: Some("Waiting for example.com".into())
+        }));
+        assert_eq!(s.status.as_deref(), Some("Waiting for example.com"));
+        // …and the status is replaced, never appended to.
+        assert!(s.reduce(&FromTab::StatusText { text: None }));
+        assert_eq!(s.status, None);
+        assert!(!s.reduce(&FromTab::StatusText { text: None }));
     }
 
     #[test]

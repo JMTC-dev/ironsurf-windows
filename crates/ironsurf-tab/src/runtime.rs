@@ -18,6 +18,13 @@
 //! single [`handle_input`] extension point; link clicks round-trip via the
 //! `NavigationProvider` hook ([`NavHook`]) already wired into every document.
 //!
+//! RESPONSIVENESS (task 11): a real mouse emits far more hover moves than this
+//! single-threaded renderer can afford, so a stdin batch is collapsed to the
+//! newest move ([`coalesce_moves`]) and a hover move that lands on the same
+//! element skips `resolve` + repaint entirely; hovering an `<a href>` reports
+//! its target as `FromTab::StatusText` so links are visibly clickable. See
+//! `docs/ENGINE_INTEGRATION.md` §E for the measured before/after numbers.
+//!
 //! JAVASCRIPT (task 8): after parse + resolve, every navigation runs the
 //! document's `<script>`s in one fresh Boa context (`crate::js` — tiny binding
 //! surface, `src=` through our own fetcher, exceptions caught). A script's
@@ -349,6 +356,9 @@ pub struct Tab {
     /// Which mouse buttons are currently held (ironsurf `PointerKind::Down/Up`
     /// track the transitions); carried in every `BlitzPointerEvent.buttons`.
     mouse_buttons: MouseEventButtons,
+    /// Last hover-reported link target (`StatusText`), for change-detection so
+    /// a moving mouse only emits when the target actually changes.
+    hover_status: Option<String>,
 }
 
 /// stdout side of the IPC: one persistent BufWriter, flushed per frame.
@@ -415,6 +425,7 @@ impl Tab {
             offline_fixtures: args.offline_fixtures.clone(),
             pipe,
             mouse_buttons: MouseEventButtons::None,
+            hover_status: None,
         }
     }
 
@@ -543,6 +554,9 @@ impl Tab {
         *self.shell.title.lock().expect("title mutex") = None;
         self.js_title = None;
         self.js_status = None;
+        // The new document has nothing under the cursor yet; the next hover
+        // transition must be allowed to report again.
+        self.hover_status = None;
         let config = DocumentConfig {
             base_url: Some(url.as_str().to_owned()),
             viewport: Some(self.viewport()),
@@ -871,11 +885,23 @@ impl Tab {
     /// unscrolled viewport position, `page` adds the document scroll offset
     /// (what blitz's hover/click hit-testing consumes, events/driver.rs).
     fn handle_input(&mut self, ev: &ToTab) {
+        // Must this event produce pixels? A plain hover move only does when it
+        // changes what is under the cursor: a mouse travelling across the page
+        // fires one event per device packet, and each `resolve` + vello_cpu
+        // repaint costs hundreds of milliseconds — unconditionally repainting
+        // buried the click that follows under seconds of stale frames.
+        let mut paint = true;
         match ev {
-            ToTab::Pointer(pointer) => self.handle_pointer(pointer),
+            ToTab::Pointer(pointer) => paint = self.handle_pointer(pointer),
             ToTab::Key(key) => self.handle_key(key),
             ToTab::Scroll(scroll) => self.handle_scroll(scroll),
             _ => {}
+        }
+        // Links announce themselves: hovering an `<a href>` puts its target in
+        // the status bar, leaving it clears that again.
+        self.report_hover();
+        if !paint {
+            return;
         }
         // Every handled input wants fresh pixels (contract §ironsurf-tab.3);
         // still coalesced by the ≤30 fps throttle in `maybe_repaint`.
@@ -886,6 +912,45 @@ impl Tab {
         if self.nav.pending.lock().expect("nav mutex").is_none() {
             self.resolve_and_maybe_paint();
         }
+    }
+
+    /// Nearest `<a href>` target under the cursor, resolved against the
+    /// document URL, as `(hovered_node, target)`. `None` target = not over a
+    /// link; a `#fragment` target is kept (blitz scrolls in place for those).
+    fn hover_link(&self) -> Option<String> {
+        let doc = self.doc.as_ref()?;
+        let mut node_id = doc.get_hover_node_id()?;
+        while let Some(node) = doc.get_node(node_id) {
+            if let Some(el) = node.element_data() {
+                if el.name.local == blitz_dom::local_name!("a") {
+                    if let Some(href) = el.attr(blitz_dom::local_name!("href")) {
+                        let href = href.trim();
+                        if !href.is_empty() {
+                            let resolved = doc
+                                .url()
+                                .join(href)
+                                .map(|u| u.to_string())
+                                .unwrap_or_else(|_| href.to_owned());
+                            return Some(resolved);
+                        }
+                    }
+                }
+            }
+            node_id = node.parent?;
+        }
+        None
+    }
+
+    /// Emit `FromTab::StatusText` when the hovered link target changes (and
+    /// only then) — this is the user-visible signal that the page is not a
+    /// picture: hovering a link shows where the click would take them.
+    fn report_hover(&mut self) {
+        let target = self.hover_link();
+        if target == self.hover_status {
+            return;
+        }
+        self.hover_status = target.clone();
+        self.emit(FromTab::StatusText { text: target });
     }
 
     /// Pointer coordinates (logical px) → blitz `PointerCoords` (CSS px,
@@ -910,7 +975,10 @@ impl Tab {
         }
     }
 
-    fn handle_pointer(&mut self, ev: &PointerEvent) {
+    /// Feed one pointer event to blitz. Returns whether fresh pixels are
+    /// wanted: presses/releases always are (active/focus/caret state), a bare
+    /// hover move only when it moved onto a different element.
+    fn handle_pointer(&mut self, ev: &PointerEvent) -> bool {
         use ironsurf_common::MouseButton;
 
         let button = match ev.button {
@@ -930,6 +998,12 @@ impl Tab {
         // blitz synthesises enter/over/out/leave *DOM events* from
         // `PointerMove` (events/driver.rs::handle_pointer_move); there is no
         // Over/Out UiEvent, so ironsurf hover transitions arrive as moves.
+        let hovering = matches!(
+            ev.kind,
+            PointerKind::Move | PointerKind::Over | PointerKind::Out
+        ) && self.mouse_buttons.is_empty();
+        let hover_before = self.doc.as_ref().and_then(|doc| doc.get_hover_node_id());
+
         let ui = match ev.kind {
             PointerKind::Move | PointerKind::Over | PointerKind::Out => {
                 // Hover transitions carry the currently-held buttons (none for
@@ -941,6 +1015,13 @@ impl Tab {
             PointerKind::Up => UiEvent::PointerUp(self.pointer_event(ev, MouseEventButtons::None)),
         };
         self.feed_ui_event(ui);
+
+        if hovering {
+            let hover_after = self.doc.as_ref().and_then(|doc| doc.get_hover_node_id());
+            hover_before != hover_after
+        } else {
+            true
+        }
     }
 
     fn pointer_event(&mut self, ev: &PointerEvent, buttons: MouseEventButtons) -> BlitzPointerEvent {
@@ -1169,6 +1250,9 @@ fn drain_stdin(tab: &mut Tab, pending: &mut Vec<u8>) -> io::Result<Option<i32>> 
         return Err(err);
     }
 
+    // Decode every complete frame that is available right now, then dispatch
+    // the batch with superseded hover moves dropped (see [`coalesce_moves`]).
+    let mut batch: Vec<ToTab> = Vec::new();
     loop {
         if pending.len() < 4 {
             break;
@@ -1190,6 +1274,10 @@ fn drain_stdin(tab: &mut Tab, pending: &mut Vec<u8>) -> io::Result<Option<i32>> 
         };
         let msg: ToTab = read_frame(&mut reader)?;
         pending.drain(..4 + len);
+        batch.push(msg);
+    }
+
+    for msg in coalesce_moves(batch) {
         if let Some(code) = tab.handle_to_tab(msg) {
             return Ok(Some(code));
         }
@@ -1200,6 +1288,90 @@ fn drain_stdin(tab: &mut Tab, pending: &mut Vec<u8>) -> io::Result<Option<i32>> 
         return Ok(Some(0));
     }
     Ok(None)
+}
+
+/// Is this a bare pointer move (no buttons involved)?
+fn is_move(msg: &ToTab) -> bool {
+    matches!(
+        msg,
+        ToTab::Pointer(PointerEvent { kind, .. })
+            if matches!(kind, PointerKind::Move | PointerKind::Over | PointerKind::Out)
+    )
+}
+
+/// Collapse runs of consecutive hover moves down to the newest one.
+///
+/// A mouse travelling across the page emits far more move events per second
+/// than the tab can hit-test and repaint, and every stale position it does
+/// process delays the click that follows it. Only the final coordinate of an
+/// uninterrupted run of moves is worth resolving; presses, releases, keys,
+/// scrolls and every shell command keep their order and are never dropped.
+fn coalesce_moves(msgs: Vec<ToTab>) -> Vec<ToTab> {
+    let mut out: Vec<ToTab> = Vec::with_capacity(msgs.len());
+    for msg in msgs {
+        if is_move(&msg) && out.last().is_some_and(is_move) {
+            // Replace a pending move; a move following any other event is kept.
+            let last = out.last_mut().expect("last is a move");
+            *last = msg;
+            continue;
+        }
+        out.push(msg);
+    }
+    out
+}
+
+#[cfg(test)]
+mod input_shaping_tests {
+    use super::*;
+
+    fn move_at(x: f32, y: f32) -> ToTab {
+        ToTab::Pointer(PointerEvent {
+            x,
+            y,
+            kind: PointerKind::Move,
+            button: ironsurf_common::MouseButton::Left,
+        })
+    }
+
+    fn press_at(x: f32, y: f32) -> ToTab {
+        ToTab::Pointer(PointerEvent {
+            x,
+            y,
+            kind: PointerKind::Down,
+            button: ironsurf_common::MouseButton::Left,
+        })
+    }
+
+    #[test]
+    fn a_run_of_moves_collapses_to_the_newest() {
+        let batch = vec![move_at(1.0, 1.0), move_at(2.0, 2.0), move_at(3.0, 3.0)];
+        let out = coalesce_moves(batch);
+        assert_eq!(out.len(), 1);
+        assert_eq!(
+            out[0],
+            move_at(3.0, 3.0),
+            "only the newest position of a move run survives"
+        );
+    }
+
+    #[test]
+    fn presses_and_commands_are_never_dropped_or_reordered() {
+        let batch = vec![
+            move_at(1.0, 1.0),
+            move_at(2.0, 2.0),
+            press_at(2.0, 2.0),
+            move_at(4.0, 4.0),
+            ToTab::Reload,
+            move_at(5.0, 5.0),
+            move_at(6.0, 6.0),
+        ];
+        let out = coalesce_moves(batch);
+        assert_eq!(
+            out,
+            vec![move_at(2.0, 2.0), press_at(2.0, 2.0), move_at(4.0, 4.0), ToTab::Reload, move_at(6.0, 6.0)],
+            "the click and the shell command survive in order"
+        );
+    }
 }
 
 /// Poll `[stdin, self-pipe]` until readable or `tick` elapses.

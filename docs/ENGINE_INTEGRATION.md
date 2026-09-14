@@ -73,6 +73,70 @@ still apply to the tab process today; their API specifics are obsolete.
   window + real `ironsurf-tab` binary + Blitz frames, headless on file fixtures in the
   container profile dir; the live `https://example.com` leg runs with `IRONSURF_ONLINE=1`.
 
+## E. Input latency & perceived feedback (task 10)
+
+Clicking a link *worked* over IPC long before it felt usable in the real window:
+a user reported “~1 minute to load page 2 from page 1” on a **local** page. A hand
+rolling a mouse emits one `ToTab::Pointer{Move}` per device packet, and the tab
+used to `resolve` + vello_cpu repaint for **every one** — ~330 ms each on this
+software-only box — so the click at the end of a swipe queued behind 60 stale
+repaints. Measured worst case (tab process, real IPC, fast and slow readers):
+
+| gesture | before | after |
+|---|---|---|
+| 60-move hover flood → click, click→load-acknowledged | **19.98 s** | **0.93 s** |
+| live window, human-style press/release on a local link | **11.5 s** | **1.5 s** (3 trials: 1.50/1.49/1.46) |
+| frames emitted during the 60-move flood | 64 | 2 |
+
+Three mechanisms, in order of effect:
+
+1. **`coalesce_moves` (`ironsurf-tab/src/runtime.rs`)** — the stdin pump decodes a
+   whole batch and collapses runs of consecutive hover moves to the newest
+   position. Presses, releases, keys, scrolls and shell commands are never
+   dropped or reordered (unit-tested).
+2. **No repaint for a hover move that lands on the same element** — blitz
+   `Document::get_hover_node_id()` is sampled before/after feeding the move; only
+   a real hover transition (or a press/release/key/scroll) sets `needs_paint`.
+   Regression test: `idle_hover_moves_do_not_repaint` (30 moves inside one
+   element ⇒ 0 frames).
+3. **Shell-side move gate (`ironsurf-shell/src/app.rs::move_due`)** — at most one
+   move per UI frame (33 ms) leaves the window; the newest dropped move is
+   flushed by the 33 Hz drain tick, so the tab is never more than one tick behind
+   the cursor. Down/Up/wheel/keys bypass the gate.
+
+Feedback the user asked for, on the same pass:
+
+* **Hover names the link target** — the tab walks up from the hover node to the
+  nearest `<a href>`, resolves it against the document base and emits
+  `FromTab::StatusText { Some(url) }` (cleared with `None` when leaving), so a
+  page never looks like a dead picture. `hovering_a_link_reports_its_target`.
+* **Loading indicator**: `navigate()` already emits `LoadingChanged(true)` +
+  `StatusText("Waiting for …")`; `sync_ui` now also refreshes the spinner
+  immediately instead of waiting up to 120 ms for the spinner timer, and shows
+  `Loading …` when a load has nothing else to report.
+* **Status text is one message, always the newest**: the bar renders
+  `error ▸ status ▸ spawn_error ▸ “Loading …”`, and `TabState::reduce` now drops a
+  recorded `Error` as soon as the next load starts — previously a stale error
+  shadowed every later status message, which is what “the status text appends the
+  old logs” actually was (`starting_a_load_drops_the_stale_error_so_status_text_shows`).
+
+**Reproducing a real click from a script** (used for the numbers above; X session
+`DISPLAY=:2.0`): `xdotool click --window <id>` sends XSendEvent synthetic events,
+which winit/Slint **ignore** — nothing reaches the tab and the gesture looks dead.
+Warp the pointer absolutely and press/release with XTEST instead:
+
+```bash
+xdotool getwindowgeometry --shell <id>          # X/Y = window origin; page area starts at y+38
+xdotool mousemove $((X+150)) $((Y+38+187))      # hover a link (status bar must update)
+sleep 0.25 && xdotool mousedown 1 && sleep 0.08 && xdotool mouseup 1
+import -window <id> -crop 1x1+150+400 -format '%[pixel:p{0,0}]' info:-   # poll for the new page
+```
+
+To observe a load with a *visible* spinner without touching the internet, serve the
+fixtures from `127.0.0.1` with a `time.sleep(2.0)` before the response; the status
+bar and the braille spinner change within ~0.8 s of the click and settle when the
+response lands.
+
 ---
 
 # Appendix — legacy Servo 0.5 spike notes (superseded by the Blitz pivot)
