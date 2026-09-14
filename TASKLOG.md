@@ -70,3 +70,8 @@ run_due_timers take Option<&mut HtmlDocument>, tab registers live doc + settles 
 shares that serializer. 16 bridge tests (identity, liveness, innerHTML round-trip, NotFound/Range/Syntax) +
 headless smoke (script-built red div ⇒ >5k pure-red px in PPM, markup in --body-out); 72u/4 headless green,
 workspace green. Known gaps: element-scoped queries are document-wide; no events/style/CSSOM yet.
+## #16 GPU acceleration — slint built with backend-linuxkms-noseat (DRM/KMS + EGL/GBM FemtoVG; bare-VT GPU path);
+main.rs force-software hack replaced by GPU-first policy: auto = winit/LinuxKMS FemtoVG with Slint's automatic
+software fallback (--software pins old path, --linuxkms pins KMS, SLINT_BACKEND wins; pure backend_choice + test);
+box has no GPU: FemtoVG still initializes via Mesa llvmpipe (libGL loaded, verified) — on real GPUs it binds vendor
+drivers. KMS libs are LINKED not dlopen'd: build -dev pkgs + runtime sonames documented in BUILD_DEBIAN/

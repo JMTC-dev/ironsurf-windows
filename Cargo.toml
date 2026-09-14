@@ -3,7 +3,12 @@ resolver = "2"
 members = ["crates/*"]
 
 [workspace.dependencies]
-slint = "1"
+# GPU acceleration: `backend-linuxkms-noseat` compiles Slint's LinuxKMS backend
+# (DRM/KMS + EGL/GBM via glutin + FemtoVG) so the shell can render on a bare
+# virtual console without X/Wayland. `renderer-femtovg` (default feature) is the
+# GPU renderer for both winit and linuxkms; `renderer-software` stays compiled
+# in as the automatic fallback on GL-less displays.
+slint = { version = "1", features = ["backend-linuxkms-noseat"] }
 serde = { version = "1", features = ["derive"] }
 bincode = "1.3"
 thiserror = "2"

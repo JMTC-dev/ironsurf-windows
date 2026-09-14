@@ -2,7 +2,7 @@
 //!
 //! Usage:
 //!   ironsurf-shell [--smoke] [--managed-net] [--no-sandbox]
-//!                 [--fake-tab] [--tab-bin PATH]
+//!                 [--fake-tab] [--tab-bin PATH] [--software] [--linuxkms]
 //!                 [--log LEVEL|--verbose|-v] [--tab-stderr|--no-tab-stderr]
 //!
 //! Logging: every line the shell (and, when inherited, every tab) writes goes
@@ -10,9 +10,14 @@
 //! trace` (or `IRONSURF_LOG`) picks the level; the level is forwarded to tab
 //! children, and `--tab-stderr` lets their lines reach this terminal.
 //!
-//! Renderer: the Slint **software renderer** is forced before any window
-//! exists (unless `SLINT_BACKEND` is set explicitly), so the shell composites
-//! on GL-less displays (softbuffer blit over X11 via winit).
+//! Renderer: **GPU first, software last**. The crate is built with Slint's
+//! LinuxKMS backend (`backend-linuxkms-noseat`), so on a bare virtual console
+//! the shell renders fullscreen through DRM/KMS with EGL/GBM-accelerated
+//! FemtoVG; on an X11/Wayland session winit uses FemtoVG/GL whenever a GPU
+//! stack answers. Where no GL exists (this fleet's headless boxes) Slint
+//! falls back to its software renderer automatically — `--software` pins
+//! that path, `--linuxkms` pins the KMS backend, and an explicit
+//! `SLINT_BACKEND` (e.g. `linuxkms/femtovg`, `winit/software`) always wins.
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -22,7 +27,7 @@ use ironsurf_common::logging;
 use ironsurf_shell::app::App;
 use ironsurf_shell::tabs::{set_tab_stderr, TabStderr};
 use ironsurf_shell::AppWindow;
-use ironsurf_common::{error, info};
+use ironsurf_common::{error, info, warn};
 use slint::ComponentHandle;
 
 fn main() -> ExitCode {
@@ -90,14 +95,40 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     };
     info!("tab binary: {}", tab_bin.display());
 
-    // Force the software renderer before the first window exists; an
-    // explicit SLINT_BACKEND (e.g. "femtovg") wins for developer machines.
-    if std::env::var_os("SLINT_BACKEND").is_none() {
-        let _ = slint::BackendSelector::new()
-            .renderer_name("software".into())
-            .select();
+    // GPU-first renderer policy, decided before the first window exists; an
+    // explicit SLINT_BACKEND (e.g. "linuxkms", "winit/software") always wins.
+    match std::env::var("SLINT_BACKEND") {
+        Ok(spec) => info!("renderer: SLINT_BACKEND={spec} (explicit)"),
+        Err(_) => match backend_choice(flag("--software"), flag("--linuxkms")) {
+            // Slint's default chain: winit → FemtoVG/GL (auto-falls back to
+            // the software renderer on GL-less displays); if no display
+            // server exists, LinuxKMS → EGL/GBM FemtoVG (software fallback).
+            None => info!("renderer: auto (GPU first: FemtoVG on winit/LinuxKMS, software fallback)"),
+            Some(choice) => {
+                let mut selector = slint::BackendSelector::new();
+                if let Some(backend) = choice.backend {
+                    selector = selector.backend_name(backend.into());
+                }
+                if let Some(renderer) = choice.renderer {
+                    selector = selector.renderer_name(renderer.into());
+                }
+                match selector.select() {
+                    Ok(()) => info!(
+                        "renderer: pinned {}", choice.describe()
+                    ),
+                    // Selector refused the combination; the default chain has
+                    // not been pinned and still runs (software catches us).
+                    // A pinned backend that only fails LATER (at window
+                    // creation, e.g. no DRM device) is an honest fatal error —
+                    // the user asked for that backend by name.
+                    Err(err) => warn!("renderer: request {} ignored: {err}", choice.describe()),
+                }
+            }
+        },
     }
 
+    // Slint 1.17 exposes no "which renderer won" query, so the policy above is
+    // everything we can honestly log before the window exists.
     let ui = AppWindow::new()?;
     let app = App::new(&ui, tab_bin, extra_tab_args)?;
 
@@ -119,6 +150,40 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     slint::run_event_loop()?;
     app.shutdown();
     Ok(())
+}
+
+/// A pinned backend/renderer combination for [`BackendSelector`]; `None` in a
+/// field means "let Slint choose".
+#[derive(Debug, PartialEq, Eq)]
+struct BackendChoice {
+    backend: Option<&'static str>,
+    renderer: Option<&'static str>,
+}
+
+impl BackendChoice {
+    fn describe(&self) -> String {
+        format!(
+            "{}/{}",
+            self.backend.unwrap_or("auto-backend"),
+            self.renderer.unwrap_or("auto-renderer")
+        )
+    }
+}
+
+/// Pure renderer policy from CLI flags. `None` = defer to Slint's default
+/// chain (GPU first — FemtoVG on winit or LinuxKMS — software last); `Some`
+/// = pin via `BackendSelector` (`--software` → software renderer, the old
+/// forced path; `--linuxkms` → the DRM/KMS GPU backend).
+fn backend_choice(software: bool, linuxkms: bool) -> Option<BackendChoice> {
+    match (software, linuxkms) {
+        (false, false) => None,
+        (true, false) => Some(BackendChoice { backend: None, renderer: Some("software") }),
+        (false, true) => Some(BackendChoice { backend: Some("linuxkms"), renderer: None }),
+        (true, true) => Some(BackendChoice {
+            backend: Some("linuxkms"),
+            renderer: Some("software"),
+        }),
+    }
 }
 
 /// Locate the tab host binary: next to our own executable first (workspace
@@ -150,6 +215,24 @@ fn resolve_tab_bin(prefer_fake: bool) -> Result<PathBuf, Box<dyn std::error::Err
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn renderer_policy_defaults_to_gpu_first_auto() {
+        // No flags → Slint's default chain (FemtoVG GPU where available,
+        // software only as automatic fallback); never an empty pin.
+        assert_eq!(backend_choice(false, false), None);
+        assert_eq!(
+            backend_choice(true, false).unwrap().renderer,
+            Some("software")
+        );
+        assert_eq!(
+            backend_choice(false, true).unwrap().backend,
+            Some("linuxkms")
+        );
+        let both = backend_choice(true, true).unwrap();
+        assert_eq!(both.backend, Some("linuxkms"));
+        assert_eq!(both.renderer, Some("software"));
+    }
 
     #[test]
     fn tab_bin_resolution_prefers_sibling_real_tab() {

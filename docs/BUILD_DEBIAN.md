@@ -33,6 +33,7 @@ cd /workspace && cargo build --workspace && cargo test --workspace
 | `pkg-config` | `openssl-sys` and `yeslogic-fontconfig-sys` build scripts resolve libs through it | both `build.rs` call `pkg_config::find_library(..)` |
 | `libssl-dev` | **`openssl-sys` ← `native-tls` ← `reqwest 0.13` ← `blitz-net`** — the engine's network stack uses OpenSSL, even though our own `reqwest 0.12` uses rustls | `objdump -p target/debug/ironsurf-tab` → `NEEDED libssl.so.3`, `libcrypto.so.3` |
 | `libfontconfig-dev` | `yeslogic-fontconfig-sys` ← `usvg` `system-fonts` ← `blitz-paint`/`anyrender_svg` and Slint's `fontique` | its `build.rs`: `pkg_config::find_library("fontconfig").unwrap()` → hard failure without `fontconfig.pc`; binary `NEEDED libfontconfig.so.1` |
+| `libudev-dev`, `libinput-dev`, `libgbm-dev`, `libxkbcommon-dev` | Slint's **LinuxKMS backend** (`backend-linuxkms-noseat` — GPU acceleration on a bare VT): `libudev-sys`/`input` link `-ludev -linput`, `gbm-sys` links `-lgbm`, `xkbcommon` links `-lxkbcommon` — **directly, not dlopen'd** | `pkg-config: Package libudev was not found` without them; `ironsurf-shell` `NEEDED libudev.so.1 libinput.so.10 libgbm.so.1 libxkbcommon.so.0` |
 | `git` | cargo git deps, and all repo work | — |
 | `curl`, `ca-certificates` | rustup download; **runtime** TLS roots for the OpenSSL path (root store is read from `/etc/ssl/certs`) | `ca-certificates` 20250419 installed here |
 
@@ -40,15 +41,19 @@ Not required (a common over-install, inherited from the old Servo build): `cmake
 `clang`/`libclang`, `llvm`, `libx11-dev`/`libxcb1-dev`/`libx11-xcb-dev`, `libwayland-dev`,
 `libgl-dev`, `libglib2.0-dev`, GStreamer packages. See §Legacy.
 
-X11/Wayland/GL libraries are **dlopen'd at runtime**, never linked at build time:
-`x11-dl`, `x11rb` (`dl-libxcb`), `tiny-xlib`, `xkbcommon-dl`, `wayland-sys` (`dlopen`),
-`softbuffer` (`x11-dlopen`). So dev headers for them only slow you down.
+X11/Wayland/GL libraries on the winit path are **dlopen'd at runtime**, never linked at
+build time: `x11-dl`, `x11rb` (`dl-libxcb`), `tiny-xlib`, `xkbcommon-dl`, `wayland-sys`
+(`dlopen`), `softbuffer` (`x11-dlopen`), glutin's EGL/GLX. So dev headers for *those* only
+slow you down — the four KMS libs above (`udev`, `input`, `gbm`, `xkbcommon`) are the one
+exception, linked directly by the LinuxKMS backend. `libgl-dev`/`libegl1-dev` remain
+unneeded: FemtoVG's GL is resolved via glutin at runtime.
 
 ## Runtime packages (running the shell, not building it)
 
-`ironsurf-shell` forces Slint's **software renderer** (`BackendSelector::renderer_name("software")`
-in `crates/ironsurf-shell/src/main.rs`) — no GPU, no GL context. The X11 libs below are loaded
-lazily (`strings` on the binary shows the exact soname list):
+`ironsurf-shell` is **GPU-first**: FemtoVG/GL via winit on a desktop session, FemtoVG on
+EGL/GBM via LinuxKMS on a bare VT, with Slint's automatic **software fallback** where no GL
+exists (`--software` pins it; see `crates/ironsurf-shell/src/main.rs`). The X11 libs below
+are loaded lazily (`strings` on the binary shows the exact soname list):
 
 | Soname (dlopen'd) | Debian package |
 |---|---|
@@ -58,13 +63,16 @@ lazily (`strings` on the binary shows the exact soname list):
 | `libfontconfig.so.1` → `libfreetype.so.6`, `libexpat.so.1`, `libpng16.so.16`, `libz.so.1`, `libuuid.so.1` | `libfontconfig1` (pulls the rest) |
 | fonts for the page renderer (`fontdb`/`usvg`) and the UI | `fonts-dejavu-core` (or `fonts-liberation`) |
 | `libssl.so.3`, `libcrypto.so.3` | `libssl3t64` (comes in automatically with `libssl-dev`) |
+| `libudev.so.1`, `libinput.so.10`, `libgbm.so.1` | `libudev1`, `libinput10`, `libgbm1` — **linked, not optional**, since the LinuxKMS backend ships in the binary |
 
 Optional:
 
 ```sh
 # Wayland session instead of X11 (wayland-sys dlopens these)
 apt install -y --no-install-recommends libwayland-client0
-# SLINT_BACKEND=femtovg (GPU/GL path) on a headless box needs a software GL:
+# GPU path (now the default): a real GPU needs its vendor EGL/GL drivers; on a GL-less
+# box (this fleet) these provide llvmpipe so FemtoVG still initializes, else Slint falls
+# back to its software renderer:
 apt install -y --no-install-recommends libegl1 libgl1 libgl1-mesa-dri
 ```
 

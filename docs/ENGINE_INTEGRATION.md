@@ -22,9 +22,10 @@ still apply to the tab process today; their API specifics are obsolete.
   (1024×768) — a fresh tab produces its first frame with **no** Resize, which is what
   lets the shell composite before the window lays out.
 * Headless by construction: no winit, no wgpu, no display server for the tab; only
-  the shell needs X (Slint software renderer via softbuffer — force
-  `renderer_name("software")` before the first window; runtime dep
-  `libxkbcommon-x11-0` for winit's X11 keyboard backend).
+  the shell needs X (Slint **GPU-first**: FemtoVG/GL, software fallback automatic —
+  `--software` pins softbuffer; built with `backend-linuxkms-noseat` so a bare VT
+  renders via DRM/KMS + EGL; runtime deps `libxkbcommon-x11-0` for winit's X11
+  keyboard, plus linked `libudev1`/`libinput10`/`libgbm1` for the KMS backend).
 
 ## B. NetProvider (`src/netmod.rs`)
 

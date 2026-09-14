@@ -351,9 +351,15 @@ are a deliberately tiny surface (no engine-internal DOM mutation yet):
 
 ## ironsurf-shell (binary) — Slint GUI
 
-Slint `1.x` (default features OK; force the **software renderer** so it composites on
-headless X11 without GL: build with `slint` default + set software-softbuffer path;
-runtime env `SLINTSoftwareRenderer`… verify flag in Slint docs, `SLINT_SCALE_FACTOR` respected).
+Slint `1.x` with **GPU acceleration, software fallback** (task: GPU): build with default
+features **plus `backend-linuxkms-noseat`**, which compiles the LinuxKMS backend (DRM/KMS +
+EGL/GBM). Default (no flags): Slint's backend chain runs winit → FemtoVG/GL on a desktop
+session (auto-falls back to the software renderer where no GL exists), and LinuxKMS →
+EGL/GBM FemtoVG on a bare VT (same software fallback). `--software` pins the old
+software-only path; `--linuxkms` pins the KMS backend; explicit `SLINT_BACKEND`
+(e.g. `linuxkms/femtovg`) always wins; `SLINT_SCALE_FACTOR` respected. The KMS backend
+**links** (not dlopen) `libudev`, `libinput`, `libgbm`, `libxkbcommon` — build needs
+`libudev-dev libinput-dev libgbm-dev libxkbcommon-dev` (see BUILD_DEBIAN.md).
 
 UI (`crates/ironsurf-shell/ui/ironsurf.slint`):
 - `AppWindow` with: toolbar row [back, forward, reload, URL `LineEdit`, "New tab",
