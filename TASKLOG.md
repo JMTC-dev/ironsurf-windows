@@ -75,3 +75,9 @@ main.rs force-software hack replaced by GPU-first policy: auto = winit/LinuxKMS 
 software fallback (--software pins old path, --linuxkms pins KMS, SLINT_BACKEND wins; pure backend_choice + test);
 box has no GPU: FemtoVG still initializes via Mesa llvmpipe (libGL loaded, verified) — on real GPUs it binds vendor
 drivers. KMS libs are LINKED not dlopen'd: build -dev pkgs + runtime sonames documented in BUILD_DEBIAN/
+## #19 FIX container manager "New" dead — row's selta TouchArea was declared AFTER the row content:
+last-declared TouchArea wins hit-testing (proven with scratch slint/test-backend repro), so it swallowed
+New/Move tab/Delete/Ren clicks (only ever fired mgr-select). selta moved first in the row (bottom z) ⇒
+buttons clickable, row still selects. Same latent bug fixed in tab strip: tabta after xt killed the ✕ —
+tabta first, ✕ in a glyph-sized Rectangle (bare TouchArea would fill the tab). Verified live on :2.0
+via xdotool: New spawns tab 2, row-click selects, ＋ works, ✕ closes; shell suite green.

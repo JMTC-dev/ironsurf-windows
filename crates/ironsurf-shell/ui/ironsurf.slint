@@ -258,12 +258,20 @@ export component AppWindow inherits Window {
                             x: parent.width - 20px;
                             vertical-alignment: center;
                         }
-                        xt := TouchArea {
-                            clicked => { root.close-tab(idx); }
-                        }
-                        // declared first ⇒ bottom z-order; ✕ wins on top
+                        // tabta declared before the ✕ ⇒ bottom z-order: the
+                        // tab activates on click; ✕zone (declared last, top,
+                        // sized to the glyph only — a bare TouchArea would
+                        // fill the whole tab) closes it instead
                         tabta := TouchArea {
                             clicked => { root.activate-tab(idx); }
+                        }
+                        xzone := Rectangle {
+                            x: parent.width - 24px;
+                            width: 20px;
+                            height: parent.height;
+                            xt := TouchArea {
+                                clicked => { root.close-tab(idx); }
+                            }
                         }
                     }
                 }
@@ -368,6 +376,12 @@ export component AppWindow inherits Window {
                     height: 54px;
                     width: parent.width;
                     sel := Rectangle { background: i == root.selected-container ? #383838 : #262626; border-radius: 4px; }
+                    // declared before the content ⇒ bottom z-order: clicking
+                    // anywhere on the row still selects it, but the New/Move
+                    // tab/Delete/Ren buttons (declared on top) keep receiving
+                    // their clicks — a TouchArea declared last swallowed all
+                    // of them, which is why "New" only ever re-selected.
+                    selta := TouchArea { clicked => { root.mgr-select(i); } }
                     VerticalLayout {
                         x: 6px; y: 3px;
                         width: parent.width - 12px;
@@ -405,7 +419,6 @@ export component AppWindow inherits Window {
                             Rectangle { horizontal-stretch: 1; }
                         }
                     }
-                    selta := TouchArea { clicked => { root.mgr-select(i); } }
                 }
 
                 Text { text: "Add container"; color: #f0f0f0; }
