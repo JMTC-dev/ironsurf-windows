@@ -772,6 +772,11 @@ mod dom_native {
     pub(super) const ATTR_REMOVE: &str = "__ironsurfDomAttrRemove";
     pub(super) const ATTR_COUNT: &str = "__ironsurfDomAttrCount";
     pub(super) const ATTR_AT: &str = "__ironsurfDomAttrAt";
+    // Form controls: value / checked (blitz editor + input special data).
+    pub(super) const VALUE: &str = "__ironsurfDomValue";
+    pub(super) const VALUE_SET: &str = "__ironsurfDomValueSet";
+    pub(super) const CHECKED: &str = "__ironsurfDomChecked";
+    pub(super) const CHECKED_SET: &str = "__ironsurfDomCheckedSet";
 }
 
 /// Live-collection kinds (the `type` argument of `LIVE_ITEM`/`LIVE_COUNT`).
@@ -1667,6 +1672,187 @@ fn register_dom_natives(context: &mut Context) {
             None => JsValue::null(),
         })
     });
+
+    // -- form controls ("<input>"/"<button>" work) ----------------------------
+
+    native!(dom_native::VALUE, 2, |_this, args, context| {
+        let doc = arg_doc(args, 0, context)?;
+        let node = arg_node(args, 1, context)?;
+        let value = with_live_doc(doc, move |document| form_value(document, node_id(node)));
+        Ok(match value.flatten() {
+            Some(value) => JsValue::from(JsString::from(value)),
+            None => JsValue::null(),
+        })
+    });
+    native!(dom_native::VALUE_SET, 3, |_this, args, context| {
+        let doc = arg_doc(args, 0, context)?;
+        let node = arg_node(args, 1, context)?;
+        let value = arg_string(args, 2, context)?;
+        // Text inputs/textareas own a live parley editor: replace its text
+        // (blitz's source of truth once it has run).
+        let editor_text = value.clone();
+        let edited = with_live_doc(doc, move |document| {
+            let node = document.get_node_mut(node_id(node))?;
+            let element = node.element_data_mut()?;
+            let input = element.text_input_data_mut()?;
+            input.editor.set_text(&editor_text);
+            node.mark_ancestors_dirty();
+            Some(())
+        })
+        .flatten();
+        if edited.is_some() {
+            return Ok(JsValue::undefined());
+        }
+        // Everything else (and inputs layout has not upgraded yet): the
+        // `value` content attribute, through the mutator (restyle hints).
+        let outcome = with_mut(doc, move |mutator| -> Result<(), boa_engine::JsNativeError> {
+            if mutator.doc.get_node(node_id(node)).is_none() {
+                return Err(JsNativeError::typ().with_message("NotFoundError: node is gone"));
+            }
+            let name = qual_name_for_attr("value").expect("valid attr name");
+            mutator.set_attribute(node_id(node), name, &value);
+            Ok(())
+        });
+        match outcome {
+            None => Err(throw_no_doc()),
+            Some(Err(err)) => Err(boa_engine::JsError::from_native(err)),
+            Some(Ok(())) => Ok(JsValue::undefined()),
+        }
+    });
+    native!(dom_native::CHECKED, 2, |_this, args, context| {
+        let doc = arg_doc(args, 0, context)?;
+        let node = arg_node(args, 1, context)?;
+        let checked = with_live_doc(doc, move |document| {
+            checkbox_state(document.get_node(node_id(node))?.element_data()?)
+        })
+        .flatten();
+        Ok(match checked {
+            Some(checked) => JsValue::new(checked),
+            None => JsValue::null(),
+        })
+    });
+    native!(dom_native::CHECKED_SET, 3, |_this, args, context| {
+        let doc = arg_doc(args, 0, context)?;
+        let node = arg_node(args, 1, context)?;
+        let checked = args.get(2).map(|v| v.to_boolean()).unwrap_or(false);
+        let outcome = with_mut(doc, move |mutator| -> Result<(), boa_engine::JsNativeError> {
+            let target = mutator
+                .doc
+                .get_node_mut(node_id(node))
+                .ok_or_else(|| JsNativeError::typ().with_message("NotFoundError: node is gone"))?;
+            let element = target
+                .element_data_mut()
+                .ok_or_else(|| JsNativeError::typ().with_message("not an element"))?;
+            if checkbox_state(element).is_none() {
+                return Err(JsNativeError::typ()
+                    .with_message("checked is only valid on checkbox/radio inputs"));
+            }
+            // Keeps the special data AND the ElementState::CHECKED bit (so
+            // `:checked` style matching follows) in sync (element.rs).
+            element.set_checkbox_input_checked(checked);
+            let name = qual_name_for_attr("checked").expect("valid attr name");
+            if checked {
+                mutator.set_attribute(node_id(node), name, "");
+            } else {
+                mutator.clear_attribute(node_id(node), name);
+            }
+            Ok(())
+        });
+        match outcome {
+            None => Err(throw_no_doc()),
+            Some(Err(err)) => Err(boa_engine::JsError::from_native(err)),
+            Some(Ok(())) => Ok(JsValue::undefined()),
+        }
+    });
+}
+
+// ---------------------------------------------------------------------------
+// Form-control value semantics (input / textarea / select / button)
+// ---------------------------------------------------------------------------
+
+/// The `type` of an `<input>` element as the DOM sees it (lower-case;
+/// unknown/missing falls back to `"text""). `None` for non-input elements.
+pub(crate) fn input_type(element: &blitz_dom::node::ElementData) -> Option<String> {
+    if element.name.local != local_name!("input") {
+        return None;
+    }
+    let raw = element.attr(local_name!("type")).unwrap_or("text").to_ascii_lowercase();
+    const KNOWN: [&str; 21] = [
+        "text", "password", "search", "email", "url", "tel", "number", "date", "time", "week",
+        "month", "datetime-local", "range", "color", "button", "submit", "reset", "checkbox",
+        "radio", "file", "hidden",
+    ];
+    Some(if KNOWN.contains(&raw.as_str()) {
+        raw
+    } else {
+        "text".to_string()
+    })
+}
+
+/// `checked` for checkbox/radio inputs (blitz's special data, seeded from
+/// the `checked` attribute at parse time); `None` for anything else.
+fn checkbox_state(element: &blitz_dom::node::ElementData) -> Option<bool> {
+    match input_type(element).as_deref() {
+        Some("checkbox") | Some("radio") => Some(element.checkbox_input_checked().unwrap_or(false)),
+        _ => None,
+    }
+}
+
+/// DOM `value` for form controls: the live editor text for text inputs
+/// (blitz's source of truth once layout has run), the `value` attribute for
+/// buttons and not-yet-upgraded inputs, the text content for textareas,
+/// the selected option's value for selects. `None` = no such property
+/// (maps to `undefined` in the bridge).
+pub(crate) fn form_value(doc: &BaseDocument, id: NodeId) -> Option<String> {
+    let node = doc.get_node(id)?;
+    let element = node.element_data()?;
+    let tag = element.name.local.clone();
+    if tag == local_name!("input") {
+        // Once the editor exists it holds the live text — even for password
+        // inputs (the DOM spec leaks plaintext; parity).
+        if let Some(input) = element.text_input_data() {
+            return Some(input.editor.raw_text().to_string());
+        }
+        return Some(match input_type(element).as_deref() {
+            Some("checkbox") | Some("radio") => {
+                element.attr(local_name!("value")).unwrap_or("on").to_string()
+            }
+            _ => element.attr(local_name!("value")).unwrap_or_default().to_string(),
+        });
+    }
+    if tag == local_name!("textarea") {
+        if let Some(input) = element.text_input_data() {
+            return Some(input.editor.raw_text().to_string());
+        }
+        return Some(node.text_content());
+    }
+    if tag == local_name!("select") {
+        // First `selected` option wins (the dropdown UI stays a no-op, but
+        // option selection drives this read side).
+        for child in node.children.iter().copied() {
+            let Some(child_node) = doc.get_node(child) else {
+                continue;
+            };
+            let Some(option) = child_node.element_data() else {
+                continue;
+            };
+            if option.name.local == local_name!("option")
+                && option.has_attr(local_name!("selected"))
+            {
+                return Some(
+                    option
+                        .attr(local_name!("value"))
+                        .map(str::to_owned)
+                        .unwrap_or_else(|| child_node.text_content()),
+                );
+            }
+        }
+        return Some(String::new());
+    }
+    if tag == local_name!("button") {
+        return Some(element.attr(local_name!("value")).unwrap_or_default().to_string());
+    }
+    None
 }
 
 /// `"xlink:href"` → `(Some("xlink"), "href")`; plain names have no prefix.
@@ -1750,6 +1936,251 @@ const PRELUDE: &str = r##"
   function noop() {}
   function returnTrue() { return true; }
 
+  // ---------------------------------------------------------------------
+  // DOM events ("<input>, <button> does not work"). blitz's EventDriver
+  // performs the default actions (focus, active, caret edits, click
+  // landing on the right node) and hands the DOM events it dispatches to
+  // the tab process, which replays them through this real EventTarget
+  // implementation: capture (window → ancestors), target, bubbling, the
+  // inline on<type>="" attribute handlers (compiled per node+type, re-
+  // compiled when the attribute text changes), and the `on<type>`
+  // property handlers — so `addEventListener`, `onclick = fn` and
+  // `<button onclick="...">` all work. Errors inside handlers are
+  // reported and never stop the propagation to the next listener.
+  // ---------------------------------------------------------------------
+  var listenerStore = Object.create(null); // targetId → type → [{fn,capture}]
+  var nextTargetId = 1;
+  function targetId(obj) {
+    if (obj.__ironsurfEtid === undefined) {
+      Object.defineProperty(obj, "__ironsurfEtid", {
+        value: nextTargetId++,
+        enumerable: false,
+        configurable: true,
+      });
+    }
+    return obj.__ironsurfEtid;
+  }
+  function listenerList(obj, type, create) {
+    var id = targetId(obj);
+    var byType = listenerStore[id];
+    if (!byType) {
+      if (!create) return null;
+      byType = listenerStore[id] = Object.create(null);
+    }
+    var list = byType[type];
+    if (!list) {
+      if (!create) return null;
+      list = byType[type] = [];
+    }
+    return list;
+  }
+  function isListener(fn) {
+    return (
+      typeof fn === "function" ||
+      (fn !== null && typeof fn === "object" && typeof fn.handleEvent === "function")
+    );
+  }
+  function callListener(entry, ev, current) {
+    try {
+      if (typeof entry.fn === "function") entry.fn.call(current, ev);
+      else entry.fn.handleEvent(ev);
+    } catch (err) {
+      reportError("listener for " + ev.type + ": " + err);
+    }
+  }
+  function addListener(obj, type, fn, options) {
+    if (!obj || !isListener(fn)) return;
+    var capture = options === true || !!(options && typeof options === "object" && options.capture);
+    var list = listenerList(obj, type, true);
+    for (var i = 0; i < list.length; i++) {
+      if (list[i].fn === fn && list[i].capture === capture) return; // already registered
+    }
+    list.push({ fn: fn, capture: capture });
+  }
+  function removeListener(obj, type, fn, options) {
+    if (!obj) return;
+    var capture = options === true || !!(options && typeof options === "object" && options.capture);
+    var list = listenerList(obj, type, false);
+    if (!list) return;
+    for (var i = 0; i < list.length; i++) {
+      if (list[i].fn === fn && list[i].capture === capture) {
+        list.splice(i, 1);
+        return;
+      }
+    }
+  }
+  // Non-bubbling event types (focus/blur fire on the target only).
+  var NO_BUBBLE = { focus: 1, blur: 1, focusin_nonbubbling: 1, scroll: 1, load: 1 };
+  // Inline `on<type>="..."` attribute handlers, compiled per (node,type);
+  // recompiled only when the attribute text changes.
+  var inlineCache = Object.create(null); // targetId → type → {src, fn}
+  function inlineAttrHandler(node, type) {
+    if (node === host || node === document || !node.getAttribute) return null;
+    var src = node.getAttribute("on" + type);
+    if (src === null || src === "") return null;
+    var byType = inlineCache[targetId(node)];
+    if (!byType) byType = inlineCache[targetId(node)] = Object.create(null);
+    var entry = byType[type];
+    if (!entry || entry.src !== src) {
+      var compiled = null;
+      try {
+        compiled = new Function("event", src);
+      } catch (err) {
+        // A page with an uncompilable handler stays alive; the handler is dead.
+        compiled = null;
+      }
+      entry = byType[type] = { src: src, fn: compiled };
+    }
+    return entry.fn;
+  }
+  function makeEvent(type, target, init) {
+    init = init || {};
+    var ev = {
+      type: type,
+      target: target,
+      currentTarget: target,
+      bubbles: init.bubbles !== false && !(init.bubbles === undefined && NO_BUBBLE[type]),
+      cancelable: init.cancelable !== false,
+      defaultPrevented: false,
+      isTrusted: false,
+      detail: typeof init.detail === "number" ? init.detail : 0,
+      // mouse axes (0 until a real MouseEvent fills them in)
+      screenX: 0, screenY: 0, clientX: 0, clientY: 0,
+      pageX: 0, pageY: 0, offsetX: 0, offsetY: 0,
+      button: 0, buttons: 0,
+      relatedTarget: null,
+      // key axes
+      key: "", code: "", location: 0, repeat: false, isComposing: false,
+      ctrlKey: false, shiftKey: false, altKey: false, metaKey: false,
+      // input events
+      inputType: "input",
+      data: null,
+      // internal propagation flags
+      _stop: false, _stopImmediate: false,
+      preventDefault: function () {
+        ev.defaultPrevented = true;
+      },
+      stopPropagation: function () {
+        ev._stop = true;
+      },
+      stopImmediatePropagation: function () {
+        ev._stop = true;
+        ev._stopImmediate = true;
+      },
+    };
+    return ev;
+  }
+  // The propagation path: target → … → <html> → document → window.
+  function eventPath(target) {
+    var path = [];
+    if (target && target.__n) {
+      var d = target.__d;
+      var seen = 0;
+      var node = target;
+      while (node && node.__n && seen++ < 4096) {
+        path.push(node);
+        node = host.__ironsurfDomParent(d, node.__n) ? wrapNode(d, host.__ironsurfDomParent(d, node.__n)) : null;
+      }
+    } else if (target && target !== document && target !== host) {
+      path.push(target);
+    }
+    path.push(document);
+    path.push(host);
+    return path;
+  }
+  // One path node: its listeners (filtered by phase), its inline attribute
+  // handler and its on<type> property handler.
+  function visitNode(node, ev, phase) {
+    var list = listenerList(node, ev.type, false);
+    if (list) {
+      // Snapshot: a listener may add/remove listeners during dispatch.
+      var pending = list.slice();
+      for (var i = 0; i < pending.length; i++) {
+        if (ev._stopImmediate) return;
+        var entry = pending[i];
+        if (phase === "target" || entry.capture === (phase === "capture")) {
+          ev.currentTarget = node;
+          callListener(entry, ev, node);
+        }
+      }
+    }
+    if (ev._stopImmediate) return;
+    // Inline handlers: the attribute form and the property form share the
+    // slot semantics of real `on*` DOM attributes (one handler, bubble
+    // phase, runs even when no listener was registered).
+    var handler = null;
+    if (node === host || node === document) {
+      var prop = node["on" + ev.type];
+      if (typeof prop === "function") handler = prop;
+    } else {
+      handler = inlineAttrHandler(node, ev.type);
+      if (!handler) {
+        var own = node["on" + ev.type];
+        if (typeof own === "function") handler = own;
+      }
+    }
+    if (handler && (phase === "target" || phase === "bubble")) {
+      ev.currentTarget = node;
+      try {
+        handler.call(node, ev);
+      } catch (err) {
+        reportError("on" + ev.type + " handler: " + err);
+      }
+    }
+  }
+  // Fire one event: capture down, target, bubble up (unless it does not
+  // bubble). Returns nothing; `ev.defaultPrevented` tells the caller.
+  function firePath(path, ev) {
+    for (var i = path.length - 1; i >= 1; i--) {
+      if (ev._stop) return;
+      visitNode(path[i], ev, "capture");
+    }
+    if (!ev._stop) visitNode(path[0], ev, "target");
+    if (ev.bubbles) {
+      for (var j = 1; j < path.length; j++) {
+        if (ev._stop) return;
+        visitNode(path[j], ev, "bubble");
+      }
+    }
+  }
+  // The entry point the tab process calls after blitz ran the default
+  // actions for a real user interaction (and what dispatchEvent uses).
+  // `init` carries the event axes (mouse coords, key labels, modifiers).
+  function fireDomEvent(type, target, init) {
+    var ev = makeEvent(type, target, init || {});
+    if (init) {
+      if (typeof init.clientX === "number") {
+        ev.clientX = ev.pageX = ev.offsetX = init.clientX;
+        ev.clientY = ev.pageY = ev.offsetY = init.clientY;
+        ev.screenX = init.screenX !== undefined ? init.screenX : init.clientX;
+        ev.screenY = init.screenY !== undefined ? init.screenY : init.clientY;
+      }
+      if (typeof init.button === "number") ev.button = init.button;
+      if (init.key !== undefined) ev.key = String(init.key);
+      if (init.code !== undefined) ev.code = String(init.code);
+      if (init.repeat) ev.repeat = true;
+      if (init.ctrlKey) ev.ctrlKey = true;
+      if (init.shiftKey) ev.shiftKey = true;
+      if (init.altKey) ev.altKey = true;
+      if (init.metaKey) ev.metaKey = true;
+      if (init.inputType !== undefined) ev.inputType = String(init.inputType);
+      if (init.data !== undefined) ev.data = init.data;
+    }
+    firePath(eventPath(target), ev);
+    return ev;
+  }
+  host.__ironsurfFire = function (type, d, n, init) {
+    var target = n ? wrapNode(d, n) : host;
+    return fireDomEvent(String(type), target, init);
+  };
+  function dispatchUserEvent(type, targetObj, init) {
+    var target = targetObj || host;
+    var ev = target && target.__n
+      ? host.__ironsurfFire(String(type), target.__d, target.__n, init || {})
+      : fireDomEvent(String(type), target, init || {});
+    return !ev.defaultPrevented;
+  }
+
   var location = {
     // Reflector: the document URL. JS-driven navigation is not implemented
     // (TODO: route it through the tab's navigation entry point).
@@ -1791,9 +2222,27 @@ const PRELUDE: &str = r##"
   host.outerWidth = 0;
   host.outerHeight = 0;
   host.location = location;
-  host.addEventListener = noop;
-  host.removeEventListener = noop;
-  host.dispatchEvent = returnTrue;
+  host.addEventListener = function (type, fn, options) {
+    addListener(host, String(type), fn, options);
+  };
+  host.removeEventListener = function (type, fn, options) {
+    removeListener(host, String(type), fn, options);
+  };
+  host.dispatchEvent = function (ev) {
+    // A plain object or the output of makeEvent-style code is accepted;
+    // it dispatches on `window` with real capture/bubble propagation.
+    if (!ev || typeof ev.type !== "string") return returnTrue();
+    var event = ev;
+    if (!event.__ironsurfEvent) {
+      event = makeEvent(String(ev.type), host, ev);
+      Object.keys(ev).forEach(function (k) {
+        if (event[k] === undefined && k !== "type") event[k] = ev[k];
+      });
+    }
+    event.target = host;
+    firePath(eventPath(host), event);
+    return !event.defaultPrevented;
+  };
   // Real timers: the natives append to the tab's timer queue and the poll
   // loop runs the callbacks (rAF is a 16 ms one-shot).
   host.setTimeout = host.__ironsurfSetTimeout;
@@ -2060,6 +2509,28 @@ const PRELUDE: &str = r##"
   );
   protoGet("outerHTML", function () { return host.__ironsurfDomSerialize(this.__d, this.__n, true); });
 
+  // Form control value/checked (task: `<form>`): the natives read the live
+  // parley editor text blitz keeps for text inputs and textareas (falling
+  // back to the `value` content attribute), and checkbox/radio checkedness
+  // (blitz's input special data, mirrored to the `checked` attribute). On a
+  // non-control `value`/`checked` stay `undefined`, like the DOM.
+  protoAccessor(
+    "value",
+    function () {
+      var v = host.__ironsurfDomValue(this.__d, this.__n);
+      return v === null ? undefined : v;
+    },
+    function (v) { host.__ironsurfDomValueSet(this.__d, this.__n, String(v)); }
+  );
+  protoAccessor(
+    "checked",
+    function () {
+      var c = host.__ironsurfDomChecked(this.__d, this.__n);
+      return c === null ? undefined : !!c;
+    },
+    function (v) { host.__ironsurfDomCheckedSet(this.__d, this.__n, !!v); }
+  );
+
   // ChildNode mutations: the natives validate (throwing NotFoundError
   // TypeErrors, like DOMExceptions do here) and apply via blitz.
   function unwrapChild(child) {
@@ -2143,9 +2614,25 @@ const PRELUDE: &str = r##"
     host.__ironsurfDomQuery(this.__d, String(selector));
     return makeList(this.__d, 3, 0, String(selector));
   });
-  protoMethod("addEventListener", function () {});
-  protoMethod("removeEventListener", function () {});
-  protoMethod("dispatchEvent", function () { return true; });
+  protoMethod("addEventListener", function (type, fn, options) {
+    addListener(this, String(type), fn, options);
+  });
+  protoMethod("removeEventListener", function (type, fn, options) {
+    removeListener(this, String(type), fn, options);
+  });
+  protoMethod("dispatchEvent", function (ev) {
+    if (!ev || typeof ev.type !== "string") return true;
+    var event = ev;
+    if (!event.__ironsurfEvent) {
+      event = makeEvent(String(ev.type), this, ev);
+      Object.keys(ev).forEach(function (k) {
+        if (event[k] === undefined && k !== "type") event[k] = ev[k];
+      });
+    }
+    event.target = this;
+    firePath(eventPath(this), event);
+    return !event.defaultPrevented;
+  });
   // getElementsByClassName on any element (live, like the document one).
   protoMethod("getElementsByClassName", function (name) {
     // Not scoped to descendants in this bridge — document-wide live list.
@@ -2305,9 +2792,25 @@ const PRELUDE: &str = r##"
       return fragPatch(makeFragment());
     },
     createEvent: function () { return {}; },
-    addEventListener: function () {},
-    removeEventListener: function () {},
-    dispatchEvent: function () { return true; },
+    addEventListener: function (type, fn, options) {
+      addListener(document, String(type), fn, options);
+    },
+    removeEventListener: function (type, fn, options) {
+      removeListener(document, String(type), fn, options);
+    },
+    dispatchEvent: function (ev) {
+      if (!ev || typeof ev.type !== "string") return true;
+      var event = ev;
+      if (!event.__ironsurfEvent) {
+        event = makeEvent(String(ev.type), document, ev);
+        Object.keys(ev).forEach(function (k) {
+          if (event[k] === undefined && k !== "type") event[k] = ev[k];
+        });
+      }
+      event.target = document;
+      firePath(eventPath(document), event);
+      return !event.defaultPrevented;
+    },
     write: function () {},
     writeln: function () {},
     get title() {
@@ -2646,6 +3149,40 @@ impl JsRuntime {
         let _active = self.activate();
         let _live_doc = register_live_doc(doc);
         self.context.eval(Source::from_bytes(source))
+    }
+
+    /// Replay a real user interaction through the page's own event system
+    /// (`__ironsurfFire`, the glue's documented entry point): blitz has just
+    /// run the default actions for a pointer/key event, and the tab hands the
+    /// event to capture/bubble dispatch so `addEventListener`, inline
+    /// `onclick=""` and property handlers all run. Returns whether the page
+    /// called `preventDefault()` (task: `<form>` — which also gates the
+    /// default action the tab owns, form submission).
+    pub(crate) fn fire_event(
+        &mut self,
+        doc: &mut HtmlDocument,
+        node: Option<NodeId>,
+        kind: &str,
+        init: &str,
+    ) -> bool {
+        let n = match node {
+            Some(node) => node.as_u64().to_string(),
+            None => "null".to_owned(),
+        };
+        let source = format!(
+            "(function () {{ var e = __ironsurfFire({kind:?}, 0, {n}, {init}); return !!e.defaultPrevented; }})()"
+        );
+        // The same world page scripts live in, with `doc` as the live
+        // document (docId 0) — the glue's wrappers resolve against it.
+        let _active = self.activate();
+        let _live_doc = register_live_doc(doc);
+        match self.context.eval(Source::from_bytes(&source)) {
+            Ok(value) => value.as_boolean().unwrap_or(false),
+            Err(err) => {
+                warn!("js {kind} dispatch failed: {err}");
+                false
+            }
+        }
     }
 
     /// Execute every timer callback due at `now`, in due order. Exceptions

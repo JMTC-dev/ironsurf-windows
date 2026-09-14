@@ -339,6 +339,31 @@ are a deliberately tiny surface (no engine-internal DOM mutation yet):
 - Script exceptions must never kill the tab: catch, report via StatusText, continue.
 - `javascript:` URLs are refused (status text), matching the shell contract.
 
+### HTML forms (`src/forms.rs`)
+Blitz parses forms but its submission algorithm is incomplete (`<select>` values are a TODO in
+`construct_entry_list`; actions resolving outside `http(s):`/`data:`/`mailto:` are dropped), so
+the tab owns submission outright — blitz's own submission is never used for its triggers:
+- Triggers: a left-click press on a submit control (*arms*, finalised on release — a page JS
+  `click` handler that `preventDefault()`s cancels it; the tab's entry list always replaces
+  blitz's incomplete one in the navigation hook) and Enter in a single-line text field
+  (implicit submission; the Enter is then not fed to blitz at all). Pointer/key events are
+  replayed through the page's own JS event system (`__ironsurfFire`) around blitz's defaults.
+- Entries follow the spec's "constructing the form data set" subset: tree order,
+  `form=`/ancestor ownership, disabled/nameless/`datalist` exclusions, checkbox/radio
+  checkedness, live parley editor text for inputs/textareas, select selectedness.
+  GET becomes the query string; POST the request body per `enctype` (urlencoded,
+  `text/plain`, multipart for string entries) — carried as `netmod::MainDocPost` into the
+  main-document fetch, which POSTs for real (never cached) with the enctype `Content-Type`.
+- Schemes: GET navigations work for every scheme we fetch (`http(s)`, `file`, `data`,
+  `ironsurf:` — which blitz itself drops); POST only for `http(s)`, anything else is an
+  honest status text, never a silent drop.
+- `<select>` interaction lives here too (blitz renders options as plain text): clicking an
+  option toggles its `selected` attribute + highlight and syncs the `<select>`'s `value`
+  attribute. `prepare_document` seeds textarea editors from their child text and every
+  select's initial selectedness once per parsed document, before the first layout.
+- The welcome page (`ironsurf://welcome`) is a working GET-form demo: it echoes the query
+  string its own form submits against it.
+
 ### Headless tests (must run with no X display)
 - `tests/spike.rs`: render a `file://` fixture (tempdir HTML with colored blocks) through
   the full parse→resolve→paint path; assert buffer size `w*h*4` and non-uniform pixels.

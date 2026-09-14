@@ -57,7 +57,7 @@ use std::time::{Duration, Instant};
 
 use anyrender::{render_to_buffer, PaintScene};
 use anyrender_vello_cpu::VelloCpuImageRenderer;
-use blitz_dom::{Document as _, DocumentConfig};
+use blitz_dom::{Document as _, DocumentConfig, NodeId};
 use blitz_html::HtmlDocument;
 use blitz_paint::paint_scene;
 use blitz_traits::events::{
@@ -82,8 +82,9 @@ use ironsurf_sandbox::SandboxPolicy;
 use ironsurf_storage::{ContainerStore, CookieJar, NetCache};
 use url::Url;
 
+use crate::forms::{self, FormMethod, FormSubmission};
 use crate::js::{self, HostRef};
-use crate::netmod::{self, BlitzNetProvider, NetPolicy};
+use crate::netmod::{self, BlitzNetProvider, MainDocPost, NetPolicy};
 
 /// Default page size until the shell sends `ToTab::Resize` (physical px).
 const DEFAULT_SIZE: (u32, u32) = (1024, 768);
@@ -469,6 +470,13 @@ pub struct Tab {
     /// Which mouse buttons are currently held (ironsurf `PointerKind::Down/Up`
     /// track the transitions); carried in every `BlitzPointerEvent.buttons`.
     mouse_buttons: MouseEventButtons,
+    /// A form submission resolved from a submit-button press or an implicit
+    /// Enter (task: `<form>`); consumed by `drain_nav_hook` at the end of the
+    /// stdin batch, exactly like the blitz `NavigationProvider` hook.
+    pending_form: Option<FormSubmission>,
+    /// A submit-control press armed on mouse-down and finalised on release
+    /// (a JS `click` handler may cancel it; task: `<form>`).
+    form_press: Option<FormPress>,
     /// Last hover-reported link target (`StatusText`), for change-detection so
     /// a moving mouse only emits when the target actually changes.
     hover_status: Option<String>,
@@ -562,6 +570,8 @@ impl Tab {
             pipe,
             mouse_buttons: MouseEventButtons::None,
             hover_status: None,
+            pending_form: None,
+            form_press: None,
         }
     }
 
@@ -619,8 +629,23 @@ impl Tab {
     /// Navigate to `raw` (shell text). `history` says what to do with the
     /// URL-only session history (fresh loads truncate forward entries).
     pub fn navigate(&mut self, raw: &str, history: NavHistory) -> bool {
+        self.navigate_post(raw, history, None)
+    }
+
+    /// [`Self::navigate`] carrying an HTML form submission's POST body (task:
+    /// `<form>`) — the main-document fetch sends a real POST with the
+    /// enctype's `Content-Type` instead of a body-less GET.
+    pub fn navigate_post(
+        &mut self,
+        raw: &str,
+        history: NavHistory,
+        post: Option<&MainDocPost>,
+    ) -> bool {
         let started = Instant::now();
-        info!("navigate \"{raw}\" ({history:?})");
+        info!(
+            "navigate \"{raw}\" ({history:?}{})",
+            if post.is_some() { ", form POST" } else { "" }
+        );
         let url = match parse_input_url(raw) {
             Ok(url) => url,
             Err(err) => {
@@ -667,8 +692,9 @@ impl Tab {
             "fetching main document {url} (net policy {:?})",
             self_provider_policy(&self.provider)
         );
-        match netmod::fetch_document(
+        match netmod::fetch_document_post(
             &url,
+            post,
             self_provider_policy(&self.provider),
             &mut self.jar,
             &self.cache,
@@ -779,7 +805,11 @@ impl Tab {
             ..Default::default()
         };
         let parsed = Instant::now();
-        let document = HtmlDocument::from_html(html, config);
+        let mut document = HtmlDocument::from_html(html, config);
+        // `<form>` groundwork (task: `<form>`): seed textarea editors from
+        // their child text and the selected/value state of every select,
+        // before the first layout freezes those in.
+        forms::prepare_document(&mut document);
         self.doc = Some(document);
         self.settle();
         debug!(
@@ -1251,10 +1281,11 @@ impl Tab {
         // Every handled input wants fresh pixels (contract §ironsurf-tab.3);
         // still coalesced by the ≤30 fps throttle in `maybe_repaint`.
         self.needs_paint = true;
-        // A link click filled the NavigationProvider hook inline; skip painting
-        // the outgoing page — the loop's `drain_nav_hook` replaces the
-        // document (and paints the incoming one) right after this returns.
-        if self.nav.pending.lock().expect("nav mutex").is_none() {
+        // A link click filled the NavigationProvider hook inline (or a form
+        // press filled `pending_form`); skip painting the outgoing page — the
+        // loop's `drain_nav_hook` replaces the document (and paints the
+        // incoming one) right after this returns.
+        if self.pending_form.is_none() && self.nav.pending.lock().expect("nav mutex").is_none() {
             self.resolve_and_maybe_paint();
         }
     }
@@ -1331,6 +1362,43 @@ impl Tab {
             MouseButton::Right => MouseEventButton::Secondary,
             MouseButton::Middle => MouseEventButton::Auxiliary,
         };
+
+        // `<form>` presses (task: `<form>`), decided from blitz's live hover
+        // node (the shell always moves the mouse before pressing). Nothing is
+        // swallowed: clicking an `<option>` selects it (this engine renders
+        // selects as always-open lists), and pressing a submit control *arms*
+        // the submission — finalised on release, after the page's own JS
+        // `click` handlers have run and possibly cancelled it.
+        if ev.button == MouseButton::Left {
+            if matches!(ev.kind, PointerKind::Down) {
+                if let Some(hover) = self.doc.as_ref().and_then(|doc| doc.get_hover_node_id()) {
+                    if let Some((select, option)) = self
+                        .doc
+                        .as_ref()
+                        .and_then(|doc| forms::option_for_click(doc, hover))
+                    {
+                        if let Some(doc) = self.doc.as_mut() {
+                            forms::apply_option_click(doc, select, option);
+                        }
+                        debug!("form: option selected");
+                        self.needs_paint = true;
+                    }
+                    self.form_press = self
+                        .doc
+                        .as_ref()
+                        .and_then(|doc| forms::submit_control_for_click(doc, hover))
+                        .map(|(submitter, form)| FormPress {
+                            submitter,
+                            form,
+                        });
+                }
+                // The page sees the press too (mousedown handlers, :active
+                // styling logic of any page script); its cancellation is the
+                // engine's business only for the default action of the *pair*,
+                // decided on release.
+                self.fire_js_pointer("mousedown", ev);
+            }
+        }
         // Track the held-button set the way the DOM does: Down adds this
         // button, Up clears it (blitz reads `buttons` for drag/caret state,
         // events/mod.rs `may_move_text_input_caret`).
@@ -1371,6 +1439,48 @@ impl Tab {
             PointerKind::Up => UiEvent::PointerUp(self.pointer_event(ev, MouseEventButtons::None)),
         };
         self.feed_ui_event(ui);
+
+        // Release: blitz has just run the click default actions (which for a
+        // submit control is its own submission — an incomplete entry list that
+        // forgets selects, and nothing at all for `file:`/`ironsurf:` actions).
+        // Replay the release through the page's JS first; then the tab's own
+        // complete submission wins where the press armed one.
+        if ev.button == ironsurf_common::MouseButton::Left
+            && matches!(ev.kind, PointerKind::Up)
+        {
+            self.fire_js_pointer("mouseup", ev);
+            let prevented = self.fire_js_pointer("click", ev);
+            if let Some(press) = self.form_press.take() {
+                // Whatever blitz's hook now holds was produced by this very
+                // press — the tab's entry list replaces it either way.
+                self.nav
+                    .pending
+                    .lock()
+                    .expect("nav mutex")
+                    .take();
+                if prevented {
+                    debug!("form: submission cancelled by a JS click handler");
+                } else if let Some(doc) = self.doc.as_ref() {
+                    match forms::build_submission(doc, press.form, Some(press.submitter)) {
+                        Ok(sub) => {
+                            debug!(
+                                "form: {} submission of {} entry(s) → {}",
+                                if sub.method == FormMethod::Post { "POST" } else { "GET" },
+                                sub.entries,
+                                sub.url
+                            );
+                            self.pending_form = Some(sub);
+                        }
+                        Err(err) => {
+                            warn!("form submission failed: {err}");
+                            self.emit(FromTab::StatusText {
+                                text: Some(format!("form: {err}")),
+                            });
+                        }
+                    }
+                }
+            }
+        }
 
         if hovering {
             let hover_after = self.doc.as_ref().and_then(|doc| doc.get_hover_node_id());
@@ -1414,6 +1524,53 @@ impl Tab {
     /// no-op, events/mod.rs:222); there is no release in the contract to
     /// model beyond that.
     fn handle_key(&mut self, ev: &KeyEvent) {
+        // The page's JS sees every press first: a `keydown` handler that
+        // calls `preventDefault()` swallows the default action — no editor
+        // insert, no form submission, no focus move (task: `<form>` glue with
+        // the JS event system).
+        if self.fire_js_key("keydown", ev) {
+            self.fire_js_key("keyup", ev);
+            return;
+        }
+        // `<form>` implicit submission (task: `<form>`): Enter in a
+        // single-line text field submits the owning form — resolved here (on
+        // the live entry list, every action scheme) rather than by blitz,
+        // whose version forgets selects and only acts on http(s)/data/
+        // mailto. Textareas keep inserting newlines (blitz's own path), and
+        // a focused node outside a form is blitz's business as before.
+        if ev.key == "Enter" && !ev.repeat && self.pending_form.is_none() {
+            let focused = self
+                .doc
+                .as_ref()
+                .and_then(|doc| doc.get_focussed_node_id());
+            if let Some(focused) = focused {
+                if let Some(outcome) = self
+                    .doc
+                    .as_ref()
+                    .and_then(|doc| forms::implicit_submission(doc, focused))
+                {
+                    match outcome {
+                        Ok(sub) => {
+                            debug!(
+                                "form: implicit Enter submission ({} entries) → {}",
+                                sub.entries, sub.url
+                            );
+                            self.pending_form = Some(sub);
+                            self.fire_js_key("keyup", ev);
+                            return;
+                        }
+                        Err(note) => {
+                            info!("form: {note}");
+                            self.emit(FromTab::StatusText {
+                                text: Some(note),
+                            });
+                            self.fire_js_key("keyup", ev);
+                            return;
+                        }
+                    }
+                }
+            }
+        }
         let key = ev.key.parse::<Key>().unwrap_or(Key::Unidentified);
         let code = ev.code.parse::<Code>().unwrap_or(Code::Unidentified);
         let text = ev
@@ -1440,6 +1597,7 @@ impl Tab {
             ..base
         };
         self.feed_ui_event(UiEvent::KeyUp(release));
+        self.fire_js_key("keyup", ev);
     }
 
     /// Wheel/scroll: blitz's default action scrolls by `Lines(x, y) * 20`
@@ -1471,16 +1629,95 @@ impl Tab {
         }
     }
 
-    /// Drain a pending `NavigationProvider` request (link click / form POST).
+    /// Replay a real pointer interaction through the page's own JS event
+    /// system (capture/bubble over the hover node's path, inline `onclick`,
+    /// listeners — task: `<form>`: `<button onclick>` must run). Returns the
+    /// event's `defaultPrevented`.
+    fn fire_js_pointer(&mut self, kind: &str, ev: &PointerEvent) -> bool {
+        let node = self.doc.as_ref().and_then(|doc| doc.get_hover_node_id());
+        let init = format!("{{ clientX: {}, clientY: {}, button: 0 }}", ev.x, ev.y);
+        self.fire_js_event(node, kind, &init)
+    }
+
+    /// The same for keyboard input: the focused node is the target (a plain
+    /// key with nothing focused still reaches window-level listeners).
+    fn fire_js_key(&mut self, kind: &str, ev: &KeyEvent) -> bool {
+        let node = self
+            .doc
+            .as_ref()
+            .and_then(|doc| doc.get_focussed_node_id());
+        let init = format!(
+            "{{ key: \"{}\", code: \"{}\", repeat: {} }}",
+            js_string_lit(&ev.key),
+            js_string_lit(&ev.code),
+            ev.repeat
+        );
+        self.fire_js_event(node, kind, &init)
+    }
+
+    /// The single JS-event funnel (`__ironsurfFire`, the glue's entry point).
+    /// No page, no JS runtime, or a failed dispatch all mean "not prevented":
+    /// the engine's default actions never wait on the page.
+    fn fire_js_event(&mut self, node: Option<NodeId>, kind: &str, init: &str) -> bool {
+        let js = self.js.as_mut();
+        let doc = self.doc.as_mut();
+        match (js, doc) {
+            (Some(js), Some(doc)) => js.fire_event(doc, node, kind, init),
+            _ => false,
+        }
+    }
+
+    /// Drain a pending navigation: first the tab's own form submissions
+    /// (task: `<form>` — resolved by the form layer from a submit press or an
+    /// implicit Enter), then the `NavigationProvider` hook (link clicks, and
+    /// — as a backstop — any blitz-side submission that slips through, whose
+    /// POST body is honoured here rather than dropped).
     fn drain_nav_hook(&mut self) -> bool {
+        // A press that never got its release is not a click; forget it.
+        self.form_press = None;
+        if let Some(sub) = self.pending_form.take() {
+            self.navigate_submission(&sub);
+            return true;
+        }
         let pending = self.nav.pending.lock().expect("nav mutex").take();
         if let Some(options) = pending {
-            // 7d will honour POST bodies; top-level GETs work today.
-            self.navigate(options.url.as_str(), NavHistory::Fresh);
+            let url = options.url.as_str().to_owned();
+            match form_body_from_nav(&options) {
+                Some(post) => {
+                    info!("form POST (blitz hook) → {url} ({} B)", post.body.len());
+                    self.navigate_post(&url, NavHistory::Fresh, Some(&post));
+                }
+                None => {
+                    self.navigate(&url, NavHistory::Fresh);
+                }
+            }
             return true;
         }
         false
     }
+
+    /// Act on a submission the form layer resolved: POST only goes to the
+    /// network (a local scheme has nowhere to put a body — say so in the
+    /// status bar instead of silently dropping it); GET navigations of any
+    /// scheme we fetch (`http(s)`, `file`, `data`, `ironsurf:`, …) proceed.
+    fn navigate_submission(&mut self, sub: &FormSubmission) {
+        let scheme = sub.url.scheme().to_owned();
+        if sub.method == FormMethod::Post && !(scheme == "http" || scheme == "https") {
+            info!("form: refusing to POST to a {scheme}: URL");
+            self.emit(FromTab::StatusText {
+                text: Some(format!(
+                    "form: cannot POST to a {scheme}: URL (no transport for the body)"
+                )),
+            });
+            return;
+        }
+        let post = (sub.method == FormMethod::Post).then(|| MainDocPost {
+            content_type: sub.content_type.clone(),
+            body: sub.body.clone(),
+        });
+        self.navigate_post(sub.url.as_str(), NavHistory::Fresh, post.as_ref());
+    }
+
 
     pub(crate) fn persist(&mut self) {
         // Best-effort: both jar handles (main-doc + subresource) live inside
@@ -1564,6 +1801,64 @@ fn to_blitz_mods(m: Modifiers) -> KMods {
 /// runtime never carries a second copy.
 fn self_provider_policy(provider: &Arc<BlitzNetProvider>) -> NetPolicy {
     provider.policy()
+}
+
+/// A submit control press armed on mouse-down (task: `<form>`): finalised on
+/// the matching release, after the page's JS `click` handlers have run.
+#[derive(Clone, Copy)]
+struct FormPress {
+    submitter: NodeId,
+    form: NodeId,
+}
+
+/// Escape a Rust string for embedding inside a JS string literal (the event
+/// init of `__ironsurfFire`).
+fn js_string_lit(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+/// A `NavigationOptions` carrying a `POST` body (blitz's own submission —
+/// the fallback path if a form ever submits past the tab's interception):
+/// rebuild the request body from `Body::Form` entries (urlencoded) or bytes
+/// so the fetch sends a real POST with the right `Content-Type` instead of a
+/// bodyless GET. `None` = an ordinary GET navigation (link clicks).
+fn form_body_from_nav(options: &NavigationOptions) -> Option<MainDocPost> {
+    use blitz_traits::net::Body;
+    let content_type = match &options.document_resource {
+        Body::Empty => return None,
+        Body::Form(_) => Some(
+            options
+                .content_type
+                .clone()
+                .unwrap_or_else(|| "application/x-www-form-urlencoded".to_owned()),
+        ),
+        Body::Bytes(_) => options.content_type.clone(),
+    };
+    let body = match &options.document_resource {
+        Body::Form(form) => {
+            let entries: Vec<(String, String)> = form
+                .0
+                .iter()
+                .map(|entry| (entry.name.clone(), entry.value.as_ref().to_owned()))
+                .collect();
+            forms::serialize_urlencoded(&entries).into_bytes()
+        }
+        Body::Bytes(bytes) => bytes.to_vec(),
+        Body::Empty => Vec::new(),
+    };
+    Some(MainDocPost { content_type, body })
 }
 
 /// `blitz_traits::net::NetWaker`: Blitz's own providers wake the doc client
@@ -2120,5 +2415,232 @@ mod tests {
         assert!(poll_inputs(-1, pipe.read_fd(), Duration::from_millis(0)));
         pipe.drain();
         assert!(!poll_inputs(-1, pipe.read_fd(), Duration::from_millis(0)));
+    }
+
+    // ------------------------------------------------------------------
+    // Form controls ("<input>, <button> do not work") — reproduction
+    // ------------------------------------------------------------------
+
+    const FORM_PAGE: &str = r#"<!doctype html>
+<html><head><title>Form</title></head>
+<body style="margin:0">
+  <input id="i" style="display:block;width:200px;height:40px">
+  <button id="b" style="display:block;width:100px;height:40px">Go</button>
+  <div id="out"></div>
+  <script>
+    var i = document.querySelector('#i');
+    var b = document.querySelector('#b');
+    var out = document.querySelector('#out');
+    b.addEventListener('click', function () { out.textContent = 'clicked:' + i.value; });
+  </script>
+</body></html>"#;
+
+    fn form_tab(dir: &std::path::Path) -> Tab {
+        let args = TabArgs {
+            tab_id: TabId(1),
+            container_id: ContainerId(1),
+            profile_dir: dir.to_path_buf(),
+            url: "about:blank".into(),
+            offline_fixtures: None,
+            net_policy: NetPolicy::Passthrough,
+            no_sandbox: true,
+        };
+        let pipe = Arc::new(SelfPipe::new().expect("pipe"));
+        Tab::new_headless(&args, pipe)
+    }
+
+    fn ptr(x: f32, y: f32, kind: PointerKind) -> ToTab {
+        ToTab::Pointer(PointerEvent { x, y, kind, button: ironsurf_common::MouseButton::Left })
+    }
+
+    /// Tag name of the currently focused node (if it is an element).
+    fn focused_tag(doc: &mut blitz_html::HtmlDocument) -> Option<blitz_dom::LocalName> {
+        let id = doc.get_focussed_node_id()?;
+        let node = doc.get_node(id)?;
+        Some(node.element_data()?.name.local.clone())
+    }
+
+    /// Live editor text of the currently focused text input.
+    fn focused_input_value(doc: &mut blitz_html::HtmlDocument) -> Option<String> {
+        let id = doc.get_focussed_node_id()?;
+        let node = doc.get_node(id)?;
+        let el = node.element_data()?;
+        Some(el.text_input_data()?.editor.raw_text().to_string())
+    }
+
+    /// Text content of the first element matching `selector`.
+    fn text_of(doc: &mut blitz_html::HtmlDocument, selector: &str) -> Option<String> {
+        let id = doc.query_selector(selector).ok()??;
+        Some(doc.get_node(id)?.text_content())
+    }
+
+    fn key(ch: char) -> ToTab {
+        ToTab::Key(KeyEvent {
+            key: ch.to_string(),
+            code: format!("Key{}", ch.to_ascii_uppercase()),
+            text: Some(ch.to_string()),
+            repeat: false,
+            mods: Modifiers::NONE,
+        })
+    }
+
+    /// Click the <input>, type "hi", click the <button>; the page's click
+    /// handler must run and report the typed value.
+    #[test]
+    fn repro_input_button_roundtrip() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let page = dir.path().join("f.html");
+        std::fs::write(&page, FORM_PAGE).expect("write page");
+        let mut tab = form_tab(dir.path());
+        tab.handle_to_tab(ToTab::Resize { width: 800, height: 600, scale: 1.0 });
+        tab.navigate(
+            url::Url::from_file_path(&page).expect("file url").as_str(),
+            NavHistory::Fresh,
+        );
+
+        // 1. Click the input (centre of the 200x40 box at the top-left).
+        tab.handle_to_tab(ptr(100.0, 20.0, PointerKind::Move));
+        tab.handle_to_tab(ptr(100.0, 20.0, PointerKind::Down));
+        tab.handle_to_tab(ptr(100.0, 20.0, PointerKind::Up));
+        let focused_is_input = tab
+            .document_mut()
+            .and_then(focused_tag)
+            .is_some_and(|name| name == blitz_dom::local_name!("input"));
+        assert!(focused_is_input, "clicking <input> must focus it");
+
+        // 2. Type "hi".
+        tab.handle_to_tab(key('h'));
+        tab.handle_to_tab(key('i'));
+        let value = tab.document_mut().and_then(focused_input_value);
+        assert_eq!(value.as_deref(), Some("hi"), "typing into the focused <input>");
+
+        // 3. Click the button (the 100x40 box under the input): its click
+        //    handler writes "clicked:hi" into #out.
+        tab.handle_to_tab(ptr(50.0, 60.0, PointerKind::Move));
+        tab.handle_to_tab(ptr(50.0, 60.0, PointerKind::Down));
+        tab.handle_to_tab(ptr(50.0, 60.0, PointerKind::Up));
+        let out_text = tab
+            .document_mut()
+            .and_then(|doc| text_of(doc, "#out"))
+            .unwrap_or_default();
+        assert_eq!(out_text, "clicked:hi", "<button> click handler must run with the live value");
+    }
+
+    // ------------------------------------------------------------------
+    // `<form>` end to end (task: `<form>`)
+    // ------------------------------------------------------------------
+
+    const SUBMIT_PAGE: &str = r#"<!doctype html>
+<html><head><title>F</title></head>
+<body style="margin:0">
+  <form action="out.html" method="get">
+    <input name="q" style="display:block;width:200px;height:40px">
+    <select name="where">
+      <option value="a" selected>A</option>
+      <option value="b">B</option>
+    </select>
+    <button type="submit" style="display:block">Go</button>
+  </form>
+</body></html>"#;
+
+    fn key_named(key: &str, code: &str) -> ToTab {
+        ToTab::Key(KeyEvent {
+            key: key.to_owned(),
+            code: code.to_owned(),
+            text: None,
+            repeat: false,
+            mods: Modifiers::NONE,
+        })
+    }
+
+    fn submit_tab(dir: &std::path::Path, page_html: &str) -> Tab {
+        std::fs::write(dir.join("index.html"), page_html).expect("write index");
+        std::fs::write(
+            dir.join("out.html"),
+            "<!doctype html><html><body><p>out</p></body></html>",
+        )
+        .expect("write out");
+        let args = TabArgs {
+            tab_id: TabId(1),
+            container_id: ContainerId(1),
+            profile_dir: dir.to_path_buf(),
+            url: "about:blank".into(),
+            offline_fixtures: None,
+            net_policy: NetPolicy::Passthrough,
+            no_sandbox: true,
+        };
+        let pipe = Arc::new(SelfPipe::new().expect("pipe"));
+        let mut tab = Tab::new_headless(&args, pipe);
+        tab.handle_to_tab(ToTab::Resize {
+            width: 800,
+            height: 600,
+            scale: 1.0,
+        });
+        tab.navigate(
+            url::Url::from_file_path(dir.join("index.html"))
+                .expect("file url")
+                .as_str(),
+            NavHistory::Fresh,
+        );
+        tab
+    }
+
+    /// Enter in the form's only text field submits it — with the *typed*
+    /// value and the selected `<option>` (which blitz's own entry list
+    /// forgets) — and the GET navigation against a `file:` action works
+    /// (which blitz drops entirely).
+    #[test]
+    fn implicit_enter_get_submits_selects_and_navigates() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut tab = submit_tab(dir.path(), SUBMIT_PAGE);
+
+        tab.handle_to_tab(ptr(100.0, 20.0, PointerKind::Move));
+        tab.handle_to_tab(ptr(100.0, 20.0, PointerKind::Down));
+        tab.handle_to_tab(ptr(100.0, 20.0, PointerKind::Up));
+        tab.handle_to_tab(key('h'));
+        tab.handle_to_tab(key('i'));
+        tab.handle_to_tab(key_named("Enter", "Enter"));
+        assert!(tab.drain_nav_hook(), "the Enter press submits the form");
+
+        let url = tab
+            .document_mut()
+            .map(|doc| doc.url().as_str().to_owned())
+            .unwrap_or_default();
+        let base = url::Url::from_file_path(dir.path().join("out.html")).expect("file url");
+        assert_eq!(
+            url,
+            format!("{}?q=hi&where=a", base.as_str()),
+            "the Enter-submitted GET carries the typed value and the selected option"
+        );
+        let body = tab
+            .document_mut()
+            .and_then(|doc| text_of(doc, "p"))
+            .unwrap_or_default();
+        assert_eq!(body, "out", "the submitted document was loaded");
+    }
+
+    /// A POST to a local scheme has nowhere to put its body: honest status,
+    /// no navigation, the page stays put.
+    #[test]
+    fn post_to_a_local_scheme_is_refused_honestly() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let page = SUBMIT_PAGE.replace("method=\"get\"", "method=\"post\"");
+        let mut tab = submit_tab(dir.path(), &page);
+
+        tab.handle_to_tab(ptr(100.0, 20.0, PointerKind::Move));
+        tab.handle_to_tab(ptr(100.0, 20.0, PointerKind::Down));
+        tab.handle_to_tab(ptr(100.0, 20.0, PointerKind::Up));
+        tab.handle_to_tab(key('h'));
+        tab.handle_to_tab(key_named("Enter", "Enter"));
+        assert!(tab.drain_nav_hook(), "the submission is drained");
+
+        let url = tab
+            .document_mut()
+            .map(|doc| doc.url().as_str().to_owned())
+            .unwrap_or_default();
+        assert!(
+            url.ends_with("index.html"),
+            "no navigation happened for a POST to file:: {url}"
+        );
     }
 }

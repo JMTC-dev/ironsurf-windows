@@ -298,7 +298,15 @@ pub fn internal_page_bytes(url: &Url) -> Option<Vec<u8>> {
     let page = internal_page_name(url);
     let shown = escape_html_text(url.as_str());
     let html = if page == "welcome" || page.is_empty() {
-        WELCOME_PAGE.replace("{url}", &shown)
+        // The welcome page doubles as the form demo: it echoes whatever
+        // query string a GET submission against it carried.
+        let query = match url.query() {
+            Some(q) if !q.is_empty() => escape_html_text(&q.replace('+', " ")),
+            _ => "nothing yet".to_owned(),
+        };
+        WELCOME_PAGE
+            .replace("{url}", &shown)
+            .replace("{query}", &query)
     } else {
         INTERNAL_NOT_FOUND
             .replace("{page}", &escape_html_text(&page))
@@ -352,6 +360,25 @@ const WELCOME_PAGE: &str = r#"<!doctype html>
   <p>Typed <code>host/path</code> navigations are upgraded to HTTPS; an upgrade
      that fails is <em>blocked</em>, not silently downgraded. Internal
      <code>ironsurf://</code> pages like this one never touch the network.</p>
+
+  <h2>Try a form</h2>
+  <p>HTML forms work end to end &mdash; text fields, selects, checkboxes,
+     radios, textareas, GET and POST. This page answers submissions itself:
+     press Search and the browser builds the entry list and re-navigates with
+     your values as a query string.</p>
+  <form method="get">
+    <p>
+      <input type="text" name="q" value="hello" size="18">
+      <select name="where">
+        <option value="everywhere" selected>everywhere</option>
+        <option value="internal">internal pages</option>
+        <option value="nothing">nowhere</option>
+      </select>
+      <input type="checkbox" name="safe" value="on" checked>
+      <button type="submit">Search</button>
+    </p>
+  </form>
+  <p>You submitted: <code>{query}</code></p>
 
   <p class="foot">You are looking at <code>{url}</code> &mdash; a page built into
      the tab process. It is the default start page.</p>
@@ -724,21 +751,51 @@ pub fn deliver(handler: Option<Box<dyn NetHandler>>, resolved_url: String, bytes
     }
 }
 
-/// Plain (`Passthrough`) HTTP GET: our User-Agent plus whatever the Blitz
-/// `Request` carried; no cookies, no cache.
+/// A main-document `POST` (an HTML form submission): the encoded body and
+/// the enctype we are sending it as. `None` everywhere below means GET.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MainDocPost {
+    pub content_type: Option<String>,
+    pub body: Vec<u8>,
+}
+
+/// Build the request line: GET, or POST with the form body (and its
+/// `Content-Type`) riding along.
+fn build_request(
+    client: &reqwest::blocking::Client,
+    url: &Url,
+    post: Option<&MainDocPost>,
+) -> reqwest::blocking::RequestBuilder {
+    match post {
+        Some(body) => {
+            let req = client.post(url.as_str()).body(body.body.clone());
+            match &body.content_type {
+                Some(content_type) => req.header(reqwest::header::CONTENT_TYPE, content_type.as_str()),
+                None => req,
+            }
+        }
+        None => client.get(url.as_str()),
+    }
+}
+
+/// Plain (`Passthrough`) HTTP fetch (GET, or a form `POST` with `post`):
+/// our User-Agent plus whatever the Blitz `Request` carried; no cookies, no
+/// cache — and a POST never consults the cache either.
 pub fn plain_http_fetch(
     client: &reqwest::blocking::Client,
     url: &Url,
     extra: Option<&HeaderMap>,
+    post: Option<&MainDocPost>,
 ) -> Result<FetchOutcome, String> {
-    let mut req = client.get(url.as_str()).header("User-Agent", USER_AGENT);
+    let verb = if post.is_some() { "POST" } else { "GET" };
+    let mut req = build_request(client, url, post).header("User-Agent", USER_AGENT);
     if let Some(headers) = extra {
         if !headers.is_empty() {
             req = req.headers(headers.clone());
         }
     }
     let response = req.send().map_err(|e| {
-        warn!("passthrough GET {url} failed: {e}");
+        warn!("passthrough {verb} {url} failed: {e}");
         format!("fetch {url}: {e}")
     })?;
     let status = response.status().as_u16();
@@ -748,7 +805,7 @@ pub fn plain_http_fetch(
         .bytes()
         .map(|b| b.to_vec())
         .map_err(|e| format!("body {url}: {e}"))?;
-    debug!("GET {url} -> {status} ({} B, passthrough)", body.len());
+    debug!("{verb} {url} -> {status} ({} B, passthrough)", body.len());
     Ok(FetchOutcome {
         final_url,
         status,
@@ -758,11 +815,13 @@ pub fn plain_http_fetch(
     })
 }
 
-/// Managed HTTP GET: injects the container jar's `Cookie` header, sends the
-/// cached entry's `If-None-Match`/`If-Modified-Since` validators, captures
-/// every `Set-Cookie` (against the **final** URL) and serves/stores
-/// [`NetCache`] entries. `extra` (from the Blitz `Request`) never overrides
-/// our `Cookie` header.
+/// Managed HTTP fetch (GET, or a form `POST` with `post`): injects the
+/// container jar's `Cookie` header, sends the cached entry's
+/// `If-None-Match`/`If-Modified-Since` validators, captures every
+/// `Set-Cookie` (against the **final** URL) and serves/stores [`NetCache`]
+/// entries. A `POST` consults and mutates the cache **never** (it is not a
+/// safe method), but gets the full cookie treatment. `extra` (from the Blitz
+/// `Request`) never overrides our `Cookie` header.
 pub fn managed_http_fetch(
     client: &reqwest::blocking::Client,
     url: &Url,
@@ -770,8 +829,10 @@ pub fn managed_http_fetch(
     cache: &NetCache,
     now: i64,
     extra: Option<&HeaderMap>,
+    post: Option<&MainDocPost>,
 ) -> Result<FetchOutcome, String> {
-    let mut req = client.get(url.as_str()).header("User-Agent", USER_AGENT);
+    let is_post = post.is_some();
+    let mut req = build_request(client, url, post).header("User-Agent", USER_AGENT);
     if let Some(headers) = extra {
         for (name, value) in headers {
             if name.as_str().eq_ignore_ascii_case("cookie") {
@@ -784,10 +845,15 @@ pub fn managed_http_fetch(
         req = req.header(reqwest::header::COOKIE, cookie);
     }
 
-    let cached = cache.lookup(url.as_str());
-    if cached.is_some() {
-        debug!("cache entry for {url}: revalidating");
-    }
+    let cached = if is_post {
+        None // POSTs bypass the cache entirely (lookup and store).
+    } else {
+        let cached = cache.lookup(url.as_str());
+        if cached.is_some() {
+            debug!("cache entry for {url}: revalidating");
+        }
+        cached
+    };
     if let Some(entry) = cached.as_ref() {
         let (etag, last_modified) = validators(&entry.headers);
         if let Some(etag) = etag {
@@ -857,9 +923,11 @@ pub fn managed_http_fetch(
             })
         }
         Revalidate::UseFresh { .. } => {
-            if status < 400 {
+            if !is_post && status < 400 {
                 debug!("GET {url} -> {status} ({} B, stored in cache)", body.len());
                 cache.store(url.as_str(), status, &headers, body.clone(), now);
+            } else if is_post {
+                debug!("POST {url} -> {status} ({} B, never cached)", body.len());
             } else {
                 debug!("GET {url} -> {status} ({} B, not cacheable)", body.len());
             }
@@ -958,9 +1026,9 @@ impl BlitzNetProvider {
             let outcome = if managed {
                 let mut jar = jar.lock().expect("jar mutex poisoned");
                 let cache = cache.lock().expect("cache mutex poisoned");
-                managed_http_fetch(worker.client(), &url, &mut jar, &cache, now_unix(), None)
+                managed_http_fetch(worker.client(), &url, &mut jar, &cache, now_unix(), None, None)
             } else {
-                plain_http_fetch(worker.client(), &url, Some(&request.headers))
+                plain_http_fetch(worker.client(), &url, Some(&request.headers), None)
             };
             // Same as upstream blitz-net: wake the doc thread even on error,
             // and drop the handler when the fetch failed (no error path).
@@ -1154,18 +1222,40 @@ pub fn fetch_document(
     cache: &NetCache,
     now: i64,
 ) -> Result<DocFetch, NetError> {
+    fetch_document_post(url, None, policy, jar, cache, now)
+}
+
+/// [`fetch_document`] with an HTML form submission's POST body attached
+/// (`post = Some(..)`): only http(s) accepts a POST; every local scheme
+/// (`file:`/`about:`/`data:`/`ironsurf:`) is answered as GET and refuses a
+/// POST body outright, so the caller (the tab's form layer) routes those
+/// before ever calling here.
+pub fn fetch_document_post(
+    url: &Url,
+    post: Option<&MainDocPost>,
+    policy: NetPolicy,
+    jar: &mut CookieJar,
+    cache: &NetCache,
+    now: i64,
+) -> Result<DocFetch, NetError> {
     let worker = shared_worker();
-    fetch_document_with_worker(url, policy, jar, cache, now, &worker)
+    fetch_document_with_worker(url, post, policy, jar, cache, now, &worker)
 }
 
 fn fetch_document_with_worker(
     url: &Url,
+    post: Option<&MainDocPost>,
     policy: NetPolicy,
     jar: &mut CookieJar,
     cache: &NetCache,
     now: i64,
     worker: &FetchWorker,
 ) -> Result<DocFetch, NetError> {
+    if post.is_some() && !is_http_scheme(url) {
+        // Defensive: a body to a local scheme has nowhere to go.
+        warn!("refusing to POST to non-http scheme: {url}");
+        return Err(NetError::Unsupported { url: url.clone() });
+    }
     // Local schemes: identical under both policies.
     match url.scheme() {
         "file" => {
@@ -1225,7 +1315,7 @@ fn fetch_document_with_worker(
 
     match plan(policy, url, true) {
         // Escape hatch keeps working: passthrough fetches exactly what was asked.
-        Plan::Pass => plain_http_fetch(worker.client(), url, None)
+        Plan::Pass => plain_http_fetch(worker.client(), url, None, post)
             .map(|o| DocFetch {
                 url: o.final_url,
                 status: o.status,
@@ -1235,19 +1325,21 @@ fn fetch_document_with_worker(
                 url: url.clone(),
                 message,
             }),
-        Plan::Fetch(target) => managed_http_fetch(worker.client(), &target, jar, cache, now, None)
-            .map(|o| DocFetch {
-                url: o.final_url,
-                status: o.status,
-                body: o.body,
-            })
-            .map_err(|message| NetError::Transport {
-                url: url.clone(),
-                message,
-            }),
+        Plan::Fetch(target) => {
+            managed_http_fetch(worker.client(), &target, jar, cache, now, None, post)
+                .map(|o| DocFetch {
+                    url: o.final_url,
+                    status: o.status,
+                    body: o.body,
+                })
+                .map_err(|message| NetError::Transport {
+                    url: url.clone(),
+                    message,
+                })
+        }
         Plan::Upgrade(https) => {
             debug!("https-upgrade: {url} -> {https}");
-            match managed_http_fetch(worker.client(), &https, jar, cache, now, None) {
+            match managed_http_fetch(worker.client(), &https, jar, cache, now, None, post) {
                 Ok(o) => Ok(DocFetch {
                     url: o.final_url,
                     status: o.status,
@@ -1648,6 +1740,7 @@ mod tests {
         for policy in [NetPolicy::Passthrough, NetPolicy::Managed] {
             let doc = fetch_document_with_worker(
                 &file_url,
+                None,
                 policy,
                 &mut jar,
                 &cache,
@@ -1663,6 +1756,7 @@ mod tests {
         // about: built-ins.
         let doc = fetch_document_with_worker(
             &url("about:ironsurf"),
+            None,
             NetPolicy::Managed,
             &mut jar,
             &cache,
@@ -1676,6 +1770,7 @@ mod tests {
         // upgraded, never on the wire, URL round-trips for UrlChanged.
         let doc = fetch_document_with_worker(
             &url("ironsurf://welcome"),
+            None,
             NetPolicy::Managed,
             &mut jar,
             &cache,
@@ -1690,6 +1785,7 @@ mod tests {
         // Unsupported schemes are refused, not fetched.
         let err = fetch_document_with_worker(
             &url("javascript:alert(1)"),
+            None,
             NetPolicy::Managed,
             &mut jar,
             &cache,
@@ -1713,6 +1809,7 @@ mod tests {
         let http = url("http://127.0.0.1:1/");
         let err = fetch_document_with_worker(
             &http,
+            None,
             NetPolicy::Managed,
             &mut jar,
             &cache,
@@ -1744,6 +1841,7 @@ mod tests {
         // Passthrough to the same dead port is a plain transport error.
         let err = fetch_document_with_worker(
             &http,
+            None,
             NetPolicy::Passthrough,
             &mut jar,
             &cache,

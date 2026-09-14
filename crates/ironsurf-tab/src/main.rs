@@ -8,6 +8,7 @@
 //! semantics land in task 7d). The standalone render spike ([`spike`]) is
 //! kept behind `--spike`.
 
+mod forms;
 mod headless;
 mod js;
 mod netmod;

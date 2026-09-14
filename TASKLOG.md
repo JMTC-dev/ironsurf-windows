@@ -81,3 +81,13 @@ New/Move tab/Delete/Ren clicks (only ever fired mgr-select). selta moved first i
 buttons clickable, row still selects. Same latent bug fixed in tab strip: tabta after xt killed the ✕ —
 tabta first, ✕ in a glyph-sized Rectangle (bare TouchArea would fill the tab). Verified live on :2.0
 via xdotool: New spawns tab 2, row-click selects, ＋ works, ✕ closes; shell suite green.
+## #20 HTML <form> end to end — new src/forms.rs: spec entry list (tree order, form=/ancestor
+owner, disabled/nameless/datalist out, checkbox/radio checkedness, live editor text, select
+selectedness), GET query / POST bodies per enctype (urlencoded, text/plain, multipart), triggers
+= armed submit press finalised on release (JS click preventDefault cancels; our entry list
+replaces blitz's select-less one) + implicit Enter (not fed to blitz); selects clickable
+(selected attr+highlight, value attr synced), prepare_document seeds textarea editors; POST rides
+netmod::fetch_document_post/MainDocPost (real POST, never cached); GET works for file:/ironsurf:
+(blitz drops), POST to local schemes = honest status; JS events replay via __ironsurfFire
+(mousedown/up/click, keydown/up) + .value/.checked bindings (live editor); welcome page is a
+working form demo echoing its query. 88u + all integration suites green; ARCH §HTML forms.
