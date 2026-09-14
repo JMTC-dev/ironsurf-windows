@@ -35,10 +35,13 @@
 //! executes the due callbacks, then settle + coalesced repaint exactly like
 //! the input path. A throwing callback is reported like a script error and
 //! never stops later timers or the tab. A script's `document.title = …`
-//! becomes `FromTab::TitleChanged` + a repaint; script errors, refused
-//! `location` writes and `console.*` output become `FromTab::StatusText`.
-//! `javascript:` URLs are refused at [`Tab::navigate`], the single navigation
-//! entry point.
+//! becomes `FromTab::TitleChanged` + a repaint; script errors and
+//! `console.*` output become `FromTab::StatusText`. JS-driven navigation is
+//! real: `location.href=`/`assign`/`replace` queue a load the poll loop
+//! follows via [`Tab::drain_nav_hook`] (search-engine redirects), and
+//! `javascript:` URLs run as programs at [`Tab::navigate`] — the single
+//! navigation entry point — with a string completion value becoming a new
+//! `about:blank` document (per spec).
 //!
 //! `data:` URLS: a fetched `data:` document goes through [`render_document`]
 //! before it reaches the HTML parser, so `data:text/javascript;base64,…` (and
@@ -330,6 +333,23 @@ fn apply_sandbox(args: &TabArgs) {
 /// Resolve shell-provided URL text: parse as-is; if that fails and the text
 /// looks like a bare host (no whitespace), assume `https://…` — the same
 /// search-or-navigate leniency the shell applies.
+/// A `javascript:` URL's program text (case-insensitive scheme, surrounding
+/// whitespace stripped), percent-decoded the way a browser decodes a URL
+/// before treating it as code. `None` for anything else — every other scheme
+/// keeps going through [`parse_input_url`]/the fetch path.
+fn javascript_url_code(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    if trimmed
+        .get(.."javascript:".len())?
+        .eq_ignore_ascii_case("javascript:")
+    {
+        let body = &trimmed["javascript:".len()..];
+        let code = String::from_utf8_lossy(&netmod::percent_decode(body.as_bytes())).into_owned();
+        return Some(code);
+    }
+    None
+}
+
 pub fn parse_input_url(input: &str) -> Result<Url, Box<dyn Error>> {
     match Url::parse(input) {
         Ok(url) => Ok(url),
@@ -459,8 +479,8 @@ pub struct Tab {
     /// `document.title` as last assigned by page JavaScript (task 8). Wins over
     /// the `ShellProvider`/`<title>` node sources while the document is live.
     js_title: Option<String>,
-    /// Status text raised by the script run (errors, refused `location` writes,
-    /// `console.*`), emitted once per navigation after the load-finished clear.
+    /// Status text raised by the script run (errors, `console.*`), emitted
+    /// once per navigation after the load-finished clear.
     js_status: Option<String>,
     /// The document's JavaScript world (task: real timers): Context + host +
     /// live timer queue, alive for the lifetime of the document so callbacks
@@ -669,6 +689,16 @@ impl Tab {
             "navigate \"{raw}\" ({history:?}{})",
             if post.is_some() { ", form POST" } else { "" }
         );
+        // `javascript:` is never fetched: the text after the scheme is a
+        // program for the current page's JS world (address bar, `<a href>`,
+        // or a page's own `location.href = "javascript:…"`). Checked on the
+        // raw text, before parsing: a URL-bar program contains whitespace,
+        // which `Url::parse`/`parse_input_url` would reject.
+        if let Some(code) = javascript_url_code(raw) {
+            // (Session history is left alone: a `javascript:` program never
+            // becomes a history entry.)
+            return self.run_javascript_url(&code);
+        }
         let url = match parse_input_url(raw) {
             Ok(url) => url,
             Err(err) => {
@@ -679,14 +709,6 @@ impl Tab {
                 return false;
             }
         };
-        if url.scheme() == "javascript" {
-            // Contract: javascript: URLs are refused with a status text.
-            warn!("refused javascript: URL {raw}");
-            self.emit(FromTab::StatusText {
-                text: Some(format!("refused javascript: URL {raw}")),
-            });
-            return false;
-        }
         if history == NavHistory::Fresh {
             self.history.truncate(self.history_index + 1);
         }
@@ -978,6 +1000,120 @@ impl Tab {
         self.settle();
         self.consume_js_status(extraction.notes.first().cloned(), &errors);
         self.take_js_title();
+    }
+
+    /// Run a `javascript:` URL's program (task: JS-driven navigation): the
+    /// code executes in the **current document's** JS world (same realm, same
+    /// live DOM — which is exactly what makes bookmarklets work in every
+    /// browser). A string completion value becomes a brand-new `about:blank`
+    /// document at the current history
+    /// entry (browser/spec behaviour); `undefined` changes nothing; a thrown
+    /// exception is reported like any script error. Never touches the
+    /// network, never kills the tab.
+    fn run_javascript_url(&mut self, code: &str) -> bool {
+        if code.trim().is_empty() {
+            return true; // `javascript:` alone is a no-op everywhere
+        }
+        if self.js.is_none() {
+            warn!("javascript: URL with no page to run it in");
+            self.emit(FromTab::StatusText {
+                text: Some("javascript: URL: no page is loaded to run it in".to_string()),
+            });
+            return false;
+        }
+        info!("running javascript: URL program ({} B)", code.len());
+        let outcome = {
+            let runtime = self.js.as_mut().expect("js world checked above");
+            runtime.eval_javascript_url(code, self.doc.as_mut())
+        };
+        match outcome {
+            Ok(Some(body)) => {
+                // The string becomes the document (per spec) at `about:blank`,
+                // replacing the current history entry; the program's other
+                // side effects die with the document it mutated.
+                let blank = Url::parse("about:blank").expect("about:blank parses");
+                let history = if self.history.is_empty() {
+                    NavHistory::Fresh
+                } else {
+                    NavHistory::Session(self.history_index)
+                };
+                self.load_html(&blank, &body, history);
+                self.emit_js_status();
+                true
+            }
+            Ok(None) => {
+                // The program may have mutated the DOM/title: same settle +
+                // repaint shape a timer batch gets.
+                self.settle();
+                self.needs_paint = true;
+                self.consume_js_status(None, &[]);
+                self.take_js_title();
+                self.check_meta();
+                self.maybe_repaint();
+                self.emit_js_status();
+                true
+            }
+            Err(err) => {
+                self.settle();
+                self.consume_js_status(None, &[err]);
+                self.take_js_title();
+                self.check_meta();
+                self.maybe_repaint();
+                self.emit_js_status();
+                false
+            }
+        }
+    }
+
+    /// Follow the navigation the current document's scripts queued during
+    /// the last JS turn (`location.href=`/`assign`/`replace`/`reload`) —
+    /// search-engine redirect pages live this way. Relative targets resolve
+    /// against the document URL; a `javascript:` target runs as a program.
+    /// Called from [`Tab::drain_nav_hook`], i.e. from the poll loop, never
+    /// from inside the stack that queued it (a self-redirecting page spins
+    /// the loop like any browser's redirect loop; it cannot grow the stack).
+    fn follow_pending_js_nav(&mut self) -> bool {
+        let Some(nav) = self
+            .js
+            .as_ref()
+            .and_then(|runtime| runtime.take_pending_navigation())
+        else {
+            return false;
+        };
+        if let Some(code) = javascript_url_code(&nav.target) {
+            return self.run_javascript_url(&code);
+        }
+        // Resolve against the live document URL (fall back to the history
+        // entry we are showing, same precedence as `check_meta`).
+        let base = self
+            .doc
+            .as_ref()
+            .map(|doc| doc.url().clone())
+            .or_else(|| self.history.get(self.history_index).cloned());
+        let resolved = match base.as_ref().and_then(|base| base.join(&nav.target).ok()) {
+            Some(url) => url,
+            None => {
+                warn!("js navigation to {:?} did not resolve", nav.target);
+                self.emit(FromTab::StatusText {
+                    text: Some(format!("invalid navigation target {}", nav.target)),
+                });
+                return true;
+            }
+        };
+        info!(
+            "following js navigation → {resolved} ({})",
+            if nav.replace {
+                "replace entry"
+            } else {
+                "push entry"
+            }
+        );
+        let history = if nav.replace && !self.history.is_empty() {
+            NavHistory::Session(self.history_index)
+        } else {
+            NavHistory::Fresh
+        };
+        self.navigate_post(resolved.as_str(), history, None)
     }
 
     /// Fold the JS host cell's side effects (console output, notes) and these
@@ -1737,7 +1873,9 @@ impl Tab {
     /// (task: `<form>` — resolved by the form layer from a submit press or an
     /// implicit Enter), then the `NavigationProvider` hook (link clicks, and
     /// — as a backstop — any blitz-side submission that slips through, whose
-    /// POST body is honoured here rather than dropped).
+    /// POST body is honoured here rather than dropped), and finally the page's
+    /// own queued JS navigation (`location.href=`/`assign`/`replace`/`reload`;
+    /// task: JS-driven navigation).
     fn drain_nav_hook(&mut self) -> bool {
         // A press that never got its release is not a click; forget it.
         self.form_press = None;
@@ -1759,7 +1897,9 @@ impl Tab {
             }
             return true;
         }
-        false
+        // 3. The page's own navigation request (`location.href=`/`assign`/
+        //    `replace`/`reload` from scripts, timers, or event handlers).
+        self.follow_pending_js_nav()
     }
 
     /// Act on a submission the form layer resolved: POST only goes to the

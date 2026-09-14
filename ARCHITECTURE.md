@@ -371,7 +371,15 @@ are a deliberately tiny surface (no engine-internal DOM mutation yet):
   and repaint), `document.body.textContent` read-only snapshot,
   `console.log/info/warn/error` → tab stderr + `FromTab::StatusText`.
 - Script exceptions must never kill the tab: catch, report via StatusText, continue.
-- `javascript:` URLs are refused (status text), matching the shell contract.
+- **JS-driven navigation is implemented**: `location.href=`/`assign`/`replace`/`reload` queue a
+  real navigation (`HostState::pending_nav`) that the tab's poll loop follows through its single
+  navigation entry point after each JS turn — `assign`/`href=` push history, `replace`/`reload`
+  replace the current entry, relative targets resolve against the document URL (this is how
+  search-engine JS redirect pages get followed). `javascript:` URLs are *executed* in the current
+  document's realm (address bar, `<a href>`, or a `location` write), and a string completion
+  value becomes a new `about:blank` document at the current history entry (browser/spec
+  behaviour); `undefined` changes nothing; a throw is reported like any script error. Matching
+  the shell contract, which passes `javascript:` text through to the tab.
 
 ### HTML forms (`src/forms.rs`)
 Blitz parses forms but its submission algorithm is incomplete (`<select>` values are a TODO in
@@ -448,8 +456,8 @@ Process/tab management (`src/tabs.rs`):
   `data:` (whose base64 payloads never look like a host, e.g. `data:text/javascript;base64,…`),
   `ironsurf://` (the internal pages — the host has no dot, so without the scheme match
   `ironsurf://welcome` would silently become a search) and
-  `javascript:` — the last is handed to the tab, which refuses it by contract, so the refusal is
-  visible instead of silently becoming a search.
+  `javascript:` — the last is handed to the tab, which *runs it* as a program in the current
+  page (never a fetch, never a history entry), instead of silently becoming a search.
 - Container default from registry; per-container "remember last chosen container for new tabs"
   in `~/.local/share/ironsurf/ui.json` (best-effort).
 

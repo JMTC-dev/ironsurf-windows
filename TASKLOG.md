@@ -1,4 +1,11 @@
 # Task log
+## #25 JS-driven navigation implemented (was: refused) — location.href=/assign/replace/reload queue
+js::PendingNav on HostState via __ironsurfNavigate (glue location also gained real protocol/host/
+hostname/pathname/search/hash getters); Tab::drain_nav_hook follows it after every JS turn (relative
+resolve vs doc URL; replace→Session(idx) history); javascript: URLs execute in the live page realm
+(run_javascript_url, pre-parse raw check + percent-decode) with string completion value → new
+about:blank doc replacing the entry (spec); netmod still never *fetches* javascript:; 4 e2e green
+(in-page exec, string→doc, href-push+Back, replace-hides-referrer) + js unit tests; ARCH/docs synced.
 ## #24 search engine → https://html.duckduckgo.com/html/?q= (was duckduckgo.com/?q=) — classify::search_url +
 all test expectations + gui.rs + ARCH §URL-bar updated; ironsurf-shell suite green (26u + gui/e2e).
 ## #23 cookies actually returned to sites — navigations are never cookie-less: plan_document (old plan dropped)

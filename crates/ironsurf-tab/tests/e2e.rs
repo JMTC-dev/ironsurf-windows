@@ -806,10 +806,11 @@ fn tab_survives_script_syntax_error() {
     exit_cleanly(&mut tab);
 }
 
-/// Task 8 / shell contract: `javascript:` URLs are refused at the navigation
-/// entry point with a status text — never executed, never navigated to.
+/// Shell contract (JS-driven navigation): a `javascript:` URL typed into the
+/// address bar runs as a program in the current page's JS world — here it
+/// rewrites the title in place; the document URL never becomes `javascript:`.
 #[test]
-fn tab_refuses_javascript_url_navigation() {
+fn tab_executes_javascript_url_in_the_page() {
     let dir = tempfile::tempdir().expect("tempdir");
     let profile = dir.path().join("profile");
     std::fs::create_dir_all(&profile).expect("profile dir");
@@ -821,21 +822,21 @@ fn tab_refuses_javascript_url_navigation() {
     let mut seen = Vec::new();
 
     tab.wait_for(
-        "UrlChanged(index.html) before the refusal",
+        "UrlChanged(index.html) before the program runs",
         |m| matches!(m, FromTab::UrlChanged { url: Some(u) } if u.ends_with("/index.html")),
         deadline,
         &mut seen,
     );
 
     tab.send(ToTab::Navigate {
-        url: "javascript:document.title='pwned'".to_string(),
+        url: "javascript:document.title='pwned'; void(0)".to_string(),
     });
     let after = tab.collect(Duration::from_millis(1500));
     assert!(
         after
             .iter()
-            .any(|m| matches!(m, FromTab::StatusText { text: Some(t) } if t.contains("refused javascript:"))),
-        "no refusal status text for a javascript: URL: {after:?}"
+            .any(|m| matches!(m, FromTab::TitleChanged { title: Some(t) } if t == "pwned")),
+        "the javascript: URL program did not run: {after:?}"
     );
     assert!(
         !after.iter().any(
@@ -844,16 +845,159 @@ fn tab_refuses_javascript_url_navigation() {
         "the tab navigated to a javascript: URL: {after:?}"
     );
     assert!(
-        !after
-            .iter()
-            .any(|m| matches!(m, FromTab::TitleChanged { title: Some(t) } if t == "pwned")),
-        "the javascript: URL was executed, not refused: {after:?}"
+        tab.child.try_wait().expect("try_wait").is_none(),
+        "executing a javascript: URL killed the tab"
+    );
+
+    exit_cleanly(&mut tab);
+}
+
+/// …and a string completion value becomes a brand-new document at
+/// `about:blank` (browser/spec behaviour), not an in-place no-op.
+#[test]
+fn tab_renders_javascript_url_string_result_as_a_document() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let profile = dir.path().join("profile");
+    std::fs::create_dir_all(&profile).expect("profile dir");
+    let fixture = profile.join("index.html");
+    std::fs::write(&fixture, FIXTURE).expect("write fixture");
+
+    let deadline = Instant::now() + DEADLINE;
+    let mut tab = spawn_tab(&fixture, &profile);
+    let mut seen = Vec::new();
+
+    tab.wait_for(
+        "UrlChanged(index.html) before the program runs",
+        |m| matches!(m, FromTab::UrlChanged { url: Some(u) } if u.ends_with("/index.html")),
+        deadline,
+        &mut seen,
+    );
+
+    tab.send(ToTab::Navigate {
+        url: "javascript:'<title>from-js</title><h1>hi</h1>'".to_string(),
+    });
+    tab.wait_for(
+        "UrlChanged(about:blank) for the generated document",
+        |m| matches!(m, FromTab::UrlChanged { url: Some(u) } if u == "about:blank"),
+        deadline,
+        &mut seen,
+    );
+    tab.wait_for(
+        "TitleChanged(from-js) from the generated document",
+        |m| matches!(m, FromTab::TitleChanged { title: Some(t) } if t == "from-js"),
+        deadline,
+        &mut seen,
+    );
+
+    exit_cleanly(&mut tab);
+}
+
+/// Shell contract (JS-driven navigation): a search-engine-style redirect
+/// page — `location.href = "second.html"` from a page script — is followed
+/// by the tab, pushes a history entry, and Back still returns to the
+/// referring page.
+const JS_REDIRECT_PUSH_PAGE: &str = r#"<!doctype html>
+<html>
+  <head><title>Redirecting</title></head>
+  <body style="margin: 0; background: #ffffff">
+    <script>location.href = "second.html";</script>
+  </body>
+</html>
+"#;
+
+/// `location.replace` variant: the redirecting page never stays in history.
+const JS_REDIRECT_REPLACE_PAGE: &str = r#"<!doctype html>
+<html>
+  <head><title>Redirecting</title></head>
+  <body style="margin: 0; background: #ffffff">
+    <script>location.replace("final.html");</script>
+  </body>
+</html>
+"#;
+
+const JS_REDIRECT_TARGET: &str = r#"<!doctype html>
+<html>
+  <head><title>Arrived</title></head>
+  <body style="margin: 0; background: #00ff00"></body>
+</html>
+"#;
+
+#[test]
+fn tab_follows_js_location_href_push() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let profile = dir.path().join("profile");
+    std::fs::create_dir_all(&profile).expect("profile dir");
+    std::fs::write(profile.join("second.html"), JS_REDIRECT_TARGET).expect("target");
+    let fixture = profile.join("redirect-push.html");
+    std::fs::write(&fixture, JS_REDIRECT_PUSH_PAGE).expect("fixture");
+
+    let deadline = Instant::now() + DEADLINE;
+    let mut tab = spawn_tab(&fixture, &profile);
+    let mut seen = Vec::new();
+
+    tab.wait_for(
+        "UrlChanged(second.html) from the script's location.href",
+        |m| matches!(m, FromTab::UrlChanged { url: Some(u) } if u.ends_with("/second.html")),
+        deadline,
+        &mut seen,
+    );
+    tab.wait_for(
+        "TitleChanged(\"Arrived\")",
+        |m| matches!(m, FromTab::TitleChanged { title: Some(t) } if t == "Arrived"),
+        deadline,
+        &mut seen,
+    );
+    // `href=` pushed an entry: Back returns to the redirecting page.
+    tab.send(ToTab::Back);
+    tab.wait_for_new(
+        "UrlChanged back to the referring page",
+        |m| matches!(m, FromTab::UrlChanged { url: Some(u) } if u.ends_with("/redirect-push.html")),
+        deadline,
+        &mut seen,
     );
     assert!(
         tab.child.try_wait().expect("try_wait").is_none(),
-        "a refused javascript: URL killed the tab"
+        "a js-driven redirect killed the tab"
     );
+    exit_cleanly(&mut tab);
+}
 
+#[test]
+fn tab_follows_js_location_replace() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let profile = dir.path().join("profile");
+    std::fs::create_dir_all(&profile).expect("profile dir");
+    std::fs::write(profile.join("final.html"), JS_REDIRECT_TARGET).expect("target");
+    let fixture = profile.join("redirect-replace.html");
+    std::fs::write(&fixture, JS_REDIRECT_REPLACE_PAGE).expect("fixture");
+
+    let deadline = Instant::now() + DEADLINE;
+    let mut tab = spawn_tab(&fixture, &profile);
+    let mut seen = Vec::new();
+
+    tab.wait_for(
+        "UrlChanged(final.html) from location.replace",
+        |m| matches!(m, FromTab::UrlChanged { url: Some(u) } if u.ends_with("/final.html")),
+        deadline,
+        &mut seen,
+    );
+    tab.wait_for(
+        "TitleChanged(\"Arrived\")",
+        |m| matches!(m, FromTab::TitleChanged { title: Some(t) } if t == "Arrived"),
+        deadline,
+        &mut seen,
+    );
+    // `replace` overwrote the current entry: Back cannot return to the
+    // redirecting page (the entry under index 0 is the target itself).
+    tab.send(ToTab::Back);
+    tab.send(ToTab::Forward);
+    let after = tab.collect(Duration::from_millis(800));
+    assert!(
+        !after.iter().any(
+            |m| matches!(m, FromTab::UrlChanged { url: Some(u) } if u.ends_with("/redirect-replace.html"))
+        ),
+        "location.replace left the redirecting page in history: {after:?}"
+    );
     exit_cleanly(&mut tab);
 }
 

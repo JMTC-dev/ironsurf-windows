@@ -587,7 +587,7 @@ pub fn decode_data_url(url: &Url) -> Option<Vec<u8>> {
 }
 
 /// Minimal percent decoding (byte oriented; UTF-8 is reassembled downstream).
-fn percent_decode(input: &[u8]) -> Vec<u8> {
+pub(crate) fn percent_decode(input: &[u8]) -> Vec<u8> {
     let digit = |c: u8| -> Option<u8> {
         match c {
             b'0'..=b'9' => Some(c - b'0'),
@@ -1265,7 +1265,8 @@ pub enum NetError {
     Transport { url: Url, message: String },
     /// I/O error reading a `file:` URL.
     Io { url: Url, message: String },
-    /// Scheme we refuse to navigate to (e.g. `javascript:`).
+    /// Scheme the fetcher never fetches (`javascript:` — the tab runs these as
+    /// programs; everything else unsupported).
     Unsupported { url: Url },
 }
 

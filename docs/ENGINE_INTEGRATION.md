@@ -54,7 +54,7 @@ still apply to the tab process today; their API specifics are obsolete.
 * Every `eval` is caught: a throwing script is reported (`ConsoleLog`/`Error`) and
   the **next** script still runs (asserted in `tests/e2e.rs`).
 * Timers (`setTimeout`/`setInterval`) are counted-only today (scheduled = TODO);
-  `javascript:` URLs are refused at `navigate()` time.
+  `javascript:` URLs run as programs at `navigate()` (string completion value → new `about:blank` document); `location.href=`/`assign`/`replace` queue real navigations the poll loop follows.
 
 ## D. History & shell-side lessons (task 9)
 

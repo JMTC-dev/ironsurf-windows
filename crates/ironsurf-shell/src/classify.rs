@@ -14,8 +14,8 @@ pub fn classify_input(input: &str) -> Option<String> {
         return None;
     }
 
-    // explicit scheme → pass through (the tab applies its own policy, including
-    // its refusal of `javascript:` URLs, which stays visible in the status bar
+    // explicit scheme → pass through (the tab applies its own policy, running
+    // `javascript:` URLs as programs in the current page, which stays visible
     // instead of becoming a search for the text after the colon).
     let scheme_haystack = input.to_ascii_lowercase();
     for scheme in [
@@ -148,9 +148,9 @@ mod tests {
     }
 
     #[test]
-    fn javascript_urls_reach_the_tab_that_refuses_them() {
-        // The tab owns the `javascript:` refusal (StatusText + no navigation);
-        // searching instead hid that decision from the user.
+    fn javascript_urls_reach_the_tab_that_runs_them() {
+        // The tab owns `javascript:` (it executes the program; the URL itself
+        // never becomes the document URL); searching would never run it.
         assert_eq!(
             classify_input("javascript:void(0)").as_deref(),
             Some("javascript:void(0)")

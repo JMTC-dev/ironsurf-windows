@@ -428,7 +428,7 @@ during `handle_ui_event`), the main loop sees it after the event and starts a to
 the "navigation request round-trip" the contract asks for). Caveats: `target=_blank` and
 click-modifier semantics are **not** handled by blitz (every anchor click is same-document-nav);
 `href` resolution + same-URL-with-fragment filtering already done; `javascript:` URLs arrive as
-ordinary `Url`s (scheme `javascript`) — refuse them in the hook (contract requires StatusText + no nav).
+ordinary `Url`s (scheme `javascript`) — the tab runs them as programs in the current page (never fetches, never a history entry).
 
 ### 5.2 Getting the clicked/target node id
 

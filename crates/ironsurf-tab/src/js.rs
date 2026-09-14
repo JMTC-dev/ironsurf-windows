@@ -5,9 +5,10 @@
 //! (fresh realm per document, no cross-document leakage), binds:
 //!
 //! - `window` — eventTarget-ish no-ops (`addEventListener`/`removeEventListener`
-//!   /`dispatchEvent`), `window.window === window`, `location.href` reflecting
-//!   the current document URL (writes are refused with a status note; JS-driven
-//!   navigation is TODO once the shell contract grows a reason to route it),
+//!   /`dispatchEvent`), `window.window === window`, `location` reflecting the
+//!   current document URL; `href=`/`assign`/`replace`/`reload` queue a real
+//!   navigation ([`HostState::pending_nav`]) that the tab's poll loop follows
+//!   (search engines redirect this way),
 //! - `document` — `title` get/set (a set stores the title, marks the host
 //!   `title_assigned` so the tab emits `FromTab::TitleChanged` and repaints),
 //!   `body.textContent` as a read-only snapshot of the parsed body,
@@ -260,9 +261,14 @@ pub struct HostState {
     pub title_assigned: Option<String>,
     /// Captured `console.*` output (level + already stringified message).
     pub console: Vec<(ConsoleLevel, String)>,
-    /// Human-readable notes raised by the bindings (refused `location` writes,
-    /// timer calls) — the runtime shows the newest as `FromTab::StatusText`.
+    /// Human-readable notes raised by the bindings (timer calls) — the runtime
+    /// shows the newest as `FromTab::StatusText`.
     pub notes: Vec<String>,
+    /// A page-driven navigation (`location.href=`/`assign`/`replace`/`reload`)
+    /// waiting for the tab: `href=`/`assign` push history, `replace`/`reload`
+    /// replace the current entry. Taken by the tab after every JS turn
+    /// ([`JsRuntime::take_pending_navigation`]); the last write of a turn wins.
+    pub pending_nav: Option<PendingNav>,
     /// A script changed something that needs a fresh frame.
     pub repaint: bool,
     /// Number of timer/rAF scheduling calls (stats + debug).
@@ -293,6 +299,17 @@ impl HostState {
     pub fn latest_note(&self) -> Option<&str> {
         self.notes.last().map(String::as_str)
     }
+}
+
+/// One page-driven navigation waiting for the tab's poll loop.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PendingNav {
+    /// Raw target as the page wrote it (absolute or relative; may itself be a
+    /// `javascript:` program). The tab resolves it against the document URL.
+    pub target: String,
+    /// `location.replace`/`reload` semantics: replace the current history
+    /// entry instead of pushing a new one.
+    pub replace: bool,
 }
 
 /// Shared handle (the tab keeps ownership, the bindings borrow it while the
@@ -1892,7 +1909,7 @@ mod native {
     pub(super) const TITLE_GET: &str = "__ironsurfTitleGet";
     pub(super) const TITLE_SET: &str = "__ironsurfTitleSet";
     pub(super) const CONSOLE: &str = "__ironsurfConsole";
-    pub(super) const REFUSE: &str = "__ironsurfRefuse";
+    pub(super) const NAVIGATE: &str = "__ironsurfNavigate";
     pub(super) const SET_TIMEOUT: &str = "__ironsurfSetTimeout";
     pub(super) const SET_INTERVAL: &str = "__ironsurfSetInterval";
     pub(super) const RAF: &str = "__ironsurfRaf";
@@ -1930,8 +1947,10 @@ const PRELUDE: &str = r##"
 (function () {
   var host = globalThis;
 
-  function refused(target) {
-    host.__ironsurfRefuse(String(target));
+  function navTo(target, replace) {
+    // Queue a real navigation: the tab's poll loop follows it after the
+    // current JS turn (search engines redirect exactly this way).
+    host.__ironsurfNavigate(String(target), !!replace);
   }
   function noop() {}
   function returnTrue() { return true; }
@@ -2181,29 +2200,70 @@ const PRELUDE: &str = r##"
     return !ev.defaultPrevented;
   }
 
+  // URL-component decomposition of an href string (no URL parser in the
+  // realm; this is the whole algorithm — the reflection is always the tab's
+  // own canonical URL string, so a light split is honest here).
+  function urlParts(u) {
+    u = String(u == null ? "" : u);
+    var hash = "";
+    var cut = u.indexOf("#");
+    if (cut >= 0) { hash = u.slice(cut); u = u.slice(0, cut); }
+    var search = "";
+    cut = u.indexOf("?");
+    if (cut >= 0) { search = u.slice(cut); u = u.slice(0, cut); }
+    var protoCut = u.indexOf(":");
+    var rest = u;
+    var protocol = "";
+    if (protoCut > 0 && /^[a-zA-Z][a-zA-Z0-9+.\-]*$/.test(u.slice(0, protoCut))) {
+      protocol = u.slice(0, protoCut + 1).toLowerCase();
+      rest = u.slice(protoCut + 1);
+    }
+    var auth = "";
+    var path = rest;
+    if (rest.charAt(0) === "/" && rest.charAt(1) === "/") {
+      var end = rest.length;
+      for (var i = 2; i < rest.length; i++) {
+        var c = rest.charAt(i);
+        if (c === "/" || c === "?" || c === "#") { end = i; break; }
+      }
+      auth = rest.slice(2, end);
+      path = rest.slice(end) || "/";
+    }
+    var at = auth.indexOf("@");
+    var hostport = at >= 0 ? auth.slice(at + 1) : auth;
+    return {
+      protocol: protocol,
+      host: hostport,
+      hostname: hostport.replace(/:\d+$/, ""),
+      pathname: auth === "" && path === "" ? "" : path,
+      search: search,
+      hash: hash,
+    };
+  }
+
   var location = {
-    // Reflector: the document URL. JS-driven navigation is not implemented
-    // (TODO: route it through the tab's navigation entry point).
+    // The document URL — and a real navigation choke point: `href=`,
+    // `assign()` and `replace()` queue the load for the tab's poll loop
+    // (`replace` overwrites the current history entry), exactly how
+    // search-engine redirect pages send us on.
     get href() {
       return host.__ironsurfUrl;
     },
     set href(target) {
-      refused(target);
+      navTo(target, false);
     },
-    assign: refused,
-    replace: refused,
-    reload: function () {
-      refused(host.__ironsurfUrl);
-    },
+    assign: function (target) { navTo(target, false); },
+    replace: function (target) { navTo(target, true); },
+    reload: function () { navTo(host.__ironsurfUrl, true); },
     toString: function () {
       return host.__ironsurfUrl;
     },
-    get protocol() { return ""; },
-    get host() { return ""; },
-    get hostname() { return ""; },
-    get pathname() { return ""; },
-    get search() { return ""; },
-    get hash() { return ""; },
+    get protocol() { return urlParts(host.__ironsurfUrl).protocol; },
+    get host() { return urlParts(host.__ironsurfUrl).host; },
+    get hostname() { return urlParts(host.__ironsurfUrl).hostname; },
+    get pathname() { return urlParts(host.__ironsurfUrl).pathname; },
+    get search() { return urlParts(host.__ironsurfUrl).search; },
+    get hash() { return urlParts(host.__ironsurfUrl).hash; },
   };
 
 
@@ -2946,10 +3006,12 @@ pub fn build_context(host: &HostRef, _timers: &Rc<RefCell<TimerQueue>>) -> Conte
     ) {
         error!("js binding `console` failed to install: {err}");
     }
-    // location writes: refused, with a status note.
+    // location writes: queued as the host's pending navigation — the tab's
+    // poll loop follows it after the current JS turn (replacing the current
+    // history entry when `replace` is set).
     if let Err(err) = context.register_global_builtin_callable(
-        JsString::from(native::REFUSE),
-        1,
+        JsString::from(native::NAVIGATE),
+        2,
         NativeFunction::from_copy_closure(|_this, args, _context| {
             let target = args
                 .first()
@@ -2957,10 +3019,13 @@ pub fn build_context(host: &HostRef, _timers: &Rc<RefCell<TimerQueue>>) -> Conte
                 .unwrap_or(JsValue::undefined())
                 .to_string(_context)?
                 .to_std_string_escaped();
-            warn!("refused javascript navigation to {target}");
+            let replace = args.get(1).is_some_and(|v| v.to_boolean());
+            if target.is_empty() {
+                return Ok(JsValue::undefined());
+            }
+            info!("js navigation requested → {target} (replace={replace})");
             with_host(|host| {
-                host.notes
-                    .push(format!("refused javascript navigation to {target}"));
+                host.pending_nav = Some(PendingNav { target, replace });
             });
             Ok(JsValue::undefined())
         }),
@@ -3067,6 +3132,54 @@ impl JsRuntime {
     /// The host cell the bindings write through (title, console, notes).
     pub fn host(&self) -> &HostRef {
         &self.host
+    }
+
+    /// Take the navigation this document's scripts queued since the last turn
+    /// (`location.href=`/`assign`/`replace`/`reload`). The tab calls this
+    /// after every JS turn and follows it through its own navigation entry
+    /// point — never re-entering the stack that queued it.
+    pub fn take_pending_navigation(&self) -> Option<PendingNav> {
+        self.host.borrow_mut().pending_nav.take()
+    }
+
+    /// Evaluate a `javascript:` URL's program in this document's world (the
+    /// same realm page scripts live in, with `doc` as the live document).
+    /// Ok(`Some(text)`) when the completion value is a string to render as a
+    /// new document (spec), Ok(`None`) when it is `undefined`/empty (nothing
+    /// loads), Err on a thrown exception.
+    pub(crate) fn eval_javascript_url(
+        &mut self,
+        source: &str,
+        doc: Option<&mut HtmlDocument>,
+    ) -> Result<Option<String>, ScriptError> {
+        let _active = self.activate();
+        let _live_doc = doc.map(register_live_doc);
+        match self.context.eval(Source::from_bytes(source)) {
+            Ok(value) => {
+                if value.is_undefined() || value.is_null() {
+                    return Ok(None);
+                }
+                // Numbers/objects stringify through JS semantics; a throwing
+                // `toString` reads as "no document" rather than an error.
+                let text = value
+                    .to_string(&mut self.context)
+                    .map(|s| s.to_std_string_escaped())
+                    .unwrap_or_default();
+                if text.is_empty() {
+                    Ok(None)
+                } else {
+                    Ok(Some(text))
+                }
+            }
+            Err(err) => {
+                let message = first_line(&err);
+                error!("javascript error in javascript: URL: {message}");
+                Err(ScriptError {
+                    origin: "javascript:".to_string(),
+                    message,
+                })
+            }
+        }
     }
 
     /// Whether the poll loop has anything left to wait for.
@@ -3346,15 +3459,97 @@ mod tests {
                 .map(|s| s.to_std_string_escaped()),
             Some("https://example.test/page.html".to_string())
         );
-        // Writes are refused with a note, and do not change the reflection.
-        eval_snippet("window.location.assign('https://evil.test/')", &host);
+        // Writes queue a real navigation for the tab; the reflection keeps
+        // reporting the current document URL until it actually loads.
+        assert_eq!(
+            eval_snippet(
+                "window.location.assign('https://evil.test/x'); 'ok'",
+                &host
+            )
+            .as_string()
+            .map(|s| s.to_std_string_escaped()),
+            Some("ok".to_string())
+        );
+        assert_eq!(
+            host.borrow().pending_nav,
+            Some(PendingNav {
+                target: "https://evil.test/x".to_string(),
+                replace: false,
+            })
+        );
+        eval_snippet("window.location.replace('/next?a=1#b')", &host);
+        assert_eq!(
+            host.borrow().pending_nav,
+            Some(PendingNav {
+                target: "/next?a=1#b".to_string(),
+                replace: true,
+            })
+        );
         eval_snippet("window.location.href = 'https://evil.test/'", &host);
         let borrowed = host.borrow();
         assert_eq!(borrowed.url, "https://example.test/page.html");
-        assert!(borrowed
-            .notes
-            .iter()
-            .any(|note| note.contains("refused javascript navigation to https://evil.test/")));
+        assert_eq!(
+            borrowed.pending_nav,
+            Some(PendingNav {
+                target: "https://evil.test/".to_string(),
+                replace: false,
+            })
+        );
+        // `reload()` re-reads the current URL with replace semantics.
+        drop(borrowed);
+        eval_snippet("window.location.reload()", &host);
+        assert_eq!(
+            host.borrow().pending_nav,
+            Some(PendingNav {
+                target: "https://example.test/page.html".to_string(),
+                replace: true,
+            })
+        );
+    }
+
+    #[test]
+    fn location_components_reflect_the_document_url() {
+        let host = Rc::new(RefCell::new(HostState::new(
+            "https://ex.test:8443/a/b?q=1#frag",
+            None,
+            None,
+        )));
+        assert_eq!(
+            eval_snippet("location.protocol", &host)
+                .as_string()
+                .map(|s| s.to_std_string_escaped()),
+            Some("https:".to_string())
+        );
+        assert_eq!(
+            eval_snippet("location.host", &host)
+                .as_string()
+                .map(|s| s.to_std_string_escaped()),
+            Some("ex.test:8443".to_string())
+        );
+        assert_eq!(
+            eval_snippet("location.hostname", &host)
+                .as_string()
+                .map(|s| s.to_std_string_escaped()),
+            Some("ex.test".to_string())
+        );
+        assert_eq!(
+            eval_snippet("location.pathname", &host)
+                .as_string()
+                .map(|s| s.to_std_string_escaped()),
+            Some("/a/b".to_string())
+        );
+        assert_eq!(
+            eval_snippet("location.search", &host)
+                .as_string()
+                .map(|s| s.to_std_string_escaped()),
+            Some("?q=1".to_string())
+        );
+        assert_eq!(
+            eval_snippet("location.hash", &host)
+                .as_string()
+                .map(|s| s.to_std_string_escaped()),
+            Some("#frag".to_string())
+        );
     }
 
     #[test]
