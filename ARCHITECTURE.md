@@ -307,6 +307,14 @@ in `ironsurf-tab/src/netmod.rs` and pass `Arc<OurProvider>` as `DocumentConfig.n
 - Main-document navigations always go through our own reqwest fetcher in the tab process
   (not via NetProvider), so the managed policy always applies to top-level requests
   regardless of provider mode.
+- `data:` URLs (RFC 2397) are decoded by us, never fetched: `parse_data_url` returns the media
+  type, optional `charset`, whether the payload was `;base64`, and the bytes; both the percent-
+  encoded and base64 forms work for top-level documents and for subresources (`<script src=…>`,
+  `<img>`, css). The media type decides what the tab *does* with the bytes: markup is parsed,
+  non-markup (`data:text/javascript;base64,…`, css, JSON, `text/*`) is shown as inert escaped
+  source titled by its media type — running a URL-bar program would be a `javascript:` URL by
+  another name. A page may still load and run `data:text/javascript;base64,…` via `<script src>`;
+  that is the page's own decision. See `docs/ENGINE_INTEGRATION.md` §G.
 - Container isolation holds even in Passthrough: one process = one container; its on-disk
   state lives under the sandbox-visible profile dir only.
 
@@ -360,6 +368,10 @@ Process/tab management (`src/tabs.rs`):
   Esc unfocuses.
 - Default start page: `about:blank` then URL bar typing does search-or-navigate: contains dot
   → `https://host` (upgrading typed `host/path` to HTTPS), else → `https://duckduckgo.com/?q=`.
+  Explicit-scheme pass-through is case-insensitive and covers `http(s)://`, `about:`, `file://`,
+  `data:` (whose base64 payloads never look like a host, e.g. `data:text/javascript;base64,…`) and
+  `javascript:` — the last is handed to the tab, which refuses it by contract, so the refusal is
+  visible instead of silently becoming a search.
 - Container default from registry; per-container "remember last chosen container for new tabs"
   in `~/.local/share/ironsurf/ui.json` (best-effort).
 

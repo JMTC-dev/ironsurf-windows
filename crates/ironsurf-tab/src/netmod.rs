@@ -284,15 +284,130 @@ pub fn builtin_page_bytes(url: &Url) -> Option<Vec<u8>> {
     }
 }
 
-/// Decode a `data:` URL (RFC 2397): `data:[<mediatype>][;base64],<payload>`.
-pub fn decode_data_url(url: &Url) -> Option<Vec<u8>> {
+/// A `data:` URL (RFC 2397) parsed into media type + decoded bytes.
+///
+/// `data:[<mediatype>][;base64],<payload>` where `mediatype` is
+/// `type/subtype[;charset=…]`. Callers need the media type, not just the
+/// bytes: `data:text/javascript;base64,…` is a *program*, and handing it to the
+/// HTML parser (or executing it) would both be wrong — see
+/// [`DataUrl::renders_as_source`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DataUrl {
+    /// Lowercased media type without parameters (`text/javascript`).
+    /// Missing/empty type means `text/plain`, and an unknown type is never
+    /// guessed from the payload (no sniffing).
+    pub mime: String,
+    /// `charset` parameter, lowercased (`utf-8`, `iso-8859-1`, …).
+    pub charset: Option<String>,
+    /// Whether the payload used the `;base64` transfer encoding.
+    pub base64: bool,
+    /// Decoded payload bytes.
+    pub bytes: Vec<u8>,
+}
+
+impl DataUrl {
+    /// Media types we hand to the HTML parser (`image/svg+xml` is included
+    /// because Blitz rasterises/inline-renders it like a markup document).
+    pub fn is_html(&self) -> bool {
+        matches!(
+            self.mime.as_str(),
+            "text/html"
+                | "application/xhtml+xml"
+                | "image/svg+xml"
+                | "text/xml"
+                | "application/xml"
+        )
+    }
+
+    /// JavaScript media types (same set the `<script type>` matcher accepts,
+    /// see `js::is_classic_script_type`), plus the `module` suffix type.
+    pub fn is_javascript(&self) -> bool {
+        matches!(
+            self.mime.as_str(),
+            "text/javascript"
+                | "application/javascript"
+                | "application/x-javascript"
+                | "text/ecmascript"
+                | "application/ecmascript"
+                | "text-javascript"
+        )
+    }
+
+    /// True for documents we display as **inert source text** instead of
+    /// parsing: scripts, stylesheets, JSON, and any `text/*` that is not
+    /// markup. Binary types (`image/png`, `application/octet-stream`, …) keep
+    /// the previous behaviour — the subresource path is where they belong.
+    pub fn renders_as_source(&self) -> bool {
+        if self.is_html() {
+            return false;
+        }
+        self.is_javascript()
+            || self.mime.starts_with("text/")
+            || (self.mime.starts_with("application/")
+                && matches!(
+                    self.mime.as_str(),
+                    "application/json"
+                        | "application/manifest+json"
+                        | "application/ld+json"
+                        | "application/x-web-app-manifest+json"
+                        | "application/css+json"
+                ))
+    }
+
+    /// Payload as text. We honour `charset` only as far as recognising UTF-8:
+    /// every other label decodes lossily, like our other document reads.
+    pub fn text(&self) -> String {
+        match self.charset.as_deref() {
+            // fast path — no copy for the overwhelmingly common case
+            Some("utf-8") | None => match std::str::from_utf8(&self.bytes) {
+                Ok(s) => s.to_owned(),
+                Err(_) => String::from_utf8_lossy(&self.bytes).into_owned(),
+            },
+            _ => String::from_utf8_lossy(&self.bytes).into_owned(),
+        }
+    }
+}
+
+/// Parse a `data:` URL into its media type and decoded bytes; `None` for other
+/// schemes, for payloads without the `,` separator, and for invalid base64.
+pub fn parse_data_url(url: &Url) -> Option<DataUrl> {
+    if url.scheme() != "data" {
+        return None;
+    }
     let rest = url.as_str().strip_prefix("data:")?;
     let (meta, payload) = rest.split_once(',')?;
-    if meta.split(';').any(|p| p.eq_ignore_ascii_case("base64")) {
-        decode_base64(payload)
+    let mut parts = meta.split(';');
+    let mime_raw = parts.next().unwrap_or_default().trim();
+    let params: Vec<&str> = parts.map(str::trim).collect();
+    let base64 = params.iter().any(|p| p.eq_ignore_ascii_case("base64"));
+    let charset = params.iter().find_map(|p| {
+        p.to_ascii_lowercase()
+            .strip_prefix("charset=")
+            .map(|c| c.trim_matches('"').trim().to_owned())
+    });
+    let bytes = if base64 {
+        decode_base64(payload)?
     } else {
-        Some(percent_decode(payload.as_bytes()))
-    }
+        percent_decode(payload.as_bytes())
+    };
+    let mime = if mime_raw.is_empty() {
+        "text/plain".to_owned()
+    } else {
+        mime_raw.to_ascii_lowercase()
+    };
+    Some(DataUrl {
+        mime,
+        charset,
+        base64,
+        bytes,
+    })
+}
+
+/// Decode a `data:` URL (RFC 2397): `data:[<mediatype>][;base64],<payload>`.
+/// Use [`parse_data_url`] when the media type matters (it always does for
+/// top-level documents).
+pub fn decode_data_url(url: &Url) -> Option<Vec<u8>> {
+    parse_data_url(url).map(|d| d.bytes)
 }
 
 /// Minimal percent decoding (byte oriented; UTF-8 is reassembled downstream).
@@ -317,6 +432,38 @@ fn percent_decode(input: &[u8]) -> Vec<u8> {
         }
         out.push(input[i]);
         i += 1;
+    }
+    out
+}
+
+/// Standard-alphabet base64 encoder (RFC 4648, `=` padded). Only tests build
+/// `data:` URLs, so it is test-only code kept beside [`decode_base64`] — the
+/// pair cannot drift.
+#[cfg(test)]
+pub fn encode_base64(input: &[u8]) -> String {
+    const ALPHA: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ\
+                                    abcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(input.len().div_ceil(3) * 4);
+    for chunk in input.chunks(3) {
+        let b = [
+            chunk[0],
+            *chunk.get(1).unwrap_or(&0),
+            *chunk.get(2).unwrap_or(&0),
+        ];
+        let n = (b[0] as u32) << 16 | (b[1] as u32) << 8 | b[2] as u32;
+        let chars = [
+            ALPHA[(n >> 18) as usize & 63],
+            ALPHA[(n >> 12) as usize & 63],
+            ALPHA[(n >> 6) as usize & 63],
+            ALPHA[n as usize & 63],
+        ];
+        let used = chunk.len() + 1; // 1..=3 real bytes ⇒ 2..=4 characters
+        for &c in &chars[..used] {
+            out.push(c as char);
+        }
+        for _ in used..4 {
+            out.push('=');
+        }
     }
     out
 }
@@ -419,7 +566,12 @@ pub struct FetchOutcome {
 fn collect_headers(headers: &reqwest::header::HeaderMap) -> Vec<(String, String)> {
     headers
         .iter()
-        .map(|(k, v)| (k.as_str().to_owned(), v.to_str().unwrap_or_default().to_owned()))
+        .map(|(k, v)| {
+            (
+                k.as_str().to_owned(),
+                v.to_str().unwrap_or_default().to_owned(),
+            )
+        })
         .collect()
 }
 
@@ -527,12 +679,7 @@ pub fn managed_http_fetch(
         .map(|b| b.to_vec())
         .map_err(|e| format!("body {url}: {e}"))?;
 
-    capture_set_cookies(
-        jar,
-        &final_url,
-        set_cookies.iter().map(String::as_str),
-        now,
-    );
+    capture_set_cookies(jar, &final_url, set_cookies.iter().map(String::as_str), now);
     if !set_cookies.is_empty() {
         debug!(
             "captured {} Set-Cookie header(s) for {}",
@@ -658,19 +805,16 @@ impl BlitzNetProvider {
         }
     }
 
-    fn spawn_http(
-        &self,
-        doc_id: usize,
-        url: Url,
-        request: Request,
-        handler: Box<dyn NetHandler>,
-    ) {
+    fn spawn_http(&self, doc_id: usize, url: Url, request: Request, handler: Box<dyn NetHandler>) {
         let worker = Arc::clone(&self.worker);
         let managed = self.policy == NetPolicy::Managed;
         let jar = Arc::clone(&self.jar);
         let cache = Arc::clone(&self.cache);
         let waker = self.waker.lock().expect("waker mutex poisoned").clone();
-        debug!("subresource GET {url} (doc {doc_id}, {})", if managed { "managed" } else { "passthrough" });
+        debug!(
+            "subresource GET {url} (doc {doc_id}, {})",
+            if managed { "managed" } else { "passthrough" }
+        );
         self.worker.spawn(move || {
             let signal = request.signal.clone();
             let outcome = if managed {
@@ -690,7 +834,9 @@ impl BlitzNetProvider {
                 Ok(o) if !aborted && o.status < 400 => {
                     debug!(
                         "subresource {} -> {} delivered ({} B)",
-                        url, o.status, o.body.len()
+                        url,
+                        o.status,
+                        o.body.len()
                     );
                     deliver(Some(handler), o.final_url.to_string(), o.body)
                 }
@@ -741,7 +887,10 @@ impl NetProvider for BlitzNetProvider {
             },
             "about" => match builtin_page_bytes(&url) {
                 Some(bytes) => {
-                    debug!("subresource {url} served from built-ins ({} B)", bytes.len());
+                    debug!(
+                        "subresource {url} served from built-ins ({} B)",
+                        bytes.len()
+                    );
                     deliver(Some(handler), url.to_string(), bytes)
                 }
                 None => {
@@ -1006,7 +1155,11 @@ mod tests {
 
     #[test]
     fn managed_passes_non_http_schemes() {
-        for scheme_url in ["file:///tmp/x/index.html", "about:blank", "data:text/html,x"] {
+        for scheme_url in [
+            "file:///tmp/x/index.html",
+            "about:blank",
+            "data:text/html,x",
+        ] {
             assert_eq!(
                 plan(NetPolicy::Managed, &url(scheme_url), true),
                 Plan::Pass,
@@ -1018,12 +1171,16 @@ mod tests {
     #[test]
     fn https_upgrade_folding() {
         assert_eq!(
-            upgrade_to_https(&url("http://example.com/")).unwrap().as_str(),
+            upgrade_to_https(&url("http://example.com/"))
+                .unwrap()
+                .as_str(),
             "https://example.com/"
         );
         // The insecure default port is folded away…
         assert_eq!(
-            upgrade_to_https(&url("http://example.com:80/x")).unwrap().as_str(),
+            upgrade_to_https(&url("http://example.com:80/x"))
+                .unwrap()
+                .as_str(),
             "https://example.com/x"
         );
         // …but a real port survives.
@@ -1045,7 +1202,12 @@ mod tests {
         );
         // 304 + matching Last-Modified → cached.
         assert_eq!(
-            revalidate(&cached(None, Some("Tue, 1 Jul 2025 00:00:00 GMT")), 304, None, Some("Tue, 1 Jul 2025 00:00:00 GMT")),
+            revalidate(
+                &cached(None, Some("Tue, 1 Jul 2025 00:00:00 GMT")),
+                304,
+                None,
+                Some("Tue, 1 Jul 2025 00:00:00 GMT")
+            ),
             Revalidate::ServeCached
         );
         // 304 without any validators → fresh.
@@ -1078,8 +1240,10 @@ mod tests {
     #[test]
     fn managed_cookie_rules_over_the_container_jar() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let store =
-            ironsurf_storage::ContainerStore::from_profile_dir(ironsurf_common::ContainerId(9), dir.path());
+        let store = ironsurf_storage::ContainerStore::from_profile_dir(
+            ironsurf_common::ContainerId(9),
+            dir.path(),
+        );
         let mut jar = store.cookie_jar();
         let now = 1_700_000_000;
 
@@ -1092,7 +1256,8 @@ mod tests {
         );
         assert_eq!(jar.cookies().len(), 1);
         assert_eq!(
-            jar.cookie_header(&url("https://example.com/"), now).as_deref(),
+            jar.cookie_header(&url("https://example.com/"), now)
+                .as_deref(),
             Some("sid=42")
         );
         assert_eq!(
@@ -1121,7 +1286,10 @@ mod tests {
             .cookie_header(&url("https://b.example.com/"), now)
             .expect("header");
         assert!(header.contains("shared=2"));
-        assert!(!header.contains("h=1"), "host-only cookie leaked to subdomain");
+        assert!(
+            !header.contains("h=1"),
+            "host-only cookie leaked to subdomain"
+        );
 
         // Persistence round-trip: exactly what the tab does on Destroy.
         jar.save().expect("save jar");
@@ -1135,7 +1303,11 @@ mod tests {
 
     #[test]
     fn blocked_page_mentions_both_urls() {
-        let page = blocked_error_page(&url("http://example.com/"), &url("https://example.com/"), "boom");
+        let page = blocked_error_page(
+            &url("http://example.com/"),
+            &url("https://example.com/"),
+            "boom",
+        );
         assert!(page.contains("http://example.com/"));
         assert!(page.contains("https://example.com/"));
         assert!(page.contains("boom"));
@@ -1184,11 +1356,8 @@ mod tests {
             ironsurf_common::ContainerId(7),
             dir.path(),
         );
-        let provider = BlitzNetProvider::shared(
-            NetPolicy::Managed,
-            store.cookie_jar(),
-            store.cache(),
-        );
+        let provider =
+            BlitzNetProvider::shared(NetPolicy::Managed, store.cookie_jar(), store.cache());
         fn assert_net_provider(_: &Arc<dyn NetProvider>) {}
         let dyn_provider: Arc<dyn NetProvider> = provider;
         assert_net_provider(&dyn_provider);
@@ -1220,11 +1389,7 @@ mod tests {
 
         // data: — percent-encoded and base64 payloads.
         let (handler, log) = mock_handler();
-        provider.fetch(
-            1,
-            Request::get(url("data:text/html,hi%21")),
-            handler,
-        );
+        provider.fetch(1, Request::get(url("data:text/html,hi%21")), handler);
         let got = wait_for(&log);
         assert_eq!(got[0].1, b"hi!");
 
@@ -1382,7 +1547,10 @@ mod tests {
             std::collections::BTreeSet::from(["a=1", "b=2"]),
             "unexpected assembled header {https_header:?}"
         );
-        assert!(!https_header.contains(','), "pairs are '; '-joined, not comma");
+        assert!(
+            !https_header.contains(','),
+            "pairs are '; '-joined, not comma"
+        );
         // Over http the Secure cookie must drop out of the assembled header.
         let http_header = jar
             .cookie_header(&url("http://example.com/path"), now)
@@ -1427,12 +1595,24 @@ mod tests {
 
     #[test]
     fn data_url_decode_helpers() {
-        assert_eq!(decode_base64("aGVsbG8=").as_deref(), Some(b"hello".as_slice()));
-        assert_eq!(decode_base64("aGVsbG8").as_deref(), Some(b"hello".as_slice()));
+        assert_eq!(
+            decode_base64("aGVsbG8=").as_deref(),
+            Some(b"hello".as_slice())
+        );
+        assert_eq!(
+            decode_base64("aGVsbG8").as_deref(),
+            Some(b"hello".as_slice())
+        );
         assert_eq!(decode_base64("").as_deref(), Some(b"".as_slice()));
-        assert_eq!(decode_base64("////").as_deref(), Some([0xff, 0xff, 0xff].as_slice()));
+        assert_eq!(
+            decode_base64("////").as_deref(),
+            Some([0xff, 0xff, 0xff].as_slice())
+        );
         // URL-safe alphabet maps to the same values as the standard one.
-        assert_eq!(decode_base64("____").as_deref(), Some([0xff, 0xff, 0xff].as_slice()));
+        assert_eq!(
+            decode_base64("____").as_deref(),
+            Some([0xff, 0xff, 0xff].as_slice())
+        );
         assert_eq!(decode_base64("__8="), decode_base64("//8="));
         assert_eq!(
             decode_base64("TWFuw6c=").as_deref(),
@@ -1454,11 +1634,157 @@ mod tests {
         assert_eq!(decode_data_url(&url("data:text/html")), None);
     }
 
+    #[test]
+    fn base64_encoder_round_trips_with_the_decoder() {
+        assert_eq!(encode_base64(b""), "");
+        assert_eq!(encode_base64(b"h"), "aA==");
+        assert_eq!(encode_base64(b"he"), "aGU=");
+        assert_eq!(encode_base64(b"hel"), "aGVs");
+        assert_eq!(encode_base64(b"hello"), "aGVsbG8=");
+        assert_eq!(encode_base64(&[0xff, 0xff, 0xff]), "////");
+        // Every byte value survives the round trip.
+        let all: Vec<u8> = (0..=255u8).collect();
+        assert_eq!(
+            decode_base64(&encode_base64(&all)).as_deref(),
+            Some(all.as_slice())
+        );
+        // The canonical JS payload used by the data: tests.
+        assert_eq!(
+            encode_base64("console.log(\"hi\"); document.title = \"js\";".as_bytes()),
+            JS_B64
+        );
+    }
+
+    /// `data:text/javascript;base64,…` is the shape real pages use for inline
+    /// program text: `console.log("hi"); document.title = "js";`.
+    const JS_B64: &str = "Y29uc29sZS5sb2coImhpIik7IGRvY3VtZW50LnRpdGxlID0gImpzIjs=";
+
+    #[test]
+    fn data_url_javascript_base64_parses() {
+        let data =
+            parse_data_url(&url(&format!("data:text/javascript;base64,{JS_B64}"))).expect("parses");
+        assert_eq!(data.mime, "text/javascript");
+        assert_eq!(data.charset.as_deref(), None);
+        assert!(data.base64);
+        assert_eq!(data.text(), "console.log(\"hi\"); document.title = \"js\";");
+        assert!(data.is_javascript());
+        assert!(!data.is_html());
+        // A program is displayed, never parsed/evaluated as a document.
+        assert!(data.renders_as_source());
+    }
+
+    #[test]
+    fn data_url_media_types_and_parameters() {
+        // Uppercase scheme/parameters are normalised; `;base64` may follow a
+        // charset parameter.
+        let data = parse_data_url(&url(
+            "data:Text/JavaScript;charset=UTF-8;BASE64,Y29uc29sZS5sb2coMSk=",
+        ))
+        .expect("parses");
+        assert_eq!(data.mime, "text/javascript");
+        assert_eq!(data.charset.as_deref(), Some("utf-8"));
+        assert!(data.base64);
+        assert_eq!(data.text(), "console.log(1)");
+
+        // No media type at all ⇒ text/plain (percent-encoded), still source.
+        let plain = parse_data_url(&url("data:,a%20b")).expect("parses");
+        assert_eq!(plain.mime, "text/plain");
+        assert!(!plain.base64);
+        assert_eq!(plain.text(), "a b");
+        assert!(plain.renders_as_source());
+
+        // Markup keeps going through the parser.
+        assert!(parse_data_url(&url("data:text/html,<b>x</b>")).is_some_and(|d| d.is_html()));
+        assert!(!parse_data_url(&url("data:text/html,<b>x</b>"))
+            .unwrap()
+            .renders_as_source());
+        assert!(parse_data_url(&url("data:application/xhtml+xml,x")).is_some_and(|d| d.is_html()));
+        assert!(parse_data_url(&url("data:image/svg+xml,%3Csvg/%3E")).is_some_and(|d| d.is_html()));
+
+        // Other script/stylesheet/JSON flavours are source too.
+        for mime in [
+            "application/javascript",
+            "application/x-javascript",
+            "text/ecmascript",
+            "text/css",
+            "application/json",
+            "application/ld+json",
+        ] {
+            let d = parse_data_url(&url(&format!("data:{mime},x"))).expect("parses");
+            assert!(
+                d.renders_as_source(),
+                "{mime} must render as source, not be parsed as HTML"
+            );
+        }
+
+        // Binary types are not documents (unchanged behaviour, no sniffing).
+        let png = parse_data_url(&url("data:image/png;base64,iVBORw0KGgo=")).expect("parses");
+        assert!(!png.renders_as_source());
+        assert_eq!(png.bytes, [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+    }
+
+    #[test]
+    fn data_url_parse_rejects_what_decoding_cannot_produce() {
+        // Not a data: URL.
+        assert_eq!(parse_data_url(&url("http://example.com/x")), None);
+        assert_eq!(parse_data_url(&url("file:///tmp/x")), None);
+        // No `,` separator.
+        assert_eq!(parse_data_url(&url("data:text/javascript;base64")), None);
+        // Invalid base64 characters in the payload (`(` is not in the alphabet).
+        assert_eq!(
+            parse_data_url(&url("data:text/javascript;base64,Y29uc29sZS(bG9nKDEp")),
+            None
+        );
+        assert_eq!(
+            parse_data_url(&url("data:text/javascript;base64,a!b")),
+            None
+        );
+        // Empty payload after `,` is legal and decodes to nothing.
+        assert_eq!(
+            parse_data_url(&url("data:text/javascript;base64,")).map(|d| d.bytes),
+            Some(Vec::new())
+        );
+    }
+
+    #[test]
+    fn data_url_round_trips_through_the_provider_and_the_fetcher() {
+        let raw = format!("data:text/javascript;base64,{JS_B64}");
+        let u = url(&raw);
+
+        // Main-document fetch (what `Tab::navigate` uses).
+        let mut jar = CookieJar::default();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = ironsurf_storage::ContainerStore::from_profile_dir(
+            ironsurf_common::ContainerId(9),
+            dir.path(),
+        );
+        let cache = store.cache();
+        let fetch = fetch_document(&u, NetPolicy::Managed, &mut jar, &cache, now_unix())
+            .expect("data: URLs always fetch");
+        assert_eq!(fetch.status, 200);
+        assert_eq!(fetch.url, u);
+        assert_eq!(
+            String::from_utf8(fetch.body).expect("utf8"),
+            "console.log(\"hi\"); document.title = \"js\";"
+        );
+
+        // Subresource fetch (`<script src="data:…">`) delivers the same bytes.
+        let provider = BlitzNetProvider::new(NetPolicy::Managed, store.cookie_jar(), store.cache());
+        let (handler, log) = mock_handler();
+        provider.fetch(1, Request::get(u.clone()), handler);
+        let got = wait_for(&log);
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].0, u.as_str());
+        assert_eq!(
+            String::from_utf8(got[0].1.clone()).expect("utf8"),
+            "console.log(\"hi\"); document.title = \"js\";"
+        );
+    }
+
     // Small helper: dedicated short-timeout client for connection-refused tests.
     #[allow(clippy::redundant_clone)]
     fn worker_for_test() -> &'static FetchWorker {
         static WORKER: OnceLock<Arc<FetchWorker>> = OnceLock::new();
-        WORKER
-            .get_or_init(|| FetchWorker::with_timeout(std::time::Duration::from_secs(5)))
+        WORKER.get_or_init(|| FetchWorker::with_timeout(std::time::Duration::from_secs(5)))
     }
 }

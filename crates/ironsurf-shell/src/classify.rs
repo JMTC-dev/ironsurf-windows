@@ -2,7 +2,10 @@
 //!
 //! Rule (per ARCHITECTURE.md §ironsurf-shell): a typed value whose host part
 //! contains a dot becomes an `https://` URL; everything else becomes a
-//! DuckDuckGo search. Explicit schemes pass through untouched.
+//! DuckDuckGo search. Explicit schemes pass through untouched — matched
+//! case-insensitively (per the URL spec) and including `data:`, whose payload
+//! is base64 in practice (`data:text/javascript;base64,…`) and therefore never
+//! looks like a host.
 
 /// Typed text → a URL to navigate to (already absolute).
 pub fn classify_input(input: &str) -> Option<String> {
@@ -11,9 +14,19 @@ pub fn classify_input(input: &str) -> Option<String> {
         return None;
     }
 
-    // explicit scheme → pass through (the tab applies its own policy)
-    for scheme in ["http://", "https://", "about:", "file://", "data:"] {
-        if input.starts_with(scheme) {
+    // explicit scheme → pass through (the tab applies its own policy, including
+    // its refusal of `javascript:` URLs, which stays visible in the status bar
+    // instead of becoming a search for the text after the colon).
+    let scheme_haystack = input.to_ascii_lowercase();
+    for scheme in [
+        "http://",
+        "https://",
+        "about:",
+        "file://",
+        "data:",
+        "javascript:",
+    ] {
+        if scheme_haystack.starts_with(scheme) {
             return Some(input.to_string());
         }
     }
@@ -24,9 +37,7 @@ pub fn classify_input(input: &str) -> Option<String> {
     }
 
     // `host` / `host:port` / `host/path` with a dot in the authority → https
-    let host_end = input
-        .find(['/', '?', '#'])
-        .unwrap_or(input.len());
+    let host_end = input.find(['/', '?', '#']).unwrap_or(input.len());
     let host = &input[..host_end];
     if host.contains('.') {
         return Some(format!("https://{input}"));
@@ -73,7 +84,10 @@ mod tests {
             classify_input("http://example.com").as_deref(),
             Some("http://example.com")
         );
-        assert_eq!(classify_input("about:blank").as_deref(), Some("about:blank"));
+        assert_eq!(
+            classify_input("about:blank").as_deref(),
+            Some("about:blank")
+        );
         assert_eq!(
             classify_input("https://example.com/a?b=1").as_deref(),
             Some("https://example.com/a?b=1")
@@ -81,6 +95,59 @@ mod tests {
         assert_eq!(
             classify_input("file:///tmp/index.html").as_deref(),
             Some("file:///tmp/index.html")
+        );
+    }
+
+    /// `data:text/javascript;base64,…` — the payload has no dot and is not a
+    /// host, so the scheme match is what keeps it out of the search box.
+    const JS_DATA_URL: &str =
+        "data:text/javascript;base64,Y29uc29sZS5sb2coImhpIik7IGRvY3VtZW50LnRpdGxlID0gImpzIjs=";
+
+    #[test]
+    fn data_url_passes_through_instead_of_becoming_a_search() {
+        assert_eq!(classify_input(JS_DATA_URL).as_deref(), Some(JS_DATA_URL));
+        // The typed text is a URL the tab can actually parse (and whose media
+        // type it can act on).
+        let parsed = url::Url::parse(&classify_input(JS_DATA_URL).unwrap()).unwrap();
+        assert_eq!(parsed.scheme(), "data");
+        assert!(!parsed.as_str().contains("duckduckgo"));
+    }
+
+    #[test]
+    fn scheme_match_is_case_insensitive() {
+        // URL schemes are case-insensitive, and `DATA:`/`Data:` arrive from
+        // pasted links just as often as lowercase.
+        assert_eq!(
+            classify_input("DATA:Text/HTML,<p>hi</p>").as_deref(),
+            Some("DATA:Text/HTML,<p>hi</p>")
+        );
+        assert_eq!(
+            classify_input("HTTPS://example.com/X").as_deref(),
+            Some("HTTPS://example.com/X")
+        );
+        assert_eq!(
+            classify_input("File:///tmp/index.html").as_deref(),
+            Some("File:///tmp/index.html")
+        );
+        let payload = JS_DATA_URL.split_once(',').expect("data url").1;
+        let upper = format!("DATA:TEXT/JAVASCRIPT;BASE64,{payload}");
+        let got = classify_input(&upper).unwrap();
+        assert_eq!(got, upper);
+        assert_eq!(url::Url::parse(&got).unwrap().scheme(), "data");
+    }
+
+    #[test]
+    fn javascript_urls_reach_the_tab_that_refuses_them() {
+        // The tab owns the `javascript:` refusal (StatusText + no navigation);
+        // searching instead hid that decision from the user.
+        assert_eq!(
+            classify_input("javascript:void(0)").as_deref(),
+            Some("javascript:void(0)")
+        );
+        // Words that merely start with the scheme are still searches.
+        assert_eq!(
+            classify_input("javascript tutorial").as_deref(),
+            Some("https://duckduckgo.com/?q=javascript+tutorial")
         );
     }
 

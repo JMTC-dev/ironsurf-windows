@@ -32,6 +32,12 @@
 //! errors, refused `location` writes and `console.*` output become
 //! `FromTab::StatusText`. `javascript:` URLs are refused at [`Tab::navigate`],
 //! the single navigation entry point.
+//!
+//! `data:` URLS: a fetched `data:` document goes through [`render_document`]
+//! before it reaches the HTML parser, so `data:text/javascript;base64,…` (and
+//! other non-markup media types) is displayed as inert source instead of being
+//! parsed as HTML — while a page's own `<script src="data:text/javascript;base64,…">`
+//! still fetches and runs (`docs/ENGINE_INTEGRATION.md` §G).
 
 use std::cell::RefCell;
 use std::error::Error;
@@ -48,19 +54,18 @@ use blitz_dom::{Document as _, DocumentConfig};
 use blitz_html::HtmlDocument;
 use blitz_paint::paint_scene;
 use blitz_traits::events::{
-    BlitzKeyEvent, BlitzPointerEvent, BlitzPointerId, BlitzWheelDelta, BlitzWheelEvent,
-    KeyState, MouseEventButton, MouseEventButtons, PointerCoords, PointerDetails, Point,
-    UiEvent,
+    BlitzKeyEvent, BlitzPointerEvent, BlitzPointerId, BlitzWheelDelta, BlitzWheelEvent, KeyState,
+    MouseEventButton, MouseEventButtons, Point, PointerCoords, PointerDetails, UiEvent,
 };
 use blitz_traits::navigation::{NavigationOptions, NavigationProvider};
 use blitz_traits::shell::{ColorScheme, ShellProvider, Viewport};
+use ironsurf_common::{
+    read_frame, write_frame, ContainerId, FromTab, KeyEvent, Modifiers, PointerEvent, PointerKind,
+    ScrollEvent, TabId, ToTab,
+};
 use keyboard_types::{Code, Key, Location, Modifiers as KMods};
 use kurbo::{Affine, Rect, Size};
 use peniko::{Color, Fill};
-use ironsurf_common::{
-    read_frame, write_frame, ContainerId, FromTab, KeyEvent, Modifiers, PointerEvent,
-    PointerKind, ScrollEvent, TabId, ToTab,
-};
 // stderr diagnostics (see `ironsurf_common::logging`): `info` = the user-visible
 // timeline (navigation, load start/finish, title/url), `debug` = per-step detail,
 // `trace` = per-frame/per-input noise. stdout is the IPC channel — never a log.
@@ -115,12 +120,12 @@ impl TabArgs {
             };
             match arg.as_str() {
                 "--tab-id" => tab_id = TabId(value("tab-id")?.parse()?),
-                "--container-id" => {
-                    container_id = ContainerId(value("container-id")?.parse()?)
-                }
+                "--container-id" => container_id = ContainerId(value("container-id")?.parse()?),
                 "--profile-dir" => profile_dir = Some(PathBuf::from(value("profile-dir")?)),
                 "--url" => url = Some(value("url")?),
-                "--offline-fixtures" => offline_fixtures = Some(PathBuf::from(value("offline-fixtures")?)),
+                "--offline-fixtures" => {
+                    offline_fixtures = Some(PathBuf::from(value("offline-fixtures")?))
+                }
                 "--managed-net" => managed = true,
                 "--no-sandbox" => no_sandbox = true,
                 // Verbosity flags: the level itself is read from argv by
@@ -177,9 +182,7 @@ impl SelfPipe {
     pub fn new() -> io::Result<Self> {
         let mut fds = [0 as RawFd; 2];
         // SAFETY: writing two fds into a 2-element array.
-        let rc = unsafe {
-            libc::pipe2(fds.as_mut_ptr(), libc::O_NONBLOCK | libc::O_CLOEXEC)
-        };
+        let rc = unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_NONBLOCK | libc::O_CLOEXEC) };
         if rc != 0 {
             return Err(io::Error::last_os_error());
         }
@@ -199,11 +202,7 @@ impl SelfPipe {
         // SAFETY: single-byte write to our own pipe end.
         unsafe {
             let byte: [u8; 1] = [1];
-            libc::write(
-                self.write_fd,
-                byte.as_ptr() as *const libc::c_void,
-                1,
-            );
+            libc::write(self.write_fd, byte.as_ptr() as *const libc::c_void, 1);
         }
     }
 
@@ -302,7 +301,11 @@ fn apply_sandbox(args: &TabArgs) {
         exec_ro: exe.map(|exe| vec![exe]).unwrap_or_default(),
         ..SandboxPolicy::default()
     };
-    debug!("applying sandbox: {} readable, writable {}", policy.readable_ro.len(), policy.writable_rw.len());
+    debug!(
+        "applying sandbox: {} readable, writable {}",
+        policy.readable_ro.len(),
+        policy.writable_rw.len()
+    );
     match ironsurf_sandbox::apply(&policy) {
         Ok(status) => info!(
             "sandbox applied: landlock={} rlimits={} notes={:?}",
@@ -326,11 +329,93 @@ pub fn parse_input_url(input: &str) -> Result<Url, Box<dyn Error>> {
             if input.contains(char::is_whitespace) {
                 return Err(format!("not a URL: {input:?} ({original})").into());
             }
-            Url::parse(&format!("https://{input}")).map_err(|_| {
-                format!("not a URL: {input:?} ({original})").into()
-            })
+            Url::parse(&format!("https://{input}"))
+                .map_err(|_| format!("not a URL: {input:?} ({original})").into())
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// What the HTML parser actually receives
+
+/// Escape text for use in HTML PCDATA (the source view must show `<script>`
+/// tags as text, never as live markup).
+fn escape_html(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 16);
+    for c in s.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&#39;"),
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
+/// A read-only viewer for a non-markup document, in the spirit of what a
+/// browser shows when you navigate to a script/stylesheet/plain-text URL: a
+/// header line plus the source in a `<pre>`.
+fn source_view_document(title: &str, meta: &str, source: &str) -> String {
+    format!(
+        r#"<!doctype html>
+<html><head><meta charset="utf-8"><title>{title}</title></head>
+<body style="margin: 0; background: #ffffff; color: #101010; font-family: monospace">
+  <div style="padding: 8px 12px; background: #f0f0f0; border-bottom: 1px solid #d0d0d0; font-size: 12px">
+    {meta}
+  </div>
+  <pre style="margin: 0; padding: 12px; font-size: 13px; white-space: pre-wrap; word-break: break-word">{source}</pre>
+</body></html>
+"#,
+        title = escape_html(title),
+        meta = escape_html(meta),
+        source = escape_html(source),
+    )
+}
+
+/// Decide what bytes the HTML parser should receive for a fetched main
+/// document.
+///
+/// `data:` URLs carry their own media type, and most of them are **not**
+/// markup. `data:text/javascript;base64,…` (and every other script/stylesheet/
+/// JSON/`text/*` payload, base64 or percent-encoded) is displayed as inert
+/// source: parsing it as HTML would paint the program text as a page of
+/// garbage, and evaluating it would be a `javascript:` URL by another name —
+/// those the tab refuses by contract. Markup types (`text/html`, xhtml, svg,
+/// xml) and every other scheme (http(s), file, about) are handed to the parser
+/// exactly as before, and subresources are unaffected: a page may still load
+/// `data:text/javascript;base64,…` through `<script src>`, which is where
+/// running that program is the page's own decision.
+pub fn render_document(fetch: &netmod::DocFetch) -> String {
+    if let Some(data) = netmod::parse_data_url(&fetch.url) {
+        if data.renders_as_source() {
+            let source = data.text();
+            debug!(
+                "data: URL is {} ({} B of source) — rendering the source view, not parsing it",
+                data.mime,
+                data.bytes.len()
+            );
+            return source_view_document(
+                &data.mime,
+                &format!(
+                    "{} · {} · {} bytes · {}",
+                    data.mime,
+                    if data.base64 {
+                        "base64"
+                    } else {
+                        "percent-encoded"
+                    },
+                    data.bytes.len(),
+                    fetch.url.as_str(),
+                ),
+                &source,
+            );
+        }
+        debug!("data: URL is {} — parsing as markup", data.mime);
+    }
+    fetch.body_text()
 }
 
 // ---------------------------------------------------------------------------
@@ -525,7 +610,15 @@ impl Tab {
 
         self.emit(FromTab::LoadingChanged { loading: true });
         self.emit(FromTab::StatusText {
-            text: Some(format!("Waiting for {}", url.host_str().unwrap_or(url.as_str()))),
+            // Host when we have one; otherwise the URL itself, with `data:`
+            // payloads reduced to a length so a multi-MB inline asset cannot
+            // spray the status bar.
+            text: Some(format!(
+                "Waiting for {}",
+                url.host_str()
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| netmod::url_for_log(&url))
+            )),
         });
 
         let url = self.apply_offline_fixtures(url);
@@ -548,7 +641,8 @@ impl Tab {
                     doc_fetch.body.len(),
                     started.elapsed().as_millis()
                 );
-                self.load_html(&doc_fetch.url, &doc_fetch.body_text(), history);
+                let html = render_document(&doc_fetch);
+                self.load_html(&doc_fetch.url, &html, history);
                 info!(
                     "loaded {} in {} ms",
                     doc_fetch.url,
@@ -573,7 +667,10 @@ impl Tab {
                         false
                     }
                     None => {
-                        error!("navigation to {url} failed after {} ms: {err}", started.elapsed().as_millis());
+                        error!(
+                            "navigation to {url} failed after {} ms: {err}",
+                            started.elapsed().as_millis()
+                        );
                         self.emit(FromTab::Error {
                             message: err.to_string(),
                         });
@@ -613,7 +710,7 @@ impl Tab {
         }
     }
 
-    /// Build a fresh `HtmlDocument` for an already-fetched document, run its
+    /// Build a fresh `HtmlDocument` for an already-parsed document, run its
     /// scripts, drive it to a first paint; then emit the metadata deltas
     /// (url/title/history).
     fn load_html(&mut self, url: &Url, html: &str, history: NavHistory) {
@@ -627,11 +724,15 @@ impl Tab {
         let config = DocumentConfig {
             base_url: Some(url.as_str().to_owned()),
             viewport: Some(self.viewport()),
-            net_provider: Some(Arc::clone(&self.provider) as Arc<dyn blitz_traits::net::NetProvider>),
-            navigation_provider: Some(Arc::clone(&self.nav)
-                as Arc<dyn blitz_traits::navigation::NavigationProvider>),
-            shell_provider: Some(Arc::clone(&self.shell)
-                as Arc<dyn blitz_traits::shell::ShellProvider>),
+            net_provider: Some(
+                Arc::clone(&self.provider) as Arc<dyn blitz_traits::net::NetProvider>
+            ),
+            navigation_provider: Some(
+                Arc::clone(&self.nav) as Arc<dyn blitz_traits::navigation::NavigationProvider>
+            ),
+            shell_provider: Some(
+                Arc::clone(&self.shell) as Arc<dyn blitz_traits::shell::ShellProvider>
+            ),
             ..Default::default()
         };
         let parsed = Instant::now();
@@ -775,9 +876,11 @@ impl Tab {
             .console
             .last()
             .map(|(level, text)| format!("js console {level}: {text}"));
-        let note = host.borrow().latest_note().map(str::to_owned).or_else(|| {
-            extraction.notes.first().map(String::to_owned)
-        });
+        let note = host
+            .borrow()
+            .latest_note()
+            .map(str::to_owned)
+            .or_else(|| extraction.notes.first().map(String::to_owned));
         self.js_status = js::status_text_for_errors(&errors)
             .or(console_last)
             .or(note);
@@ -812,8 +915,13 @@ impl Tab {
     }
 
     fn paint_now(&mut self) {
-        let Some(_doc) = self.doc.as_mut() else { return };
-        let (width, height) = ((self.width as f32 * self.scale) as u32, (self.height as f32 * self.scale) as u32);
+        let Some(_doc) = self.doc.as_mut() else {
+            return;
+        };
+        let (width, height) = (
+            (self.width as f32 * self.scale) as u32,
+            (self.height as f32 * self.scale) as u32,
+        );
         if width == 0 || height == 0 {
             return;
         }
@@ -825,7 +933,10 @@ impl Tab {
                     Affine::IDENTITY,
                     Color::from_rgb8(255, 255, 255),
                     None,
-                    &Rect::from_origin_size((0.0, 0.0), Size::new(f64::from(width), f64::from(height))),
+                    &Rect::from_origin_size(
+                        (0.0, 0.0),
+                        Size::new(f64::from(width), f64::from(height)),
+                    ),
                 );
                 // `&mut HtmlDocument` coerces to `&mut BaseDocument` via DerefMut.
                 paint_scene(
@@ -862,7 +973,10 @@ impl Tab {
         if current_url.is_none() {
             // Before the first successful load the tab still reports the
             // URL it is trying to show (stable contract for the shell).
-            current_url = self.history.get(self.history_index).map(|u| u.as_str().to_owned());
+            current_url = self
+                .history
+                .get(self.history_index)
+                .map(|u| u.as_str().to_owned());
         }
         if current_url != self.last_url {
             self.last_url = current_url;
@@ -1114,7 +1228,11 @@ impl Tab {
         }
     }
 
-    fn pointer_event(&mut self, ev: &PointerEvent, buttons: MouseEventButtons) -> BlitzPointerEvent {
+    fn pointer_event(
+        &mut self,
+        ev: &PointerEvent,
+        buttons: MouseEventButtons,
+    ) -> BlitzPointerEvent {
         BlitzPointerEvent {
             id: BlitzPointerId::Mouse,
             is_primary: true,
@@ -1319,13 +1437,7 @@ fn drain_stdin(tab: &mut Tab, pending: &mut Vec<u8>) -> io::Result<Option<i32>> 
     let mut eof = false;
     loop {
         // SAFETY: read into a valid buffer from stdin.
-        let n = unsafe {
-            libc::read(
-                fd,
-                chunk.as_mut_ptr() as *mut libc::c_void,
-                chunk.len(),
-            )
-        };
+        let n = unsafe { libc::read(fd, chunk.as_mut_ptr() as *mut libc::c_void, chunk.len()) };
         if n > 0 {
             pending.extend_from_slice(&chunk[..n as usize]);
             if (n as usize) < chunk.len() {
@@ -1464,7 +1576,13 @@ mod input_shaping_tests {
         let out = coalesce_moves(batch);
         assert_eq!(
             out,
-            vec![move_at(2.0, 2.0), press_at(2.0, 2.0), move_at(4.0, 4.0), ToTab::Reload, move_at(6.0, 6.0)],
+            vec![
+                move_at(2.0, 2.0),
+                press_at(2.0, 2.0),
+                move_at(4.0, 4.0),
+                ToTab::Reload,
+                move_at(6.0, 6.0)
+            ],
             "the click and the shell command survive in order"
         );
     }
@@ -1535,7 +1653,9 @@ pub fn run(args: TabArgs) -> i32 {
         return 1;
     }
 
-    tab.emit(FromTab::Ready { tab_id: args.tab_id });
+    tab.emit(FromTab::Ready {
+        tab_id: args.tab_id,
+    });
 
     // Initial navigation (the shell may still send Navigate later; the
     // start URL mirrors the old runtime's behaviour of loading eagerly).
@@ -1627,6 +1747,71 @@ mod tests {
         assert!(parse_input_url("about:blank").is_ok());
     }
 
+    fn data_fetch(raw: &str, body: &str) -> netmod::DocFetch {
+        netmod::DocFetch {
+            url: Url::parse(raw).expect("data url"),
+            status: 200,
+            body: body.as_bytes().to_vec(),
+        }
+    }
+
+    #[test]
+    fn javascript_data_url_renders_as_inert_source() {
+        // base64 of `console.log('<b>hi</b>'); document.title='pwned';` — the
+        // `<b>hi</b>` inside the program text proves the viewer escapes: tags
+        // must be shown as text, never handed back as live markup.
+        let source = "console.log('<b>hi</b>'); document.title='pwned';";
+        let raw = format!(
+            "data:text/javascript;base64,{}",
+            crate::netmod::encode_base64(source.as_bytes())
+        );
+        let html = render_document(&data_fetch(&raw, source));
+        assert!(
+            html.contains("&lt;b&gt;hi&lt;/b&gt;"),
+            "source not escaped: {html}"
+        );
+        assert!(
+            !html.contains("<b>hi</b>"),
+            "raw markup leaked into the viewer: {html}"
+        );
+        // A text document titled by its media type, with the program visible.
+        assert!(html.contains("<title>text/javascript</title>"), "{html}");
+        assert!(html.contains("<pre"), "{html}");
+        assert!(html.contains("base64"), "{html}");
+        // Nothing the parser could execute.
+        assert!(!html.contains("<script"), "{html}");
+    }
+
+    #[test]
+    fn javascript_data_url_percent_encoded_is_source_too() {
+        let html = render_document(&data_fetch(
+            "data:application/javascript,document.title%3D1",
+            "document.title=1",
+        ));
+        assert!(html.contains("document.title=1"), "{html}");
+        assert!(html.contains("percent-encoded"), "{html}");
+        assert!(!html.contains("<script"), "{html}");
+    }
+
+    #[test]
+    fn markup_and_other_schemes_reach_the_parser_unchanged() {
+        // `text/html` data URLs: parsed exactly as before.
+        let html = "<!doctype html><title>ok</title><p>hi</p>";
+        assert_eq!(
+            render_document(&data_fetch("data:text/html,<p>hi</p>", html)),
+            html
+        );
+        // http(s) and file: bodies never go through the source view, even when
+        // the body happens to look like a script.
+        let script = "document.title = 'from http'";
+        let fetched = netmod::DocFetch {
+            url: Url::parse("https://example.com/a.js").unwrap(),
+            status: 200,
+            body: script.as_bytes().to_vec(),
+        };
+        assert_eq!(render_document(&fetched), script);
+    }
+
     #[test]
     fn parse_input_url_upgrades_bare_hosts() {
         assert_eq!(
@@ -1656,7 +1841,10 @@ mod tests {
             "--container-id".into(),
             "2".into(),
             "--profile-dir".into(),
-            std::env::temp_dir().join("ironsurf-tab-args-test").display().to_string(),
+            std::env::temp_dir()
+                .join("ironsurf-tab-args-test")
+                .display()
+                .to_string(),
         ])
         .expect("parse");
         assert_eq!(args.tab_id, TabId(3));
@@ -1669,23 +1857,24 @@ mod tests {
 
     #[test]
     fn tab_args_all_flags() {
-        let args = TabArgs::parse(
-            &[
-                "ironsurf-tab".to_string(),
-                "--tab-id".into(),
-                "7".into(),
-                "--container-id".into(),
-                "1".into(),
-                "--profile-dir".into(),
-                std::env::temp_dir().join("ironsurf-tab-args-test2").display().to_string(),
-                "--url".into(),
-                "https://example.org".into(),
-                "--offline-fixtures".into(),
-                "/tmp/fixtures".into(),
-                "--managed-net".into(),
-                "--no-sandbox".into(),
-            ],
-        )
+        let args = TabArgs::parse(&[
+            "ironsurf-tab".to_string(),
+            "--tab-id".into(),
+            "7".into(),
+            "--container-id".into(),
+            "1".into(),
+            "--profile-dir".into(),
+            std::env::temp_dir()
+                .join("ironsurf-tab-args-test2")
+                .display()
+                .to_string(),
+            "--url".into(),
+            "https://example.org".into(),
+            "--offline-fixtures".into(),
+            "/tmp/fixtures".into(),
+            "--managed-net".into(),
+            "--no-sandbox".into(),
+        ])
         .expect("parse");
         assert_eq!(args.url, "https://example.org");
         assert_eq!(args.net_policy, NetPolicy::Managed);
@@ -1701,7 +1890,10 @@ mod tests {
             vec![
                 "ironsurf-tab".to_string(),
                 "--profile-dir".into(),
-                std::env::temp_dir().join("ironsurf-tab-args-log").display().to_string(),
+                std::env::temp_dir()
+                    .join("ironsurf-tab-args-log")
+                    .display()
+                    .to_string(),
             ]
         };
         for flag in ["--log", "--log=trace", "-v", "-vv", "--verbose", "--debug"] {

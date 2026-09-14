@@ -31,3 +31,8 @@ docs §F + README; 133 tests green.
 tasks ⇒ every pthread_create EAGAIN ⇒ reqwest tokio build panicked (netmod.rs). Now NPROC = current
 task count (from /proc Threads: for our euid) + max_processes headroom, never below live usage;
 notes explain; ARCHITECTURE comment extended; +unit test + examples/nproc_check reproducer.
+## #15 data: URLs are MIME-aware — netmod::parse_data_url (DataUrl{mime,charset,base64,bytes}) decodes
+both RFC 2397 forms; data:text/javascript;base64,… typed/navigated to renders as INERT escaped source titled
+by media type (render_document, between fetch and HtmlDocument::from_html) instead of being parsed as HTML —
+executing it would be a javascript: URL by another name; markup (html/xhtml/svg/xml) parses as before, and
+<script src="data:…"> still runs. Shell: scheme match case-insensitive + javascript: passed to the tab.

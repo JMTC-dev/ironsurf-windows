@@ -88,6 +88,26 @@ const JS_BROKEN_PAGE: &str = r#"<!doctype html>
 </html>
 "#;
 
+/// A page whose classic script comes from a base64 `data:` URL — the payload is
+/// `console.log("data-script-ran"); document.title = "data-title";`. The `src`
+/// is quoted: unquoted attribute values may not contain `=`, and `,`/`=` are
+/// exactly what a base64 `data:` URL is made of.
+const JS_DATA_SCRIPT_PAGE: &str = r#"<!doctype html>
+<html>
+  <head><title>Base Title</title></head>
+  <body style="margin: 0; background: #ffffff">
+    <div style="width: 120px; height: 120px; background: #009632"></div>
+    <script src="data:text/javascript;base64,Y29uc29sZS5sb2coImRhdGEtc2NyaXB0LXJhbiIpOyBkb2N1bWVudC50aXRsZSA9ICJkYXRhLXRpdGxlIjs="></script>
+  </body>
+</html>
+"#;
+
+/// A top-level navigation target: base64 of
+/// `console.log("data-url-executed"); document.title = "should-not-run";`.
+/// Displaying this as source is the point — executing it is the bug.
+const JS_DATA_URL_TOP_LEVEL: &str =
+    "data:text/javascript;base64,Y29uc29sZS5sb2coImRhdGEtdXJsLWV4ZWN1dGVkIik7IGRvY3VtZW50LnRpdGxlID0gInNob3VsZC1ub3QtcnVuIjs=";
+
 const DEADLINE: Duration = Duration::from_secs(60);
 
 struct TabChild {
@@ -119,7 +139,10 @@ impl TabChild {
             if step.is_zero() || Instant::now() >= until {
                 return msgs;
             }
-            match self.events.recv_timeout(step.min(Duration::from_millis(200))) {
+            match self
+                .events
+                .recv_timeout(step.min(Duration::from_millis(200)))
+            {
                 Ok(msg) => msgs.push(msg),
                 Err(mpsc::RecvTimeoutError::Timeout) => {}
                 Err(mpsc::RecvTimeoutError::Disconnected) => return msgs,
@@ -262,10 +285,7 @@ fn rgba_is_uniform(rgba: &[u8]) -> bool {
         return true;
     }
     let first = &rgba[..4];
-    !rgba
-        .chunks_exact(4)
-        .step_by(97)
-        .any(|px| px != first)
+    !rgba.chunks_exact(4).step_by(97).any(|px| px != first)
 }
 
 /// A frame is "rendered" if it is the right size and not a single flat color.
@@ -477,12 +497,14 @@ fn tab_link_click_navigates() {
 
     // Click the centre of the 200x40 anchor at the top-left (margin:0 body,
     // default 1024x768 scale-1 viewport): CSS px == shell px (100, 20).
-    let click = |kind| ToTab::Pointer(ironsurf_common::PointerEvent {
-        x: 100.0,
-        y: 20.0,
-        kind,
-        button: ironsurf_common::MouseButton::Left,
-    });
+    let click = |kind| {
+        ToTab::Pointer(ironsurf_common::PointerEvent {
+            x: 100.0,
+            y: 20.0,
+            kind,
+            button: ironsurf_common::MouseButton::Left,
+        })
+    };
     tab.send(click(ironsurf_common::PointerKind::Move));
     tab.send(click(ironsurf_common::PointerKind::Down));
     tab.send(click(ironsurf_common::PointerKind::Up));
@@ -680,7 +702,9 @@ fn tab_script_sets_title_over_ipc() {
         }
     );
     assert!(
-        !seen.iter().any(|m| matches!(m, FromTab::TitleChanged { title: Some(t) } if t == "Base Title")),
+        !seen
+            .iter()
+            .any(|m| matches!(m, FromTab::TitleChanged { title: Some(t) } if t == "Base Title")),
         "a script-assigned title must win over the parsed <title>: {seen:?}"
     );
 
@@ -814,7 +838,9 @@ fn tab_refuses_javascript_url_navigation() {
         "no refusal status text for a javascript: URL: {after:?}"
     );
     assert!(
-        !after.iter().any(|m| matches!(m, FromTab::UrlChanged { url: Some(u) } if u.starts_with("javascript:"))),
+        !after.iter().any(
+            |m| matches!(m, FromTab::UrlChanged { url: Some(u) } if u.starts_with("javascript:"))
+        ),
         "the tab navigated to a javascript: URL: {after:?}"
     );
     assert!(
@@ -826,6 +852,115 @@ fn tab_refuses_javascript_url_navigation() {
     assert!(
         tab.child.try_wait().expect("try_wait").is_none(),
         "a refused javascript: URL killed the tab"
+    );
+
+    exit_cleanly(&mut tab);
+}
+
+/// `data:text/javascript;base64,…` loaded by the page itself
+/// (`<script src="data:…">`): the payload is RFC 2397 base64, decoded by our
+/// own fetcher, and runs like any other classic script — the page opted in.
+#[test]
+fn tab_runs_data_url_script() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let profile = dir.path().join("profile");
+    std::fs::create_dir_all(&profile).expect("profile dir");
+    let fixture = profile.join("index.html");
+    std::fs::write(&fixture, JS_DATA_SCRIPT_PAGE).expect("write fixture");
+
+    let deadline = Instant::now() + DEADLINE;
+    let mut tab = spawn_tab(&fixture, &profile);
+    let mut seen = Vec::new();
+
+    tab.wait_for(
+        "TitleChanged(\"data-title\") from the data: script",
+        |m| matches!(m, FromTab::TitleChanged { title: Some(t) } if t == "data-title"),
+        deadline,
+        &mut seen,
+    );
+    tab.wait_for(
+        "the data: script's console.log reaches the shell",
+        |m| matches!(m, FromTab::StatusText { text: Some(t) } if t.contains("data-script-ran")),
+        deadline,
+        &mut seen,
+    );
+    tab.wait_for(
+        "rendered Frame(1024x768) for the data:-script page",
+        |m| {
+            matches!(m, FromTab::Frame { width, height, rgba, .. }
+                if *width == 1024 && *height == 768 && !rgba_is_uniform(rgba))
+        },
+        deadline,
+        &mut seen,
+    );
+
+    exit_cleanly(&mut tab);
+}
+
+/// The *same* `data:text/javascript;base64,…` typed into the URL bar is a
+/// program, not a document. The tab loads it as a page (200, `UrlChanged`) and
+/// displays it as inert source titled by its media type — it must never be
+/// parsed as HTML or executed, which would make it a `javascript:` URL under a
+/// different name (and those the tab refuses by contract).
+#[test]
+fn tab_shows_top_level_data_url_script_as_source() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let profile = dir.path().join("profile");
+    std::fs::create_dir_all(&profile).expect("profile dir");
+    let fixture = profile.join("index.html");
+    std::fs::write(&fixture, FIXTURE).expect("write fixture");
+
+    let deadline = Instant::now() + DEADLINE;
+    let mut tab = spawn_tab(&fixture, &profile);
+    let mut seen = Vec::new();
+
+    tab.wait_for(
+        "UrlChanged(index.html) before the data: navigation",
+        |m| matches!(m, FromTab::UrlChanged { url: Some(u) } if u.ends_with("/index.html")),
+        deadline,
+        &mut seen,
+    );
+
+    // Everything the tab says about this navigation, in order: the forced first
+    // frame of the new document, then its URL/title deltas, then load-finished
+    // (see `runtime::load_html`), so the whole batch is collected and asserted
+    // at once rather than waited for item by item.
+    tab.send(ToTab::Navigate {
+        url: JS_DATA_URL_TOP_LEVEL.to_string(),
+    });
+    let after = tab.collect(Duration::from_millis(4000));
+    let any = |pred: fn(&FromTab) -> bool| after.iter().any(pred);
+
+    assert!(
+        any(|m| matches!(m, FromTab::UrlChanged { url: Some(u) } if u == JS_DATA_URL_TOP_LEVEL)),
+        "the tab did not navigate to the data: URL: {after:?}"
+    );
+    // The source viewer titles the document by its media type …
+    assert!(
+        any(|m| matches!(m, FromTab::TitleChanged { title: Some(t) } if t == "text/javascript")),
+        "no TitleChanged(\"text/javascript\") from the source viewer: {after:?}"
+    );
+    // … and it paints (a real document, not a blank or a crash).
+    assert!(
+        any(|m| matches!(m, FromTab::Frame { width, height, rgba, .. }
+            if *width == 1024 && *height == 768 && !rgba_is_uniform(rgba))),
+        "no rendered Frame for the source viewer: {after:?}"
+    );
+    // The program was displayed, never run — executing it would have set this
+    // title and logged to the page console.
+    assert!(
+        !any(|m| matches!(m, FromTab::TitleChanged { title: Some(t) } if t == "should-not-run")),
+        "a top-level data:text/javascript URL executed: {after:?}"
+    );
+    assert!(
+        !any(
+            |m| matches!(m, FromTab::StatusText { text: Some(t) } if t.contains("data-url-executed"))
+        ),
+        "a top-level data:text/javascript URL executed: {after:?}"
+    );
+    assert!(
+        tab.child.try_wait().expect("try_wait").is_none(),
+        "a data:text/javascript navigation killed the tab"
     );
 
     exit_cleanly(&mut tab);

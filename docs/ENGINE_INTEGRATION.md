@@ -353,3 +353,37 @@ logger has no stdout path at all.
   browser, interleaved, `shell`/`tab N` prefixed), or a single tab under
   `printf '' | IRONSURF_LOG=debug ./target/debug/ironsurf-tab --tab-id 1 \
   --profile-dir /tmp/p --managed-net --url https://example.com --no-sandbox >/dev/null`.
+
+## G. `data:` URLs and media types (task 14)
+
+* **Decoding is ours** (`netmod::parse_data_url`, RFC 2397): it returns
+  `mime` (lowercased, empty ⇒ `text/plain`), `charset`, `base64`
+  (the `;base64` flag, matched case-insensitively, may follow a `charset`
+  parameter) and the decoded `bytes`. Both forms work: percent-encoded
+  (`data:text/javascript,document.title%3D1`) and base64
+  (`data:text/javascript;base64,…`). Invalid base64 / a missing `,` is
+  `None`, which the caller turns into a dropped subresource or a failed
+  navigation — never a panic. `decode_data_url` is the bytes-only convenience
+  wrapper. No MIME sniffing: what the URL says is what we get.
+* **The media type drives the top level** (`runtime::render_document`, called
+  between fetch and `HtmlDocument::from_html`): markup (`text/html`,
+  xhtml, svg, xml) is parsed; everything else that is a document-ish type —
+  `text/javascript`/`application/javascript`/`text/ecmascript`, `text/css`,
+  JSON, any other `text/*` — is rendered by a read-only **source view**
+  (escaped `<pre>`, header naming media type + encoding + size, document title
+  = media type). Feeding a program to the HTML parser showed the source as
+  broken markup, and evaluating it would be a `javascript:` URL under another
+  name (those `navigate()` refuses by contract). Non-text binary types
+  (`image/png`, …) keep their old behaviour: they belong to the subresource path.
+* **Subresources are unchanged**: `BlitzNetProvider::fetch` delivers decoded
+  `data:` bytes to Blitz, and `<script src="data:text/javascript;base64,…">` is
+  fetched through `fetch_document` and **executes** — a page opting in is not
+  the same decision as the user pasting a program into the URL bar
+  (both paths are asserted in `tests/e2e.rs`: `tab_runs_data_url_script`,
+  `tab_shows_top_level_data_url_script_as_source`).
+* **URL bar**: `data:` passes classification untouched and the match is
+  case-insensitive (`DATA:Text/HTML,…`), which matters because a base64 payload
+  contains no dot and would otherwise be searched, never navigated.
+* **Logs / status bar**: `data:` payloads never spray — `netmod::url_for_log`
+  reduces them to `data: URL (N bytes)` and the "Waiting for …" status text uses
+  the same reduction when the URL has no host.
