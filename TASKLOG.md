@@ -46,3 +46,9 @@ unknown page = honest internal 404, URL escaped not injected; main-doc + subreso
 status line shows full internal URL; shell classify: ironsurf:// pass-through (no-dot host
 would've become a search); gui test + ARCH updated. Live: tab loads it, title "Welcome to
 IronSurf"; workspace green.
+## #17 ACID3 testing started — plan queued (#72–#79): acid3.acidtests.org fetched OK (self-contained 183KB page;
+score lands in #score firstChild; tests run in setTimeout buckets; every CSS/selector test uses iframe#selectors
+contentDocument+doc.write). Queue order: headless --headless harness → real timers → DOM bridge (identity-cached
+wrappers {__d,__n}, LIVE NodeList, mutator-backed create/append/remove/query via blitz-dom) → getComputedStyle+el.style
+→ DOM Events → contentDocument+write → acid3 measure+fix top misses → harden+docs. Baseline pre-queue: JS cannot
+bootstrap acid3 at all (no createElement/timers). Design refs: docs/ACID3_STATUS.md will hold repro + score.
