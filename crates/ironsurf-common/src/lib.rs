@@ -3,6 +3,8 @@
 //! Framing: `u32` LE length prefix + bincode payload, over stdin/stdout pipes.
 //! See `/workspace/ARCHITECTURE.md` §ironsurf-common (single source of truth).
 
+pub mod logging;
+
 use serde::{Deserialize, Serialize};
 
 /// Identifier of a container (isolated session).
