@@ -206,9 +206,19 @@ impl CookieJar {
 // Cookie rules (must be unit-tested):
 //  - Secure cookies are ONLY sent over https: URLs and ONLY set over https:
 //  - domain suffix match (request host == cookie domain or ends with ".{cookie domain}")
-//  - path prefix match per RFC6265
-//  - expired cookies are dropped on load/access
-//  - host-only cookies (no leading dot) match exact host
+//      — a Domain= cookie is a wildcard for the domain and every subdomain;
+//  - host-only cookies (no leading dot) match the exact host only; a cookie
+//    set by www.example.com is NEVER sent to example.com or a subdomain, and
+//    .example.com never matches a lookalike like notexample.com
+//  - a Domain= attribute must be a suffix of the request host; against an IP
+//    request host or with a single-label value it rejects the cookie
+//  - path prefix match per RFC6265 §5.1.4 verbatim (/foo matches /foo and
+//    /foo/bar, never /foobar; /foo/ never matches bare /foo)
+//  - HttpOnly is captured/persisted (scripts never see cookies at all) and
+//    is still sent normally over HTTP
+//  - expired cookies are dropped on load/access; an already-expired
+//    Set-Cookie (or Max-Age<=0, or a malformed Max-Age) deletes the cookie
+//    it names instead of storing it
 
 pub struct NetCache; // bounded by total bytes (~256 MB) & entries (~1000), LRU eviction
 impl NetCache {
@@ -322,7 +332,18 @@ in `ironsurf-tab/src/netmod.rs` and pass `Arc<OurProvider>` as `DocumentConfig.n
   page on failure; `about:`/`file://`/local fixtures exempt).
 - Main-document navigations always go through our own reqwest fetcher in the tab process
   (not via NetProvider), so the managed policy always applies to top-level requests
-  regardless of provider mode.
+  regardless of provider mode. Concretely: **the container cookie jar is always
+  attached to navigations under both policies** — cookies come back from the
+  server and ride back on every later navigation and every redirect hop.
+  Redirects are followed hop-by-hop (a manual-redirect client): each hop gets
+  its own jar-computed `Cookie` header for its own origin, and each hop's
+  `Set-Cookie`s bind to that hop; POST→GET conversion follows the browser
+  rules (303 always, 301/302 convert; 307/308 keep method+body).
+  `Passthrough` therefore skips only the https-upgrade and the response cache
+  on navigations. One jar instance (`Arc<Mutex<CookieJar>>`) is shared by the
+  tab's main-document fetches and the provider's subresource fetches — cookies
+  set by either are instantly visible to the other, and shutdown persistence
+  flushes the one jar (never two copies overwriting each other).
 - `data:` URLs (RFC 2397) are decoded by us, never fetched: `parse_data_url` returns the media
   type, optional `charset`, whether the payload was `;base64`, and the bytes; both the percent-
   encoded and base64 forms work for top-level documents and for subresources (`<script src=…>`,

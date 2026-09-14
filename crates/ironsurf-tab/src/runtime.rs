@@ -441,7 +441,12 @@ pub struct Tab {
     zoom: f32,
     visible: bool,
     doc: Option<HtmlDocument>,
-    jar: CookieJar,
+    /// The container's cookie jar — the very same `Arc<Mutex<..>>` the
+    /// Blitz provider mutates for subresources. One jar per container per
+    /// tab: main-document `Set-Cookie`s reach subresource requests (and
+    /// vice versa), and shutdown persistence can no longer let one handle
+    /// overwrite the other's cookies.
+    jar: Arc<Mutex<CookieJar>>,
     cache: NetCache,
     provider: Arc<BlitzNetProvider>,
     shell: Arc<ShellHook>,
@@ -536,9 +541,9 @@ impl Tab {
 
     fn new(args: &TabArgs, pipe: Arc<SelfPipe>) -> Self {
         let store = ContainerStore::from_profile_dir(args.container_id, &args.profile_dir);
-        // The tab drives main-document fetches with its own jar/cache; the
-        // provider owns a second handle to the same on-disk jar for
-        // subresources (both are flushed on shutdown).
+        // One cookie jar per container per tab: the provider owns it, and
+        // the tab holds the same Arc handle for main-document fetches
+        // (cookies flow both ways; a single save flushes everything).
         let provider = Arc::new(
             BlitzNetProvider::new(args.net_policy, store.cookie_jar(), store.cache())
                 .with_waker(Arc::new(PipeWaker(Arc::clone(&pipe)))),
@@ -551,7 +556,7 @@ impl Tab {
             zoom: 1.0,
             visible: true,
             doc: None,
-            jar: store.cookie_jar(),
+            jar: provider.jar(),
             cache: store.cache(),
             provider,
             shell: Arc::new(ShellHook {
@@ -710,14 +715,18 @@ impl Tab {
             "fetching main document {url} (net policy {:?})",
             self_provider_policy(&self.provider)
         );
-        match netmod::fetch_document_post(
+        let jar = Arc::clone(&self.jar);
+        let mut jar = jar.lock().expect("jar mutex poisoned");
+        let fetch = netmod::fetch_document_post(
             &url,
             post,
             self_provider_policy(&self.provider),
-            &mut self.jar,
+            &mut jar,
             &self.cache,
             netmod::now_unix(),
-        ) {
+        );
+        drop(jar);
+        match fetch {
             Ok(doc_fetch) => {
                 debug!(
                     "document fetched: {} status {} ({} B) in {} ms",
@@ -909,11 +918,13 @@ impl Tab {
             // Disjoint field borrows: `doc` stays immutable while the fetcher
             // mutably borrows the jar (subresources may also flow through the
             // Blitz provider, which owns its own handle to the same state).
+            let jar = Arc::clone(&self.jar);
             let mut fetch = |script_url: &Url| -> Result<String, String> {
+                let mut jar = jar.lock().expect("jar mutex poisoned");
                 netmod::fetch_document(
                     script_url,
                     policy,
-                    &mut self.jar,
+                    &mut jar,
                     &self.cache,
                     netmod::now_unix(),
                 )
@@ -1775,14 +1786,11 @@ impl Tab {
 
 
     pub(crate) fn persist(&mut self) {
-        // Best-effort: both jar handles (main-doc + subresource) live inside
-        // the sandbox-writable profile dir.
-        debug!("persisting cookie jars to profile dir");
+        // Best-effort: the one shared jar (main doc + subresources) lives
+        // inside the sandbox-writable profile dir.
+        debug!("persisting cookie jar to profile dir");
         if let Err(err) = self.provider.save_cookies() {
-            warn!("subresource cookie jar not saved: {err}");
-        }
-        if let Err(err) = self.jar.save() {
-            warn!("main-document cookie jar not saved: {err}");
+            warn!("cookie jar not saved: {err}");
         }
     }
 
@@ -2489,6 +2497,43 @@ mod tests {
     b.addEventListener('click', function () { out.textContent = 'clicked:' + i.value; });
   </script>
 </body></html>"#;
+
+    /// One cookie jar per container per tab: the main-document handle and
+    /// the Blitz subresource provider must be the SAME jar, and the single
+    /// shutdown flush must persist whatever either put into it.
+    #[test]
+    fn the_tab_and_its_provider_share_one_cookie_jar() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let args = TabArgs {
+            tab_id: TabId(1),
+            container_id: ContainerId(1),
+            profile_dir: dir.path().to_path_buf(),
+            url: "about:blank".into(),
+            offline_fixtures: None,
+            net_policy: NetPolicy::Managed,
+            no_sandbox: true,
+        };
+        let pipe = Arc::new(SelfPipe::new().expect("pipe"));
+        let tab = Tab::new_headless(&args, pipe);
+        assert!(
+            Arc::ptr_eq(&tab.jar, &tab.provider.jar()),
+            "Tab::jar and the provider must alias one jar, not two copies"
+        );
+        // Set through the tab's main-document handle, flush through the
+        // provider (the Destroy path) — the cookie must land on disk.
+        {
+            let mut jar = tab.jar.lock().expect("jar");
+            jar.set_from_set_cookie(
+                &url::Url::parse("https://example.com/").expect("url"),
+                "shared=1; Path=/; Secure",
+                netmod::now_unix(),
+            );
+        }
+        tab.provider.save_cookies().expect("save");
+        let on_disk =
+            std::fs::read_to_string(dir.path().join("cookies.json")).expect("cookies.json");
+        assert!(on_disk.contains("shared"), "{on_disk}");
+    }
 
     fn form_tab(dir: &std::path::Path) -> Tab {
         let args = TabArgs {

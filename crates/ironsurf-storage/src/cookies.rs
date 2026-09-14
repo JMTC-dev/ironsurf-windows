@@ -3,10 +3,21 @@
 //! Rules implemented (and unit-tested):
 //! - `Secure` cookies are only ever **set** from an `https:` request URL and
 //!   only ever **sent** to `https:` URLs;
-//! - domain-matched cookies (leading `.` / `Domain=` attribute) match the
-//!   cookie domain and any `.sub.domain`; host-only cookies match exactly;
-//! - path matching is RFC6265 section 5.1.4 (with cookie-path normalization);
-//! - expired cookies are pruned on load, on access, and on `set` replacement;
+//! - domain-matched cookies (leading `.` / `Domain=` attribute) act as
+//!   wildcards: they match the cookie domain itself and any `.sub.domain`;
+//!   host-only cookies (no `Domain=`) match the exact host only — a cookie
+//!   set by `www.example.com` is never sent to `example.com` or
+//!   `sub.www.example.com`, and `.example.com` never matches `notexample.com`;
+//! - a `Domain=` attribute is honoured only when it is a suffix of the
+//!   request host; against an IP request host it is ignored (host-only), and
+//!   single-label (undotted) domains can never widen scope;
+//! - path matching is RFC6265 section 5.1.4 verbatim (`/foo` matches `/foo`
+//!   and `/foo/bar` but not `/foobar`; `/foo/` never matches bare `/foo`);
+//! - `HttpOnly` is captured and persisted (never exposed to scripts — the JS
+//!   layer has no cookie access at all) but still sent normally over HTTP;
+//! - expired cookies are pruned on load, on access, and on `set` replacement
+//!   (a `Set-Cookie` whose `Expires` is already past deletes the cookie it
+//!   would have replaced, exactly like a `Max-Age<=0`);
 //! - `Max-Age` takes precedence over `Expires`; a `Max-Age<=0` deletes.
 
 use crate::registry::StoreError;
@@ -62,6 +73,10 @@ impl CookieJar {
     /// Apply one `Set-Cookie` header value against `request_url` at `now_unix`.
     pub fn set_from_set_cookie(&mut self, request_url: &url::Url, header_value: &str, now_unix: i64) {
         let is_https = request_url.scheme() == "https";
+        let request_host = request_url.host_str().unwrap_or("").to_ascii_lowercase();
+        // An IP request host never accepts a Domain attribute (RFC6265 is
+        // silent; every browser treats such cookies as host-only).
+        let host_is_ip = request_host.parse::<std::net::IpAddr>().is_ok();
         let mut it = header_value.split(';');
         let Some(name_value) = it.next() else { return };
         let (name, value) = match name_value.split_once('=') {
@@ -89,23 +104,37 @@ impl CookieJar {
             };
             match key.as_str() {
                 "domain" => {
-                    if let Some(d) = normalize_domain(val) {
-                        domain = Some(d);
+                    // A Domain= against an IP request host rejects the
+                    // cookie (no IP domain-matches a name); browsers do the
+                    // same and never fall back to an implicit host-only set.
+                    if host_is_ip {
+                        return;
+                    }
+                    // An unusable Domain value (empty, single-label, junk)
+                    // drops the cookie rather than silently widening it to
+                    // host-only (§5.2.3: no domain-match ⇒ ignore).
+                    match normalize_domain(val) {
+                        Some(d) => domain = Some(d),
+                        None => return,
                     }
                 }
                 "path" => {
                     if !val.is_empty() && val.starts_with('/') {
-                        path = Some(normalize_cookie_path(val));
+                        path = Some(val.to_string());
                     }
                 }
                 "secure" => secure = true,
                 "httponly" => http_only = true,
                 // Max-Age takes precedence over Expires (§5.3), so they are
-                // kept separate until the end.
+                // kept separate until the end. A value that is not a plain
+                // run of digits (signed, floating, junk) means expiry-time 0
+                // — i.e. delete (§5.2.2 "char-after-digits" rule).
                 "max-age" => match val.parse::<i64>() {
-                    Ok(d) if d > 0 => max_age = Some(now_unix.saturating_add(d)),
+                    Ok(d) if d > 0 && !val.starts_with('-') && !val.starts_with('+') => {
+                        max_age = Some(now_unix.saturating_add(d))
+                    }
                     Ok(_) => max_age_delete = true,
-                    _ => {}
+                    Err(_) => max_age_delete = true,
                 },
                 "expires" => {
                     if let Some(t) = parse_http_date(val) {
@@ -123,7 +152,6 @@ impl CookieJar {
             return;
         }
 
-        let request_host = request_url.host_str().unwrap_or("").to_ascii_lowercase();
         // Domain-scope cookies keep a leading dot (".example.com"); host-only
         // cookies keep the bare host — matching the on-disk RFC6265 convention.
         let cookie_domain = match domain {
@@ -144,7 +172,10 @@ impl CookieJar {
 
         let cookie_path = path.unwrap_or_else(|| default_cookie_path(&request_url));
 
-        if max_age_delete {
+        // A cookie that is already dead at set time (Max-Age<=0, a malformed
+        // Max-Age, or an Expires in the past) deletes the cookie it names
+        // instead of being stored.
+        if max_age_delete || expires.map(|e| e <= now_unix).unwrap_or(false) {
             self.remove_matching(name, &cookie_domain, &cookie_path);
             return;
         }
@@ -229,33 +260,20 @@ fn domain_match(host: &str, cookie_domain: &str) -> bool {
     }
 }
 
-/// RFC6265 §5.1.4 path-match with cookie-path normalization on both sides.
+/// RFC6265 §5.1.4 path-match, verbatim: equal paths match; otherwise the
+/// cookie-path must be a prefix of the request-path AND either end in `/`
+/// or stop exactly at a `/` boundary in the request-path. `/foo` therefore
+/// matches `/foo` and `/foo/bar` but never `/foobar`, and `/foo/` never
+/// matches the bare `/foo`.
 fn path_match(request_path: &str, cookie_path: &str) -> bool {
-    let cookie_path = normalize_cookie_path(cookie_path);
-    let request_path = normalize_cookie_path(request_path);
     if cookie_path == "/" {
         return true;
     }
     if request_path == cookie_path {
         return true;
     }
-    request_path.starts_with(&cookie_path)
+    request_path.starts_with(cookie_path)
         && (cookie_path.ends_with('/') || request_path.as_bytes()[cookie_path.len()] == b'/')
-}
-
-/// RFC6265 §5.1.4: empty → "/", append "/" unless already "/".
-fn normalize_cookie_path(raw: &str) -> String {
-    if raw.is_empty() {
-        "/".to_string()
-    } else if raw.starts_with('/') {
-        if raw.ends_with('/') {
-            raw.to_string()
-        } else {
-            format!("{raw}/")
-        }
-    } else {
-        format!("/{raw}/")
-    }
 }
 
 /// Default cookie path = the directory of the request path (§5.1.4).

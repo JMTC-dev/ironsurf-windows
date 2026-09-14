@@ -18,8 +18,13 @@
 //!   documented "allow http" escape hatch).
 //!
 //! Main-document navigations always go through [`fetch_document`] in the tab
-//! process (never via the provider), so the managed policy applies to
-//! top-level requests regardless of provider mode.
+//! process (never via the provider), so **the container cookie jar always
+//! applies to top-level requests, regardless of provider mode**: cookies a
+//! site sets on a navigation are captured and the matching ones are sent
+//! back on every later navigation and on every redirect hop. What
+//! `Passthrough` skips is only the https-upgrade and the [`NetCache`]; what
+//! it additionally skips for *subresources* is cookie handling entirely (the
+//! documented escape hatch).
 //!
 //! Everything policy-related is a pure function over plain types so it can be
 //! unit-tested without a live network (see `tests/e2e.rs`).
@@ -108,22 +113,28 @@ pub fn upgrade_to_https(url: &Url) -> Option<Url> {
     Some(upgraded)
 }
 
-/// Classify one request under the managed policy.
-pub fn plan(policy: NetPolicy, request_url: &Url, is_for_main_frame: bool) -> Plan {
-    if policy != NetPolicy::Managed || !is_http_scheme(request_url) {
-        return Plan::Pass;
+/// Classify one **main-document** navigation. Unlike subresources (where
+/// `Passthrough` keeps the documented no-cookie escape hatch), the top-level
+/// fetch always rides on [`managed_http_fetch`] — cookies are always sent
+/// and captured for navigations. `Passthrough` only skips the https-upgrade
+/// (and the cache, via the `cacheable` argument at the call site); `Managed`
+/// upgrades `http:` and blocks with an error page when the upgrade fails.
+pub fn plan_document(policy: NetPolicy, request_url: &Url) -> Plan {
+    if !is_http_scheme(request_url) {
+        return Plan::Pass; // local schemes never reach the network layer
     }
     match request_url.scheme() {
         "https" => Plan::Fetch(request_url.clone()),
-        "http" if is_for_main_frame => match upgrade_to_https(request_url) {
-            Some(https) => Plan::Upgrade(https),
-            // Cannot parse? Still fetch as-is.
-            None => Plan::Pass,
+        _ => match upgrade_to_https(request_url) {
+            Some(https) if policy == NetPolicy::Managed => Plan::Upgrade(https),
+            // Passthrough (or an unparseable upgrade): fetch the URL as
+            // asked for — still with cookies from the container jar.
+            _ => Plan::Fetch(request_url.clone()),
         },
-        // Documented escape hatch: http sub-resources keep working.
-        _ => Plan::Pass,
     }
 }
+
+
 
 /// Revalidation outcome for a cached entry.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -675,6 +686,8 @@ pub fn decode_base64(input: &str) -> Option<Vec<u8>> {
 /// freshly-spawned worker threads, feeding `Box<dyn NetHandler>` callbacks.
 pub struct FetchWorker {
     client: reqwest::blocking::Client,
+    /// Same transport, redirects left to the caller (the managed cookie path).
+    redirect_manual: reqwest::blocking::Client,
 }
 
 impl FetchWorker {
@@ -694,11 +707,30 @@ impl FetchWorker {
             .timeout(timeout)
             .build()
             .expect("reqwest client");
-        FetchWorker { client }
+        // Managed fetches follow redirects themselves: reqwest's automatic
+        // policy would replay the first hop's `Cookie` header verbatim and
+        // only expose the final hop's `Set-Cookie`s, silently breaking the
+        // per-origin cookie rules. Manual policy hands us every hop.
+        let redirect_manual = reqwest::blocking::Client::builder()
+            .use_rustls_tls()
+            .redirect(reqwest::redirect::Policy::none())
+            .timeout(timeout)
+            .build()
+            .expect("reqwest manual-redirect client");
+        FetchWorker {
+            client,
+            redirect_manual,
+        }
     }
 
     pub fn client(&self) -> &reqwest::blocking::Client {
         &self.client
+    }
+
+    /// The client managed cookie fetches must use (3xx responses come back
+    /// to us instead of being followed blindly).
+    pub fn managed_client(&self) -> &reqwest::blocking::Client {
+        &self.redirect_manual
     }
 
     /// Execute a blocking fetch job on a spawned thread. The job's closure
@@ -815,13 +847,24 @@ pub fn plain_http_fetch(
     })
 }
 
-/// Managed HTTP fetch (GET, or a form `POST` with `post`): injects the
-/// container jar's `Cookie` header, sends the cached entry's
-/// `If-None-Match`/`If-Modified-Since` validators, captures every
-/// `Set-Cookie` (against the **final** URL) and serves/stores [`NetCache`]
-/// entries. A `POST` consults and mutates the cache **never** (it is not a
-/// safe method), but gets the full cookie treatment. `extra` (from the Blitz
-/// `Request`) never overrides our `Cookie` header.
+/// Maximum redirects a single managed fetch follows before giving up.
+const MAX_MANAGED_REDIRECTS: u32 = 10;
+
+/// Managed HTTP fetch (GET, or a form `POST` with `post`): the full cookie
+/// workhorse. Redirects are followed **hop by hop** (the caller must hand us
+/// a `Policy::none()` client — [`FetchWorker::managed_client`]) so that
+/// every hop gets its own `Cookie` header from the container jar and every
+/// hop's `Set-Cookie`s are captured against **that hop's** URL — reqwest's
+/// automatic redirect would replay hop 1's cookies to hop 2 verbatim and
+/// only ever see the final hop's `Set-Cookie`s, silently breaking the
+/// per-origin rules. Method conversion follows the browser convention: 303
+/// always retries as GET; 301/302 turn a POST into a GET; 307/308 keep the
+/// method and body.
+///
+/// `If-None-Match`/`If-Modified-Since` validators go on the first hop and
+/// [`NetCache`] entries are stored under the original `url` — but only when
+/// `cacheable` (a `POST` is never cached, look up or store). `extra` (from
+/// the Blitz `Request`) never overrides our `Cookie` header.
 pub fn managed_http_fetch(
     client: &reqwest::blocking::Client,
     url: &Url,
@@ -830,67 +873,108 @@ pub fn managed_http_fetch(
     now: i64,
     extra: Option<&HeaderMap>,
     post: Option<&MainDocPost>,
+    cacheable: bool,
 ) -> Result<FetchOutcome, String> {
     let is_post = post.is_some();
-    let mut req = build_request(client, url, post).header("User-Agent", USER_AGENT);
-    if let Some(headers) = extra {
-        for (name, value) in headers {
-            if name.as_str().eq_ignore_ascii_case("cookie") {
-                continue; // the jar owns the Cookie header
-            }
-            req = req.header(name.clone(), value.clone());
-        }
-    }
-    if let Some(cookie) = jar.cookie_header(url, now) {
-        req = req.header(reqwest::header::COOKIE, cookie);
-    }
-
-    let cached = if is_post {
-        None // POSTs bypass the cache entirely (lookup and store).
-    } else {
+    let cacheable = cacheable && !is_post;
+    let cached = if cacheable {
         let cached = cache.lookup(url.as_str());
         if cached.is_some() {
             debug!("cache entry for {url}: revalidating");
         }
         cached
+    } else {
+        None
     };
-    if let Some(entry) = cached.as_ref() {
-        let (etag, last_modified) = validators(&entry.headers);
-        if let Some(etag) = etag {
-            req = req.header(reqwest::header::IF_NONE_MATCH, etag);
-        } else if let Some(lm) = last_modified {
-            req = req.header(reqwest::header::IF_MODIFIED_SINCE, lm);
+
+    let mut current = url.clone();
+    let mut method = post; // POST -> GET conversions happen on redirect
+    let mut first_hop = true;
+    let mut hops_left = MAX_MANAGED_REDIRECTS;
+    let (status, final_url, headers, body) = loop {
+        let mut req = build_request(client, &current, method).header("User-Agent", USER_AGENT);
+        if let Some(extra_headers) = extra {
+            for (name, value) in extra_headers {
+                if name.as_str().eq_ignore_ascii_case("cookie") {
+                    continue; // the jar owns the Cookie header
+                }
+                req = req.header(name.clone(), value.clone());
+            }
         }
-    }
+        // The jar answers for this hop's origin, at this hop's URL — a
+        // redirect into another host must never inherit cookies blindly.
+        if let Some(cookie) = jar.cookie_header(&current, now) {
+            req = req.header(reqwest::header::COOKIE, cookie);
+        }
+        if first_hop {
+            if let Some(entry) = cached.as_ref() {
+                let (etag, last_modified) = validators(&entry.headers);
+                if let Some(etag) = etag {
+                    req = req.header(reqwest::header::IF_NONE_MATCH, etag);
+                } else if let Some(lm) = last_modified {
+                    req = req.header(reqwest::header::IF_MODIFIED_SINCE, lm);
+                }
+            }
+        }
+        let verb = if method.is_some() { "POST" } else { "GET" };
+        let response = req.send().map_err(|e| {
+            warn!("{verb} {current} failed: {e}");
+            format!("fetch {current}: {e}")
+        })?;
+        let status = response.status().as_u16();
 
-    let response = req.send().map_err(|e| {
-        warn!("GET {url} failed: {e}");
-        format!("fetch {url}: {e}")
-    })?;
-    let status = response.status().as_u16();
-    // Cookies are captured against the final URL (redirect target).
-    let final_url = response.url().clone();
-    let set_cookies: Vec<String> = response
-        .headers()
-        .get_all(reqwest::header::SET_COOKIE)
-        .iter()
-        .filter_map(|v| v.to_str().ok())
-        .map(str::to_owned)
-        .collect();
-    let headers = collect_headers(response.headers());
-    let body = response
-        .bytes()
-        .map(|b| b.to_vec())
-        .map_err(|e| format!("body {url}: {e}"))?;
+        // Every hop's Set-Cookies bind to the hop that sent them.
+        let set_cookies: Vec<String> = response
+            .headers()
+            .get_all(reqwest::header::SET_COOKIE)
+            .iter()
+            .filter_map(|v| v.to_str().ok())
+            .map(str::to_owned)
+            .collect();
+        capture_set_cookies(jar, &current, set_cookies.iter().map(String::as_str), now);
+        if !set_cookies.is_empty() {
+            debug!(
+                "captured {} Set-Cookie header(s) for {}",
+                set_cookies.len(),
+                current
+            );
+        }
 
-    capture_set_cookies(jar, &final_url, set_cookies.iter().map(String::as_str), now);
-    if !set_cookies.is_empty() {
-        debug!(
-            "captured {} Set-Cookie header(s) for {}",
-            set_cookies.len(),
-            final_url
-        );
-    }
+        if matches!(status, 301 | 302 | 303 | 307 | 308) {
+            let location = response
+                .headers()
+                .get(reqwest::header::LOCATION)
+                .and_then(|v| v.to_str().ok())
+                .map(str::trim)
+                .filter(|loc| !loc.is_empty())
+                .and_then(|loc| current.join(loc).ok());
+            match location {
+                Some(target) if hops_left > 0 => {
+                    debug!("{verb} {current} -> {status} redirect to {target} ({hops_left} hops left)");
+                    // 303 always retries with GET; 301/302 convert a POST.
+                    // 307/308 keep the method and body.
+                    if status == 303 || (matches!(status, 301 | 302) && method.is_some()) {
+                        method = None;
+                    }
+                    current = target;
+                    first_hop = false;
+                    hops_left -= 1;
+                    continue; // response dropped here: hop body unread
+                }
+                Some(target) => {
+                    warn!("redirect loop budget exhausted at {current} (to {target}); serving the {status}");
+                }
+                None => {} // no usable Location: the 3xx is the answer
+            }
+        }
+
+        let headers = collect_headers(response.headers());
+        let body = response
+            .bytes()
+            .map(|b| b.to_vec())
+            .map_err(|e| format!("body {current}: {e}"))?;
+        break (status, current.clone(), headers, body);
+    };
 
     let (etag, last_modified) = validators(&headers);
     let empty = || CachedEntry {
@@ -923,13 +1007,13 @@ pub fn managed_http_fetch(
             })
         }
         Revalidate::UseFresh { .. } => {
-            if !is_post && status < 400 {
+            if cacheable && status < 400 {
                 debug!("GET {url} -> {status} ({} B, stored in cache)", body.len());
                 cache.store(url.as_str(), status, &headers, body.clone(), now);
             } else if is_post {
                 debug!("POST {url} -> {status} ({} B, never cached)", body.len());
             } else {
-                debug!("GET {url} -> {status} ({} B, not cacheable)", body.len());
+                debug!("managed {url} -> {status} ({} B, not cacheable)", body.len());
             }
             Ok(FetchOutcome {
                 final_url,
@@ -1003,6 +1087,15 @@ impl BlitzNetProvider {
         self.jar.lock().expect("jar mutex poisoned").save()
     }
 
+    /// The tab's handle on the **same** jar the provider uses for
+    /// subresources — one jar per container per process, so a `Set-Cookie`
+    /// from a main-document navigation is immediately visible to
+    /// subresources (and vice versa), and persistence cannot overwrite one
+    /// handle's cookies with the other's.
+    pub fn jar(&self) -> Arc<Mutex<CookieJar>> {
+        Arc::clone(&self.jar)
+    }
+
     #[allow(dead_code)] // waker fires via the NetWaker installed by with_waker
     fn wake(&self, doc_id: usize) {
         let guard = self.waker.lock().expect("waker mutex poisoned");
@@ -1026,7 +1119,16 @@ impl BlitzNetProvider {
             let outcome = if managed {
                 let mut jar = jar.lock().expect("jar mutex poisoned");
                 let cache = cache.lock().expect("cache mutex poisoned");
-                managed_http_fetch(worker.client(), &url, &mut jar, &cache, now_unix(), None, None)
+                managed_http_fetch(
+                    worker.managed_client(),
+                    &url,
+                    &mut jar,
+                    &cache,
+                    now_unix(),
+                    None,
+                    None,
+                    true,
+                )
             } else {
                 plain_http_fetch(worker.client(), &url, Some(&request.headers), None)
             };
@@ -1211,10 +1313,12 @@ fn shared_worker() -> Arc<FetchWorker> {
 /// Fetch a **main document** under `policy` (never via the NetProvider, per
 /// ARCHITECTURE). `file:` is read from disk and never upgraded;
 /// `about:`/local fixture pages are answered from built-ins; `data:` decodes
-/// inline. `Passthrough` fetches http(s) as-is; `Managed` injects cookies,
-/// captures `Set-Cookie`, serves/stores [`NetCache`] entries with ETag
-/// revalidation, and https-upgrades `http:` navigations — blocking with
-/// [`NetError::Blocked`] (carrying the error page) when the upgrade fails.
+/// inline. Both policies send and capture container cookies on the
+/// navigation (the jar is consulted per hop through [`managed_http_fetch`],
+/// including redirects and redirect chains across origins); `Managed` adds
+/// [`NetCache`] service/storage and https-upgrades `http:` navigations —
+/// blocking with [`NetError::Blocked`] (carrying the error page) when the
+/// upgrade fails.
 pub fn fetch_document(
     url: &Url,
     policy: NetPolicy,
@@ -1313,8 +1417,11 @@ fn fetch_document_with_worker(
         return Err(NetError::Unsupported { url: url.clone() });
     }
 
-    match plan(policy, url, true) {
-        // Escape hatch keeps working: passthrough fetches exactly what was asked.
+    // The jar always applies to top-level loads; only the cache follows the
+    // managed policy.
+    let cacheable = policy == NetPolicy::Managed;
+    match plan_document(policy, url) {
+        // Non-http scheme that still reached here (unknown scheme): refuse.
         Plan::Pass => plain_http_fetch(worker.client(), url, None, post)
             .map(|o| DocFetch {
                 url: o.final_url,
@@ -1326,7 +1433,7 @@ fn fetch_document_with_worker(
                 message,
             }),
         Plan::Fetch(target) => {
-            managed_http_fetch(worker.client(), &target, jar, cache, now, None, post)
+            managed_http_fetch(worker.managed_client(), &target, jar, cache, now, None, post, cacheable)
                 .map(|o| DocFetch {
                     url: o.final_url,
                     status: o.status,
@@ -1339,7 +1446,7 @@ fn fetch_document_with_worker(
         }
         Plan::Upgrade(https) => {
             debug!("https-upgrade: {url} -> {https}");
-            match managed_http_fetch(worker.client(), &https, jar, cache, now, None, post) {
+            match managed_http_fetch(worker.managed_client(), &https, jar, cache, now, None, post, true) {
                 Ok(o) => Ok(DocFetch {
                     url: o.final_url,
                     status: o.status,
@@ -1364,6 +1471,8 @@ fn fetch_document_with_worker(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
 
     fn url(s: &str) -> Url {
         Url::parse(s).expect("test url")
@@ -1381,42 +1490,43 @@ mod tests {
     }
 
     #[test]
-    fn passthrough_policy_never_intercepts() {
+    fn document_plan_fetches_under_both_policies_never_without_the_jar() {
+        // The whole point: a navigation is never "Pass"ed to a cookie-less
+        // plain fetch. Passthrough fetches the URL as asked (jar attached);
+        // Managed upgrades http: first.
         assert_eq!(
-            plan(NetPolicy::Passthrough, &url("https://example.com"), true),
-            Plan::Pass
+            plan_document(NetPolicy::Passthrough, &url("https://example.com")),
+            Plan::Fetch(url("https://example.com"))
         );
         assert_eq!(
-            plan(NetPolicy::Passthrough, &url("http://example.com"), true),
-            Plan::Pass
+            plan_document(NetPolicy::Passthrough, &url("http://example.com/x")),
+            Plan::Fetch(url("http://example.com/x"))
         );
-    }
-
-    #[test]
-    fn managed_fetches_https_and_upgrades_http_navigations() {
-        let https = url("https://example.com/page");
         assert_eq!(
-            plan(NetPolicy::Managed, &https, true),
-            Plan::Fetch(https.clone())
+            plan_document(NetPolicy::Managed, &url("https://example.com/page")),
+            Plan::Fetch(url("https://example.com/page"))
         );
-        let http = url("http://example.com/page");
         assert_eq!(
-            plan(NetPolicy::Managed, &http, true),
+            plan_document(NetPolicy::Managed, &url("http://example.com/page")),
             Plan::Upgrade(url("https://example.com/page"))
         );
-        // Escape hatch: http sub-resources keep working unmodified.
-        assert_eq!(plan(NetPolicy::Managed, &http, false), Plan::Pass);
     }
 
     #[test]
-    fn managed_passes_non_http_schemes() {
+    fn document_plan_passes_non_http_schemes() {
         for scheme_url in [
             "file:///tmp/x/index.html",
             "about:blank",
             "data:text/html,x",
+            "ironsurf://welcome",
         ] {
             assert_eq!(
-                plan(NetPolicy::Managed, &url(scheme_url), true),
+                plan_document(NetPolicy::Managed, &url(scheme_url)),
+                Plan::Pass,
+                "{scheme_url} must pass through"
+            );
+            assert_eq!(
+                plan_document(NetPolicy::Passthrough, &url(scheme_url)),
                 Plan::Pass,
                 "{scheme_url} must pass through"
             );
@@ -2111,5 +2221,254 @@ mod tests {
     fn worker_for_test() -> &'static FetchWorker {
         static WORKER: OnceLock<Arc<FetchWorker>> = OnceLock::new();
         WORKER.get_or_init(|| FetchWorker::with_timeout(std::time::Duration::from_secs(5)))
+    }
+
+    // -- live localhost HTTP: the cookie goes out and comes back -------------
+    //
+    // A tiny HTTP/1.0 server on 127.0.0.1 answering fixed routes, used to
+    // prove the *wire* behaviour the jar unit tests cannot: `Cookie` headers
+    // actually riding on requests, `Set-Cookie` actually coming back, every
+    // hop of a redirect chain handled against its own origin.
+
+    enum Route {
+        /// 302 to `to` with the listed Set-Cookie headers.
+        Redirect { to: String, set_cookie: Vec<String> },
+        /// 200 echoing the `Cookie` header it received (`-` when none).
+        Echo,
+    }
+
+    /// Spawn the test server; returns its port. Serves one request per
+    /// connection (HTTP/1.0: close after the response). Dual-stack bind so
+    /// BOTH `127.0.0.1` and `localhost` (-> ::1) reach the same server on
+    /// the same port — two distinct origin host names for the cross-origin
+    /// redirect test.
+    fn spawn_local_http_server(routes: Vec<(&str, Route)>) -> u16 {
+        let listener = TcpListener::bind(("[::]", 0))
+            .or_else(|_| TcpListener::bind(("127.0.0.1", 0)))
+            .expect("bind loopback");
+        let port = listener.local_addr().expect("addr").port();
+        let routes: Vec<(String, Route)> = routes
+            .into_iter()
+            .map(|(p, r)| (p.to_string(), r))
+            .collect();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { continue };
+                // Read the request head (non-verbose GETs only).
+                let mut buf: Vec<u8> = Vec::new();
+                let mut byte = [0u8; 1];
+                while !buf.ends_with(b"\r\n\r\n") {
+                    match stream.read(&mut byte) {
+                        Ok(0) | Err(_) => break,
+                        Ok(_) => buf.push(byte[0]),
+                    }
+                    if buf.len() > 64 * 1024 {
+                        break;
+                    }
+                }
+                let head = String::from_utf8_lossy(&buf).to_string();
+                let path = head
+                    .split_whitespace()
+                    .nth(1)
+                    .unwrap_or("/")
+                    .to_string();
+                let cookie = head
+                    .lines()
+                    .find(|line| line.to_ascii_lowercase().starts_with("cookie:"))
+                    .map(|line| line["cookie:".len()..].trim().to_owned())
+                    .unwrap_or_default();
+                let route = routes
+                    .iter()
+                    .find(|(p, _)| *p == path)
+                    .map(|(_, r)| match r {
+                        Route::Redirect { to, set_cookie } => Route::Redirect {
+                            to: to.replace("{port}", &port.to_string()),
+                            set_cookie: set_cookie.clone(),
+                        },
+                        Route::Echo => Route::Echo,
+                    });
+                let response = match route {
+                    Some(Route::Redirect { to, set_cookie }) => {
+                        let mut r = format!("HTTP/1.0 302 Found\r\nLocation: {to}\r\n");
+                        for value in set_cookie {
+                            r.push_str(&format!("Set-Cookie: {value}\r\n"));
+                        }
+                        r.push_str("Connection: close\r\n\r\n");
+                        r
+                    }
+                    Some(Route::Echo) => {
+                        let body = if cookie.is_empty() { "-".into() } else { cookie };
+                        format!(
+                            "HTTP/1.0 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                            body.len()
+                        )
+                    }
+                    None => "HTTP/1.0 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_string(),
+                };
+                let _ = stream.write_all(response.as_bytes());
+                let _ = stream.flush();
+            }
+        });
+        port
+    }
+
+    fn test_cache(name: &str) -> NetCache {
+        let dir = std::env::temp_dir().join(format!("ironsurf-tab-cookie-{name}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        NetCache::with_limits(dir, 16, 4096)
+    }
+
+    fn get(url: &str) -> Url {
+        Url::parse(url).expect("test url")
+    }
+
+    /// One jar, one worker, both redirect legs: cookies set on earlier hops
+    /// must be on the later hops' requests, and vice versa.
+    fn fetch(path: &str, port: u16, jar: &mut CookieJar, cache: &NetCache) -> FetchOutcome {
+        managed_http_fetch(
+            worker_for_test().managed_client(),
+            &get(&format!("http://127.0.0.1:{port}{path}")),
+            jar,
+            cache,
+            now_unix(),
+            None,
+            None,
+            false,
+        )
+        .expect("localhost fetch")
+    }
+
+    #[test]
+    fn redirect_chain_cookies_are_captured_and_sent_per_hop() {
+        let port = spawn_local_http_server(vec![
+            (
+                "/multi",
+                Route::Redirect {
+                    to: "/hop2".into(),
+                    set_cookie: vec!["m1=1; Path=/".into()],
+                },
+            ),
+            (
+                "/hop2",
+                Route::Redirect {
+                    to: "/echo".into(),
+                    set_cookie: vec!["m2=2; Path=/".into()],
+                },
+            ),
+            ("/echo", Route::Echo),
+        ]);
+        let mut jar = CookieJar::new();
+        let out = fetch("/multi", port, &mut jar, &test_cache("chain"));
+        let echoed = String::from_utf8_lossy(&out.body).to_string();
+        assert_eq!(out.final_url.as_str(), format!("http://127.0.0.1:{port}/echo"));
+        // The final hop saw BOTH chain cookies — each captured on its own
+        // hop and replayed by the jar on the following one.
+        assert!(echoed.contains("m1=1"), "hop-1 cookie missing from {echoed:?}");
+        assert!(echoed.contains("m2=2"), "hop-2 cookie missing from {echoed:?}");
+    }
+
+    #[test]
+    fn path_and_domain_scope_are_enforced_on_the_wire() {
+        let port = spawn_local_http_server(vec![
+            (
+                "/start",
+                Route::Redirect {
+                    to: "/echo".into(),
+                    set_cookie: vec![
+                        "hop=1; Path=/".into(),
+                        // Scoped to /start: must NOT ride along to /echo.
+                        "scoped=9; Path=/start".into(),
+                        // Domain attributes against these hosts are invalid:
+                        // foreign suffix and single-label both reject.
+                        "badhost=7; Domain=example.com; Path=/".into(),
+                        "single=8; Domain=localhost; Path=/".into(),
+                        // Secure over plain http: rejected out right.
+                        "sec=5; Path=/; Secure".into(),
+                    ],
+                },
+            ),
+            ("/echo", Route::Echo),
+        ]);
+        let mut jar = CookieJar::new();
+        let out = fetch("/start", port, &mut jar, &test_cache("scope"));
+        let echoed = String::from_utf8_lossy(&out.body).to_string();
+        assert_eq!(echoed, "hop=1", "only the Path=/ cookie may reach /echo, got {echoed:?}");
+        // The jar itself kept nothing but the valid host-only cookies.
+        let domains: Vec<&str> = jar.cookies().iter().map(|c| c.domain.as_str()).collect();
+        assert!(domains.iter().all(|d| *d == "127.0.0.1"), "{domains:?}");
+        assert!(!jar.cookies().iter().any(|c| c.name == "sec"), "Secure cookie set over http");
+    }
+
+    #[test]
+    fn host_only_cookie_never_follows_a_redirect_to_another_host() {
+        // Reached via `localhost`, /cross sets a host-only cookie and
+        // redirects to 127.0.0.1 — a DIFFERENT origin. The echo on that
+        // host must not see the cookie, but the jar must still have it.
+        let port = spawn_local_http_server(vec![
+            (
+                "/cross",
+                Route::Redirect {
+                    to: format!("http://127.0.0.1:{{port}}/echo"),
+                    set_cookie: vec!["mk=keep; Path=/".into()],
+                },
+            ),
+            ("/echo", Route::Echo),
+        ]);
+        let mut jar = CookieJar::new();
+        let out = managed_http_fetch(
+            worker_for_test().managed_client(),
+            &get(&format!("http://localhost:{port}/cross")),
+            &mut jar,
+            &test_cache("cross"),
+            now_unix(),
+            None,
+            None,
+            false,
+        )
+        .expect("localhost redirect fetch");
+        let echoed = String::from_utf8_lossy(&out.body).to_string();
+        assert_eq!(echoed, "-", "host-only cookie leaked to the other host: {echoed:?}");
+        assert!(jar.cookies().iter().any(|c| c.name == "mk" && c.domain == "localhost"));
+    }
+
+    #[test]
+    fn main_document_navigations_carry_the_jar_even_under_passthrough() {
+        // The headline rule: even the *default* (Passthrough) policy sends
+        // cookies on top-level loads — a site that set a cookie on one
+        // navigation must see it come back on the next. (Under Managed the
+        // navigation rides the very same managed_http_fetch the tests above
+        // exercise against this server; its only addition is the http→https
+        // upgrade, which a plain-http loopback server cannot show.)
+        let port = spawn_local_http_server(vec![
+            (
+                "/set",
+                Route::Redirect {
+                    to: "/echo".into(),
+                    set_cookie: vec!["back=1; Path=/".into()],
+                },
+            ),
+            ("/echo", Route::Echo),
+        ]);
+        let cache = test_cache("nav");
+        let mut jar = CookieJar::new();
+        let first = fetch_document(
+            &get(&format!("http://127.0.0.1:{port}/set")),
+            NetPolicy::Passthrough,
+            &mut jar,
+            &cache,
+            now_unix(),
+        )
+        .expect("navigation 1");
+        assert_eq!(first.url.as_str(), format!("http://127.0.0.1:{port}/echo"));
+        let second = fetch_document(
+            &get(&format!("http://127.0.0.1:{port}/echo")),
+            NetPolicy::Passthrough,
+            &mut jar,
+            &cache,
+            now_unix(),
+        )
+        .expect("navigation 2");
+        let echoed = String::from_utf8_lossy(&second.body).to_string();
+        assert_eq!(echoed, "back=1", "Passthrough navigation never returned the cookie");
     }
 }

@@ -1,17 +1,17 @@
 # Task log
-## #8 Boa JS layer (ironsurf-tab/src/js.rs) — <script>s in document order (src= via fetch_document ⇒ same net
-policy); ONE boa-0.22 Context per navigation; 5 natives + trusted glue (global IS window): title get/set→
-TitleChanged+repaint, body textContent, console→StatusText, eval caught, timers counted-only (TODO),
-javascript: refused at navigate().
-## #9 DONE — workspace green on Blitz stack; shell tabs are REAL — slint 1.17 drift fixed (Color u8, Image::size()),
-pump test→tests/pump.rs (no CARGO_BIN_EXE in lib tests); history Fresh index fixed (Back was dead) + wait_for_new;
-tests/real_tab.rs (+IRONSURF_ONLINE=1→example.com live); docs SERVO→ENGINE_INTEGRATION.md (Blitz/Boa §A–D).
-## #10 rename servfox→ironsurf — crates/dirs, crate+bin names, slint ui→ironsurf.slint, env IRONSURF_*,
-all src/tests/docs/TASKLOG refs; Cargo.lock rewritten.
-## #11 instant-feeling link clicks + honest status bar — tab: coalesce_moves drops superseded hover moves per
-stdin batch + no repaint when get_hover_node_id() unchanged (flood→click ack 19.98s→0.93s, frames 64→2), hover
-<a href>⇒StatusText(target); shell: move_due 33 ms gate, LoadingChanged(true) clears sticky Error, spinner at load
-start; live human-click 11.5s→1.5s; docs §E.
+## #23 cookies actually returned to sites — navigations are never cookie-less: plan_document (old plan dropped)
+routes every top-level http(s) load through managed_http_fetch EVEN under default Passthrough (Passthrough now skips
+only https-upgrade+cache); redirects followed hop-by-hop on a Policy::none() client (FetchWorker::managed_client):
+per-hop jar Cookie (cross-host redirect never replays blindly; localhost≠127.0.0.1 proven), per-hop Set-Cookie
+capture (chain cookies reach the final hop), POST→GET on 303/301/302, 307/308 keep body; Tab+provider share ONE
+Arc<Mutex<CookieJar>> (was two jars, last-save-won clobbered subresource cookies). cookies.rs RFC6265 hardening:
+§5.1.4 path-match exact (Path=/foo hits /foo+/foo/bar, /foo/ never /foo; no trailing-slash normalization), Domain= on
+IP host or invalid/single-label → reject, malformed Max-Age → delete, already-expired Expires deletes not stores;
+HttpOnly persisted+sent normally, scripts have zero cookie access; per-container jars = profile dirs
+(containers_have_separate_jars test + sandbox probe). localhost HTTP wire tests (redirect chain, path/domain scope,
+cross-host, Passthrough nav), runtime ptr_eq shared-jar test; ARCH cookie rules+net layer updated; workspace green,
+live example.com real_tab ok.
+
 ## #12 docs/BUILD_DEBIAN.md — apt prereqs proven from cargo tree/build.rs/objdump: build-essential, pkg-config,
 git/curl/ca-certs, libssl-dev (native-tls←reqwest0.13←blitz-net), libfontconfig-dev (usvg/fontique); X11/Wayland/GL
 are dlopen'd so NO -dev headers; runtime lib list in that doc; Servo-era deps dropped from README+AGENTS.

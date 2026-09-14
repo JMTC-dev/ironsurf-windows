@@ -180,6 +180,118 @@ fn malformed_set_cookie_values_are_ignored() {
     assert!(jar.cookies().is_empty());
 }
 
+#[test]
+fn cookie_path_boundaries_are_exact() {
+    // RFC6265 §5.1.4: "/foo" matches "/foo" and "/foo/bar" but never "/foobar".
+    let jar = jar_with("p=1; Path=/foo; Secure", "https://example.com/");
+    assert!(jar.cookie_header(&url("https://example.com/foo"), T).is_some());
+    assert!(jar.cookie_header(&url("https://example.com/foo/"), T).is_some());
+    assert!(jar.cookie_header(&url("https://example.com/foo/bar"), T).is_some());
+    assert_eq!(jar.cookie_header(&url("https://example.com/foobar"), T), None);
+    assert_eq!(jar.cookie_header(&url("https://example.com/fo"), T), None);
+    // A trailing-slash cookie-path never matches the bare directory.
+    let dir = jar_with("q=1; Path=/foo/; Secure", "https://example.com/");
+    assert_eq!(dir.cookie_header(&url("https://example.com/foo"), T), None);
+    assert!(dir.cookie_header(&url("https://example.com/foo/"), T).is_some());
+    assert!(dir.cookie_header(&url("https://example.com/foo/bar"), T).is_some());
+}
+
+#[test]
+fn already_expired_expires_deletes_the_cookie() {
+    // A Set-Cookie whose Expires is already past deletes the cookie it names
+    // instead of storing (and later pruning) a corpse.
+    let mut jar = jar_with("s=1; Path=/; Secure", "https://example.com/");
+    jar.set_from_set_cookie(
+        &url("https://example.com/"),
+        "s=1; Path=/; Expires=Wed, 09 Jun 2021 10:18:14 GMT",
+        T,
+    );
+    assert!(jar.cookies().is_empty());
+    assert_eq!(jar.cookie_header(&url("https://example.com/"), T), None);
+}
+
+#[test]
+fn malformed_max_age_deletes() {
+    // RFC6265 §5.2.2: a Max-Age that is not a plain run of digits means
+    // expiry-time 0 — delete, do not ignore.
+    let mut jar = jar_with("m=1; Path=/; Secure", "https://example.com/");
+    jar.set_from_set_cookie(&url("https://example.com/"), "m=1; Path=/; Max-Age=soon", T);
+    assert!(jar.cookies().is_empty());
+}
+
+#[test]
+fn http_only_cookie_is_sent_over_the_wire_but_flagged() {
+    // HttpOnly governs script access (the JS layer never sees cookies), not
+    // the HTTP request: it must still be sent to the server, and the flag
+    // must survive the cookies.json round trip.
+    let jar = jar_with("h=1; Path=/; HttpOnly", "https://example.com/");
+    assert!(jar.cookies()[0].http_only);
+    assert_eq!(
+        jar.cookie_header(&url("https://example.com/"), T).as_deref(),
+        Some("h=1")
+    );
+    assert_eq!(
+        jar.cookie_header(&url("http://example.com/"), T).as_deref(),
+        Some("h=1"),
+        "HttpOnly says nothing about transport security"
+    );
+    let json = serde_json::to_string(&jar.cookies().to_vec()).unwrap();
+    let back: Vec<ironsurf_storage::Cookie> = serde_json::from_str(&json).unwrap();
+    assert!(back[0].http_only);
+}
+
+#[test]
+fn domain_attribute_ignored_for_ip_request_hosts() {
+    // Against an IP host a Domain= attribute is ignored: the cookie stays
+    // host-only for the IP, and an unrelated Domain= rejects the set.
+    let jar = jar_with("d=1; Domain=example.com; Path=/", "http://127.0.0.1:8080/");
+    assert!(jar.cookies().is_empty());
+    let host = jar_with("d=1; Path=/", "http://127.0.0.1:8080/");
+    assert_eq!(host.cookies()[0].domain, "127.0.0.1");
+    assert_eq!(
+        host.cookie_header(&url("http://127.0.0.1:8080/x"), T).as_deref(),
+        Some("d=1"),
+        "cookie-domain matching ignores the port"
+    );
+}
+
+/// Each container gets its own jar: cookies set in one are invisible to
+/// the other, on disk and in every freshly loaded jar.
+#[test]
+fn containers_have_separate_cookie_jars() {
+    use ironsurf_storage::{ContainerStore, Store};
+
+    let tmp = tempfile::tempdir().unwrap();
+    let mut store = Store::open(tmp.path()).unwrap();
+    let a = store.create_container("A", "#ff0000").unwrap();
+    let b = store.create_container("B", "#00ff00").unwrap();
+    let ca = ContainerStore::open(&store, a);
+    let cb = ContainerStore::open(&store, b);
+
+    let mut jar_a = ca.cookie_jar();
+    jar_a.set_from_set_cookie(&url("https://corp.example/"), "who=a; Path=/; Secure", T);
+    jar_a.save().unwrap();
+
+    // B's jar (fresh from disk) knows nothing of A's cookie…
+    let jar_b = cb.cookie_jar();
+    assert_eq!(jar_b.cookie_header(&url("https://corp.example/"), T), None);
+
+    // …and B writing its own jar never touches A's file.
+    let mut jar_b = cb.cookie_jar();
+    jar_b.set_from_set_cookie(&url("https://corp.example/"), "who=b; Path=/; Secure", T);
+    jar_b.save().unwrap();
+    assert_eq!(
+        ca.cookie_jar().cookie_header(&url("https://corp.example/"), T).as_deref(),
+        Some("who=a")
+    );
+    assert_eq!(
+        cb.cookie_jar().cookie_header(&url("https://corp.example/"), T).as_deref(),
+        Some("who=b")
+    );
+    // Distinct profile dirs is the isolation mechanism.
+    assert_ne!(ca.profile_dir(), cb.profile_dir());
+}
+
 /// End-to-end persistence + isolation through ContainerStore files.
 #[test]
 fn jar_persists_per_container_file() {
