@@ -301,3 +301,55 @@ servo = { version = "0.5", default-features = false,
   so the `file://` fixture lives *inside* the profile dir (which is
   writable+readable to the tab) — that's also the shape of future
   `--offline-fixtures` layouts.
+
+## F. Observability — stderr diagnostics (task 13)
+
+Every process logs to **stderr**; stdout stays the binary IPC channel
+(`read_frame`/`write_frame`), so a log byte there is a corrupt frame — the
+logger has no stdout path at all.
+
+* **Core:** `ironsurf_common::logging` (dependency-free, no `log`/`tracing`).
+  `Level::Off < Error < Warn < Info < Debug < Trace` (Off sorts lowest so it
+  acts as a zero cap), macros `error!/warn!/info!/debug!/trace!` exported from
+  `ironsurf_common` — a filtered line skips `format_args!` entirely.
+* **Format:** `[14:22:07.418] INFO tab 3 runtime: message` — UTC time-of-day,
+  level, per-process context (`set_context`: `shell`, `tab 3`), then
+  `module_path!()` with the crate segment stripped.
+* **Level control** (first hit wins): `--log <lvl>|--log=<lvl>|-v|-vv`
+  (`logging::level_from_args`), then `IRONSURF_LOG`, then `RUST_LOG`,
+  then `info`. The shell relays `--log <lvl>` to tab children, and
+  `IRONSURF_LOG` reaches them through the inherited environment anyway.
+* **Level grammar** accepts `off|error|warn|info|debug|trace` and a comma list
+  where only a bare/`*` token applies (`--log 'ironsurf_tab=trace'` is ignored
+  in v1) — so an existing `RUST_LOG=warn` keeps working.
+* **Volume contract (important):** the shell does **not** read a tab's
+  stderr, so a flood can fill the 64 KiB pipe buffer and block the tab. Frames
+  (`FromTab::Frame`), key/pointer/scroll events and repaint decisions are
+  `trace`-only; per-IPC-message lines are `debug`; `info` is the user-visible
+  timeline (navigate, load start/finish, url/title, tab spawn/exit) — a handful
+  of lines per navigation.
+* **Child stderr wiring:** `tabs::TabStderr::Auto` (default) inherits our
+  stderr into the tab only when the level reaches `debug` **and** our own
+  stderr is a terminal (drained by the emulator); otherwise it is
+  `Stdio::null()`. `--tab-stderr` / `IRONSURF_TAB_STDERR=1` force inherit,
+  `--no-tab-stderr` / `=0` force null (`tabs::stderr_inherit`, unit-tested).
+* **What is logged where:**
+  - tab `runtime`: startup (ids, profile, policy, sandbox, level),
+    `navigate "<raw>" (Fresh|Session(n))`, fetch+status+bytes+ms, parse/settle
+    ms, script counts/errors, `url →`, `title →`, `loading started/finished`,
+    every `FromTab` (frames at trace), every `ToTab` (input at trace),
+    cookie-persist failures, sandbox apply/degradation, protocol errors, exit code;
+  - tab `netmod`: request dispatch (main doc vs subresource, managed vs
+    passthrough), response status + bytes + cache store/serve, Set-Cookie
+    counts, https-upgrade, block decisions, dropped subresources;
+  - tab `js`: `console.*` at the page's own level (error→ERROR, warn→WARN,
+    log/info→INFO), script errors (one line, no backtrace), refused
+    `location` writes, binding/prelude install failures;
+  - shell `tabs`/`app`: spawn command + result, destroy/exit/killed, every
+    `FromTab` reduced (url/title/loading/error at info), address-bar
+    classification, shortcuts, reaped tabs, history writes.
+* **Try it:**
+  `IRONSURF_LOG=debug ./target/debug/ironsurf-shell --tab-stderr` (whole
+  browser, interleaved, `shell`/`tab N` prefixed), or a single tab under
+  `printf '' | IRONSURF_LOG=debug ./target/debug/ironsurf-tab --tab-id 1 \
+  --profile-dir /tmp/p --managed-net --url https://example.com --no-sandbox >/dev/null`.

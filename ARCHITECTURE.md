@@ -220,7 +220,8 @@ pub struct SandboxPolicy {
     pub writable_rw: Vec<PathBuf>, // exactly ONE: the container profile dir (+ /tmp? NO)
     pub exec_ro:     Vec<PathBuf>, // the ironsurf-tab executable path
     pub max_open_files: u64,       // default 1024
-    pub max_processes:  u64,       // default 128
+    pub max_processes:  u64,       // default 128 — per-UID headroom on Linux (RLIMIT_NPROC is uid-wide;
+                                   // applied as current-task-count + N, never below the uid's live tasks)
     pub address_space_mb: Option<u64>,
 }
 pub struct SandboxStatus { pub landlock_active: bool, pub rlimits_applied: bool, pub notes: Vec<String> }

@@ -3,6 +3,12 @@
 //! Usage:
 //!   ironsurf-shell [--smoke] [--managed-net] [--no-sandbox]
 //!                 [--fake-tab] [--tab-bin PATH]
+//!                 [--log LEVEL|--verbose|-v] [--tab-stderr|--no-tab-stderr]
+//!
+//! Logging: every line the shell (and, when inherited, every tab) writes goes
+//! to **stderr** — stdout stays untouched. `--log off|error|warn|info|debug|
+//! trace` (or `IRONSURF_LOG`) picks the level; the level is forwarded to tab
+//! children, and `--tab-stderr` lets their lines reach this terminal.
 //!
 //! Renderer: the Slint **software renderer** is forced before any window
 //! exists (unless `SLINT_BACKEND` is set explicitly), so the shell composites
@@ -12,15 +18,20 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::Duration;
 
+use ironsurf_common::logging;
 use ironsurf_shell::app::App;
+use ironsurf_shell::tabs::{set_tab_stderr, TabStderr};
 use ironsurf_shell::AppWindow;
+use ironsurf_common::{error, info};
 use slint::ComponentHandle;
 
 fn main() -> ExitCode {
     match run() {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {
-            eprintln!("ironsurf-shell: {err}");
+            // `run` initialises logging before it can fail, so this lands as a
+            // proper ERROR line (stderr) rather than a bare write.
+            error!("fatal: {err}");
             ExitCode::FAILURE
         }
     }
@@ -31,12 +42,42 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let flag = |f: &str| args.iter().any(|a| a == f);
     let smoke = flag("--smoke");
 
+    // Level from --log/-v, then IRONSURF_LOG/RUST_LOG, then `info`.
+    let level = logging::level_from_args(&args)
+        .or_else(|| {
+            [logging::ENV_VAR, "RUST_LOG"]
+                .iter()
+                .filter_map(|k| std::env::var(*k).ok())
+                .find_map(|spec| logging::level_from_spec(&spec))
+        })
+        .unwrap_or(logging::DEFAULT_LEVEL);
+    logging::init("shell", Some(level));
+    info!(
+        "ironsurf-shell starting: smoke={} managed-net={} no-sandbox={} fake-tab={} log {}",
+        smoke,
+        flag("--managed-net"),
+        flag("--no-sandbox"),
+        flag("--fake-tab"),
+        level.as_str(),
+    );
+
+    // Tab children inherit our environment; the explicit flag also relays the
+    // level so `ironsurf-shell --log debug` traces the whole browser.
     let mut extra_tab_args: Vec<String> = Vec::new();
     if flag("--managed-net") {
         extra_tab_args.push("--managed-net".into());
     }
     if flag("--no-sandbox") {
         extra_tab_args.push("--no-sandbox".into());
+    }
+    if logging::level_from_args(&args).is_some() {
+        extra_tab_args.push("--log".into());
+        extra_tab_args.push(level.as_str().to_ascii_lowercase());
+    }
+    if flag("--tab-stderr") {
+        set_tab_stderr(TabStderr::Inherit);
+    } else if flag("--no-tab-stderr") {
+        set_tab_stderr(TabStderr::Null);
     }
 
     let tab_bin = match args.iter().position(|a| a == "--tab-bin") {
@@ -47,6 +88,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             .ok_or("--tab-bin requires a path")?,
         None => resolve_tab_bin(flag("--fake-tab"))?,
     };
+    info!("tab binary: {}", tab_bin.display());
 
     // Force the software renderer before the first window exists; an
     // explicit SLINT_BACKEND (e.g. "femtovg") wins for developer machines.

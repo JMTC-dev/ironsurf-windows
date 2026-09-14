@@ -44,7 +44,11 @@ pub struct SandboxPolicy {
     pub exec_ro: Vec<PathBuf>,
     /// `RLIMIT_NOFILE` (soft+hard).
     pub max_open_files: u64,
-    /// `RLIMIT_NPROC` (soft+hard).
+    /// `RLIMIT_NPROC` headroom. On Linux RLIMIT_NPROC is enforced per *real
+    /// UID* (every process+thread of that user system-wide), so this is applied
+    /// as `current tasks owned by our uid + max_processes`, never below the
+    /// uid's live task count (doing so makes every `pthread_create` fail with
+    /// `EAGAIN` and breaks e.g. reqwest's tokio runtime build).
     pub max_processes: u64,
     /// Optional `RLIMIT_AS` in megabytes. Off by default: breaks most allocators
     /// unless chosen carefully.
@@ -215,6 +219,42 @@ pub fn apply(policy: &SandboxPolicy) -> Result<SandboxStatus, SandboxError> {
 // rlimits (any unix)
 // ---------------------------------------------------------------------------
 
+/// Number of tasks (processes + threads) currently owned by real uid `uid`,
+/// counted from the `Threads:` field of every `/proc/<pid>/status`.
+/// Returns `None` if /proc is unreadable (degrades to the old absolute-cap
+/// behaviour).
+#[cfg(target_os = "linux")]
+fn current_task_count(uid: u32) -> Option<u64> {
+    let mut total: u64 = 0;
+    let entries = std::fs::read_dir("/proc").ok()?;
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if !name.bytes().all(|b| b.is_ascii_digit()) || name.is_empty() {
+            continue; // non-pid entries like "self", "thread-self"
+        }
+        let Ok(status) = std::fs::read_to_string(format!("/proc/{name}/status")) else {
+            continue; // raced exit or EPERM
+        };
+        let mut uid_match = false;
+        let mut threads: u64 = 1; // a process always has >= 1 task
+        for line in status.lines() {
+            if let Some(rest) = line.strip_prefix("Uid:\t") {
+                uid_match = rest.split('\t').next() == Some(&uid.to_string()[..]);
+                if !uid_match {
+                    break;
+                }
+            } else if let Some(rest) = line.strip_prefix("Threads:\t") {
+                threads = rest.trim().parse().unwrap_or(1);
+            }
+        }
+        if uid_match {
+            total = total.saturating_add(threads);
+        }
+    }
+    Some(total)
+}
+
 /// `setrlimit`'s resource argument type differs per libc (`__rlimit_resource_t`
 /// on Linux-gnu, `c_int` elsewhere).
 #[cfg(all(unix, target_os = "linux"))]
@@ -277,7 +317,29 @@ fn apply_rlimits(policy: &SandboxPolicy, notes: &mut Vec<String>) -> bool {
         policy.max_open_files,
         notes,
     );
-    applied |= set(libc::RLIMIT_NPROC, "NPROC", policy.max_processes, notes);
+    // RLIMIT_NPROC is per-UID on Linux: an absolute cap below the uid's current
+    // task count instantly breaks every thread spawn in *all* the user's
+    // processes (EAGAIN). Treat `max_processes` as headroom above current usage
+    // and refuse to lower the limit under what the uid is already using.
+    #[cfg(target_os = "linux")]
+    let nproc_value = {
+        // SAFETY: geteuid() always succeeds.
+        let uid = unsafe { libc::geteuid() };
+        match current_task_count(uid) {
+            Some(current) => {
+                let value = current.saturating_add(policy.max_processes);
+                notes.push(format!(
+                    "RLIMIT_NPROC is per-UID on Linux: uid {uid} has {current} tasks; setting to current+requested {value} (headroom {}) rather than absolute cap",
+                    policy.max_processes
+                ));
+                value
+            }
+            None => policy.max_processes,
+        }
+    };
+    #[cfg(not(target_os = "linux"))]
+    let nproc_value = policy.max_processes;
+    applied |= set(libc::RLIMIT_NPROC, "NPROC", nproc_value, notes);
     if let Some(mb) = policy.address_space_mb {
         // RLIMIT_AS is off by default: a too-low value reliably kills the
         // process instead of sandboxing it.
@@ -416,6 +478,47 @@ mod tests {
         assert_eq!(p.address_space_mb, None);
         assert!(p.writable_rw.is_empty());
         assert!(!p.readable_ro.is_empty());
+    }
+
+    /// RLIMIT_NPROC must never be lowered below the uid's live task count
+    /// (per-UID semantics: doing so breaks all thread creation with EAGAIN).
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn nproc_limit_stays_above_current_task_count() {
+        let extra: Vec<_> = (0..3)
+            .map(|_| {
+                std::thread::spawn(|| std::thread::sleep(std::time::Duration::from_millis(100)))
+            })
+            .collect();
+        // SAFETY: geteuid() always succeeds.
+        let uid = unsafe { libc::geteuid() };
+        let before = current_task_count(uid).expect("/proc readable");
+        assert!(before >= 1);
+
+        let mut notes = Vec::new();
+        let policy = SandboxPolicy {
+            max_processes: 128,
+            ..SandboxPolicy::new()
+        };
+        let applied = super::apply_rlimits(&policy, &mut notes);
+        assert!(applied);
+
+        let mut lim = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        // SAFETY: valid out-param.
+        assert_eq!(unsafe { libc::getrlimit(libc::RLIMIT_NPROC, &mut lim) }, 0);
+        if lim.rlim_cur != libc::RLIM_INFINITY {
+            assert!(
+                lim.rlim_cur as u64 > before,
+                "NPROC soft {} must exceed pre-apply task count {before}",
+                lim.rlim_cur
+            );
+        }
+        for h in extra {
+            let _ = h.join();
+        }
     }
 
     #[test]

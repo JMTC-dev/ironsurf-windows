@@ -15,6 +15,19 @@ pub struct ContainerId(pub u32);
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct TabId(pub u32);
 
+/// Both ids print as bare numbers, which is what log lines want (`tab 3`).
+impl std::fmt::Display for TabId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl std::fmt::Display for ContainerId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
 /// A named, colored, isolated browsing session.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Container {

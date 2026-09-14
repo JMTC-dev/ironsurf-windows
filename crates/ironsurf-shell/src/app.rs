@@ -11,6 +11,7 @@ use std::rc::Rc;
 use std::time::{Duration, Instant};
 use std::sync::mpsc::{channel, Receiver, Sender};
 
+use ironsurf_common::{debug, error, info, trace, warn};
 use ironsurf_common::{default_url, ContainerId, FromTab, TabId, ToTab};
 use ironsurf_storage::default_data_root;
 use slint::{
@@ -125,8 +126,9 @@ impl App {
 
     /// Persist settings and shut every tab process down (idempotent).
     pub fn shutdown(&self) {
-        self.core.save_settings();
         let procs = std::mem::take(&mut *self.core.procs.borrow_mut());
+        info!("shutting down: saving settings, closing {} tab(s)", procs.len());
+        self.core.save_settings();
         for mut p in procs {
             p.tab.destroy();
         }
@@ -165,10 +167,17 @@ impl Core {
     }
 
     fn send_active(&self, msg: ToTab) {
-        let Some(id) = self.active_tab_id() else { return };
+        let Some(id) = self.active_tab_id() else {
+            debug!("dropped {msg:?}: no active tab");
+            return;
+        };
         let procs = self.procs.borrow();
         if let Some(p) = procs.iter().find(|p| p.tab.id == id) {
-            let _ = p.tab.send(msg);
+            if let Err(err) = p.tab.send(msg) {
+                // `msg` is consumed by send(); the command itself is already
+                // on the record via `tabs::TabProc::send`'s trace line.
+                warn!("tab {id} could not receive a command: {err}");
+            }
         }
     }
 
@@ -214,6 +223,7 @@ impl Core {
             id
         };
         let extra_refs: Vec<&str> = extra.iter().map(String::as_str).collect();
+        debug!("open tab {id} in container {}: url {:?}", container.0, url);
         match TabProc::spawn(&tab_bin, id, container, &profile_dir, url, &extra_refs, &self.sink) {
             Ok(tab) => {
                 *self.spawn_error.borrow_mut() = None;
@@ -228,6 +238,7 @@ impl Core {
                 }
             }
             Err(err) => {
+                error!("spawn {} failed: {err}", tab_bin.display());
                 *self.spawn_error.borrow_mut() =
                     Some(format!("spawn {} failed: {err}", tab_bin.display()));
             }
@@ -241,6 +252,7 @@ impl Core {
         if idx >= procs.len() {
             return;
         }
+        info!("closing tab {} ({} still open)", procs[idx].tab.id.0, procs.len() - 1);
         let mut proc = procs.remove(idx);
         proc.tab.destroy();
         let empty = procs.is_empty();
@@ -261,8 +273,10 @@ impl Core {
         {
             let procs = self.procs.borrow();
             if idx >= procs.len() {
+                debug!("activate ignored: no tab at index {idx}");
                 return;
             }
+            debug!("activate tab {} (index {idx})", procs[idx].tab.id.0);
         }
         self.active.set(idx);
         self.set_visible_except();
@@ -296,13 +310,16 @@ impl Core {
     }
 
     fn navigate(&self, text: &str) {
-        if let Some(url) = classify_input(text) {
-            self.send_active(ToTab::Navigate { url: url.clone() });
-            if let Some(ui) = self.ui() {
-                ui.set_url_text(url.into());
-                // After navigating from the URL bar, focus returns to the page.
-                ui.set_focus_page_token(ui.get_focus_page_token() + 1);
-            }
+        let Some(url) = classify_input(text) else {
+            debug!("address bar: {text:?} is not a URL/search term, ignored");
+            return;
+        };
+        info!("address bar: {text:?} → navigating to {url}");
+        self.send_active(ToTab::Navigate { url: url.clone() });
+        if let Some(ui) = self.ui() {
+            ui.set_url_text(url.into());
+            // After navigating from the URL bar, focus returns to the page.
+            ui.set_focus_page_token(ui.get_focus_page_token() + 1);
         }
     }
 
@@ -321,6 +338,10 @@ impl Core {
     fn page_key(&self, pressed: bool, text: &str, ctrl: bool, shift: bool, alt: bool, meta: bool, repeat: bool) {
         if !pressed {
             return; // releases are not forwarded: the tab protocol models presses only
+        }
+        match keymap::shortcut_for(text, ctrl, alt, meta) {
+            Some(sc) => debug!("shortcut {sc:?} (key {text:?} ctrl={ctrl} alt={alt} meta={meta})"),
+            None => trace!("key {text:?} ctrl={ctrl} alt={alt} meta={meta} → page"),
         }
         match keymap::shortcut_for(text, ctrl, alt, meta) {
             Some(Shortcut::FocusUrl) => {
@@ -464,6 +485,7 @@ impl Core {
         }
         let profile_dir = self.store.borrow().profile_dir(cid);
         let (w, h) = self.page_size();
+        info!("moving tab {id} to container {}: respawning the process", cid.0);
         let replacement = TabProc::spawn(
             &self.tab_bin,
             id,
@@ -492,7 +514,9 @@ impl Core {
         let Some(cid) = self.containers_snapshot().get(idx).copied() else { return };
         // Store::delete_container refuses the default and removes the
         // profile dir — that is the data wipe.
+        info!("deleting container {} (profile wipe)", cid.0);
         if self.store.borrow_mut().delete_container(cid).is_err() {
+            warn!("container {} could not be deleted (default container?)", cid.0);
             self.manager_open(false);
             self.sync_ui();
             return;
@@ -585,6 +609,32 @@ impl Core {
         let mut newest_frame: Option<Image> = None;
 
         for (tid, msg) in msgs {
+            // Diagnostics first: the message we drop below is the one thing
+            // that must never be formatted (up to ~4 MB per frame).
+            match &msg {
+                FromTab::Frame { width, height, scale, rgba } => trace!(
+                    "tab {tid} frame {}x{}@{scale:.2} ({} B)",
+                    width,
+                    height,
+                    rgba.len()
+                ),
+                FromTab::Error { message } => error!("tab {tid} error: {message}"),
+                FromTab::ConsoleLog { level, message } => {
+                    info!("tab {tid} console[{level}]: {message}")
+                }
+                FromTab::UrlChanged { url } => {
+                    info!("tab {tid} url → {}", url.as_deref().unwrap_or("<none>"))
+                }
+                FromTab::TitleChanged { title } => {
+                    info!("tab {tid} title → {}", title.as_deref().unwrap_or("<none>"))
+                }
+                FromTab::LoadingChanged { loading } => info!(
+                    "tab {tid} loading {}",
+                    if *loading { "started" } else { "finished" }
+                ),
+                FromTab::Closed => info!("tab {tid} says it is closed"),
+                other => debug!("tab {tid} → {other:?}"),
+            }
             if let FromTab::Frame { width, height, ref rgba, .. } = msg {
                 if Some(tid) == active {
                     if let Some(img) = image_from_rgba(width, height, rgba) {
@@ -614,7 +664,11 @@ impl Core {
                 if let Some((container, title)) = entry {
                     let store = self.store.borrow();
                     let cs = ironsurf_storage::ContainerStore::open(&store, container);
-                    let _ = cs.append_history(&url, Some(&title));
+                    if let Err(err) = cs.append_history(&url, Some(&title)) {
+                        warn!("history entry for {url} not written: {err}");
+                    } else {
+                        debug!("history: recorded {url} in container {}", container.0);
+                    }
                 }
             }
         }
@@ -634,6 +688,7 @@ impl Core {
             (before, after)
         };
         if before != after {
+            info!("reaped {} closed tab(s); {} remain", before - after, after);
             dirty = true;
         }
 
