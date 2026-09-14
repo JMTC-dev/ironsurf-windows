@@ -39,6 +39,22 @@ use boa_engine::{Context, JsNativeError, JsString, JsValue, NativeFunction, Sour
 use blitz_dom::{local_name, BaseDocument, Node, NodeId};
 use url::Url;
 
+// Page-side diagnostics: `console.*` and script errors go to stderr at the
+// level the page itself asked for (see [`log_console`]).
+use ironsurf_common::{error, info, trace, warn};
+
+/// Emit one `console.*` line to stderr at the level the page chose.
+/// The same line also reaches the shell (status text) via the host capture.
+fn log_console(level: ConsoleLevel, url: &str, text: &str) {
+    match level {
+        ConsoleLevel::Error => error!("page console [{level}] {url}: {text}"),
+        ConsoleLevel::Warn => warn!("page console [{level}] {url}: {text}"),
+        ConsoleLevel::Info | ConsoleLevel::Log => {
+            info!("page console [{level}] {url}: {text}")
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Script extraction
 
@@ -458,7 +474,7 @@ pub fn build_context(host: &HostRef) -> Context {
             value,
             Attribute::all(),
         ) {
-            eprintln!("ironsurf-tab: js binding {name} failed: {err}");
+            error!("js binding `{name}` failed to install: {err}");
         }
     }
 
@@ -472,7 +488,7 @@ pub fn build_context(host: &HostRef) -> Context {
             Ok(JsValue::from(JsString::from(title)))
         }),
     ) {
-        eprintln!("ironsurf-tab: js binding title getter failed: {err}");
+        error!("js binding `title` getter failed to install: {err}");
     }
     if let Err(err) = context.register_global_builtin_callable(
         JsString::from(native::TITLE_SET),
@@ -493,7 +509,7 @@ pub fn build_context(host: &HostRef) -> Context {
             Ok(JsValue::undefined())
         }),
     ) {
-        eprintln!("ironsurf-tab: js binding title setter failed: {err}");
+        error!("js binding `title` setter failed to install: {err}");
     }
     // console.log/info/warn/error → tab stderr + the per-navigation capture.
     if let Err(err) = context.register_global_builtin_callable(
@@ -517,11 +533,11 @@ pub fn build_context(host: &HostRef) -> Context {
                 host.url.clone()
             })
             .unwrap_or_default();
-            eprintln!("ironsurf-tab: js console [{level:?}] {url}: {text}");
+            log_console(level, &url, &text);
             Ok(JsValue::undefined())
         }),
     ) {
-        eprintln!("ironsurf-tab: js binding console failed: {err}");
+        error!("js binding `console` failed to install: {err}");
     }
     // location writes: refused, with a status note.
     if let Err(err) = context.register_global_builtin_callable(
@@ -534,6 +550,7 @@ pub fn build_context(host: &HostRef) -> Context {
                 .unwrap_or(JsValue::undefined())
                 .to_string(_context)?
                 .to_std_string_escaped();
+            warn!("refused javascript navigation to {target}");
             with_host(|host| {
                 host.notes
                     .push(format!("refused javascript navigation to {target}"));
@@ -541,7 +558,7 @@ pub fn build_context(host: &HostRef) -> Context {
             Ok(JsValue::undefined())
         }),
     ) {
-        eprintln!("ironsurf-tab: js binding location failed: {err}");
+        error!("js binding `location` failed to install: {err}");
     }
     // Timers: counted and reported once, never scheduled (TODO).
     if let Err(err) = context.register_global_builtin_callable(
@@ -558,13 +575,13 @@ pub fn build_context(host: &HostRef) -> Context {
             Ok(JsValue::undefined())
         }),
     ) {
-        eprintln!("ironsurf-tab: js binding timers failed: {err}");
+        error!("js binding `timers` failed to install: {err}");
     }
 
     if let Err(err) = context.eval(Source::from_bytes(PRELUDE)) {
         // Our own glue failing is a bug, not page input: report loudly, keep
         // the globals that did install, and let the tab run.
-        eprintln!("ironsurf-tab: js prelude failed: {err}");
+        error!("js prelude failed to evaluate: {err}");
     }
 
     context
@@ -583,19 +600,23 @@ pub struct ScriptError {
 /// Every evaluation is wrapped: an exception is collected and the next script
 /// still runs (contract: script errors must never kill the tab).
 pub fn run_scripts(scripts: &[ScriptSource], host: &HostRef) -> Vec<ScriptError> {
+    let started = std::time::Instant::now();
     ACTIVE_HOSTS.with(|stack| stack.borrow_mut().push(Rc::clone(host)));
     let mut context = build_context(host);
     let mut errors = Vec::new();
     for script in scripts {
+        trace!(
+            "eval [{}] ({} bytes, started {}ms ago)",
+            script.origin,
+            script.code.len(),
+            started.elapsed().as_millis()
+        );
         match context.eval(Source::from_bytes(script.code.as_str())) {
             Ok(_) => {}
             Err(err) => {
                 // boa's Display adds a shadow-stack backtrace; keep one line.
                 let message = err.to_string().lines().next().unwrap_or("script error").to_string();
-                eprintln!(
-                    "ironsurf-tab: js error in {}: {message}",
-                    script.origin
-                );
+                error!("javascript error in {origin}: {message}", origin = script.origin);
                 errors.push(ScriptError {
                     origin: script.origin.clone(),
                     message,

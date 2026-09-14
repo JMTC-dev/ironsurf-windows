@@ -36,6 +36,21 @@ use blitz_traits::net::{Bytes, HeaderMap, NetHandler, NetProvider, NetWaker, Req
 use ironsurf_storage::{CachedEntry, CookieJar, NetCache, StoreError};
 use url::Url;
 
+// Every request/response decision is logged to stderr at `debug`; only things
+// that silently broke a load (transport failures, dropped subresources) reach
+// `warn`, so a normal page stays quiet at the default level.
+use ironsurf_common::{debug, trace, warn};
+
+/// A loggable rendering of `url`: `data:` URLs are reduced to their length so
+/// a 2 MB inline asset cannot spray itself across stderr.
+pub fn url_for_log(url: &Url) -> String {
+    if url.scheme() == "data" {
+        format!("data: URL ({} bytes)", url.as_str().len())
+    } else {
+        url.as_str().to_owned()
+    }
+}
+
 /// Current wall-clock seconds since the Unix epoch (same clock the storage
 /// layer uses for cookie expiry).
 pub fn now_unix() -> i64 {
@@ -432,7 +447,10 @@ pub fn plain_http_fetch(
             req = req.headers(headers.clone());
         }
     }
-    let response = req.send().map_err(|e| format!("fetch {url}: {e}"))?;
+    let response = req.send().map_err(|e| {
+        warn!("passthrough GET {url} failed: {e}");
+        format!("fetch {url}: {e}")
+    })?;
     let status = response.status().as_u16();
     let final_url = response.url().clone();
     let headers = collect_headers(response.headers());
@@ -440,6 +458,7 @@ pub fn plain_http_fetch(
         .bytes()
         .map(|b| b.to_vec())
         .map_err(|e| format!("body {url}: {e}"))?;
+    debug!("GET {url} -> {status} ({} B, passthrough)", body.len());
     Ok(FetchOutcome {
         final_url,
         status,
@@ -476,6 +495,9 @@ pub fn managed_http_fetch(
     }
 
     let cached = cache.lookup(url.as_str());
+    if cached.is_some() {
+        debug!("cache entry for {url}: revalidating");
+    }
     if let Some(entry) = cached.as_ref() {
         let (etag, last_modified) = validators(&entry.headers);
         if let Some(etag) = etag {
@@ -485,7 +507,10 @@ pub fn managed_http_fetch(
         }
     }
 
-    let response = req.send().map_err(|e| format!("fetch {url}: {e}"))?;
+    let response = req.send().map_err(|e| {
+        warn!("GET {url} failed: {e}");
+        format!("fetch {url}: {e}")
+    })?;
     let status = response.status().as_u16();
     // Cookies are captured against the final URL (redirect target).
     let final_url = response.url().clone();
@@ -508,6 +533,13 @@ pub fn managed_http_fetch(
         set_cookies.iter().map(String::as_str),
         now,
     );
+    if !set_cookies.is_empty() {
+        debug!(
+            "captured {} Set-Cookie header(s) for {}",
+            set_cookies.len(),
+            final_url
+        );
+    }
 
     let (etag, last_modified) = validators(&headers);
     let empty = || CachedEntry {
@@ -526,6 +558,11 @@ pub fn managed_http_fetch(
     ) {
         Revalidate::ServeCached => {
             let entry = cached.expect("ServeCached implies a cached entry existed");
+            debug!(
+                "GET {url} -> {status} served from cache ({} B, cached at {})",
+                entry.body.len(),
+                entry.cached_at
+            );
             Ok(FetchOutcome {
                 final_url,
                 status: entry.status,
@@ -536,7 +573,10 @@ pub fn managed_http_fetch(
         }
         Revalidate::UseFresh { .. } => {
             if status < 400 {
+                debug!("GET {url} -> {status} ({} B, stored in cache)", body.len());
                 cache.store(url.as_str(), status, &headers, body.clone(), now);
+            } else {
+                debug!("GET {url} -> {status} ({} B, not cacheable)", body.len());
             }
             Ok(FetchOutcome {
                 final_url,
@@ -630,6 +670,7 @@ impl BlitzNetProvider {
         let jar = Arc::clone(&self.jar);
         let cache = Arc::clone(&self.cache);
         let waker = self.waker.lock().expect("waker mutex poisoned").clone();
+        debug!("subresource GET {url} (doc {doc_id}, {})", if managed { "managed" } else { "passthrough" });
         self.worker.spawn(move || {
             let signal = request.signal.clone();
             let outcome = if managed {
@@ -647,9 +688,24 @@ impl BlitzNetProvider {
             let aborted = signal.as_ref().is_some_and(|s| s.aborted());
             match outcome {
                 Ok(o) if !aborted && o.status < 400 => {
+                    debug!(
+                        "subresource {} -> {} delivered ({} B)",
+                        url, o.status, o.body.len()
+                    );
                     deliver(Some(handler), o.final_url.to_string(), o.body)
                 }
-                _ => deliver(None, String::new(), Vec::new()),
+                Ok(o) if aborted => {
+                    trace!("subresource {url} aborted (status {})", o.status);
+                    deliver(None, String::new(), Vec::new())
+                }
+                Ok(o) => {
+                    warn!("subresource {url} -> HTTP {} (not delivered)", o.status);
+                    deliver(None, String::new(), Vec::new())
+                }
+                Err(message) => {
+                    warn!("subresource {url} failed: {message}");
+                    deliver(None, String::new(), Vec::new())
+                }
             }
         });
     }
@@ -661,20 +717,47 @@ impl NetProvider for BlitzNetProvider {
         match url.scheme() {
             // Local schemes complete inline — the doc thread will resolve again.
             "data" => match decode_data_url(&url) {
-                Some(bytes) => deliver(Some(handler), url.to_string(), bytes),
-                None => deliver(None, String::new(), Vec::new()),
+                Some(bytes) => {
+                    debug!(
+                        "subresource data: URL decoded ({} B) for doc {doc_id}",
+                        bytes.len()
+                    );
+                    deliver(Some(handler), url.to_string(), bytes)
+                }
+                None => {
+                    warn!("subresource {} could not be decoded", url_for_log(&url));
+                    deliver(None, String::new(), Vec::new())
+                }
             },
             "file" => match read_file_url(&url) {
-                Ok(bytes) => deliver(Some(handler), url.to_string(), bytes),
-                Err(_) => deliver(None, String::new(), Vec::new()),
+                Ok(bytes) => {
+                    debug!("subresource {url} read from disk ({} B)", bytes.len());
+                    deliver(Some(handler), url.to_string(), bytes)
+                }
+                Err(err) => {
+                    warn!("subresource {url} unreadable: {err}");
+                    deliver(None, String::new(), Vec::new())
+                }
             },
             "about" => match builtin_page_bytes(&url) {
-                Some(bytes) => deliver(Some(handler), url.to_string(), bytes),
-                None => deliver(None, String::new(), Vec::new()),
+                Some(bytes) => {
+                    debug!("subresource {url} served from built-ins ({} B)", bytes.len());
+                    deliver(Some(handler), url.to_string(), bytes)
+                }
+                None => {
+                    debug!("subresource {url}: no built-in page (dropped)");
+                    deliver(None, String::new(), Vec::new())
+                }
             },
             "http" | "https" => self.spawn_http(doc_id, url, request, handler),
-            // javascript:/blob:/…: silently unsupported (dropped handler).
-            _ => deliver(None, String::new(), Vec::new()),
+            // javascript:/blob:/…: unsupported (dropped handler).
+            other => {
+                debug!(
+                    "subresource scheme {other} unsupported ({}), dropped",
+                    url_for_log(&url)
+                );
+                deliver(None, String::new(), Vec::new())
+            }
         }
     }
 }
@@ -786,10 +869,14 @@ fn fetch_document_with_worker(
     // Local schemes: identical under both policies.
     match url.scheme() {
         "file" => {
-            let body = read_file_url(url).map_err(|e| NetError::Io {
-                url: url.clone(),
-                message: e,
+            let body = read_file_url(url).map_err(|e| {
+                warn!("cannot read {url}: {e}");
+                NetError::Io {
+                    url: url.clone(),
+                    message: e,
+                }
             })?;
+            debug!("document {url} read from disk ({} B)", body.len());
             return Ok(DocFetch {
                 url: url.clone(),
                 status: 200,
@@ -798,6 +885,7 @@ fn fetch_document_with_worker(
         }
         "about" => {
             if let Some(body) = builtin_page_bytes(url) {
+                debug!("document {url} served from built-ins ({} B)", body.len());
                 return Ok(DocFetch {
                     url: url.clone(),
                     status: 200,
@@ -807,6 +895,7 @@ fn fetch_document_with_worker(
         }
         "data" => {
             if let Some(body) = decode_data_url(url) {
+                debug!("document {} decoded ({} B)", url_for_log(url), body.len());
                 return Ok(DocFetch {
                     url: url.clone(),
                     status: 200,
@@ -818,6 +907,7 @@ fn fetch_document_with_worker(
     }
 
     if !is_http_scheme(url) {
+        warn!("refusing to navigate to unsupported scheme: {url}");
         return Err(NetError::Unsupported { url: url.clone() });
     }
 
@@ -844,17 +934,21 @@ fn fetch_document_with_worker(
                 message,
             }),
         Plan::Upgrade(https) => {
+            debug!("https-upgrade: {url} -> {https}");
             match managed_http_fetch(worker.client(), &https, jar, cache, now, None) {
                 Ok(o) => Ok(DocFetch {
                     url: o.final_url,
                     status: o.status,
                     body: o.body,
                 }),
-                Err(reason) => Err(NetError::Blocked {
-                    request: url.clone(),
-                    https,
-                    reason,
-                }),
+                Err(reason) => {
+                    warn!("https upgrade for {url} failed, navigation blocked: {reason}");
+                    Err(NetError::Blocked {
+                        request: url.clone(),
+                        https,
+                        reason,
+                    })
+                }
             }
         }
     }

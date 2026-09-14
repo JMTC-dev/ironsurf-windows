@@ -61,6 +61,11 @@ use ironsurf_common::{
     read_frame, write_frame, ContainerId, FromTab, KeyEvent, Modifiers, PointerEvent,
     PointerKind, ScrollEvent, TabId, ToTab,
 };
+// stderr diagnostics (see `ironsurf_common::logging`): `info` = the user-visible
+// timeline (navigation, load start/finish, title/url), `debug` = per-step detail,
+// `trace` = per-frame/per-input noise. stdout is the IPC channel — never a log.
+use ironsurf_common::logging;
+use ironsurf_common::{debug, error, info, trace, warn};
 use ironsurf_sandbox::SandboxPolicy;
 use ironsurf_storage::{ContainerStore, CookieJar, NetCache};
 use url::Url;
@@ -118,6 +123,14 @@ impl TabArgs {
                 "--offline-fixtures" => offline_fixtures = Some(PathBuf::from(value("offline-fixtures")?)),
                 "--managed-net" => managed = true,
                 "--no-sandbox" => no_sandbox = true,
+                // Verbosity flags: the level itself is read from argv by
+                // `logging::level_from_args` in `run`; they are accepted here so
+                // passing them is not a fatal "unexpected argument".
+                "--log" | "--log-level" => {
+                    value("log")?;
+                }
+                "-v" | "-vv" | "--verbose" | "--debug" => {}
+                other if other.starts_with("--log=") => {}
                 other => return Err(format!("unexpected argument {other:?}").into()),
             }
         }
@@ -232,6 +245,7 @@ impl ShellProvider for ShellHook {
         self.pipe.wake();
     }
     fn set_window_title(&self, title: String) {
+        debug!("document title flushed by blitz: {title:?}");
         *self.title.lock().expect("title mutex") = Some(title);
         self.pipe.wake();
     }
@@ -248,6 +262,7 @@ struct NavHook {
 
 impl NavigationProvider for NavHook {
     fn navigate_to(&self, options: NavigationOptions) {
+        debug!("page asked to navigate → {}", options.url);
         *self.pending.lock().expect("nav mutex") = Some(options);
         self.pipe.wake();
     }
@@ -287,13 +302,14 @@ fn apply_sandbox(args: &TabArgs) {
         exec_ro: exe.map(|exe| vec![exe]).unwrap_or_default(),
         ..SandboxPolicy::default()
     };
+    debug!("applying sandbox: {} readable, writable {}", policy.readable_ro.len(), policy.writable_rw.len());
     match ironsurf_sandbox::apply(&policy) {
-        Ok(status) => eprintln!(
-            "ironsurf-tab: sandbox landlock={} rlimits={} notes={:?}",
+        Ok(status) => info!(
+            "sandbox applied: landlock={} rlimits={} notes={:?}",
             status.landlock_active, status.rlimits_applied, status.notes
         ),
         // Sandboxing must never abort the tab (contract): degrade loudly.
-        Err(err) => eprintln!("ironsurf-tab: sandbox failed (degraded, continuing): {err}"),
+        Err(err) => error!("sandbox failed (degraded, continuing): {err}"),
     }
 }
 
@@ -429,7 +445,34 @@ impl Tab {
         }
     }
 
+    /// The single tab→shell choke point. Every message is logged except frames,
+    /// which are `trace`-only because they fire up to 30× a second.
     fn emit(&mut self, msg: FromTab) {
+        match &msg {
+            FromTab::Frame {
+                width,
+                height,
+                scale,
+                rgba,
+            } => trace!(
+                "frame {}x{}@{scale:.2} ({} B rgba)",
+                width,
+                height,
+                rgba.len()
+            ),
+            FromTab::UrlChanged { url } => {
+                info!("url → {}", url.as_deref().unwrap_or("<none>"))
+            }
+            FromTab::TitleChanged { title } => {
+                info!("title → {}", title.as_deref().unwrap_or("<none>"))
+            }
+            FromTab::LoadingChanged { loading } => {
+                info!("loading {}", if *loading { "started" } else { "finished" })
+            }
+            FromTab::Error { message } => error!("to shell: {message}"),
+            FromTab::ConsoleLog { level, message } => info!("to shell: console[{level}] {message}"),
+            other => debug!("to shell: {other:?}"),
+        }
         self.out.send(msg);
     }
 
@@ -456,9 +499,12 @@ impl Tab {
     /// Navigate to `raw` (shell text). `history` says what to do with the
     /// URL-only session history (fresh loads truncate forward entries).
     pub fn navigate(&mut self, raw: &str, history: NavHistory) -> bool {
+        let started = Instant::now();
+        info!("navigate \"{raw}\" ({history:?})");
         let url = match parse_input_url(raw) {
             Ok(url) => url,
             Err(err) => {
+                warn!("bad url {raw:?}: {err}");
                 self.emit(FromTab::Error {
                     message: format!("bad url {raw:?}: {err}"),
                 });
@@ -467,6 +513,7 @@ impl Tab {
         };
         if url.scheme() == "javascript" {
             // Contract: javascript: URLs are refused with a status text.
+            warn!("refused javascript: URL {raw}");
             self.emit(FromTab::StatusText {
                 text: Some(format!("refused javascript: URL {raw}")),
             });
@@ -482,6 +529,10 @@ impl Tab {
         });
 
         let url = self.apply_offline_fixtures(url);
+        debug!(
+            "fetching main document {url} (net policy {:?})",
+            self_provider_policy(&self.provider)
+        );
         match netmod::fetch_document(
             &url,
             self_provider_policy(&self.provider),
@@ -490,7 +541,19 @@ impl Tab {
             netmod::now_unix(),
         ) {
             Ok(doc_fetch) => {
+                debug!(
+                    "document fetched: {} status {} ({} B) in {} ms",
+                    doc_fetch.url,
+                    doc_fetch.status,
+                    doc_fetch.body.len(),
+                    started.elapsed().as_millis()
+                );
                 self.load_html(&doc_fetch.url, &doc_fetch.body_text(), history);
+                info!(
+                    "loaded {} in {} ms",
+                    doc_fetch.url,
+                    started.elapsed().as_millis()
+                );
                 self.emit(FromTab::LoadingChanged { loading: false });
                 self.emit(FromTab::StatusText { text: None });
                 // Script output outranks the "load finished" clear (task 8).
@@ -499,21 +562,25 @@ impl Tab {
             }
             Err(err) => {
                 // Fetch failure: report, keep the previous document on screen.
-                eprintln!("ironsurf-tab: navigation to {url} failed: {err}");
-                if let Some(page) = err.error_page() {
-                    // Blocked https-upgrade: render the block page at the
-                    // requested URL (it stays in history as the user typed it).
-                    self.load_html(&url, &page, history);
-                    self.emit(FromTab::LoadingChanged { loading: false });
-                    self.emit_js_status();
-                    false
-                } else {
-                    self.emit(FromTab::Error {
-                        message: err.to_string(),
-                    });
-                    self.emit(FromTab::LoadingChanged { loading: false });
-                    self.emit(FromTab::StatusText { text: None });
-                    false
+                match err.error_page() {
+                    Some(page) => {
+                        // Blocked https-upgrade: render the block page at the
+                        // requested URL (it stays in history as the user typed it).
+                        warn!("navigation blocked by policy: {err}");
+                        self.load_html(&url, &page, history);
+                        self.emit(FromTab::LoadingChanged { loading: false });
+                        self.emit_js_status();
+                        false
+                    }
+                    None => {
+                        error!("navigation to {url} failed after {} ms: {err}", started.elapsed().as_millis());
+                        self.emit(FromTab::Error {
+                            message: err.to_string(),
+                        });
+                        self.emit(FromTab::LoadingChanged { loading: false });
+                        self.emit(FromTab::StatusText { text: None });
+                        false
+                    }
                 }
             }
         }
@@ -567,9 +634,15 @@ impl Tab {
                 as Arc<dyn blitz_traits::shell::ShellProvider>),
             ..Default::default()
         };
+        let parsed = Instant::now();
         let document = HtmlDocument::from_html(html, config);
         self.doc = Some(document);
         self.settle();
+        debug!(
+            "document parsed+settled for {url} ({} B html) in {} ms",
+            html.len(),
+            parsed.elapsed().as_millis()
+        );
         // JavaScript runs on the settled DOM (ARCHITECTURE §JavaScript (Boa)).
         self.run_scripts(url);
 
@@ -676,7 +749,18 @@ impl Tab {
             parsed_title.as_deref(),
             body_text,
         )));
+        debug!(
+            "running {} script(s) for {url}; skipped: {:?}",
+            extraction.scripts.len(),
+            extraction.notes
+        );
+        let js_started = Instant::now();
         let errors = js::run_scripts(&extraction.scripts, &host);
+        debug!(
+            "script run complete: {} error(s) in {} ms",
+            errors.len(),
+            js_started.elapsed().as_millis()
+        );
 
         // Script side effects -> IPC. The title wins over `<title>` polling
         // (`check_meta` prefers `js_title`), and needs a fresh frame.
@@ -803,6 +887,12 @@ impl Tab {
     // -- shell event handling -------------------------------------------------
 
     pub fn handle_to_tab(&mut self, msg: ToTab) -> Option<i32> {
+        // Raw shell traffic: commands are `debug`, the input flood (every
+        // mouse packet) is `trace` so `--log debug` stays readable.
+        match &msg {
+            ToTab::Pointer(_) | ToTab::Key(_) | ToTab::Scroll(_) => trace!("from shell: {msg:?}"),
+            other => debug!("from shell: {other:?}"),
+        }
         match msg {
             ToTab::Navigate { url } => {
                 self.navigate(&url, NavHistory::Fresh);
@@ -1125,8 +1215,13 @@ impl Tab {
     fn persist(&mut self) {
         // Best-effort: both jar handles (main-doc + subresource) live inside
         // the sandbox-writable profile dir.
-        let _ = self.provider.save_cookies();
-        let _ = self.jar.save();
+        debug!("persisting cookie jars to profile dir");
+        if let Err(err) = self.provider.save_cookies() {
+            warn!("subresource cookie jar not saved: {err}");
+        }
+        if let Err(err) = self.jar.save() {
+            warn!("main-document cookie jar not saved: {err}");
+        }
     }
 
     fn flush_stdout(&mut self) {
@@ -1284,6 +1379,7 @@ fn drain_stdin(tab: &mut Tab, pending: &mut Vec<u8>) -> io::Result<Option<i32>> 
     }
 
     if eof {
+        debug!("stdin EOF: shell closed the pipe, persisting and exiting");
         tab.persist();
         return Ok(Some(0));
     }
@@ -1395,8 +1491,24 @@ fn poll_inputs(stdin_fd: RawFd, wake_fd: RawFd, tick: Duration) -> bool {
 
 /// Run the tab loop; returns the process exit code.
 pub fn run(args: TabArgs) -> i32 {
+    // Label every line with this tab id; level comes from `--log`/`-v`, then
+    // `IRONSURF_LOG`/`RUST_LOG` (inherited from the shell), then `info`.
+    let argv: Vec<String> = std::env::args().collect();
+    let level = logging::init(
+        &format!("tab {}", args.tab_id.0),
+        logging::level_from_args(&argv),
+    );
+    info!(
+        "starting: container {} profile {} start url {:?} net policy {:?} sandbox {} log {:?}",
+        args.container_id.0,
+        args.profile_dir.display(),
+        args.url,
+        args.net_policy,
+        !args.no_sandbox,
+        level,
+    );
     if args.no_sandbox {
-        eprintln!("ironsurf-tab: sandbox disabled (--no-sandbox)");
+        warn!("sandbox disabled (--no-sandbox): this tab is not confined");
     } else {
         // fds (stdin/stdout/profile) survive Landlock: apply touches the
         // filesystem view only, already-open descriptors keep working.
@@ -1406,6 +1518,7 @@ pub fn run(args: TabArgs) -> i32 {
     let pipe = match SelfPipe::new() {
         Ok(pipe) => Arc::new(pipe),
         Err(err) => {
+            error!("cannot create the wake self-pipe: {err}");
             let mut out = TabOut::new();
             out.send(FromTab::Error {
                 message: format!("self-pipe: {err}"),
@@ -1418,7 +1531,7 @@ pub fn run(args: TabArgs) -> i32 {
     if set_stdin_nonblocking().is_err() {
         // A blocking stdin would deadlock the poll loop; without a usable
         // descriptor we cannot speak IPC anyway — degrade by exiting.
-        eprintln!("ironsurf-tab: stdin non-blocking failed");
+        error!("stdin non-blocking failed: cannot run the poll loop");
         return 1;
     }
 
@@ -1453,7 +1566,7 @@ pub fn run(args: TabArgs) -> i32 {
             }
             Ok(None) => {}
             Err(err) => {
-                eprintln!("ironsurf-tab: stdin protocol error: {err}");
+                error!("stdin protocol error: {err}");
                 tab.emit(FromTab::Error {
                     message: format!("protocol error: {err}"),
                 });
@@ -1484,10 +1597,12 @@ pub fn run(args: TabArgs) -> i32 {
 
         if tab.out.broken {
             // Shell vanished: persist what we can, then die quietly.
+            debug!("stdout write failed: shell is gone, shutting down");
             break;
         }
     }
 
+    info!("exiting with code {exit_code}");
     tab.persist();
     tab.flush_stdout();
     exit_code
@@ -1576,6 +1691,32 @@ mod tests {
         assert_eq!(args.net_policy, NetPolicy::Managed);
         assert!(args.no_sandbox);
         assert_eq!(args.offline_fixtures, Some(PathBuf::from("/tmp/fixtures")));
+    }
+
+    #[test]
+    fn verbosity_flags_are_accepted_not_fatal() {
+        // `--log`/`-v` reach the tab from the shell (`--log debug`) or a human;
+        // they must parse cleanly (the level itself is read from argv by logging).
+        let base = || {
+            vec![
+                "ironsurf-tab".to_string(),
+                "--profile-dir".into(),
+                std::env::temp_dir().join("ironsurf-tab-args-log").display().to_string(),
+            ]
+        };
+        for flag in ["--log", "--log=trace", "-v", "-vv", "--verbose", "--debug"] {
+            let mut args = base();
+            args.push(flag.to_string());
+            if flag == "--log" {
+                args.push("debug".to_string());
+            }
+            let parsed = TabArgs::parse(&args);
+            assert!(parsed.is_ok(), "{flag} must be accepted: {parsed:?}");
+        }
+        // A bad level is not an argument error either (logging falls back to the env/default).
+        let mut args = base();
+        args.extend(["--log".to_string(), "nope".to_string()]);
+        assert!(TabArgs::parse(&args).is_ok());
     }
 
     #[test]

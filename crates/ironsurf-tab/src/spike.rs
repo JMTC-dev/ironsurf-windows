@@ -29,6 +29,7 @@ use blitz_paint::paint_scene;
 use blitz_traits::shell::{ColorScheme, Viewport};
 use kurbo::{Affine, Rect, Size};
 use peniko::{Color, Fill};
+use ironsurf_common::info;
 
 // ---------------------------------------------------------------------------
 // CLI
@@ -112,8 +113,8 @@ fn fetch_html(raw_url: &str) -> Result<(url::Url, String), Box<dyn Error>> {
 
 pub fn run(args: &[String]) -> Result<(), Box<dyn Error>> {
     let args = SpikeArgs::parse(args)?;
-    eprintln!(
-        "ironsurf-tab spike: url={} out={} size={}",
+    info!(
+        "spike: url={} out={} size={}",
         args.url,
         args.out,
         format_args!("{}x{}", args.width, args.height)
@@ -169,10 +170,10 @@ pub fn run(args: &[String]) -> Result<(), Box<dyn Error>> {
         let mut file = File::create(path)?;
         file.write_all(&buffer)?;
         file.flush()?;
-        eprintln!("ironsurf-tab spike: wrote {path} ({} bytes raw RGBA8)", buffer.len());
+        info!("spike: wrote {path} ({} bytes raw RGBA8)", buffer.len());
     }
-    eprintln!(
-        "ironsurf-tab spike: wrote {} ({}x{}, {} bytes RGBA8)",
+    info!(
+        "spike: wrote {} ({}x{}, {} bytes RGBA8)",
         args.out,
         width,
         height,
