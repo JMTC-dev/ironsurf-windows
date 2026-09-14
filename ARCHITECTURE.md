@@ -141,7 +141,9 @@ pub fn read_frame<R: std::io::Read, T: serde::de::DeserializeOwned>(r: &mut R) -
 pub const MAX_FRAME_BYTES: usize = 64 * 1024 * 1024; // guard against corrupt streams
 ```
 
-Also export `fn default_url() -> String` (`https://example.com`), `KEY_*` constants are
+Also export `const WELCOME_URL: &str` (`"ironsurf://welcome"`) and
+`fn default_url() -> String` (= `WELCOME_URL` — the built-in start page, answered locally by
+every tab; see §ironsurf-tab internal scheme), `KEY_*` constants are
 unnecessary; shell maps Slint key events → `KeyEvent`.
 
 ---
@@ -316,6 +318,13 @@ in `ironsurf-tab/src/netmod.rs` and pass `Arc<OurProvider>` as `DocumentConfig.n
   source titled by its media type — running a URL-bar program would be a `javascript:` URL by
   another name. A page may still load and run `data:text/javascript;base64,…` via `<script src>`;
   that is the page's own decision. See `docs/ENGINE_INTEGRATION.md` §G.
+- `ironsurf:` is the browser's **internal scheme** (like `chrome:`): every `ironsurf://…` URL is
+  answered locally by the tab and never touches the network, under either policy. The page is
+  chosen by `internal_page_name` (host, with a `ironsurf` host or empty host falling through to
+  the path, so `ironsurf://welcome` = `ironsurf:///welcome` = `ironsurf://ironsurf/welcome`);
+  `welcome` renders the start page (`WELCOME_URL` = `default_url()`), any other name renders an
+  honest internal "no such page" that never left the process. All output escapes the requested
+  URL — page names are user text, never markup.
 - Container isolation holds even in Passthrough: one process = one container; its on-disk
   state lives under the sandbox-visible profile dir only.
 
@@ -367,10 +376,13 @@ Process/tab management (`src/tabs.rs`):
 - `Frame` → `slint::Image` from raw RGBA buffer (`slint::Image::from_rgba8_slab`/PixelBuffer API — verify name).
 - Keyboard focus routing: Slint focus on page area → forward keys; Ctrl-L focuses URL bar;
   Esc unfocuses.
-- Default start page: `about:blank` then URL bar typing does search-or-navigate: contains dot
+- Default start page: `ironsurf://welcome` (the tab-rendered built-in welcome page —
+  `default_url()`), then URL bar typing does search-or-navigate: contains dot
   → `https://host` (upgrading typed `host/path` to HTTPS), else → `https://duckduckgo.com/?q=`.
   Explicit-scheme pass-through is case-insensitive and covers `http(s)://`, `about:`, `file://`,
-  `data:` (whose base64 payloads never look like a host, e.g. `data:text/javascript;base64,…`) and
+  `data:` (whose base64 payloads never look like a host, e.g. `data:text/javascript;base64,…`),
+  `ironsurf://` (the internal pages — the host has no dot, so without the scheme match
+  `ironsurf://welcome` would silently become a search) and
   `javascript:` — the last is handed to the tab, which refuses it by contract, so the refusal is
   visible instead of silently becoming a search.
 - Container default from registry; per-container "remember last chosen container for new tabs"

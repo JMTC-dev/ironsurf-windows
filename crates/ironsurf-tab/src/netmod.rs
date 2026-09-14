@@ -249,6 +249,144 @@ pub fn read_file_url(url: &Url) -> Result<Vec<u8>, String> {
     std::fs::read(url.path()).map_err(|e| format!("read {}: {e}", url.as_str()))
 }
 
+/// The browser's internal scheme. `ironsurf://…` URLs are **always** answered
+/// locally by the tab — they never reach the network, are never upgraded,
+/// and never carry cookies. `ironsurf://welcome` is the default start page
+/// (`ironsurf_common::WELCOME_URL`).
+pub const INTERNAL_SCHEME: &str = "ironsurf";
+
+/// Which built-in page an `ironsurf://…` URL selects. `url` puts the first
+/// authority segment of a non-special scheme into `host()` and the rest into
+/// `path()`, so `ironsurf://welcome`, `ironsurf:///welcome` and
+/// `ironsurf://ironsurf/welcome` all select `welcome`. Lowercased (schemes and
+/// hosts are case-insensitive).
+pub fn internal_page_name(url: &Url) -> String {
+    let host = url.host_str().unwrap_or("").to_ascii_lowercase();
+    let path = url.path().trim_matches('/').to_ascii_lowercase();
+    if host.is_empty() || host == INTERNAL_SCHEME {
+        path
+    } else {
+        host
+    }
+}
+
+/// Escape text for HTML PCDATA/attributes (internal pages interpolate the
+/// requested URL, which is attacker-influenced text — same rule as the
+/// `data:` source view: never parse user text as markup).
+pub fn escape_html_text(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&#39;"),
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
+/// Built-in bytes for the internal `ironsurf:` scheme: `ironsurf://welcome`
+/// (the start page); any other page name renders an honest "no such internal
+/// page" instead of a fetch error, so typos land on a real page.
+pub fn internal_page_bytes(url: &Url) -> Option<Vec<u8>> {
+    if url.scheme() != INTERNAL_SCHEME {
+        return None;
+    }
+    let page = internal_page_name(url);
+    let shown = escape_html_text(url.as_str());
+    let html = if page == "welcome" || page.is_empty() {
+        WELCOME_PAGE.replace("{url}", &shown)
+    } else {
+        INTERNAL_NOT_FOUND
+            .replace("{page}", &escape_html_text(&page))
+            .replace("{url}", &shown)
+    };
+    Some(html.into_bytes())
+}
+
+/// The built-in start page (`ironsurf://welcome`). Self-contained by design:
+/// inline styles only, no subresources, no scripts — it must render on a
+/// machine with no network, which is exactly when it matters most.
+const WELCOME_PAGE: &str = r#"<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Welcome to IronSurf</title>
+<style>
+  body { margin: 0; background: #14161a; color: #e6e6e6;
+         font-family: monospace; line-height: 1.5; }
+  .wrap { max-width: 46em; margin: 0 auto; padding: 3em 1.5em; }
+  h1 { color: #8fce8f; margin: 0 0 0.2em 0; }
+  .sub { color: #9aa0a6; margin: 0 0 2em 0; }
+  h2 { color: #8fce8f; font-size: 1.1em; margin: 2em 0 0.5em 0; }
+  code, kbd { background: #1f2227; padding: 0.1em 0.4em; border-radius: 3px; }
+  ul { padding-left: 1.2em; }
+  a { color: #8fce8f; }
+  .foot { margin-top: 3em; color: #6b7178; font-size: 0.9em; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>IronSurf</h1>
+  <p class="sub">Container-scoped private browsing &mdash; Blitz + Boa engine host,
+     every tab a sandboxed OS process.</p>
+
+  <h2>Getting around</h2>
+  <ul>
+    <li><kbd>Ctrl-L</kbd> &mdash; focus the URL bar; type a host or a search</li>
+    <li><kbd>Ctrl-T</kbd> &mdash; new tab &middot; <kbd>Ctrl-W</kbd> &mdash; close tab</li>
+    <li><kbd>Ctrl-Tab</kbd> &mdash; switch tab &middot; <kbd>Ctrl-R</kbd> &mdash; reload</li>
+    <li>middle-click a link &mdash; open it in a new tab of this container</li>
+  </ul>
+
+  <h2>Containers</h2>
+  <p>Each tab lives in a container with its own cookie jar, cache and profile
+     directory on disk. Tabs in different containers share nothing &mdash; not
+     memory, not cookies, not cache. Open the container manager from the tab
+     bar to create, color and reassign.</p>
+
+  <h2>Network policy</h2>
+  <p>Typed <code>host/path</code> navigations are upgraded to HTTPS; an upgrade
+     that fails is <em>blocked</em>, not silently downgraded. Internal
+     <code>ironsurf://</code> pages like this one never touch the network.</p>
+
+  <p class="foot">You are looking at <code>{url}</code> &mdash; a page built into
+     the tab process. It is the default start page.</p>
+</div>
+</body>
+</html>
+"#;
+
+/// Shown for an unknown `ironsurf://<page>` so a typo is a page, not an error.
+const INTERNAL_NOT_FOUND: &str = r#"<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>ironsurf: no such page</title>
+<style>
+  body { margin: 0; background: #14161a; color: #e6e6e6;
+         font-family: monospace; line-height: 1.5; }
+  .wrap { max-width: 40em; margin: 0 auto; padding: 3em 1.5em; }
+  h1 { color: #e57373; margin: 0 0 0.2em 0; }
+  a { color: #8fce8f; }
+  code { background: #1f2227; padding: 0.1em 0.4em; border-radius: 3px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>No such internal page</h1>
+  <p><code>ironsurf://{page}</code> is not built into the browser.
+     The request never left this process &mdash; nothing failed on a network.</p>
+  <p>Known page: <a href="ironsurf://welcome"><code>ironsurf://welcome</code></a></p>
+  <p><code>{url}</code></p>
+</div>
+</body>
+</html>
+"#;
+
 /// Built-in bytes for `about:` URLs we can answer locally (`about:blank`,
 /// `about:ironsurf…`); `None` for anything else.
 pub fn builtin_page_bytes(url: &Url) -> Option<Vec<u8>> {
@@ -898,6 +1036,19 @@ impl NetProvider for BlitzNetProvider {
                     deliver(None, String::new(), Vec::new())
                 }
             },
+            INTERNAL_SCHEME => match internal_page_bytes(&url) {
+                Some(bytes) => {
+                    debug!(
+                        "subresource {url} served from internal pages ({} B)",
+                        bytes.len()
+                    );
+                    deliver(Some(handler), url.to_string(), bytes)
+                }
+                None => {
+                    debug!("subresource {url}: no internal page (dropped)");
+                    deliver(None, String::new(), Vec::new())
+                }
+            },
             "http" | "https" => self.spawn_http(doc_id, url, request, handler),
             // javascript:/blob:/…: unsupported (dropped handler).
             other => {
@@ -1035,6 +1186,18 @@ fn fetch_document_with_worker(
         "about" => {
             if let Some(body) = builtin_page_bytes(url) {
                 debug!("document {url} served from built-ins ({} B)", body.len());
+                return Ok(DocFetch {
+                    url: url.clone(),
+                    status: 200,
+                    body,
+                });
+            }
+        }
+        INTERNAL_SCHEME => {
+            // Always local: no network, no cookies, no https-upgrade — whatever
+            // the page (welcome or not-found), it is answered from built-ins.
+            if let Some(body) = internal_page_bytes(url) {
+                debug!("document {url} served from internal pages ({} B)", body.len());
                 return Ok(DocFetch {
                     url: url.clone(),
                     status: 200,
@@ -1419,6 +1582,55 @@ mod tests {
     }
 
     #[test]
+    fn ironsurf_scheme_names_pages_locally() {
+        // The default start page is the internal welcome page.
+        assert_eq!(ironsurf_common::default_url(), "ironsurf://welcome");
+        let welcome = url(&ironsurf_common::default_url());
+        assert_eq!(welcome.scheme(), INTERNAL_SCHEME);
+        assert_eq!(internal_page_name(&welcome), "welcome");
+        // Authority vs path placement of non-special schemes all select welcome.
+        assert_eq!(internal_page_name(&url("ironsurf:///welcome")), "welcome");
+        assert_eq!(internal_page_name(&url("ironsurf://welcome/")), "welcome");
+        assert_eq!(
+            internal_page_name(&url("ironsurf://ironsurf/welcome")),
+            "welcome"
+        );
+        assert_eq!(internal_page_name(&url("IRONSURF://Welcome")), "welcome");
+        assert_eq!(internal_page_name(&url("ironsurf://about/config")), "about");
+        // Not our scheme → not our business.
+        assert_eq!(internal_page_name(&url("https://welcome")), "welcome");
+        assert!(internal_page_bytes(&url("https://welcome")).is_none());
+    }
+
+    #[test]
+    fn internal_welcome_page_is_self_contained_and_safe() {
+        let bytes = internal_page_bytes(&url("ironsurf://welcome")).expect("welcome page");
+        let text = String::from_utf8(bytes).expect("utf8");
+        assert!(text.contains("Welcome to IronSurf"));
+        // Self-contained: no subresources, no scripts — must render with no network.
+        assert!(!text.contains("<script"));
+        assert!(!text.contains("src="));
+        assert!(!text.contains("http://"));
+        // An unknown page name is an honest internal 404 page, not an error…
+        let gone = internal_page_bytes(&url("ironsurf://nope")).expect("not-found page");
+        let gone = String::from_utf8(gone).expect("utf8");
+        assert!(gone.contains("No such internal page"));
+        assert!(gone.contains("ironsurf://welcome"));
+        // …and the requested URL is escaped, never injected as markup. The URL
+        // parser itself rejects raw `<` in a host, and an encoded hostile page
+        // name must still produce no live script tag; the escape helper itself
+        // is asserted directly since it is the last line of defence.
+        assert_eq!(
+            escape_html_text("<s\"'>"),
+            "&lt;s&quot;&#39;&gt;"
+        );
+        let xss = internal_page_bytes(&url("ironsurf://%3Cscript%3Ealert%281%29"))
+            .expect("not-found for hostile page name");
+        let xss = String::from_utf8(xss).expect("utf8");
+        assert!(!xss.contains("<script"));
+    }
+
+    #[test]
     fn fetch_document_file_and_about_without_network() {
         let dir = tempfile::tempdir().expect("tempdir");
         let store = ironsurf_storage::ContainerStore::from_profile_dir(
@@ -1459,6 +1671,21 @@ mod tests {
         )
         .expect("about page");
         assert!(doc.body_text().contains("IronSurf"));
+
+        // ironsurf:// built-ins: answered locally under Managed too — never
+        // upgraded, never on the wire, URL round-trips for UrlChanged.
+        let doc = fetch_document_with_worker(
+            &url("ironsurf://welcome"),
+            NetPolicy::Managed,
+            &mut jar,
+            &cache,
+            now,
+            worker_for_test(),
+        )
+        .expect("internal welcome page");
+        assert_eq!(doc.status, 200);
+        assert_eq!(doc.url.as_str(), "ironsurf://welcome");
+        assert!(doc.body_text().contains("Welcome to IronSurf"));
 
         // Unsupported schemes are refused, not fetched.
         let err = fetch_document_with_worker(

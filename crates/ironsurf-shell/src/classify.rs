@@ -25,6 +25,7 @@ pub fn classify_input(input: &str) -> Option<String> {
         "file://",
         "data:",
         "javascript:",
+        "ironsurf://",
     ] {
         if scheme_haystack.starts_with(scheme) {
             return Some(input.to_string());
@@ -95,6 +96,16 @@ mod tests {
         assert_eq!(
             classify_input("file:///tmp/index.html").as_deref(),
             Some("file:///tmp/index.html")
+        );
+        // The built-in start page stays a URL: its host has no dot, so without
+        // the scheme match it would silently become a DuckDuckGo search.
+        assert_eq!(
+            classify_input("ironsurf://welcome").as_deref(),
+            Some("ironsurf://welcome")
+        );
+        assert_eq!(
+            classify_input("IRONSURF://Welcome").as_deref(),
+            Some("IRONSURF://Welcome")
         );
     }
 

@@ -40,3 +40,9 @@ executing it would be a javascript: URL by another name; markup (html/xhtml/svg/
 tab: middle Up over <a href> swallowed (no DOM click/nav hook), emits OpenLinkInNewTab; shell drain: spawns
 sibling tab in same container via open_tab; state.reduce treats it as an action (no state change). UI already
 forwarded button=2 (middle). cargo test --workspace green.
+## #16 built-in start page ironsurf://welcome (was https://example.com) — common: WELCOME_URL +
+default_url(); tab: netmod INTERNAL_SCHEME answered 100% locally (welcome page self-contained,
+unknown page = honest internal 404, URL escaped not injected; main-doc + subresource paths),
+status line shows full internal URL; shell classify: ironsurf:// pass-through (no-dot host
+would've become a search); gui test + ARCH updated. Live: tab loads it, title "Welcome to
+IronSurf"; workspace green.

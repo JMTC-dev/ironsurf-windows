@@ -35,7 +35,7 @@ fn window_model_and_fake_tab_pump() {
     let ui = AppWindow::new().expect("window on testing backend");
     let fake = PathBuf::from(env!("CARGO_BIN_EXE_fake_tab"));
     let app = App::new(&ui, fake, Vec::new()).expect("app core");
-    app.start(None); // https://example.com in the default container
+    app.start(None); // ironsurf://welcome (the built-in start page) in the default container
 
     let pump = || app.core().drain();
     let snap = || app.core().tab_snapshot();
@@ -46,16 +46,16 @@ fn window_model_and_fake_tab_pump() {
         !snap().is_empty() && snap()[0].ready && !snap()[0].title.is_empty()
     });
     let state = snap().into_iter().next().unwrap();
-    assert_eq!(state.url.as_deref(), Some("https://example.com"));
-    assert_eq!(state.title, "Fake — https://example.com");
+    assert_eq!(state.url.as_deref(), Some("ironsurf://welcome"));
+    assert_eq!(state.title, "Fake — ironsurf://welcome");
     assert!(!state.loading);
 
     let tabs = ui.get_tabs();
     assert_eq!(tabs.row_count(), 1);
     let row = tabs.row_data(0).unwrap();
-    assert_eq!(row.title.as_str(), "Fake — https://example.com");
+    assert_eq!(row.title.as_str(), "Fake — ironsurf://welcome");
     assert!(row.active);
-    assert_eq!(ui.get_url_text().as_str(), "https://example.com");
+    assert_eq!(ui.get_url_text().as_str(), "ironsurf://welcome");
     assert_eq!(ui.get_container_label().as_str(), "personal");
 
     // Bare host typed in the URL bar → classified to https:// and echoed

@@ -238,9 +238,14 @@ impl std::ops::BitOr for Modifiers {
 /// Guard against corrupt streams (frames larger than this are rejected).
 pub const MAX_FRAME_BYTES: usize = 64 * 1024 * 1024;
 
-/// Default start page URL.
+/// The browser's built-in start page. `ironsurf:` is an internal scheme:
+/// every `ironsurf://…` URL is answered locally by the tab process (see
+/// `ironsurf_tab::netmod::internal_page_bytes`) and never touches the network.
+pub const WELCOME_URL: &str = "ironsurf://welcome";
+
+/// Default start page URL (the built-in `ironsurf://welcome` page).
 pub fn default_url() -> String {
-    "https://example.com".to_string()
+    WELCOME_URL.to_string()
 }
 
 fn invalid_data<E: std::fmt::Display>(e: E) -> std::io::Error {
@@ -493,7 +498,7 @@ mod tests {
     }
 
     #[test]
-    fn default_url_is_https_example() {
-        assert_eq!(default_url(), "https://example.com");
+    fn default_url_is_the_internal_welcome_page() {
+        assert_eq!(default_url(), "ironsurf://welcome");
     }
 }

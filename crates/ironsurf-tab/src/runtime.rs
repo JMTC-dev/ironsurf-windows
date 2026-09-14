@@ -615,9 +615,15 @@ impl Tab {
             // spray the status bar.
             text: Some(format!(
                 "Waiting for {}",
-                url.host_str()
-                    .map(str::to_owned)
-                    .unwrap_or_else(|| netmod::url_for_log(&url))
+                if url.scheme() == netmod::INTERNAL_SCHEME {
+                    // `ironsurf://welcome` has an opaque host ("welcome"); the
+                    // full URL is the meaningful thing to show.
+                    netmod::url_for_log(&url)
+                } else {
+                    url.host_str()
+                        .map(str::to_owned)
+                        .unwrap_or_else(|| netmod::url_for_log(&url))
+                }
             )),
         });
 
