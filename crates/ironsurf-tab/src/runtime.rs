@@ -1645,10 +1645,17 @@ impl Tab {
     }
 
     /// Wheel/scroll: blitz's default action scrolls by `Lines(x, y) * 20`
-    /// CSS px or `Pixels(x, y)` verbatim (events/pointer.rs::handle_wheel;
-    /// positive delta = down/right). The contract doesn't pin units, so: deltas
-    /// with magnitude ≤ 3 are treated as wheel notches (lines), everything
-    /// else as CSS-px pixel deltas.
+    /// CSS px or `Pixels(x, y)` verbatim (events/pointer.rs::handle_wheel),
+    /// and it reads the winit/AccessKit sign convention: a POSITIVE delta
+    /// scrolls UP/LEFT (`scrollTop` shrinks), a negative one scrolls down —
+    /// verified against beta.2 by `wheel_down_scrolls_the_document_down_and_
+    /// wheel_up_back_up`. winit (and therefore Slint's `scroll-event`, which
+    /// the shell forwards untouched) emits the same convention, so the deltas
+    /// arriving here need no sign surgery.
+    ///
+    /// The contract doesn't pin units, so: deltas with magnitude ≤ 3 are
+    /// treated as wheel notches (lines), everything else as CSS-px pixel
+    /// deltas.
     fn handle_scroll(&mut self, ev: &ScrollEvent) {
         let z = self.zoom() as f64;
         let delta = if ev.delta_x.abs().max(ev.delta_y.abs()) <= 3.0 {
@@ -2729,5 +2736,71 @@ mod tests {
             url.ends_with("index.html"),
             "no navigation happened for a POST to file:: {url}"
         );
+    }
+
+    /// Wheel direction (regression: the wheel scrolled the wrong way).
+    ///
+    /// (Here "wheel down" = the document scrolls down = `scrollTop` grows, so
+    /// the content slides up the screen.)
+    ///
+    /// blitz beta.2 reads the winit/AccessKit convention — a NEGATIVE `delta_y`
+    /// moves the document down (`scrollTop` grows), a positive one moves it up —
+    /// and winit (hence Slint's `scroll-event`) produces deltas in that very
+    /// convention, so the shell forwards them unchanged. Pinned here for both
+    /// delta flavours (pixel deltas, and `|d| <= 3` notches = 20 CSS px each),
+    /// plus the clamp at the top of the document.
+    #[test]
+    fn wheel_down_scrolls_the_document_down_and_wheel_up_back_up() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let page = dir.path().join("tall.html");
+        std::fs::write(
+            &page,
+            "<!doctype html><meta charset=utf-8><style>body{margin:0;height:4000px}</style><p>tall</p>",
+        )
+        .expect("write");
+        let mut tab = form_tab(dir.path());
+        tab.handle_to_tab(ToTab::Resize {
+            width: 800,
+            height: 600,
+            scale: 1.0,
+        });
+        tab.navigate(
+            url::Url::from_file_path(&page).expect("url").as_str(),
+            NavHistory::Fresh,
+        );
+        tab.settle();
+        // Wheel scrolling follows the hovered scroll chain.
+        tab.handle_to_tab(ptr(100.0, 100.0, PointerKind::Move));
+        let wheel = |d: f32| {
+            ToTab::Scroll(ScrollEvent {
+                x: 100.0,
+                y: 100.0,
+                delta_x: 0.0,
+                delta_y: d,
+            })
+        };
+        let scroll_y = |tab: &mut Tab| tab.document_mut().expect("doc").viewport_scroll().y;
+
+        assert_eq!(scroll_y(&mut tab), 0.0, "documents start at the top");
+
+        // Wheel down (negative pixel delta) → content moves up, scrollTop grows.
+        tab.handle_to_tab(wheel(-200.0));
+        tab.settle();
+        assert_eq!(scroll_y(&mut tab), 200.0, "wheel down scrolls down");
+
+        // Wheel up (positive pixel delta) → back towards the top.
+        tab.handle_to_tab(wheel(50.0));
+        tab.settle();
+        assert_eq!(scroll_y(&mut tab), 150.0, "wheel up scrolls up");
+
+        // A `|d| <= 3` delta is a wheel notch: 20 CSS px, same direction.
+        tab.handle_to_tab(wheel(-1.0));
+        tab.settle();
+        assert_eq!(scroll_y(&mut tab), 170.0, "one notch down = 20 px down");
+
+        // Clamped at the top (a positive notch at scroll 0 does not go negative).
+        tab.handle_to_tab(wheel(1000.0));
+        tab.settle();
+        assert_eq!(scroll_y(&mut tab), 0.0, "scrolling up clamps at the top");
     }
 }

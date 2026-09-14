@@ -1,7 +1,4 @@
 # Task log
-## #7c/#7d Blitz IPC runtime + inputs — TabArgs CLI (+--offline-fixtures), sandbox ON (degrades, never aborts),
-1-thread poll[stdin,self-pipe], nav/back/fwd/reload/resize/SetVisible, HtmlDocument per nav→settle→vello ≤30fps,
-Title/Url/History dedupe, jars saved on Destroy/EOF; handle_input Pointer/Key/Scroll + link nav via the hook.
 ## #8 Boa JS layer (ironsurf-tab/src/js.rs) — <script>s in document order (src= via fetch_document ⇒ same net
 policy); ONE boa-0.22 Context per navigation; 5 natives + trusted glue (global IS window): title get/set→
 TitleChanged+repaint, body textContent, console→StatusText, eval caught, timers counted-only (TODO),
@@ -95,3 +92,9 @@ Viewport::zoom (blitz hidpi×zoom), SetZoom → set_viewport restyle + forced fr
 for pointer coords + pixel wheel deltas (÷zoom), zoom survives navigation (fresh docs inherit) and
 NaN/negative rejected; shell keymap: Ctrl-=/+/−/0 chords, ×÷1.1 whole-percent steps clamped 30–500%,
 per-tab factor + "Zoom N%" status. Live xdotool 100→133% repaints (98.9k px differ); workspace green.
+## #22 FIX inverted mouse wheel — ironsurf.slint negated Slint's wheel deltas before IPC, but Slint hands
+over winit's deltas untouched and blitz beta.2 speaks that very convention (positive delta_y = scroll UP:
+handle_wheel → scroll_chain_by feeds ScrollAmount::By{-x,-y}), so that extra flip reversed the wheel. Handler
+now passes delta-x/delta-y verbatim; convention pinned in common::ScrollEvent docs + ARCH ToTab section and
+by the new tab test wheel_down_scrolls_the_document_down_and_wheel_up_back_up (pixel deltas, 20px notch, clamp
+at the top); workspace green.

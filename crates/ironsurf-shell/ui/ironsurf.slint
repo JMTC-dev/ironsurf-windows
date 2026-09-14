@@ -309,10 +309,12 @@ export component AppWindow inherits Window {
                         let btn = ev.button == PointerEventButton.right ? 1 : ev.button == PointerEventButton.middle ? 2 : 0;
                         root.page-pointer(ta.mouse-x, ta.mouse-y, kind, btn);
                     }
-                    // Slint: a positive wheel delta reveals content toward the
-                    // top/left; the tab expects positive == reveal down/right.
+                    // Slint hands over winit's wheel deltas untouched, and the
+                    // tab's engine (blitz) consumes that very convention
+                    // (positive delta = wheel UP / content moves down-right),
+                    // so forward them verbatim — negating here inverted the wheel.
                     scroll-event(ev) => {
-                        root.page-wheel(ta.mouse-x, ta.mouse-y, -ev.delta-x, -ev.delta-y);
+                        root.page-wheel(ta.mouse-x, ta.mouse-y, ev.delta-x, ev.delta-y);
                         return EventResult.accept;
                     }
                 }

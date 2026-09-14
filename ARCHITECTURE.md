@@ -142,6 +142,12 @@ pub fn read_frame<R: std::io::Read, T: serde::de::DeserializeOwned>(r: &mut R) -
 pub const MAX_FRAME_BYTES: usize = 64 * 1024 * 1024; // guard against corrupt streams
 ```
 
+`ScrollEvent` deltas speak the winit/AccessKit convention both ends of the pipe
+already use: **positive `delta_y` scrolls UP** (`scrollTop` shrinks), a negative
+one scrolls DOWN; likewise `delta_x` and LEFT. The shell forwards the toolkit's
+deltas untouched and the tab hands them to blitz untouched — neither side negates
+(a negation on either side inverts the wheel).
+
 Also export `const WELCOME_URL: &str` (`"ironsurf://welcome"`) and
 `fn default_url() -> String` (= `WELCOME_URL` — the built-in start page, answered locally by
 every tab; see §ironsurf-tab internal scheme), `KEY_*` constants are

@@ -150,8 +150,15 @@ pub struct KeyEvent {
     pub mods: Modifiers,
 }
 
+/// Wheel/trackpad scroll over the page viewport.
+///
+/// Sign convention (winit/AccessKit, which both ends of the pipe speak): a
+/// POSITIVE `delta_y` scrolls UP (reveals content above; `scrollTop` shrinks),
+/// a negative one scrolls DOWN. Same for `delta_x` and LEFT. The shell passes
+/// the toolkit's deltas through untouched — do not negate them on either side.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ScrollEvent {
+    /// Pointer position (logical px, same space as `ToTab::Resize`).
     pub x: f32,
     pub y: f32,
     pub delta_x: f32,
