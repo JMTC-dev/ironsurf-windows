@@ -25,13 +25,20 @@
 //! its target as `FromTab::StatusText` so links are visibly clickable. See
 //! `docs/ENGINE_INTEGRATION.md` §E for the measured before/after numbers.
 //!
-//! JAVASCRIPT (task 8): after parse + resolve, every navigation runs the
-//! document's `<script>`s in one fresh Boa context (`crate::js` — tiny binding
-//! surface, `src=` through our own fetcher, exceptions caught). A script's
-//! `document.title = …` becomes `FromTab::TitleChanged` + a repaint; script
-//! errors, refused `location` writes and `console.*` output become
-//! `FromTab::StatusText`. `javascript:` URLs are refused at [`Tab::navigate`],
-//! the single navigation entry point.
+//! JAVASCRIPT (tasks 8 + real timers): after parse + resolve, every
+//! navigation runs the document's `<script>`s in one fresh Boa context
+//! (`crate::js` — tiny binding surface, `src=` through our own fetcher,
+//! exceptions caught). The context lives for the **lifetime of the document**
+//! ([`js::JsRuntime`], owned by [`Tab::js`]): `setTimeout`/`setInterval`/
+//! `requestAnimationFrame` create queue entries that outlive the initial
+//! script run, and every poll iteration (plus the `--headless` wait window)
+//! executes the due callbacks, then settle + coalesced repaint exactly like
+//! the input path. A throwing callback is reported like a script error and
+//! never stops later timers or the tab. A script's `document.title = …`
+//! becomes `FromTab::TitleChanged` + a repaint; script errors, refused
+//! `location` writes and `console.*` output become `FromTab::StatusText`.
+//! `javascript:` URLs are refused at [`Tab::navigate`], the single navigation
+//! entry point.
 //!
 //! `data:` URLS: a fetched `data:` document goes through [`render_document`]
 //! before it reaches the HTML parser, so `data:text/javascript;base64,…` (and
@@ -445,6 +452,11 @@ pub struct Tab {
     /// Status text raised by the script run (errors, refused `location` writes,
     /// `console.*`), emitted once per navigation after the load-finished clear.
     js_status: Option<String>,
+    /// The document's JavaScript world (task: real timers): Context + host +
+    /// live timer queue, alive for the lifetime of the document so callbacks
+    /// scheduled by page scripts fire from the poll loop. Rebuilt per
+    /// navigation (which cancels the previous document's timers with it).
+    js: Option<js::JsRuntime>,
     /// Paint state: set when a resolve produced (or may have produced) new
     /// pixels; coalesced into at most ~30 fps of `FromTab::Frame`.
     needs_paint: bool,
@@ -543,6 +555,7 @@ impl Tab {
             last_url: None,
             js_title: None,
             js_status: None,
+            js: None,
             needs_paint: false,
             last_paint: None,
             offline_fixtures: args.offline_fixtures.clone(),
@@ -742,7 +755,9 @@ impl Tab {
     /// scripts, drive it to a first paint; then emit the metadata deltas
     /// (url/title/history).
     fn load_html(&mut self, url: &Url, html: &str, history: NavHistory) {
-        // A fresh doc must not inherit the previous doc's flushed title.
+        // A fresh doc must not inherit the previous doc's flushed title —
+        // and the previous doc's JS world dies here too: replacing `self.js`
+        // drops the old Context and every timer queued on it.
         *self.shell.title.lock().expect("title mutex") = None;
         self.js_title = None;
         self.js_status = None;
@@ -829,14 +844,15 @@ impl Tab {
 
     // -- javascript ---------------------------------------------------------
 
-    /// Run the freshly parsed document's `<script>`s (task 8).
+    /// Run the freshly parsed document's `<script>`s (task 8), keeping the
+    /// Boa context alive in [`Tab::js`] for the lifetime of the document so
+    /// timers scheduled by those scripts fire later from the poll loop.
     ///
     /// Scripts are collected in document order; `src=` bodies go through the
     /// tab's own document fetcher, so the container net policy (cookies, cache,
-    /// https-upgrade) applies to them too. One `boa` context is built per
-    /// navigation and thrown away with the host afterwards. Nothing here can
-    /// kill the tab: extraction failures degrade to "no scripts", and every
-    /// `eval` is caught inside [`js::run_scripts`].
+    /// https-upgrade) applies to them too. Nothing here can kill the tab:
+    /// extraction failures degrade to "no scripts", and every `eval` is caught
+    /// inside [`js::JsRuntime::run_scripts`].
     fn run_scripts(&mut self, url: &Url) {
         let policy = self_provider_policy(&self.provider);
         let mut extraction = js::Extraction::default();
@@ -884,34 +900,124 @@ impl Tab {
             extraction.notes
         );
         let js_started = Instant::now();
-        let errors = js::run_scripts(&extraction.scripts, &host);
+        // The runtime (Context + host + timer queue) survives this call: it
+        // lives on as `self.js` until the next navigation replaces it.
+        let mut runtime = js::JsRuntime::new(host);
+        let errors = runtime.run_scripts(&extraction.scripts);
         debug!(
-            "script run complete: {} error(s) in {} ms",
+            "script run complete: {} error(s) in {} ms, timers queued: {}",
             errors.len(),
-            js_started.elapsed().as_millis()
+            js_started.elapsed().as_millis(),
+            runtime.has_timers()
         );
+        self.js = Some(runtime);
+        self.consume_js_status(extraction.notes.first().cloned(), &errors);
+        self.take_js_title();
+    }
 
-        // Script side effects -> IPC. The title wins over `<title>` polling
-        // (`check_meta` prefers `js_title`), and needs a fresh frame.
-        if let Some(title) = host.borrow().title_assigned.clone() {
+    /// Fold the JS host cell's side effects (console output, notes) and these
+    /// script errors into the tab's pending status text, draining what was
+    /// read so the next batch only reports what is new.
+    fn consume_js_status(&mut self, extraction_note: Option<String>, errors: &[js::ScriptError]) {
+        let Some(runtime) = self.js.as_ref() else {
+            return;
+        };
+        let (console_last, note) = {
+            let host = runtime.host().borrow_mut();
+            let console_last = host
+                .console
+                .last()
+                .map(|(level, text)| format!("js console {level}: {text}"));
+            let note = host.latest_note().map(str::to_owned).or(extraction_note);
+            (console_last, note)
+        };
+        {
+            // Drain what was just reported: the next batch only shows news.
+            let mut host = runtime.host().borrow_mut();
+            host.console.clear();
+            host.notes.clear();
+            host.repaint = false;
+        }
+        // One status text: script errors outrank `console.*` output, which
+        // outranks the "skipped script" extraction notes.
+        let status = js::status_text_for_errors(errors)
+            .or(console_last)
+            .or(note);
+        if status.is_some() {
+            self.js_status = status;
+        }
+    }
+
+    /// Consume a `document.title = …` assignment raised since the last check
+    /// (host → `js_title` + repaint request; `check_meta` emits the delta).
+    fn take_js_title(&mut self) {
+        let assigned = self
+            .js
+            .as_ref()
+            .and_then(|runtime| runtime.host().borrow_mut().title_assigned.take());
+        if let Some(title) = assigned {
             self.js_title = Some(title);
             self.needs_paint = true;
         }
-        // One status text per navigation: script errors outrank `console.*`
-        // output, which outranks the "skipped script / not implemented" notes.
-        let console_last = host
-            .borrow()
-            .console
-            .last()
-            .map(|(level, text)| format!("js console {level}: {text}"));
-        let note = host
-            .borrow()
-            .latest_note()
-            .map(str::to_owned)
-            .or_else(|| extraction.notes.first().map(String::to_owned));
-        self.js_status = js::status_text_for_errors(&errors)
-            .or(console_last)
-            .or(note);
+    }
+
+    /// Poll timeout capped by the earliest JS timer deadline: a page that
+    /// armed `setTimeout(fn, 10)` must not wait for the next `IDLE_TICK`.
+    fn timer_poll_tick(&self, base: Duration) -> Duration {
+        match self
+            .js
+            .as_ref()
+            .and_then(|runtime| runtime.next_timer_deadline())
+        {
+            Some(deadline) => base.min(deadline.saturating_duration_since(Instant::now())),
+            None => base,
+        }
+    }
+
+    /// Timer step (task: real timers): execute every JS timer callback due
+    /// now, then settle + refresh metadata exactly like the input path does.
+    /// Exceptions are caught per callback inside the runtime; the newest one
+    /// surfaces as `FromTab::StatusText` (same shape as a `ScriptError`).
+    /// `0` = nothing scheduled or nothing due (cheap on the idle path).
+    fn run_due_timers(&mut self) -> usize {
+        if self
+            .js
+            .as_ref()
+            .and_then(|runtime| runtime.next_timer_deadline())
+            .is_none_or(|deadline| deadline > Instant::now())
+        {
+            return 0;
+        }
+        // (block ends the borrow of `self.js` before the IPC-side steps)
+        let (fired, errors) = {
+            let Some(runtime) = self.js.as_mut() else {
+                return 0;
+            };
+            let before = runtime.host().borrow().timers_fired;
+            let errors = runtime.run_due_timers(Instant::now());
+            let fired = usize::try_from(runtime.host().borrow().timers_fired - before)
+                .unwrap_or(usize::MAX);
+            (fired, errors)
+        };
+        debug!(
+            "timer batch: {fired} callback(s) fired, {} error(s)",
+            errors.len()
+        );
+        // Same coalescing shape as the input path: settle (title/url may
+        // have moved) and mark for a repaint; the loop's paint step emits at
+        // ≤30 fps. A throwing callback must never stop the tab (contract).
+        self.settle();
+        if fired > 0 || !errors.is_empty() {
+            self.needs_paint = true;
+        }
+        self.consume_js_status(None, &errors);
+        self.take_js_title();
+        self.check_meta();
+        self.maybe_repaint();
+        // A status text raised by a callback goes out immediately (there is
+        // no "load finished" ordering to honour outside navigation time).
+        self.emit_js_status();
+        fired
     }
 
     /// Flush the status text the last script run raised. Called after the
@@ -1385,15 +1491,27 @@ impl Tab {
         let _ = self.out.writer.flush();
     }
 
-    /// One harness pump: drain a pending navigation request, else settle
-    /// (resolve + document messages) and refresh the title/url caches. Timers
-    /// and subresource completions land through here while `--wait` runs.
+    /// One harness pump: drain a pending navigation request, else run any
+    /// due JS timers (task: real timers — the `--wait` window is the
+    /// headless poll loop), then settle (resolve + document messages) and
+    /// refresh the title/url caches. Timer title changes land in `js_title`
+    /// and show up in the summary (`title_now`) and `--body-out` capture.
     pub(crate) fn headless_pump(&mut self) {
         if self.drain_nav_hook() {
             return;
         }
+        self.run_due_timers();
         self.settle();
         self.check_meta();
+    }
+
+    /// How long the harness may sleep before its next pump without missing
+    /// a JS timer deadline (`None` = nothing scheduled).
+    pub(crate) fn timer_sleep_hint(&self) -> Option<Duration> {
+        self.js
+            .as_ref()
+            .and_then(|runtime| runtime.next_timer_deadline())
+            .map(|deadline| deadline.saturating_duration_since(Instant::now()))
     }
 
     /// The live document, for harness-side DOM/serializer access.
@@ -1741,6 +1859,8 @@ pub fn run(args: TabArgs) -> i32 {
         } else {
             IDLE_TICK
         };
+        // Never sleep past the earliest JS timer deadline (task: real timers).
+        let tick = tab.timer_poll_tick(tick);
         poll_inputs(stdin_fd, wake_fd, tick);
         // Wake-ups from ShellProvider::request_redraw / the NetWaker.
         let woken = pipe.drain() > 0;
@@ -1770,6 +1890,11 @@ pub fn run(args: TabArgs) -> i32 {
         if tab.drain_nav_hook() {
             continue;
         }
+
+        // 2b. JS timers: execute every callback due since the last poll
+        // (setTimeout/setInterval/rAF), settle, and repaint coalesced exactly
+        // like the input path above.
+        tab.run_due_timers();
 
         // 3. Settle net completions / redraw requests and coalesce frames.
         //    Invisible tabs stay idle — repaints resume on SetVisible(true).

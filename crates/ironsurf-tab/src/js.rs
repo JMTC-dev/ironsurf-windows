@@ -15,14 +15,21 @@
 //! - `console.log/info/warn/error` — tab stderr **and** the per-navigation
 //!   capture the tab turns into `FromTab::StatusText`,
 //! - `setTimeout`/`setInterval`/`clearTimeout`/`clearInterval`/
-//!   `requestAnimationFrame`/`cancelAnimationFrame` — recognised but **not
-//!   implemented** (no timer thread): calls are counted, reported once via
-//!   StatusText and do nothing (TODO: plumb a timer queue into the poll loop).
+//!   `requestAnimationFrame`/`cancelAnimationFrame` — **real timers**: the
+//!   natives append entries to a [`TimerQueue`] owned by the [`JsRuntime`],
+//!   and the tab's poll loop executes due callbacks (`run_due_timers`)
+//!   between polls. rAF is a 16 ms one-shot. A throwing callback is caught,
+//!   reported like any script error, and never stops later timers.
 //!
 //! There is no DOM mutation and no engine-internal DOM binding: the glue below
-//! is the whole surface. Every script is evaluated inside a catch — a throwing
-//! script is reported (`ScriptError`, turned into `FromTab::StatusText` by the
-//! runtime) and the next script still runs.
+//! is the whole surface. Every script (and every timer callback) is evaluated
+//! inside a catch — a throwing script is reported (`ScriptError`, turned into
+//! `FromTab::StatusText` by the runtime) and the next one still runs.
+//!
+//! The context is **not** owned by the initial script run: [`JsRuntime`]
+//! (Context + host + timer queue) lives for the lifetime of the document, so
+//! callbacks scheduled by page scripts survive the first run and fire from
+//! the poll loop until the next navigation replaces the runtime.
 //!
 //! The bindings reach the tab through a thread-local host pointer: blitz's
 //! `HtmlDocument` (and therefore script execution) lives on exactly one thread
@@ -33,6 +40,7 @@
 
 use std::cell::RefCell;
 use std::rc::Rc;
+use std::time::{Duration, Instant};
 
 use boa_engine::property::Attribute;
 use boa_engine::{Context, JsNativeError, JsString, JsValue, NativeFunction, Source};
@@ -256,8 +264,10 @@ pub struct HostState {
     pub notes: Vec<String>,
     /// A script changed something that needs a fresh frame.
     pub repaint: bool,
-    /// Number of no-op timer/rAF calls (reported once, see module docs).
+    /// Number of timer/rAF scheduling calls (stats + debug).
     pub timer_calls: u32,
+    /// Number of timer callbacks the poll loop has executed.
+    pub timers_fired: u32,
     /// Read-only snapshot of `document.body.textContent`
     /// (`None` = the document has no `<body>`).
     pub body_text: Option<String>,
@@ -288,17 +298,138 @@ impl HostState {
 /// scripts run on the same thread).
 pub type HostRef = Rc<RefCell<HostState>>;
 
+/// One scheduled timer. Callbacks are `JsValue`s from the owning [`JsRuntime`]'s
+/// realm (boa 0.22 keeps GC objects alive while a `JsValue` handle exists, so
+/// storing them alongside the context is safe).
+#[derive(Clone, Debug)]
+pub struct TimerEntry {
+    /// The id handed back to the page.
+    pub id: u32,
+    /// The callback to evaluate when due.
+    pub callback: JsValue,
+    /// `setInterval` entry (re-armed after each fire).
+    pub interval: bool,
+    /// `requestAnimationFrame` entry (fires with a timestamp argument).
+    pub raf: bool,
+    /// When the tab's poll loop should run it.
+    pub due: Instant,
+    /// Re-arm period for intervals.
+    pub period: Duration,
+}
+
+/// Timer store shared between the JS natives and the tab's poll loop (the
+/// [`JsRuntime`] owns it; natives reach it through the active-scope stack).
+#[derive(Debug)]
+pub struct TimerQueue {
+    /// Ids start at 1: `0` is the "not scheduled" return browsers use for
+    /// non-callable callbacks, so a live timer must never report it.
+    next_id: u32,
+    entries: Vec<TimerEntry>,
+}
+
+impl Default for TimerQueue {
+    fn default() -> Self {
+        TimerQueue {
+            next_id: 1,
+            entries: Vec::new(),
+        }
+    }
+}
+
+impl TimerQueue {
+    /// Schedule `callback`; returns the page-visible timer id.
+    fn schedule(
+        &mut self,
+        callback: JsValue,
+        delay: Duration,
+        interval: bool,
+        raf: bool,
+        now: Instant,
+    ) -> u32 {
+        let id = self.next_id;
+        self.next_id = self.next_id.wrapping_add(1).max(1);
+        self.entries.push(TimerEntry {
+            id,
+            callback,
+            interval,
+            raf,
+            due: now + delay,
+            period: delay,
+        });
+        id
+    }
+
+    /// Remove the entry with this id (`clearTimeout`/`clearInterval`/
+    /// `cancelAnimationFrame`). True when something was cancelled.
+    fn cancel(&mut self, id: u32) -> bool {
+        let before = self.entries.len();
+        self.entries.retain(|entry| entry.id != id);
+        self.entries.len() != before
+    }
+
+    /// Earliest deadline the poll loop should wake for.
+    fn earliest(&self) -> Option<Instant> {
+        self.entries.iter().map(|entry| entry.due).min()
+    }
+
+    fn has_entries(&self) -> bool {
+        !self.entries.is_empty()
+    }
+
+    /// Take every entry due at `now`, in due order. Intervals are re-armed
+    /// **before** their callbacks run, so a `clearInterval` from inside a
+    /// callback (or from a callback scheduled in the same batch) sticks.
+    fn take_due(&mut self, now: Instant) -> Vec<TimerEntry> {
+        let mut due: Vec<TimerEntry> = Vec::new();
+        let mut keep: Vec<TimerEntry> = Vec::new();
+        for entry in std::mem::take(&mut self.entries).drain(..) {
+            if entry.due <= now {
+                due.push(entry);
+            } else {
+                keep.push(entry);
+            }
+        }
+        self.entries = keep;
+        due.sort_by_key(|entry| entry.due);
+        for entry in &due {
+            if entry.interval {
+                self.entries.push(TimerEntry {
+                    due: now + entry.period,
+                    ..entry.clone()
+                });
+            }
+        }
+        due
+    }
+}
+
+/// The pair of cells natives resolve while a context owned by a [`JsRuntime`]
+/// is evaluating (host state + the live timer queue).
+#[derive(Clone)]
+struct ActiveScope {
+    host: HostRef,
+    timers: Rc<RefCell<TimerQueue>>,
+}
+
 thread_local! {
-    /// Stack of hosts whose contexts are currently evaluating. Natives resolve
-    /// the top entry; [`run_scripts`] pushes for the duration of the run.
-    static ACTIVE_HOSTS: RefCell<Vec<HostRef>> = const { RefCell::new(Vec::new()) };
+    /// Stack of scopes whose contexts are currently evaluating. Natives
+    /// resolve the top entry; [`JsRuntime`] pushes for the duration of a
+    /// script run or a timer batch.
+    static ACTIVE_HOSTS: RefCell<Vec<ActiveScope>> = const { RefCell::new(Vec::new()) };
 }
 
 /// Borrow the active host mutably. Never called across a re-entry point (all
 /// JS→Rust string conversions happen before the borrow).
 fn with_host<R>(f: impl FnOnce(&mut HostState) -> R) -> Option<R> {
-    let host = ACTIVE_HOSTS.with(|stack| stack.borrow().last().cloned())?;
-    let outcome = f(&mut host.borrow_mut());
+    let scope = ACTIVE_HOSTS.with(|stack| stack.borrow().last().cloned())?;
+    let outcome = f(&mut scope.host.borrow_mut());
+    Some(outcome)
+}
+
+/// Mutably access the active timer queue (natives schedule/cancel here).
+fn with_timers<R>(f: impl FnOnce(&mut TimerQueue) -> R) -> Option<R> {
+    let scope = ACTIVE_HOSTS.with(|stack| stack.borrow().last().cloned())?;
+    let outcome = f(&mut scope.timers.borrow_mut());
     Some(outcome)
 }
 
@@ -315,7 +446,33 @@ mod native {
     pub(super) const TITLE_SET: &str = "__ironsurfTitleSet";
     pub(super) const CONSOLE: &str = "__ironsurfConsole";
     pub(super) const REFUSE: &str = "__ironsurfRefuse";
-    pub(super) const TIMER: &str = "__ironsurfTimer";
+    pub(super) const SET_TIMEOUT: &str = "__ironsurfSetTimeout";
+    pub(super) const SET_INTERVAL: &str = "__ironsurfSetInterval";
+    pub(super) const RAF: &str = "__ironsurfRaf";
+    pub(super) const TIMER_CLEAR: &str = "__ironsurfClearTimer";
+}
+
+/// One-shot delay used for `requestAnimationFrame` (~60 Hz; the tab has no
+/// vsync source, a fixed 16 ms frame is good enough).
+const RAF_INTERVAL: Duration = Duration::from_millis(16);
+
+/// Coerce a `setTimeout`/`setInterval` delay argument: non-numbers and
+/// non-finite values read as 0, and everything is clamped so
+/// `setTimeout(fn, 1e300)` cannot poison the poll deadline arithmetic.
+fn delay_from(
+    args: &[JsValue],
+    index: usize,
+    context: &mut Context,
+) -> Result<Duration, boa_engine::JsError> {
+    let raw = args
+        .get(index)
+        .map(|value| value.to_number(context))
+        .transpose()?
+        .unwrap_or(0.0);
+    if !raw.is_finite() || raw <= 0.0 {
+        return Ok(Duration::ZERO);
+    }
+    Ok(Duration::from_millis(raw.min(86_400_000.0 * 3650.0) as u64))
 }
 
 /// Trusted glue installed on top of the natives. Written in JS on purpose:
@@ -357,11 +514,6 @@ const PRELUDE: &str = r#"
     get hash() { return ""; },
   };
 
-  // No timers: recognised, counted, and deliberately inert.
-  function timer() {
-    host.__ironsurfTimer();
-    return 0;
-  }
 
   // Like browsers, the global object *is* `window`: window.window === window,
   // and page-level `var`s land on the same object. So `window` is not built —
@@ -381,12 +533,14 @@ const PRELUDE: &str = r#"
   host.addEventListener = noop;
   host.removeEventListener = noop;
   host.dispatchEvent = returnTrue;
-  host.setTimeout = timer;
-  host.setInterval = timer;
-  host.clearTimeout = noop;
-  host.clearInterval = noop;
-  host.requestAnimationFrame = timer;
-  host.cancelAnimationFrame = noop;
+  // Real timers: the natives append to the tab's timer queue and the poll
+  // loop runs the callbacks (rAF is a 16 ms one-shot).
+  host.setTimeout = host.__ironsurfSetTimeout;
+  host.setInterval = host.__ironsurfSetInterval;
+  host.clearTimeout = host.__ironsurfClearTimer;
+  host.clearInterval = host.__ironsurfClearTimer;
+  host.requestAnimationFrame = host.__ironsurfRaf;
+  host.cancelAnimationFrame = host.__ironsurfClearTimer;
   host.scrollTo = noop;
   host.scroll = noop;
 
@@ -452,7 +606,9 @@ const PRELUDE: &str = r#"
 /// Build a fresh boa context for one navigation, with the tiny binding surface
 /// bound to `host`. The context is intentionally thrown away at the next
 /// navigation (per `ARCHITECTURE.md` §JavaScript (Boa)).
-pub fn build_context(host: &HostRef) -> Context {
+pub fn build_context(host: &HostRef, _timers: &Rc<RefCell<TimerQueue>>) -> Context {
+    // `_timers` documents the pairing (natives reach the queue through the
+    // active-scope stack a [`JsRuntime`] pushes around every evaluation).
     let (url, body_text, has_body) = {
         let host = host.borrow();
         (
@@ -560,22 +716,54 @@ pub fn build_context(host: &HostRef) -> Context {
     ) {
         error!("js binding `location` failed to install: {err}");
     }
-    // Timers: counted and reported once, never scheduled (TODO).
+    // Timers: real queue entries the tab's poll loop executes. A non-callable
+    // callback schedules nothing and reads as id 0 (what browsers do).
+    let schedule = |interval: bool, raf: bool, delay_arg: Option<usize>| {
+        move |_this: &JsValue, args: &[JsValue], context: &mut Context| {
+            let callback = args.first().cloned().unwrap_or(JsValue::undefined());
+            if !callback.is_callable() {
+                return Ok(JsValue::new(0u32));
+            }
+            let delay = match delay_arg {
+                Some(index) => delay_from(args, index, context)?,
+                None => Duration::ZERO,
+            };
+            let delay = if raf { RAF_INTERVAL } else { delay };
+            let id = with_timers(|queue| {
+                queue.schedule(callback, delay, interval, raf, Instant::now())
+            })
+            .unwrap_or(0);
+            with_host(|host| host.timer_calls += 1);
+            Ok(JsValue::new(id))
+        }
+    };
+    for (name, interval, raf, delay_arg) in [
+        (native::SET_TIMEOUT, false, false, Some(1usize)),
+        (native::SET_INTERVAL, true, false, Some(1usize)),
+        (native::RAF, false, true, None),
+    ] {
+        let native_fn = NativeFunction::from_copy_closure(schedule(interval, raf, delay_arg));
+        if let Err(err) =
+            context.register_global_builtin_callable(JsString::from(name), 2, native_fn)
+        {
+            error!("js binding `{name}` failed to install: {err}");
+        }
+    }
+    // clearTimeout/clearInterval/cancelAnimationFrame: cancel by id.
     if let Err(err) = context.register_global_builtin_callable(
-        JsString::from(native::TIMER),
-        0,
-        NativeFunction::from_copy_closure(|_this, _args, _context| {
-            with_host(|host| {
-                host.timer_calls += 1;
-                if host.timer_calls == 1 {
-                    host.notes
-                        .push("javascript timers are not implemented (TODO)".to_string());
-                }
-            });
+        JsString::from(native::TIMER_CLEAR),
+        1,
+        NativeFunction::from_copy_closure(|_this, args, context| {
+            let id = args
+                .first()
+                .map(|value| value.to_u32(context))
+                .transpose()?
+                .unwrap_or(0);
+            with_timers(|queue| queue.cancel(id));
             Ok(JsValue::undefined())
         }),
     ) {
-        error!("js binding `timers` failed to install: {err}");
+        error!("js binding `clearTimer` failed to install: {err}");
     }
 
     if let Err(err) = context.eval(Source::from_bytes(PRELUDE)) {
@@ -595,41 +783,147 @@ pub struct ScriptError {
     pub message: String,
 }
 
-/// Evaluate `scripts` in order in one fresh context owned by `host`.
-///
-/// Every evaluation is wrapped: an exception is collected and the next script
-/// still runs (contract: script errors must never kill the tab).
-pub fn run_scripts(scripts: &[ScriptSource], host: &HostRef) -> Vec<ScriptError> {
-    let started = std::time::Instant::now();
-    ACTIVE_HOSTS.with(|stack| stack.borrow_mut().push(Rc::clone(host)));
-    let mut context = build_context(host);
-    let mut errors = Vec::new();
-    for script in scripts {
-        trace!(
-            "eval [{}] ({} bytes, started {}ms ago)",
-            script.origin,
-            script.code.len(),
-            started.elapsed().as_millis()
-        );
-        match context.eval(Source::from_bytes(script.code.as_str())) {
-            Ok(_) => {}
-            Err(err) => {
-                // boa's Display adds a shadow-stack backtrace; keep one line.
-                let message = err.to_string().lines().next().unwrap_or("script error").to_string();
-                error!("javascript error in {origin}: {message}", origin = script.origin);
-                errors.push(ScriptError {
-                    origin: script.origin.clone(),
-                    message,
-                });
-            }
+/// The JavaScript side of one document: **one `boa_engine::Context` for the
+/// lifetime of the document**, its host cell, and the live [`TimerQueue`].
+/// The tab owns this (rebuilt per navigation); because it outlives the
+/// initial script run, callbacks scheduled by page scripts fire later from
+/// the poll loop ([`JsRuntime::run_due_timers`]).
+pub struct JsRuntime {
+    context: Context,
+    host: HostRef,
+    timers: Rc<RefCell<TimerQueue>>,
+    /// Monotonic origin for rAF timestamps.
+    started: Instant,
+}
+
+impl JsRuntime {
+    /// Fresh realm for one navigation, seeded from `host`.
+    pub fn new(host: HostRef) -> Self {
+        let timers = Rc::new(RefCell::new(TimerQueue::default()));
+        let context = build_context(&host, &timers);
+        JsRuntime {
+            context,
+            host,
+            timers,
+            started: Instant::now(),
         }
     }
-    // Drop the realm before the host so nothing can observe a dead host.
-    drop(context);
-    ACTIVE_HOSTS.with(|stack| {
-        stack.borrow_mut().pop();
-    });
-    errors
+
+    /// The host cell the bindings write through (title, console, notes).
+    pub fn host(&self) -> &HostRef {
+        &self.host
+    }
+
+    /// Whether the poll loop has anything left to wait for.
+    pub fn has_timers(&self) -> bool {
+        self.timers.borrow().has_entries()
+    }
+
+    /// Earliest timer deadline (`None` = nothing scheduled).
+    pub fn next_timer_deadline(&self) -> Option<Instant> {
+        self.timers.borrow().earliest()
+    }
+
+    /// Push this runtime's scope (host + timers) onto the thread-local stack;
+    /// the guard pops it on drop, so natives resolve this runtime's cells
+    /// while any of its evaluations runs.
+    fn activate(&self) -> ActiveGuard {
+        let scope = ActiveScope {
+            host: Rc::clone(&self.host),
+            timers: Rc::clone(&self.timers),
+        };
+        ACTIVE_HOSTS.with(|stack| stack.borrow_mut().push(scope));
+        ActiveGuard
+    }
+
+    /// Evaluate `scripts` in order. Every evaluation is wrapped: an exception
+    /// is collected and the next script still runs (contract: script errors
+    /// must never kill the tab).
+    pub fn run_scripts(&mut self, scripts: &[ScriptSource]) -> Vec<ScriptError> {
+        let started = Instant::now();
+        let _active = self.activate();
+        let mut errors = Vec::new();
+        for script in scripts {
+            trace!(
+                "eval [{}] ({} bytes, started {}ms ago)",
+                script.origin,
+                script.code.len(),
+                started.elapsed().as_millis()
+            );
+            match self.context.eval(Source::from_bytes(script.code.as_str())) {
+                Ok(_) => {}
+                Err(err) => {
+                    let message = first_line(&err);
+                    error!("javascript error in {origin}: {message}", origin = script.origin);
+                    errors.push(ScriptError {
+                        origin: script.origin.clone(),
+                        message,
+                    });
+                }
+            }
+        }
+        errors
+    }
+
+    /// Evaluate one snippet with this runtime's scope active (the same world
+    /// page scripts see; used by the binding tests).
+    #[cfg(test)]
+    pub(crate) fn eval(&mut self, source: &str) -> Result<JsValue, boa_engine::JsError> {
+        let _active = self.activate();
+        self.context.eval(Source::from_bytes(source))
+    }
+
+    /// Execute every timer callback due at `now`, in due order. Exceptions
+    /// are caught **per callback** (reported like any script error: origin
+    /// `"timer"`) and never stop the remaining callbacks or later firings.
+    /// Side effects stay in the host cell — the tab turns them into IPC
+    /// exactly like [`JsRuntime::run_scripts`] does.
+    pub fn run_due_timers(&mut self, now: Instant) -> Vec<ScriptError> {
+        let due = self.timers.borrow_mut().take_due(now);
+        if due.is_empty() {
+            return Vec::new();
+        }
+        let _active = self.activate();
+        let mut errors = Vec::new();
+        for entry in due {
+            self.host.borrow_mut().timers_fired += 1;
+            // rAF callbacks receive a DOMHighResTimeStamp-ish argument.
+            let args = if entry.raf {
+                vec![JsValue::new(self.started.elapsed().as_secs_f64() * 1000.0)]
+            } else {
+                Vec::new()
+            };
+            // Non-callables cannot be scheduled by the natives, so `None`
+            // here is unreachable; treat it as a skipped callback anyway.
+            if let Some(callback) = entry.callback.as_object() {
+                if let Err(err) = callback.call(&JsValue::undefined(), &args, &mut self.context) {
+                    let message = first_line(&err);
+                    error!("javascript error in timer callback: {message}");
+                    errors.push(ScriptError {
+                        origin: "timer".to_string(),
+                        message,
+                    });
+                }
+            }
+        }
+        errors
+    }
+}
+
+/// Pops the thread-local scope stack when dropped.
+struct ActiveGuard;
+
+impl Drop for ActiveGuard {
+    fn drop(&mut self) {
+        ACTIVE_HOSTS.with(|stack| {
+            stack.borrow_mut().pop();
+        });
+    }
+}
+
+/// First line of a boa error (its Display adds a shadow-stack backtrace).
+fn first_line(err: &boa_engine::JsError) -> String {
+    err.to_string().lines().next().unwrap_or("script error").to_string()
 }
 
 /// Text to surface as `FromTab::StatusText` for these script errors
@@ -652,15 +946,11 @@ pub fn body_text_snapshot(doc: &BaseDocument) -> Option<String> {
 mod tests {
     use super::*;
 
+    /// Evaluate a snippet in a fresh per-document runtime (what the binding
+    /// tests exercise: prelude + natives, no page scripts).
     fn eval_snippet(source: &str, host: &HostRef) -> JsValue {
-        ACTIVE_HOSTS.with(|stack| stack.borrow_mut().push(Rc::clone(host)));
-        let mut context = build_context(host);
-        let result = context.eval(Source::from_bytes(source));
-        drop(context);
-        ACTIVE_HOSTS.with(|stack| {
-            stack.borrow_mut().pop();
-        });
-        result.expect("snippet should evaluate")
+        let mut runtime = JsRuntime::new(Rc::clone(host));
+        runtime.eval(source).expect("snippet should evaluate")
     }
 
     fn sample_host() -> HostRef {
@@ -802,20 +1092,130 @@ mod tests {
     }
 
     #[test]
-    fn timers_are_counted_not_scheduled() {
+    fn timer_calls_create_queue_entries_and_are_counted() {
         let host = sample_host();
-        eval_snippet("setTimeout(function () {}, 1); setInterval(function () {}, 1);", &host);
-        let borrowed = host.borrow();
-        assert_eq!(borrowed.timer_calls, 2);
-        assert_eq!(
-            borrowed
+        let mut runtime = JsRuntime::new(Rc::clone(&host));
+        let timeout_id = runtime
+            .eval("setTimeout(function () {}, 1)")
+            .expect("setTimeout")
+            .as_i32()
+            .expect("numeric id");
+        let interval_id = runtime
+            .eval("setInterval(function () {}, 1)")
+            .expect("setInterval")
+            .as_i32()
+            .expect("numeric id");
+        assert!(timeout_id > 0 && interval_id > 0 && timeout_id != interval_id);
+        assert_eq!(host.borrow().timer_calls, 2, "scheduling is counted for stats");
+        assert!(
+            host.borrow()
                 .notes
                 .iter()
-                .filter(|note| note.contains("timers are not implemented"))
-                .count(),
-            1,
-            "the note is reported once"
+                .all(|note| !note.contains("timers are not implemented")),
+            "the old not-implemented note path is gone"
         );
+        // Non-callable callbacks schedule nothing and read as id 0.
+        assert_eq!(
+            runtime.eval("setTimeout('not a function', 1)").expect("eval").as_i32(),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn timeout_fires_from_the_poll_loop_and_never_arms_again() {
+        let host = sample_host();
+        let mut runtime = JsRuntime::new(Rc::clone(&host));
+        runtime
+            .eval("setTimeout(function () { document.title = 'timer-fired'; }, 10)")
+            .expect("setTimeout");
+        assert!(host.borrow().title_assigned.is_none(), "not run yet");
+
+        let now = Instant::now();
+        // The loop polls before the deadline: nothing fires early.
+        assert!(runtime.run_due_timers(now).is_empty());
+        assert_eq!(host.borrow().title_assigned, None);
+
+        // 20 ms later the poll loop catches the due callback …
+        let later = now + Duration::from_millis(20);
+        let errors = runtime.run_due_timers(later);
+        assert!(errors.is_empty(), "{errors:?}");
+        let borrowed = host.borrow();
+        assert_eq!(borrowed.title_assigned.as_deref(), Some("timer-fired"));
+        assert_eq!(borrowed.timers_fired, 1);
+        drop(borrowed);
+
+        // … and a one-shot never re-arms.
+        assert!(!runtime.has_timers());
+        assert!(runtime.run_due_timers(later + Duration::from_secs(5)).is_empty());
+        assert_eq!(host.borrow().timers_fired, 1);
+    }
+
+    #[test]
+    fn interval_rearms_until_clearinterval_cancels_it() {
+        let host = sample_host();
+        let mut runtime = JsRuntime::new(Rc::clone(&host));
+        runtime
+            .eval(
+                "var ticks = 0; intervalId = setInterval(function () { ticks += 1; document.title = 'tick-' + ticks; }, 5);",
+            )
+            .expect("setInterval");
+
+        let now = Instant::now();
+        // First fire, and the interval re-arms itself for the next poll.
+        assert!(runtime.run_due_timers(now + Duration::from_millis(10)).is_empty());
+        assert_eq!(host.borrow().title_assigned.as_deref(), Some("tick-1"));
+        assert!(runtime.has_timers(), "intervals stay scheduled until cleared");
+
+        // clearInterval cancels: no further callback, even much later.
+        runtime.eval("clearInterval(intervalId)").expect("clearInterval");
+        assert!(!runtime.has_timers());
+        assert!(runtime.run_due_timers(now + Duration::from_secs(60)).is_empty());
+        assert_eq!(
+            runtime.eval("ticks").expect("read ticks").as_i32(),
+            Some(1),
+            "exactly one tick ran"
+        );
+        assert_eq!(host.borrow().timers_fired, 1);
+    }
+
+    #[test]
+    fn throwing_callback_is_reported_and_never_stops_the_rest() {
+        let host = sample_host();
+        let mut runtime = JsRuntime::new(Rc::clone(&host));
+        runtime
+            .eval(
+                "setTimeout(function () { throw new Error('callback boom'); }, 0);
+                 setTimeout(function () { document.title = 'after-boom'; }, 1);",
+            )
+            .expect("scheduling");
+
+        let errors = runtime.run_due_timers(Instant::now() + Duration::from_millis(50));
+        assert_eq!(errors.len(), 1, "the throwing callback is caught …");
+        assert_eq!(errors[0].origin, "timer");
+        assert!(errors[0].message.contains("callback boom"), "{errors:?}");
+        // … and its batch sibling still ran (the tab is alive and scripting).
+        assert_eq!(host.borrow().title_assigned.as_deref(), Some("after-boom"));
+        assert_eq!(runtime.eval("1 + 1").expect("eval").as_i32(), Some(2));
+    }
+
+    #[test]
+    fn request_animation_frame_is_a_sixteen_ms_one_shot() {
+        let host = sample_host();
+        let mut runtime = JsRuntime::new(Rc::clone(&host));
+        runtime
+            .eval("requestAnimationFrame(function (t) { document.title = 'raf-' + (typeof t); })")
+            .expect("requestAnimationFrame");
+        // Not due immediately: rAF waits a frame (16 ms).
+        assert!(runtime.run_due_timers(Instant::now()).is_empty());
+        assert!(host.borrow().title_assigned.is_none());
+        let errors = runtime.run_due_timers(Instant::now() + Duration::from_millis(20));
+        assert!(errors.is_empty(), "{errors:?}");
+        assert_eq!(
+            host.borrow().title_assigned.as_deref(),
+            Some("raf-number"),
+            "rAF callbacks receive a timestamp"
+        );
+        assert!(!runtime.has_timers(), "rAF is one-shot");
     }
 
     #[test]
@@ -831,7 +1231,8 @@ mod tests {
                 origin: "second.js".to_string(),
             },
         ];
-        let errors = run_scripts(&scripts, &host);
+        let mut runtime = JsRuntime::new(Rc::clone(&host));
+        let errors = runtime.run_scripts(&scripts);
         assert_eq!(errors.len(), 1);
         assert_eq!(errors[0].origin, "inline");
         assert!(errors[0].message.contains("nope"), "{:?}", errors[0]);
@@ -854,7 +1255,8 @@ mod tests {
             code: "function broken( {".to_string(),
             origin: "inline".to_string(),
         }];
-        let errors = run_scripts(&scripts, &host);
+        let mut runtime = JsRuntime::new(Rc::clone(&host));
+        let errors = runtime.run_scripts(&scripts);
         assert_eq!(errors.len(), 1, "syntax errors never abort the tab");
         assert!(!errors[0].message.is_empty());
     }
@@ -862,13 +1264,11 @@ mod tests {
     #[test]
     fn contexts_are_isolated_between_navigations() {
         let first = sample_host();
-        run_scripts(
-            &[ScriptSource {
-                code: "var leaked = 1; document.title = 'one';".to_string(),
-                origin: "inline".to_string(),
-            }],
-            &first,
-        );
+        let mut first_runtime = JsRuntime::new(Rc::clone(&first));
+        first_runtime.run_scripts(&[ScriptSource {
+            code: "var leaked = 1; document.title = 'one';".to_string(),
+            origin: "inline".to_string(),
+        }]);
         let second = Rc::new(RefCell::new(HostState::new("https://example.test/2", None, None)));
         // The second navigation gets a fresh realm: `leaked` is gone.
         assert_eq!(
@@ -1018,3 +1418,4 @@ mod tests {
         assert!(!is_module_type(Some("text/javascript")));
     }
 }
+

@@ -965,3 +965,47 @@ fn tab_shows_top_level_data_url_script_as_source() {
 
     exit_cleanly(&mut tab);
 }
+
+/// Real-timers task: a callback armed with `setTimeout` at load must fire
+/// from the *live* poll loop (not just headless) — the retitled page arrives
+/// as `TitleChanged` seconds after the initial load settled.
+#[test]
+fn tab_timer_callback_fires_from_the_poll_loop() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let profile = dir.path().join("profile");
+    std::fs::create_dir_all(&profile).expect("profile dir");
+    let fixture = profile.join("index.html");
+    std::fs::write(
+        &fixture,
+        r#"<!doctype html>
+<html>
+  <head><title>Base Title</title></head>
+  <body>
+    <script>
+      setTimeout(function () {
+        document.title = "timer-title";
+      }, 20);
+      setInterval(function () { window.__n = (window.__n || 0) + 1; }, 25);
+    </script>
+  </body>
+</html>
+"#,
+    )
+    .expect("write fixture");
+
+    let deadline = Instant::now() + DEADLINE;
+    let mut tab = spawn_tab(&fixture, &profile);
+    let mut seen = Vec::new();
+
+    // The parsed title must NOT be overridden instantly (that would mean the
+    // callback ran synchronously); the timer title arrives via the poll loop.
+    let title = tab.wait_for(
+        "TitleChanged(\"timer-title\") from the setTimeout callback",
+        |m| matches!(m, FromTab::TitleChanged { title: Some(t) } if t == "timer-title"),
+        deadline,
+        &mut seen,
+    );
+    assert_eq!(title, FromTab::TitleChanged { title: Some("timer-title".into()) });
+
+    exit_cleanly(&mut tab);
+}
