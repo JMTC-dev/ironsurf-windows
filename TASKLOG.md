@@ -52,3 +52,12 @@ contentDocument+doc.write). Queue order: headless --headless harness → real ti
 wrappers {__d,__n}, LIVE NodeList, mutator-backed create/append/remove/query via blitz-dom) → getComputedStyle+el.style
 → DOM Events → contentDocument+write → acid3 measure+fix top misses → harden+docs. Baseline pre-queue: JS cannot
 bootstrap acid3 at all (no createElement/timers). Design refs: docs/ACID3_STATUS.md will hold repro + score.
+## #17b real JS timers in ironsurf-tab (unblocks ACID3 bucket queue step 2): js.rs TimerQueue
+(ids start at 1, due-asc, intervals re-arm before run so clearInterval-inside works) + JsRuntime
+(Context+host+queue alive for the document's life; thread-local scope stack); real
+setTimeout/setInterval/clearAll/raf(16ms one-shot w/ timestamp) natives replace counted-only stub
+(count kept in stats); live poll slice clamped by earliest deadline + run_due_timers (settle,
+<=30fps repaint, throwing callback never kills tab); headless --wait pumps same queue. Fixed latent
+take_due bug (dropped future entries) + next_id=0. Tests: 4 unit + e2e TitleChanged("timer-title") +
+headless title=timer-fired. 56u/11 e2e/3 headless/3 idle/1 spike green; acid3 local mirror boots
+without timer errors (buckets still need DOM bridge, next queue steps).
