@@ -903,7 +903,9 @@ impl Tab {
         // The runtime (Context + host + timer queue) survives this call: it
         // lives on as `self.js` until the next navigation replaces it.
         let mut runtime = js::JsRuntime::new(host);
-        let errors = runtime.run_scripts(&extraction.scripts);
+        // The live document is registered for the duration of the run, so
+        // page JS can read and mutate the real DOM (docId 0).
+        let errors = runtime.run_scripts(&extraction.scripts, self.doc.as_mut());
         debug!(
             "script run complete: {} error(s) in {} ms, timers queued: {}",
             errors.len(),
@@ -911,6 +913,10 @@ impl Tab {
             runtime.has_timers()
         );
         self.js = Some(runtime);
+        // Page scripts may have mutated the DOM (created nodes, changed
+        // attributes/styles): restyle + relayout now so the pending paint
+        // (and any title mutation) reflects the post-script tree.
+        self.settle();
         self.consume_js_status(extraction.notes.first().cloned(), &errors);
         self.take_js_title();
     }
@@ -994,7 +1000,8 @@ impl Tab {
                 return 0;
             };
             let before = runtime.host().borrow().timers_fired;
-            let errors = runtime.run_due_timers(Instant::now());
+            // Same live-DOM registration as the initial script batch.
+            let errors = runtime.run_due_timers(Instant::now(), self.doc.as_mut());
             let fired = usize::try_from(runtime.host().borrow().timers_fired - before)
                 .unwrap_or(usize::MAX);
             (fired, errors)

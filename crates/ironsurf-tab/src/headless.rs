@@ -39,7 +39,6 @@ use std::time::{Duration, Instant};
 
 use anyrender::{render_to_buffer, PaintScene};
 use anyrender_vello_cpu::VelloCpuImageRenderer;
-use blitz_dom::{BaseDocument, LocalName, NodeData};
 use blitz_html::HtmlDocument;
 use blitz_paint::paint_scene;
 use kurbo::{Affine, Rect, Size};
@@ -280,102 +279,10 @@ pub fn body_html(doc: &HtmlDocument) -> String {
 }
 
 /// Serialize the children of the `<body>` element; `None` without a body.
+/// Delegates to the shared serializer in [`crate::js`] (same code the DOM
+/// bridge's `innerHTML` uses).
 pub fn inner_html(doc: &HtmlDocument) -> Option<String> {
     let body = doc.find_body_node()?;
-    let mut out = String::new();
-    for child in body.children.iter().copied() {
-        serialize_node(doc, child, false, &mut out);
-    }
-    Some(out)
-}
-
-/// HTML void elements (serialized as `<tag …>` with no end tag).
-fn is_void(local: &LocalName) -> bool {
-    let local: &str = local;
-    [
-        "area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "param",
-        "source", "track", "wbr",
-    ]
-    .contains(&local)
-}
-
-/// Pre-order serialization of one node and its DOM children.
-///
-/// `raw` marks being inside a raw-text element (`<script>`/`<style>`/
-/// `<textarea>`-alike), whose text children are emitted verbatim — exactly
-/// what `innerHTML` returns in a browser. Anonymous blocks (layout-only nodes)
-/// are transparent: their children serialize as if direct.
-fn serialize_node(doc: &BaseDocument, id: blitz_dom::NodeId, raw: bool, out: &mut String) {
-    let Some(node) = doc.get_node(id) else { return };
-    match &node.data {
-        NodeData::Text(text) => {
-            if raw {
-                out.push_str(&text.content);
-            } else {
-                escape_text(&text.content, out);
-            }
-        }
-        NodeData::Comment { contents } => {
-            out.push_str("<!--");
-            out.push_str(contents);
-            out.push_str("-->");
-        }
-        NodeData::Element(element) => {
-            let local: &str = &element.name.local;
-            // `<script>`/`<style>` bodies are raw text, never escaped markup.
-            let child_raw = matches!(local, "script" | "style");
-            out.push('<');
-            out.push_str(local);
-            if let Some(attrs) = node.data.attrs() {
-                for attr in attrs {
-                    out.push(' ');
-                    out.push_str(&attr.name.local);
-                    out.push_str("=\"");
-                    escape_attr(&attr.value, out);
-                    out.push('"');
-                }
-            }
-            out.push('>');
-            if !is_void(&element.name.local) {
-                for child in node.children.iter().copied() {
-                    serialize_node(doc, child, child_raw || raw, out);
-                }
-                out.push_str("</");
-                out.push_str(local);
-                out.push('>');
-            }
-        }
-        NodeData::AnonymousBlock(_) => {
-            for child in node.children.iter().copied() {
-                serialize_node(doc, child, raw, out);
-            }
-        }
-        NodeData::Document(_) => {
-            for child in node.children.iter().copied() {
-                serialize_node(doc, child, raw, out);
-            }
-        }
-    }
-}
-
-fn escape_text(s: &str, out: &mut String) {
-    for c in s.chars() {
-        match c {
-            '&' => out.push_str("&amp;"),
-            '<' => out.push_str("&lt;"),
-            '>' => out.push_str("&gt;"),
-            _ => out.push(c),
-        }
-    }
-}
-
-fn escape_attr(s: &str, out: &mut String) {
-    for c in s.chars() {
-        match c {
-            '&' => out.push_str("&amp;"),
-            '"' => out.push_str("&quot;"),
-            _ => out.push(c),
-        }
-    }
+    Some(crate::js::serialize_children(doc, body.id))
 }
 

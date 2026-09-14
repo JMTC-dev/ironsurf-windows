@@ -61,3 +61,12 @@ setTimeout/setInterval/clearAll/raf(16ms one-shot w/ timestamp) natives replace 
 take_due bug (dropped future entries) + next_id=0. Tests: 4 unit + e2e TitleChanged("timer-title") +
 headless title=timer-fired. 56u/11 e2e/3 headless/3 idle/1 spike green; acid3 local mirror boots
 without timer errors (buckets still need DOM bridge, next queue steps).
+## #18 DONE — real DOM for Boa (Acid3 foundation): thread-local LIVE_DOCS registry (raw ptr, only live during
+one eval; LiveDocGuard<'a> + PhantomData keeps the &mut borrow exclusive) + ~44 __ironsurfDom* natives (tree,
+attrs, mutate via DocumentMutator+flush, query w/ SyntaxError, RangeError names, clone shallow/deep, serialize)
++ PRELUDE glue: one NodeProto over {__d,__n} wrappers, realm-side __ironsurfNodeCache for identity, Proxy-based
+LIVE NodeList/HTMLCollection/NamedNodeMap (re-read per access), JS DocumentFragment, id/className; run_scripts/
+run_due_timers take Option<&mut HtmlDocument>, tab registers live doc + settles after scripts; --body-out now
+shares that serializer. 16 bridge tests (identity, liveness, innerHTML round-trip, NotFound/Range/Syntax) +
+headless smoke (script-built red div ⇒ >5k pure-red px in PPM, markup in --body-out); 72u/4 headless green,
+workspace green. Known gaps: element-scoped queries are document-wide; no events/style/CSSOM yet.

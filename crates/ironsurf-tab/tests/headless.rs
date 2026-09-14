@@ -168,3 +168,95 @@ fn headless_wait_window_runs_js_timers() {
         "the setTimeout callback must have retitled the page within --wait:\n{stderr}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// DOM bridge smoke test: page JS builds the DOM through the real blitz
+// document (`document.createElement`/`appendChild` land in the parsed tree),
+// the built node is *painted* (red pixels in the --shot PPM) and shows up in
+// the --body-out serialization.
+
+/// The box the script creates is 200x120 solid red; the viewport is bigger.
+const DOM_FIXTURE: &str = r#"<!doctype html>
+<html>
+<head><title>Before</title></head>
+<body>
+  <script>
+    var box = document.createElement("div");
+    box.id = "box";
+    box.setAttribute("style", "width: 200px; height: 120px; background: red");
+    document.body.appendChild(box);
+    box.textContent = "built:" + (document.getElementById("box") === box) +
+                      ":" + box.parentNode.nodeName +
+                      ":" + (document.getElementById("box") === box);
+    document.title = "DomBridge " + (document.body.lastElementChild === box ? "ok" : "gone");
+  </script>
+</body>
+</html>
+"#;
+
+#[test]
+fn dom_bridge_paints_red_box_and_serializes_it() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let fixture = dir.path().join("dom.html");
+    fs::write(&fixture, DOM_FIXTURE).expect("write fixture");
+    let body_out = dir.path().join("body.html");
+    let shot = dir.path().join("shot.ppm");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_ironsurf-tab"))
+        .arg("--headless")
+        .arg("--url")
+        .arg(url::Url::from_file_path(&fixture).expect("file url").as_str())
+        .args([
+            "--wait",
+            "150",
+            "--body-out",
+            body_out.to_str().unwrap(),
+            "--shot",
+            shot.to_str().unwrap(),
+            "--size",
+            "400x300",
+        ])
+        .output()
+        .expect("spawn ironsurf-tab --headless");
+    assert!(
+        output.status.success(),
+        "exit {:?}\nstderr:\n{}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // 1. The identity assertions ran (title reflects the DOM the script built).
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("HEADLESS title=DomBridge ok"),
+        "title assertion failed:\n{stderr}"
+    );
+
+    // 2. --body-out serialized the script-built node out of the real tree.
+    let body = fs::read_to_string(&body_out).expect("body out");
+    assert!(body.contains("<div"), "div missing in:\n{body}");
+    assert!(body.contains("id=\"box\""), "id attribute missing in:\n{body}");
+    assert!(
+        body.contains("background: red"),
+        "style attribute missing in:\n{body}"
+    );
+    assert!(
+        body.contains("built:true:BODY"),
+        "identity/parent assertions failed in:\n{body}"
+    );
+    assert!(body.contains("</div>"), "end tag missing in:\n{body}");
+
+    // 3. The new node is actually painted: thousands of pure-red pixels.
+    let ppm = fs::read(&shot).expect("shot");
+    let header_end = ppm
+        .windows(4)
+        .position(|w| w == b"255\n")
+        .expect("ppm maxbyte header")
+        + 4;
+    let pixels = &ppm[header_end..];
+    let red_pixels = pixels.chunks_exact(3).filter(|rgb| rgb == b"\xff\x00\x00").count();
+    assert!(
+        red_pixels > 5_000,
+        "expected a painted red box (200x120), found {red_pixels} red pixels"
+    );
+}

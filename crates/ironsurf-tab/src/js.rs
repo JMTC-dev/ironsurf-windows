@@ -44,7 +44,8 @@ use std::time::{Duration, Instant};
 
 use boa_engine::property::Attribute;
 use boa_engine::{Context, JsNativeError, JsString, JsValue, NativeFunction, Source};
-use blitz_dom::{local_name, BaseDocument, Node, NodeId};
+use blitz_dom::{local_name, BaseDocument, LocalName, Node, NodeData, NodeId, Prefix, QualName};
+use blitz_html::HtmlDocument;
 use url::Url;
 
 // Page-side diagnostics: `console.*` and script errors go to stderr at the
@@ -418,6 +419,1266 @@ thread_local! {
     static ACTIVE_HOSTS: RefCell<Vec<ActiveScope>> = const { RefCell::new(Vec::new()) };
 }
 
+// ---------------------------------------------------------------------------
+// DOM bridge (task: give Boa a real DOM via blitz-dom)
+//
+// Design (see docs/ACID3_STATUS.md):
+//
+// - While JavaScript runs (a script batch or a timer batch), the live
+//   `HtmlDocument` is registered in a thread-local Vec of raw pointers
+//   ([`LIVE_DOCS`]); index = docId (0 = the main document). The registration
+//   is popped the moment execution returns, so a pointer is never
+//   dereferenced outside JavaScript. blitz lives on exactly this thread,
+//   and no host borrow outlives the closure that takes it.
+// - Node wrappers are plain objects `{__d: docId, __n: nodeId}` sharing one
+//   prototype (`__ironsurfNodeProto`, defined in the PRELUDE). Identity is
+//   enforced by the wrap native through a realm-side cache object
+//   (`__ironsurfNodeCache`, key `"docId:nodeId"`), so two `getElementById`
+//   calls return the `===`same wrapper.
+// - All behaviour is a native global (`__ironsurfDom*`) taking docId+nodeId
+//   as integers; the JS glue on `NodeProto`/`Document` delegates with those
+//   ints. NodeList/HTMLCollection/NamedNodeMap are live `Proxy` views that
+//   re-read the document through the registry at ACCESS time (Acid3 tests
+//   removal-during-iteration).
+//
+// `NodeId` is the raw `u64` of blitz's versioned id (slotmap: index in the
+// low bits, version on top). Slotmap never hands out the null key, so `0`
+// is the bridge's "no such node" sentinel, and ids stay exact JS numbers
+// for any realistic page (version < 2^21).
+
+/// Sentinel for "no such node" (slotmap null keys are never live nodes).
+const NO_NODE: u64 = 0;
+
+thread_local! {
+    /// Documents whose JS is currently executing (design: Vec-like, index =
+    /// docId; the tab registers its main document around every evaluation).
+    static LIVE_DOCS: RefCell<Vec<*mut HtmlDocument>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Borrows `doc` mutably for the duration of one evaluation (popped — and
+/// thus unreachable from JS — the instant the guard drops).
+struct LiveDocGuard<'a> {
+    index: usize,
+    /// Keeps the registered document's unique borrow alive for the guard's
+    /// lifetime: the tab cannot touch (or drop) the document while JS holds
+    /// it registered.
+    _doc: std::marker::PhantomData<&'a mut HtmlDocument>,
+}
+
+fn register_live_doc(doc: &mut HtmlDocument) -> LiveDocGuard<'_> {
+    let index = LIVE_DOCS.with(|docs| {
+        docs.borrow_mut().push(doc);
+        docs.borrow().len() - 1
+    });
+    LiveDocGuard {
+        index,
+        _doc: std::marker::PhantomData,
+    }
+}
+
+impl Drop for LiveDocGuard<'_> {
+    fn drop(&mut self) {
+        LIVE_DOCS.with(|docs| {
+            let mut docs = docs.borrow_mut();
+            // LIFO by construction (guards nest); pop the matching frame.
+            if docs.len() > self.index {
+                docs.truncate(self.index);
+            }
+        });
+    }
+}
+
+fn with_live_doc<R>(doc_id: u32, f: impl FnOnce(&mut HtmlDocument) -> R) -> Option<R> {
+    LIVE_DOCS.with(|docs| {
+        let docs = docs.borrow();
+        let ptr = *docs.get(usize::try_from(doc_id).ok()?)?;
+        // SAFETY: registered by [`register_live_doc`] for the duration of
+        // this very JS execution; nothing else holds the document.
+        Some(unsafe { &mut *ptr }).map(f)
+    })
+}
+
+/// Read-modify-write access: hands over the document's
+/// [`blitz_dom::DocumentMutator`] (reads go through `mutator.doc`), flushes
+/// the mutator (inline `<style>` processing, title propagation, eager ops),
+/// and hands the result back. The runtime's per-batch `settle()` then
+/// restyles/relays-out so JS mutations paint.
+fn with_mut<R>(
+    doc_id: u32,
+    f: impl FnOnce(&mut blitz_dom::DocumentMutator<'_>) -> R,
+) -> Option<R> {
+    with_live_doc(doc_id, |doc| {
+        let mut mutator = doc.mutate();
+        let outcome = f(&mut mutator);
+        mutator.flush();
+        outcome
+    })
+}
+
+/// Parse a document index argument (natives take `(docId, nodeId, …)`).
+fn arg_doc(args: &[JsValue], index: usize, context: &mut Context) -> Result<u32, boa_engine::JsError> {
+    Ok(args
+        .get(index)
+        .map(|value| value.to_u32(context))
+        .transpose()?
+        .unwrap_or(0))
+}
+
+/// Parse a raw [`NodeId`] argument (0 = "no such node").
+fn arg_node(args: &[JsValue], index: usize, context: &mut Context) -> Result<u64, boa_engine::JsError> {
+    Ok(args
+        .get(index)
+        .map(|value| value.to_number(context))
+        .transpose()?
+        .map(|n| {
+            if n.is_finite() && n >= 0.0 && n < (u64::MAX as f64) {
+                // Node ids are exact JS integers well below 2^53.
+                n as u64
+            } else {
+                NO_NODE
+            }
+        })
+        .unwrap_or(NO_NODE))
+}
+
+fn node_id(raw: u64) -> NodeId {
+    NodeId::from_u64(raw)
+}
+
+fn node_raw(id: NodeId) -> u64 {
+    id.as_u64()
+}
+
+/// Best-effort DOM API name validation (HTML-ish name production; empty and
+/// characters outside the allow-list are rejected the way `createElement`
+/// and friends reject them).
+fn is_valid_dom_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.chars().all(|c| {
+            c.is_ascii_alphanumeric()
+                || matches!(c, '-' | '_' | ':' | '.')
+        })
+}
+
+/// `createElement` rules (task spec): the tag name is lowercased for HTML;
+/// prefixed names get an `xlink:` treatment like the parser's, everything
+/// else lands in the HTML namespace.
+fn qual_name_for_tag(tag: &str) -> Result<QualName, &'static str> {
+    let lowered = tag.to_ascii_lowercase();
+    if lowered.is_empty() {
+        return Err("empty tag name");
+    }
+    if !is_valid_dom_name(&lowered) {
+        return Err("invalid tag name");
+    }
+    Ok(QualName::new(None, blitz_dom::ns!(html), LocalName::from(lowered.as_str())))
+}
+
+/// `setAttribute`/`removeAttribute` name rules: like the tag rules but also
+/// rejecting `xmlns` redefinitions and prefix shenanigans (simplified).
+fn qual_name_for_attr(name: &str) -> Result<QualName, &'static str> {
+    if name.is_empty() || name.eq_ignore_ascii_case("xmlns") || !is_valid_dom_name(name) {
+        return Err("invalid attribute name");
+    }
+    let (prefix, local) = match name.split_once(':') {
+        Some((prefix, local)) if !prefix.is_empty() && !local.is_empty() => {
+            (Some(prefix.to_ascii_lowercase()), local)
+        }
+        None => (None, name),
+        Some(_) => return Err("invalid attribute name"),
+    };
+    let local = local.to_ascii_lowercase();
+    let ns = match prefix.as_deref() {
+        None => blitz_dom::ns!(html),
+        Some("xml") => blitz_dom::ns!(xml),
+        Some("xlink") => blitz_dom::ns!(xlink),
+        Some(_) => blitz_dom::ns!(html),
+    };
+    Ok(QualName::new(
+        prefix.map(Prefix::from),
+        ns,
+        LocalName::from(local.as_str()),
+    ))
+}
+
+
+/// The `<html>` element id (the document element): the first element child
+/// of the document root node.
+fn html_element_id(doc: &BaseDocument) -> Option<NodeId> {
+    let root_id = doc.root_node().id;
+    doc.get_node(root_id)?.children.iter().copied().find(|child| {
+        doc.get_node(*child)
+            .is_some_and(|node| matches!(node.data, NodeData::Element { .. }))
+    })
+}
+
+// ---------------------------------------------------------------------------
+// HTML serialization (shared by innerHTML and the headless `--body-out`)
+
+/// HTML void elements (serialized as `<tag …>` with no end tag).
+fn is_void_element(local: &LocalName) -> bool {
+    let local: &str = local;
+    [
+        "area", "base", "basefont", "bgsound", "br", "col", "embed", "frame", "hr", "img",
+        "input", "keygen", "link", "meta", "param", "source", "track", "wbr",
+    ]
+    .contains(&local)
+}
+
+/// Serialize the DOM children of `id` (its `innerHTML`).
+pub fn serialize_children(doc: &BaseDocument, id: NodeId) -> String {
+    let mut out = String::new();
+    if let Some(node) = doc.get_node(id) {
+        for child in node.children.iter().copied() {
+            serialize_node(doc, child, false, &mut out);
+        }
+    }
+    out
+}
+
+/// Serialize `id` itself (its `outerHTML`).
+pub fn serialize_node_html(doc: &BaseDocument, id: NodeId) -> String {
+    let mut out = String::new();
+    serialize_node(doc, id, false, &mut out);
+    out
+}
+
+/// Pre-order serialization of one node and its DOM children.
+///
+/// `raw` marks being inside a raw-text element (`<script>`/`<style>`/
+/// `<textarea>`-alike), whose text children are emitted verbatim — exactly
+/// what `innerHTML` returns in a browser. Text gets `&`/`<`/`>` escaped and
+/// attribute values get `&`/`"` escaped with proper quoting; void elements
+/// get no end tag and nothing ever self-closes. Anonymous blocks
+/// (layout-only nodes) are transparent: their children serialize as if direct.
+fn serialize_node(doc: &BaseDocument, id: NodeId, raw: bool, out: &mut String) {
+    let Some(node) = doc.get_node(id) else { return };
+    match &node.data {
+        NodeData::Text(text) => {
+            if raw {
+                out.push_str(&text.content);
+            } else {
+                escape_text(&text.content, out);
+            }
+        }
+        NodeData::Comment { contents } => {
+            out.push_str("<!--");
+            out.push_str(contents);
+            out.push_str("-->");
+        }
+        NodeData::Element(element) => {
+            let local: &str = &element.name.local;
+            // `<script>`/`<style>` bodies are raw text, never escaped markup.
+            let child_raw = matches!(local, "script" | "style" | "textarea" | "title");
+            out.push('<');
+            out.push_str(local);
+            if let Some(attrs) = node.data.attrs() {
+                for attr in attrs {
+                    out.push(' ');
+                    let name = attr.name.prefix.as_ref().map_or_else(
+                        || attr.name.local.to_string(),
+                        |prefix| format!("{prefix}:{}", attr.name.local),
+                    );
+                    out.push_str(&name);
+                    out.push_str("=\"");
+                    escape_attr(&attr.value, out);
+                    out.push('"');
+                }
+            }
+            out.push('>');
+            if !is_void_element(&element.name.local) {
+                for child in node.children.iter().copied() {
+                    serialize_node(doc, child, child_raw || raw, out);
+                }
+                out.push_str("</");
+                out.push_str(local);
+                out.push('>');
+            }
+        }
+        NodeData::AnonymousBlock(_) | NodeData::Document(_) => {
+            for child in node.children.iter().copied() {
+                serialize_node(doc, child, raw, out);
+            }
+        }
+    }
+}
+
+fn escape_text(s: &str, out: &mut String) {
+    for c in s.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            _ => out.push(c),
+        }
+    }
+}
+
+fn escape_attr(s: &str, out: &mut String) {
+    for c in s.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '"' => out.push_str("&quot;"),
+            _ => out.push(c),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The DOM natives (`__ironsurfDom*`)
+
+
+/// Names of the DOM natives (module-private).
+mod dom_native {
+    pub(super) const HAS_DOC: &str = "__ironsurfDomHasDoc";
+    pub(super) const ROOT: &str = "__ironsurfDomRoot";
+    pub(super) const HTML: &str = "__ironsurfDomHtml";
+    pub(super) const HEAD: &str = "__ironsurfDomHead";
+    pub(super) const BODY: &str = "__ironsurfDomBody";
+    pub(super) const NODE_TYPE: &str = "__ironsurfDomNodeType";
+    pub(super) const NODE_NAME: &str = "__ironsurfDomNodeName";
+    pub(super) const DATA: &str = "__ironsurfDomData";
+    pub(super) const SET_DATA: &str = "__ironsurfDomSetData";
+    pub(super) const PARENT: &str = "__ironsurfDomParent";
+    pub(super) const PREVIOUS_SIBLING: &str = "__ironsurfDomPrevSibling";
+    pub(super) const NEXT_SIBLING: &str = "__ironsurfDomNextSibling";
+    pub(super) const PREVIOUS_ELEMENT_SIBLING: &str = "__ironsurfDomPrevElementSibling";
+    pub(super) const NEXT_ELEMENT_SIBLING: &str = "__ironsurfDomNextElementSibling";
+    pub(super) const CHILD_COUNT: &str = "__ironsurfDomChildCount";
+    pub(super) const CHILD_AT: &str = "__ironsurfDomChildAt";
+    pub(super) const FIRST_CHILD: &str = "__ironsurfDomFirstChild";
+    pub(super) const LAST_CHILD: &str = "__ironsurfDomLastChild";
+    pub(super) const FIRST_ELEMENT_CHILD: &str = "__ironsurfDomFirstElementChild";
+    pub(super) const LAST_ELEMENT_CHILD: &str = "__ironsurfDomLastElementChild";
+    pub(super) const CREATE_ELEMENT: &str = "__ironsurfDomCreateElement";
+    pub(super) const CREATE_TEXT: &str = "__ironsurfDomCreateText";
+    pub(super) const CREATE_COMMENT: &str = "__ironsurfDomCreateComment";
+    pub(super) const GET_BY_ID: &str = "__ironsurfDomGetById";
+    pub(super) const LIVE_ITEM: &str = "__ironsurfDomLiveItem";
+    pub(super) const LIVE_COUNT: &str = "__ironsurfDomLiveCount";
+    pub(super) const QUERY: &str = "__ironsurfDomQuery";
+    pub(super) const APPEND_CHILD: &str = "__ironsurfDomAppendChild";
+    pub(super) const INSERT_BEFORE: &str = "__ironsurfDomInsertBefore";
+    pub(super) const REMOVE_CHILD: &str = "__ironsurfDomRemoveChild";
+    pub(super) const REPLACE_CHILD: &str = "__ironsurfDomReplaceChild";
+    pub(super) const DETACH: &str = "__ironsurfDomDetach";
+    pub(super) const CLONE: &str = "__ironsurfDomClone";
+    pub(super) const TEXT: &str = "__ironsurfDomText";
+    pub(super) const TEXT_SET: &str = "__ironsurfDomTextSet";
+    pub(super) const SERIALIZE: &str = "__ironsurfDomSerialize";
+    pub(super) const SET_INNER: &str = "__ironsurfDomSetInner";
+    pub(super) const ATTR: &str = "__ironsurfDomAttr";
+    pub(super) const ATTR_SET: &str = "__ironsurfDomAttrSet";
+    pub(super) const ATTR_REMOVE: &str = "__ironsurfDomAttrRemove";
+    pub(super) const ATTR_COUNT: &str = "__ironsurfDomAttrCount";
+    pub(super) const ATTR_AT: &str = "__ironsurfDomAttrAt";
+}
+
+/// Live-collection kinds (the `type` argument of `LIVE_ITEM`/`LIVE_COUNT`).
+mod live_kind {
+    pub(super) const CHILDREN: u32 = 0;
+    pub(super) const TAGS: u32 = 1;
+    pub(super) const CLASSES: u32 = 2;
+    pub(super) const SELECTOR: u32 = 3;
+    /// `getElementsByTagName("*")`: every element in tree order.
+    pub(super) const ALL_ELEMENTS: u32 = 4;
+}
+
+/// Whether `node` is an element (live collections skip anonymous blocks).
+fn is_element(node: &Node) -> bool {
+    matches!(node.data, NodeData::Element(_))
+}
+
+fn child_ids(doc: &BaseDocument, id: NodeId) -> Vec<NodeId> {
+    doc.get_node(id)
+        .map(|node| node.children.iter().copied().collect())
+        .unwrap_or_default()
+}
+
+/// Pre-order walk collecting node ids (bounded; used by the `*` collection).
+fn elements_in_tree_order(doc: &BaseDocument) -> Vec<NodeId> {
+    let mut out = Vec::new();
+    fn walk(doc: &BaseDocument, id: NodeId, out: &mut Vec<NodeId>) {
+        for child in child_ids(doc, id) {
+            if is_element(doc.get_node(child).expect("child is live")) {
+                out.push(child);
+            }
+            walk(doc, child, out);
+        }
+    }
+    walk(doc, doc.root_node().id, &mut out);
+    out
+}
+
+/// The live membership of a collection (`param` is the lowercased tag name,
+/// class name, or selector — read fresh from the document every time).
+fn live_ids(doc: &BaseDocument, kind: u32, param: &str) -> Vec<NodeId> {
+    match kind {
+        live_kind::TAGS | live_kind::CLASSES => {
+            let selector = if kind == live_kind::TAGS {
+                if param.is_empty() {
+                    return Vec::new();
+                }
+                param.to_string()
+            } else {
+                if param.split_whitespace().any(str::is_empty) || param.trim().is_empty() {
+                    return Vec::new();
+                }
+                let joined = param
+                    .split_whitespace()
+                    .collect::<Vec<_>>()
+                    .join(".");
+                format!(".{joined}")
+            };
+            doc.query_selector_all(&selector)
+                .map(|ids| ids.to_vec())
+                .unwrap_or_default()
+        }
+        live_kind::SELECTOR => doc
+            .query_selector_all(param)
+            .map(|ids| ids.to_vec())
+            .unwrap_or_default(),
+        live_kind::ALL_ELEMENTS => elements_in_tree_order(doc),
+        _ => Vec::new(),
+    }
+}
+
+/// Sibling of `node` at `offset` (±1) within its parent's child list.
+fn sibling_at(doc: &BaseDocument, id: NodeId, offset: isize) -> Option<NodeId> {
+    let node = doc.get_node(id)?;
+    let parent = doc.get_node(node.parent?)?;
+    let position = parent.children.iter().position(|child| *child == id)?;
+    let next = position as isize + offset;
+    if next < 0 {
+        return None;
+    }
+    parent.children.get(next as usize).copied()
+}
+
+/// Element sibling of `node` at `offset` (skipping non-element siblings).
+fn element_sibling_at(doc: &BaseDocument, id: NodeId, offset: isize) -> Option<NodeId> {
+    let mut current = sibling_at(doc, id, offset)?;
+    loop {
+        if doc.get_node(current).is_some_and(is_element) {
+            return Some(current);
+        }
+        current = sibling_at(doc, current, offset)?;
+    }
+}
+
+fn throw_no_doc() -> boa_engine::JsError {
+    JsNativeError::typ()
+        .with_message("no live DOM document registered for this script")
+        .into()
+}
+
+fn arg_string(args: &[JsValue], index: usize, context: &mut Context) -> Result<String, boa_engine::JsError> {
+    Ok(args
+        .get(index)
+        .cloned()
+        .unwrap_or(JsValue::undefined())
+        .to_string(context)?
+        .to_std_string_escaped())
+}
+
+fn arg_u32(args: &[JsValue], index: usize, context: &mut Context) -> Result<u32, boa_engine::JsError> {
+    Ok(args
+        .get(index)
+        .map(|value| value.to_u32(context))
+        .transpose()?
+        .unwrap_or(u32::MAX))
+}
+
+fn arg_i64(args: &[JsValue], index: usize, context: &mut Context) -> Result<i64, boa_engine::JsError> {
+    Ok(args
+        .get(index)
+        .map(|value| value.to_number(context))
+        .transpose()?
+        .map(|n| {
+            if n.is_finite() && n >= (i64::MIN as f64) && n < (i64::MAX as f64) {
+                n as i64
+            } else {
+                -1
+            }
+        })
+        .unwrap_or(-1))
+}
+
+/// Install every DOM native on `context` (design: all behaviour is native;
+/// the JS glue only delegates — see the PRELUDE).
+fn register_dom_natives(context: &mut Context) {
+    macro_rules! native {
+        ($name:expr, $len:expr, $body:expr) => {
+            if let Err(err) = context.register_global_builtin_callable(
+                JsString::from($name),
+                $len,
+                NativeFunction::from_copy_closure($body),
+            ) {
+                error!("js dom binding `{}` failed to install: {err}", $name);
+            }
+        };
+    }
+
+    native!(dom_native::HAS_DOC, 0, |_this, _args, _context| {
+        let any = LIVE_DOCS.with(|docs| !docs.borrow().is_empty());
+        Ok(JsValue::from(any))
+    });
+    native!(dom_native::ROOT, 1, |_this, args, context| {
+        let doc = arg_doc(args, 0, context)?;
+        let raw = with_live_doc(doc, |document| node_raw(document.root_node().id))
+            .unwrap_or(NO_NODE);
+        Ok(JsValue::new(raw as f64))
+    });
+    native!(dom_native::HTML, 1, |_this, args, context| {
+        let doc = arg_doc(args, 0, context)?;
+        let raw = with_live_doc(doc, |document| html_element_id(document).map(node_raw))
+            .flatten()
+            .unwrap_or(NO_NODE);
+        Ok(JsValue::new(raw as f64))
+    });
+    native!(dom_native::HEAD, 1, |_this, args, context| {
+        let doc = arg_doc(args, 0, context)?;
+        let raw = with_live_doc(doc, |document| {
+            document.find_head_node().map(|node| node_raw(node.id))
+        })
+        .flatten()
+        .unwrap_or(NO_NODE);
+        Ok(JsValue::new(raw as f64))
+    });
+    native!(dom_native::BODY, 1, |_this, args, context| {
+        let doc = arg_doc(args, 0, context)?;
+        let raw = with_live_doc(doc, |document| {
+            document.find_body_node().map(|node| node_raw(node.id))
+        })
+        .flatten()
+        .unwrap_or(NO_NODE);
+        Ok(JsValue::new(raw as f64))
+    });
+    native!(dom_native::NODE_TYPE, 2, |_this, args, context| {
+        let doc = arg_doc(args, 0, context)?;
+        let node = arg_node(args, 1, context)?;
+        let kind = with_live_doc(doc, |document| {
+            document
+                .get_node(node_id(node))
+                .map(|node| match node.data {
+                    NodeData::Element(_) | NodeData::AnonymousBlock(_) => 1u8,
+                    NodeData::Text(_) => 3,
+                    NodeData::Comment { .. } => 8,
+                    NodeData::Document(_) => 9,
+                })
+        })
+        .flatten()
+        .unwrap_or(0);
+        Ok(JsValue::new(i32::from(kind)))
+    });
+    native!(dom_native::NODE_NAME, 2, |_this, args, context| {
+        let doc = arg_doc(args, 0, context)?;
+        let node = arg_node(args, 1, context)?;
+        let name = with_live_doc(doc, |document| {
+            document.get_node(node_id(node)).map(|node| match &node.data {
+                NodeData::Element(element) => element.name.local.to_uppercase(),
+                NodeData::AnonymousBlock(_) => String::new(),
+                NodeData::Text(_) => "#text".to_string(),
+                NodeData::Comment { .. } => "#comment".to_string(),
+                NodeData::Document(_) => "#document".to_string(),
+            })
+        })
+        .flatten()
+        .unwrap_or_default();
+        Ok(JsValue::from(JsString::from(name)))
+    });
+    native!(dom_native::DATA, 2, |_this, args, context| {
+        let doc = arg_doc(args, 0, context)?;
+        let node = arg_node(args, 1, context)?;
+        let data = with_live_doc(doc, |document| {
+            document.get_node(node_id(node)).and_then(|node| match &node.data {
+                NodeData::Text(text) => Some(text.content.to_string()),
+                NodeData::Comment { contents } => Some(contents.clone()),
+                _ => None,
+            })
+        })
+        .flatten();
+        Ok(match data {
+            Some(value) => JsValue::from(JsString::from(value)),
+            None => JsValue::null(),
+        })
+    });
+    native!(dom_native::SET_DATA, 3, |_this, args, context| {
+        let doc = arg_doc(args, 0, context)?;
+        let node = arg_node(args, 1, context)?;
+        let value = arg_string(args, 2, context)?;
+        let Some(outcome) = with_mut(doc, move |mutator| -> Result<(), boa_engine::JsNativeError> {
+            let target = mutator
+                .doc
+                .get_node(node_id(node))
+                .ok_or_else(|| JsNativeError::typ().with_message("NotFoundError: node is gone"))?;
+            match target.data {
+                NodeData::Text(_) => mutator.set_node_text(node_id(node), &value),
+                NodeData::Comment { .. } => {
+                    if let Some(target) = mutator.doc.get_node_mut(node_id(node)) {
+                        if let NodeData::Comment { contents } = &mut target.data {
+                            *contents = value;
+                        }
+                    }
+                }
+                _ => {}
+            }
+            Ok(())
+        }) else {
+            return Err(throw_no_doc());
+        };
+        outcome.map_err(boa_engine::JsError::from_native)?;
+        Ok(JsValue::undefined())
+    });
+    native!(dom_native::PARENT, 2, |_this, args, context| {
+        let doc = arg_doc(args, 0, context)?;
+        let node = arg_node(args, 1, context)?;
+        let raw = with_live_doc(doc, |document| {
+            document
+                .get_node(node_id(node))
+                .and_then(|node| node.parent)
+                .map_or(NO_NODE, node_raw)
+        })
+        .unwrap_or(NO_NODE);
+        Ok(JsValue::new(raw as f64))
+    });
+    native!(dom_native::PREVIOUS_SIBLING, 2, |_this, args, context| {
+        let doc = arg_doc(args, 0, context)?;
+        let node = arg_node(args, 1, context)?;
+        let raw = with_live_doc(doc, |document| {
+            sibling_at(document, node_id(node), -1).map_or(NO_NODE, node_raw)
+        })
+        .unwrap_or(NO_NODE);
+        Ok(JsValue::new(raw as f64))
+    });
+    native!(dom_native::NEXT_SIBLING, 2, |_this, args, context| {
+        let doc = arg_doc(args, 0, context)?;
+        let node = arg_node(args, 1, context)?;
+        let raw = with_live_doc(doc, |document| {
+            sibling_at(document, node_id(node), 1).map_or(NO_NODE, node_raw)
+        })
+        .unwrap_or(NO_NODE);
+        Ok(JsValue::new(raw as f64))
+    });
+    native!(dom_native::PREVIOUS_ELEMENT_SIBLING, 2, |_this, args, context| {
+        let doc = arg_doc(args, 0, context)?;
+        let node = arg_node(args, 1, context)?;
+        let raw = with_live_doc(doc, |document| {
+            element_sibling_at(document, node_id(node), -1).map_or(NO_NODE, node_raw)
+        })
+        .unwrap_or(NO_NODE);
+        Ok(JsValue::new(raw as f64))
+    });
+    native!(dom_native::NEXT_ELEMENT_SIBLING, 2, |_this, args, context| {
+        let doc = arg_doc(args, 0, context)?;
+        let node = arg_node(args, 1, context)?;
+        let raw = with_live_doc(doc, |document| {
+            element_sibling_at(document, node_id(node), 1).map_or(NO_NODE, node_raw)
+        })
+        .unwrap_or(NO_NODE);
+        Ok(JsValue::new(raw as f64))
+    });
+    native!(dom_native::CHILD_COUNT, 2, |_this, args, context| {
+        let doc = arg_doc(args, 0, context)?;
+        let node = arg_node(args, 1, context)?;
+        let count = with_live_doc(doc, |document| {
+            document
+                .get_node(node_id(node))
+                .map_or(0, |node| node.children.len())
+        })
+        .unwrap_or(0);
+        Ok(JsValue::new(count as f64))
+    });
+    native!(dom_native::CHILD_AT, 3, |_this, args, context| {
+        let doc = arg_doc(args, 0, context)?;
+        let node = arg_node(args, 1, context)?;
+        let index = arg_i64(args, 2, context)?;
+        let raw = with_live_doc(doc, |document| {
+            let target = document.get_node(node_id(node))?;
+            usize::try_from(index)
+                .ok()
+                .and_then(|index| target.children.get(index).copied())
+                .map(node_raw)
+        })
+        .flatten()
+        .unwrap_or(NO_NODE);
+        Ok(JsValue::new(raw as f64))
+    });
+    native!(dom_native::FIRST_CHILD, 2, |_this, args, context| {
+        let doc = arg_doc(args, 0, context)?;
+        let node = arg_node(args, 1, context)?;
+        let raw = with_live_doc(doc, |document| {
+            document
+                .get_node(node_id(node))
+                .and_then(|node| node.children.first().copied())
+                .map(node_raw)
+        })
+        .flatten()
+        .unwrap_or(NO_NODE);
+        Ok(JsValue::new(raw as f64))
+    });
+    native!(dom_native::LAST_CHILD, 2, |_this, args, context| {
+        let doc = arg_doc(args, 0, context)?;
+        let node = arg_node(args, 1, context)?;
+        let raw = with_live_doc(doc, |document| {
+            document
+                .get_node(node_id(node))
+                .and_then(|node| node.children.last().copied())
+                .map(node_raw)
+        })
+        .flatten()
+        .unwrap_or(NO_NODE);
+        Ok(JsValue::new(raw as f64))
+    });
+    native!(dom_native::FIRST_ELEMENT_CHILD, 2, |_this, args, context| {
+        let doc = arg_doc(args, 0, context)?;
+        let node = arg_node(args, 1, context)?;
+        let raw = with_live_doc(doc, |document| {
+            child_ids(document, node_id(node))
+                .into_iter()
+                .find(|child| document.get_node(*child).is_some_and(is_element))
+                .map(node_raw)
+        })
+        .flatten()
+        .unwrap_or(NO_NODE);
+        Ok(JsValue::new(raw as f64))
+    });
+    native!(dom_native::LAST_ELEMENT_CHILD, 2, |_this, args, context| {
+        let doc = arg_doc(args, 0, context)?;
+        let node = arg_node(args, 1, context)?;
+        let raw = with_live_doc(doc, |document| {
+            child_ids(document, node_id(node))
+                .into_iter()
+                .rev()
+                .find(|child| document.get_node(*child).is_some_and(is_element))
+                .map(node_raw)
+        })
+        .flatten()
+        .unwrap_or(NO_NODE);
+        Ok(JsValue::new(raw as f64))
+    });
+    native!(dom_native::CREATE_ELEMENT, 2, |_this, args, context| {
+        let doc = arg_doc(args, 0, context)?;
+        let tag = arg_string(args, 1, context)?;
+        let name = qual_name_for_tag(&tag)
+            .map_err(|reason| {
+                JsNativeError::range().with_message(format!("InvalidCharacterError: {reason}"))
+            })
+            .map_err(boa_engine::JsError::from_native)?;
+        let raw = with_mut(doc, move |mutator| node_raw(mutator.create_element(name, Vec::new())))
+            .unwrap_or(NO_NODE);
+        Ok(JsValue::new(raw as f64))
+    });
+    native!(dom_native::CREATE_TEXT, 2, |_this, args, context| {
+        let doc = arg_doc(args, 0, context)?;
+        let text = arg_string(args, 1, context)?;
+        let raw = with_mut(doc, |mutator| node_raw(mutator.create_text_node(&text)))
+            .unwrap_or(NO_NODE);
+        Ok(JsValue::new(raw as f64))
+    });
+    native!(dom_native::CREATE_COMMENT, 2, |_this, args, context| {
+        let doc = arg_doc(args, 0, context)?;
+        let text = arg_string(args, 1, context)?;
+        let raw = with_mut(doc, |mutator| node_raw(mutator.create_comment_node(&text)))
+            .unwrap_or(NO_NODE);
+        Ok(JsValue::new(raw as f64))
+    });
+    native!(dom_native::GET_BY_ID, 2, |_this, args, context| {
+        let doc = arg_doc(args, 0, context)?;
+        let id = arg_string(args, 1, context)?;
+        let raw = with_live_doc(doc, |document| {
+            document.get_element_by_id(&id).map_or(NO_NODE, node_raw)
+        })
+        .unwrap_or(NO_NODE);
+        Ok(JsValue::new(raw as f64))
+    });
+    native!(dom_native::LIVE_COUNT, 4, |_this, args, context| {
+        let doc = arg_doc(args, 0, context)?;
+        let kind = arg_u32(args, 1, context)?;
+        let raw = arg_node(args, 2, context)?;
+        let param = arg_string(args, 3, context)?;
+        let count = if kind == live_kind::CHILDREN {
+            with_live_doc(doc, |document| {
+                document
+                    .get_node(node_id(raw))
+                    .map_or(0, |node| node.children.len())
+            })
+            .unwrap_or(0)
+        } else if kind == live_kind::SELECTOR {
+            // querySelectorAll with an unparsable selector must raise
+            // SyntaxError (task contract), so propagate the parse error.
+            let count = with_live_doc(doc, |document| {
+                document.query_selector_all(&param).map(|ids| ids.len()).map_err(|_| {
+                    JsNativeError::syntax().with_message(format!("SyntaxError: invalid selector {param:?}"))
+                })
+            });
+            match count {
+                None => return Err(throw_no_doc()),
+                Some(Err(err)) => return Err(boa_engine::JsError::from_native(err)),
+                Some(Ok(count)) => count,
+            }
+        } else {
+            with_live_doc(doc, |document| live_ids(document, kind, &param).len()).unwrap_or(0)
+        };
+        Ok(JsValue::new(count as f64))
+    });
+    native!(dom_native::LIVE_ITEM, 5, |_this, args, context| {
+        let doc = arg_doc(args, 0, context)?;
+        let kind = arg_u32(args, 1, context)?;
+        let raw = arg_node(args, 2, context)?;
+        let index = arg_i64(args, 3, context)?;
+        let param = arg_string(args, 4, context)?;
+        let raw_item = if kind == live_kind::CHILDREN {
+            with_live_doc(doc, |document| {
+                let target = document.get_node(node_id(raw))?;
+                usize::try_from(index)
+                    .ok()
+                    .and_then(|index| target.children.get(index).copied())
+            })
+            .flatten()
+        } else {
+            with_live_doc(doc, |document| {
+                let ids = live_ids(document, kind, &param);
+                usize::try_from(index)
+                    .ok()
+                    .and_then(|index| ids.get(index).copied())
+            })
+            .flatten()
+        };
+        Ok(JsValue::new(raw_item.map_or(NO_NODE, node_raw) as f64))
+    });
+    native!(dom_native::QUERY, 2, |_this, args, context| {
+        let doc = arg_doc(args, 0, context)?;
+        let selector = arg_string(args, 1, context)?;
+        // An unparsable selector raises SyntaxError (task contract); a
+        // valid-but-empty match is just null at the JS layer.
+        let outcome = with_live_doc(doc, |document| {
+            document
+                .query_selector(&selector)
+                .map(|found| found.map_or(NO_NODE, node_raw))
+                .map_err(|_| {
+                    JsNativeError::syntax()
+                        .with_message(format!("SyntaxError: invalid selector {selector:?}"))
+                })
+        });
+        match outcome {
+            None => Err(throw_no_doc()),
+            Some(Err(err)) => Err(boa_engine::JsError::from_native(err)),
+            Some(Ok(raw)) => Ok(JsValue::new(raw as f64)),
+        }
+    });
+    native!(dom_native::APPEND_CHILD, 3, |_this, args, context| {
+        let doc = arg_doc(args, 0, context)?;
+        let parent = arg_node(args, 1, context)?;
+        let child = arg_node(args, 2, context)?;
+        let outcome = with_mut(doc, |mutator| -> Result<(), boa_engine::JsNativeError> {
+            if mutator.doc.get_node(node_id(parent)).is_none() {
+                return Err(JsNativeError::typ().with_message("NotFoundError: parent is gone"));
+            }
+            if mutator.doc.get_node(node_id(child)).is_none() {
+                return Err(JsNativeError::typ().with_message("NotFoundError: child is gone"));
+            }
+            mutator.append_children(node_id(parent), &[node_id(child)]);
+            Ok(())
+        });
+        match outcome {
+            None => Err(throw_no_doc()),
+            Some(Err(err)) => Err(boa_engine::JsError::from_native(err)),
+            Some(Ok(())) => Ok(JsValue::undefined()),
+        }
+    });
+    native!(dom_native::INSERT_BEFORE, 4, |_this, args, context| {
+        let doc = arg_doc(args, 0, context)?;
+        let parent = arg_node(args, 1, context)?;
+        let child = arg_node(args, 2, context)?;
+        let reference = arg_node(args, 3, context)?;
+        let outcome = with_mut(doc, |mutator| -> Result<(), boa_engine::JsNativeError> {
+            if mutator.doc.get_node(node_id(parent)).is_none() {
+                return Err(JsNativeError::typ().with_message("NotFoundError: parent is gone"));
+            }
+            if mutator.doc.get_node(node_id(child)).is_none() {
+                return Err(JsNativeError::typ().with_message("NotFoundError: child is gone"));
+            }
+            if reference == NO_NODE {
+                mutator.append_children(node_id(parent), &[node_id(child)]);
+                return Ok(());
+            }
+            let reference_node = mutator
+                .doc
+                .get_node(node_id(reference))
+                .ok_or_else(|| JsNativeError::typ().with_message("NotFoundError: reference is gone"))?;
+            if reference_node.parent != Some(node_id(parent)) {
+                return Err(JsNativeError::typ().with_message(
+                    "NotFoundError: the reference node is not a child of this node",
+                ));
+            }
+            mutator.insert_nodes_before(node_id(reference), &[node_id(child)]);
+            Ok(())
+        });
+        match outcome {
+            None => Err(throw_no_doc()),
+            Some(Err(err)) => Err(boa_engine::JsError::from_native(err)),
+            Some(Ok(())) => Ok(JsValue::undefined()),
+        }
+    });
+    native!(dom_native::REMOVE_CHILD, 3, |_this, args, context| {
+        let doc = arg_doc(args, 0, context)?;
+        let parent = arg_node(args, 1, context)?;
+        let child = arg_node(args, 2, context)?;
+        let outcome = with_mut(doc, |mutator| -> Result<(), boa_engine::JsNativeError> {
+            if mutator.doc.get_node(node_id(parent)).is_none() {
+                return Err(JsNativeError::typ().with_message("NotFoundError: parent is gone"));
+            }
+            let child_node = mutator
+                .doc
+                .get_node(node_id(child))
+                .ok_or_else(|| JsNativeError::typ().with_message("NotFoundError: child is gone"))?;
+            if child_node.parent != Some(node_id(parent)) {
+                return Err(JsNativeError::typ().with_message(
+                    "NotFoundError: the child to remove is not a child of this node",
+                ));
+            }
+            mutator.remove_node(node_id(child));
+            Ok(())
+        });
+        match outcome {
+            None => Err(throw_no_doc()),
+            Some(Err(err)) => Err(boa_engine::JsError::from_native(err)),
+            Some(Ok(())) => Ok(JsValue::undefined()),
+        }
+    });
+    native!(dom_native::REPLACE_CHILD, 4, |_this, args, context| {
+        let doc = arg_doc(args, 0, context)?;
+        let parent = arg_node(args, 1, context)?;
+        let new_child = arg_node(args, 2, context)?;
+        let old_child = arg_node(args, 3, context)?;
+        let outcome = with_mut(doc, |mutator| -> Result<(), boa_engine::JsNativeError> {
+            if mutator.doc.get_node(node_id(parent)).is_none() {
+                return Err(JsNativeError::typ().with_message("NotFoundError: parent is gone"));
+            }
+            if mutator.doc.get_node(node_id(new_child)).is_none() {
+                return Err(JsNativeError::typ().with_message("NotFoundError: new child is gone"));
+            }
+            let old = mutator
+                .doc
+                .get_node(node_id(old_child))
+                .ok_or_else(|| JsNativeError::typ().with_message("NotFoundError: old child is gone"))?;
+            if old.parent != Some(node_id(parent)) {
+                return Err(JsNativeError::typ().with_message(
+                    "NotFoundError: the child to replace is not a child of this node",
+                ));
+            }
+            mutator.replace_node_with(node_id(old_child), &[node_id(new_child)]);
+            Ok(())
+        });
+        match outcome {
+            None => Err(throw_no_doc()),
+            Some(Err(err)) => Err(boa_engine::JsError::from_native(err)),
+            Some(Ok(())) => Ok(JsValue::undefined()),
+        }
+    });
+    native!(dom_native::DETACH, 2, |_this, args, context| {
+        let doc = arg_doc(args, 0, context)?;
+        let node = arg_node(args, 1, context)?;
+        let outcome = with_mut(doc, |mutator| -> Result<(), boa_engine::JsNativeError> {
+            if mutator.doc.get_node(node_id(node)).is_none() {
+                return Err(JsNativeError::typ().with_message("NotFoundError: node is gone"));
+            }
+            if mutator
+                .doc
+                .get_node(node_id(node))
+                .and_then(|target| target.parent)
+                .is_some()
+            {
+                mutator.remove_node(node_id(node));
+            }
+            Ok(())
+        });
+        match outcome {
+            None => Err(throw_no_doc()),
+            Some(Err(err)) => Err(boa_engine::JsError::from_native(err)),
+            Some(Ok(())) => Ok(JsValue::undefined()),
+        }
+    });
+    native!(dom_native::CLONE, 3, |_this, args, context| {
+        let doc = arg_doc(args, 0, context)?;
+        let node = arg_node(args, 1, context)?;
+        let deep = args
+            .get(2)
+            .cloned()
+            .unwrap_or(JsValue::new(false))
+            .to_boolean();
+        let raw = with_mut(doc, move |mutator| -> Option<u64> {
+            if mutator.doc.get_node(node_id(node)).is_none() {
+                return None;
+            }
+            if deep {
+                return Some(node_raw(mutator.deep_clone_node(node_id(node))));
+            }
+            // Shallow clone: same kind/name/attributes, no children. Gather
+            // the owned recipe first so the read borrow ends before creating.
+            enum ShallowPlan {
+                Element(QualName, Vec<blitz_dom::Attribute>),
+                Text(String),
+                Comment(String),
+                Unsupported,
+            }
+            let plan = {
+                let source = mutator.doc.get_node(node_id(node))?;
+                match &source.data {
+                    NodeData::Element(element) => ShallowPlan::Element(
+                        element.name.clone(),
+                        element.attrs.iter().cloned().collect(),
+                    ),
+                    NodeData::Text(text) => ShallowPlan::Text(text.content.to_string()),
+                    NodeData::Comment { contents } => ShallowPlan::Comment(contents.clone()),
+                    NodeData::AnonymousBlock(_) | NodeData::Document(_) => {
+                        ShallowPlan::Unsupported
+                    }
+                }
+            };
+            match plan {
+                ShallowPlan::Element(name, attrs) => {
+                    Some(node_raw(mutator.create_element(name, attrs)))
+                }
+                ShallowPlan::Text(text) => Some(node_raw(mutator.create_text_node(&text))),
+                ShallowPlan::Comment(contents) => {
+                    Some(node_raw(mutator.create_comment_node(&contents)))
+                }
+                ShallowPlan::Unsupported => None,
+            }
+        })
+        .flatten()
+        .unwrap_or(NO_NODE);
+        Ok(JsValue::new(raw as f64))
+    });
+    native!(dom_native::TEXT, 2, |_this, args, context| {
+        let doc = arg_doc(args, 0, context)?;
+        let node = arg_node(args, 1, context)?;
+        let text = with_live_doc(doc, |document| {
+            document.get_node(node_id(node)).map(|node| node.text_content())
+        })
+        .flatten();
+        Ok(match text {
+            Some(value) => JsValue::from(JsString::from(value)),
+            None => JsValue::null(),
+        })
+    });
+    native!(dom_native::TEXT_SET, 3, |_this, args, context| {
+        let doc = arg_doc(args, 0, context)?;
+        let node = arg_node(args, 1, context)?;
+        let value = arg_string(args, 2, context)?;
+        let outcome = with_mut(doc, move |mutator| -> Result<(), boa_engine::JsNativeError> {
+            let kind = mutator
+                .doc
+                .get_node(node_id(node))
+                .map(|target| match target.data {
+                    NodeData::Text(_) => 0u8,
+                    NodeData::Comment { .. } => 1,
+                    _ => 2,
+                })
+                .ok_or_else(|| JsNativeError::typ().with_message("NotFoundError: node is gone"))?;
+            match kind {
+                0 => mutator.set_node_text(node_id(node), &value),
+                1 => {
+                    if let Some(target) = mutator.doc.get_node_mut(node_id(node)) {
+                        if let NodeData::Comment { contents } = &mut target.data {
+                            *contents = value;
+                        }
+                    }
+                }
+                _ => {
+                    let text = mutator.create_text_node(&value);
+                    mutator.replace_children(node_id(node), &[text]);
+                }
+            }
+            Ok(())
+        });
+        match outcome {
+            None => Err(throw_no_doc()),
+            Some(Err(err)) => Err(boa_engine::JsError::from_native(err)),
+            Some(Ok(())) => Ok(JsValue::undefined()),
+        }
+    });
+    native!(dom_native::SERIALIZE, 3, |_this, args, context| {
+        let doc = arg_doc(args, 0, context)?;
+        let node = arg_node(args, 1, context)?;
+        let outer = args
+            .get(2)
+            .cloned()
+            .unwrap_or(JsValue::new(false))
+            .to_boolean();
+        let html = with_live_doc(doc, |document| {
+            if outer {
+                serialize_node_html(document, node_id(node))
+            } else {
+                serialize_children(document, node_id(node))
+            }
+        })
+        .unwrap_or_default();
+        Ok(JsValue::from(JsString::from(html)))
+    });
+    native!(dom_native::SET_INNER, 3, |_this, args, context| {
+        let doc = arg_doc(args, 0, context)?;
+        let node = arg_node(args, 1, context)?;
+        let html = arg_string(args, 2, context)?;
+        let outcome = with_mut(doc, |mutator| -> Result<(), boa_engine::JsNativeError> {
+            if mutator.doc.get_node(node_id(node)).is_none() {
+                return Err(JsNativeError::typ().with_message("NotFoundError: node is gone"));
+            }
+            // Real parse: the HTML parser fragments the markup and moves the
+            // resulting children under `node` (innerHTML-set semantics).
+            mutator.remove_and_drop_all_children(node_id(node));
+            blitz_html::DocumentHtmlParser::parse_inner_html_into_mutator(
+                mutator,
+                node_id(node),
+                &html,
+            );
+            Ok(())
+        });
+        match outcome {
+            None => Err(throw_no_doc()),
+            Some(Err(err)) => Err(boa_engine::JsError::from_native(err)),
+            Some(Ok(())) => Ok(JsValue::undefined()),
+        }
+    });
+    native!(dom_native::ATTR, 2, |_this, args, context| {
+        let doc = arg_doc(args, 0, context)?;
+        let node = arg_node(args, 1, context)?;
+        let name = arg_string(args, 2, context)?;
+        let value = with_live_doc(doc, |document| {
+            let (prefix, local) = split_attr_name(&name);
+            let element = document.get_node(node_id(node))?.element_data()?;
+            element
+                .attrs
+                .iter()
+                .find(|attr| {
+                    attr.name.prefix.as_ref().map(|p| p.to_string()) == prefix
+                        && str::eq_ignore_ascii_case(&attr.name.local, local.as_str())
+                })
+                .map(|attr| attr.value.to_string())
+        })
+        .flatten();
+        Ok(match value {
+            Some(value) => JsValue::from(JsString::from(value)),
+            None => JsValue::null(),
+        })
+    });
+    native!(dom_native::ATTR_SET, 3, |_this, args, context| {
+        let doc = arg_doc(args, 0, context)?;
+        let node = arg_node(args, 1, context)?;
+        let name = arg_string(args, 2, context)?;
+        let value = arg_string(args, 3, context)?;
+        let name = qual_name_for_attr(&name)
+            .map_err(|reason| {
+                JsNativeError::range().with_message(format!("InvalidCharacterError: {reason}"))
+            })
+            .map_err(boa_engine::JsError::from_native)?;
+        let outcome = with_mut(doc, move |mutator| -> Result<(), boa_engine::JsNativeError> {
+            if mutator.doc.get_node(node_id(node)).is_none() {
+                return Err(JsNativeError::typ().with_message("NotFoundError: node is gone"));
+            }
+            mutator.set_attribute(node_id(node), name, &value);
+            Ok(())
+        });
+        match outcome {
+            None => Err(throw_no_doc()),
+            Some(Err(err)) => Err(boa_engine::JsError::from_native(err)),
+            Some(Ok(())) => Ok(JsValue::undefined()),
+        }
+    });
+    native!(dom_native::ATTR_REMOVE, 2, |_this, args, context| {
+        let doc = arg_doc(args, 0, context)?;
+        let node = arg_node(args, 1, context)?;
+        let name = arg_string(args, 2, context)?;
+        let outcome = with_mut(doc, |mutator| -> Result<(), boa_engine::JsNativeError> {
+            if mutator.doc.get_node(node_id(node)).is_none() {
+                return Err(JsNativeError::typ().with_message("NotFoundError: node is gone"));
+            }
+            // Remove the stored attribute whose local name matches (the
+            // parser stores full QualNames pages cannot spell).
+            let existing = mutator
+                .doc
+                .get_node(node_id(node))
+                .and_then(|node| node.element_data())
+                .and_then(|element| {
+                    element
+                        .attrs
+                        .iter()
+                        .find(|attr| str::eq_ignore_ascii_case(&attr.name.local, name.as_str()))
+                })
+                .map(|attr| attr.name.clone());
+            if let Some(qual_name) = existing {
+                mutator.clear_attribute(node_id(node), qual_name);
+            }
+            Ok(())
+        });
+        match outcome {
+            None => Err(throw_no_doc()),
+            Some(Err(err)) => Err(boa_engine::JsError::from_native(err)),
+            Some(Ok(())) => Ok(JsValue::undefined()),
+        }
+    });
+    native!(dom_native::ATTR_COUNT, 2, |_this, args, context| {
+        let doc = arg_doc(args, 0, context)?;
+        let node = arg_node(args, 1, context)?;
+        let count = with_live_doc(doc, |document| {
+            document
+                .get_node(node_id(node))
+                .and_then(|node| node.element_data())
+                .map_or(0, |element| element.attrs.len())
+        })
+        .unwrap_or(0);
+        Ok(JsValue::new(count as f64))
+    });
+    native!(dom_native::ATTR_AT, 3, |_this, args, context| {
+        let doc = arg_doc(args, 0, context)?;
+        let node = arg_node(args, 1, context)?;
+        let index = arg_i64(args, 2, context)?;
+        let pair = with_live_doc(doc, |document| {
+            document
+                .get_node(node_id(node))
+                .and_then(|node| node.element_data())
+                .and_then(|element| {
+                    usize::try_from(index)
+                        .ok()
+                        .and_then(|index| element.attrs.iter().nth(index))
+                })
+                .map(|attr| {
+                    let name = attr.name.prefix.as_ref().map_or_else(
+                        || attr.name.local.to_string(),
+                        |prefix| format!("{prefix}:{}", attr.name.local),
+                    );
+                    (name, attr.value.to_string())
+                })
+        })
+        .flatten();
+        Ok(match pair {
+            Some((name, value)) => {
+                let array = boa_engine::object::builtins::JsArray::from_iter(
+                    [
+                        JsValue::from(JsString::from(name)),
+                        JsValue::from(JsString::from(value)),
+                    ],
+                    context,
+                );
+                JsValue::from(array)
+            }
+            None => JsValue::null(),
+        })
+    });
+}
+
+/// `"xlink:href"` → `(Some("xlink"), "href")`; plain names have no prefix.
+fn split_attr_name(name: &str) -> (Option<String>, String) {
+    match name.split_once(':') {
+        Some((prefix, local)) if !prefix.is_empty() && !local.is_empty() => {
+            (Some(prefix.to_ascii_lowercase()), local.to_ascii_lowercase())
+        }
+        _ => (None, name.to_ascii_lowercase()),
+    }
+}
+
 /// Borrow the active host mutably. Never called across a re-entry point (all
 /// JS→Rust string conversions happen before the borrow).
 fn with_host<R>(f: impl FnOnce(&mut HostState) -> R) -> Option<R> {
@@ -479,7 +1740,7 @@ fn delay_from(
 /// argument coercion (`console.log` of objects, `title` stringification) then
 /// runs through JavaScript's own semantics, and the Rust side stays four
 /// tiny natives.
-const PRELUDE: &str = r#"
+const PRELUDE: &str = r##"
 (function () {
   var host = globalThis;
 
@@ -544,19 +1805,506 @@ const PRELUDE: &str = r#"
   host.scrollTo = noop;
   host.scroll = noop;
 
+  // ---------------------------------------------------------------------
+  // The DOM bridge (design: wrappers are plain {__d, __n} objects sharing
+  // one prototype; every behaviour is a native taking docId+nodeId ints;
+  // live lists are Proxies re-reading the document at access time).
+  // ---------------------------------------------------------------------
+
+  // Identity: one wrapper per (docId, nodeId) via this realm-side cache.
+  var nodeCache = Object.create(null);
+  Object.defineProperty(host, "__ironsurfNodeCache", { value: nodeCache });
+
+  function wrapNode(d, id) {
+    if (typeof id !== "number" || !id) return null;
+    var key = d + ":" + id;
+    var found = nodeCache[key];
+    if (found !== undefined) return found;
+    var made = Object.create(NodeProto);
+    Object.defineProperty(made, "__d", { value: d });
+    Object.defineProperty(made, "__n", { value: id });
+    nodeCache[key] = made;
+    return made;
+  }
+  Object.defineProperty(host, "__ironsurfWrap", { value: wrapNode });
+
+  // Non-index property keys ("length", "item", …) parse to -1.
+  function toIndex(key) {
+    var s = String(key);
+    if (s.length === 0 || s.length > 15) return -1;
+    var n = 0;
+    for (var i = 0; i < s.length; i++) {
+      var c = s.charCodeAt(i);
+      if (c < 48 || c > 57) return -1;
+      n = n * 10 + (c - 48);
+    }
+    return n;
+  }
+
+  // Live NodeList/HTMLCollection view: the Proxy reads the document fresh
+  // on EVERY property access (Acid3: mutations during iteration are seen).
+  // kind: 0 children, 1 tags, 2 classes, 3 selector, 4 all elements.
+  function makeList(d, kind, node, param) {
+    var target = { __d: d, __kind: kind, __node: node, __param: param };
+    function count() {
+      return host.__ironsurfDomLiveCount(d, kind, node, param);
+    }
+    function item(i) {
+      return wrapNode(d, host.__ironsurfDomLiveItem(d, kind, node, i, param));
+    }
+    var handlers = {
+      get: function (t, key) {
+        if (key === "length") return count();
+        if (key === "item")
+          return function (i) {
+            var n = toIndex(i);
+            return n < 0 || n >= count() ? null : item(n);
+          };
+        if (key === "entries")
+          return function () {
+            var pairs = [];
+            for (var i = 0, n = count(); i < n; i++) pairs.push([i, item(i)]);
+            return pairs[Symbol.iterator]();
+          };
+        if (key === "forEach")
+          return function (fn) {
+            for (var i = 0, n = count(); i < n; i++) fn(item(i), i, view);
+          };
+        if (typeof key === "symbol") {
+          // Iterating the live list yields snapshots; mutations in the
+          // middle of iteration are the *page's* problem, not ours.
+          if (key === Symbol.iterator)
+            return function () {
+              var arr = [];
+              for (var i = 0, n = count(); i < n; i++) arr.push(item(i));
+              return arr[Symbol.iterator]();
+            };
+          if (key === Symbol.toStringTag) return "NodeList";
+          return undefined;
+        }
+        var i = toIndex(key);
+        if (i >= 0) return i < count() ? item(i) : undefined;
+        if (key === "toString") return function () { return "[object NodeList]"; };
+        return undefined;
+      },
+      has: function (t, key) {
+        if (key === "length" || key === "item" || key === "forEach" || key === "entries")
+          return true;
+        var i = toIndex(key);
+        return i >= 0 && i < count();
+      },
+      ownKeys: function () {
+        var keys = ["length", "item"];
+        for (var i = 0, n = count(); i < n; i++) keys.push(String(i));
+        return keys;
+      },
+      getOwnPropertyDescriptor: function (t, key) {
+        if (key === "length")
+          return { value: count(), writable: false, enumerable: true, configurable: true };
+        if (key === "item")
+          return { value: this.get(t, "item"), writable: false, enumerable: false, configurable: true };
+        var i = toIndex(key);
+        if (i >= 0 && i < count())
+          return { value: item(i), writable: false, enumerable: true, configurable: true };
+        return undefined;
+      },
+    };
+    var view = new Proxy(target, handlers);
+    return view;
+  }
+
+  // NamedNodeMap: length/item(i)/getNamedItem(name) plus [name] lookup.
+  // Attr items are {name, value} snapshots (writing attr.value is a no-op;
+  // use setAttribute).
+  function makeAttrMap(d, n) {
+    var target = { __d: d, __n: n };
+    function attrAt(i) {
+      var pair = host.__ironsurfDomAttrAt(d, n, i);
+      if (pair === null) return null;
+      return { name: pair[0], value: pair[1], nodeType: 2 };
+    }
+    function named(name) {
+      var v = host.__ironsurfDomAttr(d, n, String(name));
+      return v === null ? null : { name: String(name), value: v, nodeType: 2 };
+    }
+    var handlers = {
+      get: function (t, key) {
+        if (key === "length") return host.__ironsurfDomAttrCount(d, n);
+        if (key === "item")
+          return function (i) {
+            var idx = toIndex(i);
+            return idx < 0 || idx >= host.__ironsurfDomAttrCount(d, n) ? null : attrAt(idx);
+          };
+        if (key === "getNamedItem") return function (name) { return named(name); };
+        if (typeof key === "symbol") return undefined;
+        var v = host.__ironsurfDomAttr(d, n, String(key));
+        if (v !== null) return v; // attrs.class === "…" (string, like browsers)
+        var i = toIndex(key);
+        if (i >= 0) {
+          var a = attrAt(i);
+          return a === null ? undefined : a;
+        }
+        return undefined;
+      },
+      has: function (t, key) {
+        if (key === "length" || key === "item" || key === "getNamedItem") return true;
+        if (typeof key === "string" && host.__ironsurfDomAttr(d, n, key) !== null) return true;
+        var i = toIndex(key);
+        return i >= 0 && i < host.__ironsurfDomAttrCount(d, n);
+      },
+      ownKeys: function () {
+        var keys = ["length"];
+        var count = host.__ironsurfDomAttrCount(d, n);
+        for (var i = 0; i < count; i++) keys.push(String(i));
+        return keys;
+      },
+      getOwnPropertyDescriptor: function (t, key) {
+        if (key === "length")
+          return { value: host.__ironsurfDomAttrCount(d, n), writable: false, enumerable: true, configurable: true };
+        var i = toIndex(key);
+        if (i >= 0 && i < host.__ironsurfDomAttrCount(d, n))
+          return { value: attrAt(i), writable: false, enumerable: true, configurable: true };
+        return undefined;
+      },
+    };
+    return new Proxy(target, handlers);
+  }
+
+  // The one Node prototype every wrapper shares (mutating accessors).
+  var NodeProto = {};
+  Object.defineProperty(host, "__ironsurfNodeProto", { value: NodeProto });
+
+  function protoGet(name, fn) {
+    Object.defineProperty(NodeProto, name, {
+      get: fn,
+      enumerable: false,
+      configurable: true,
+    });
+  }
+  function protoAccessor(name, get, set) {
+    Object.defineProperty(NodeProto, name, {
+      get: get,
+      set: set,
+      enumerable: false,
+      configurable: true,
+    });
+  }
+  function protoMethod(name, fn) {
+    Object.defineProperty(NodeProto, name, {
+      value: fn,
+      writable: true,
+      enumerable: false,
+      configurable: true,
+    });
+  }
+
+  protoGet("nodeType", function () { return host.__ironsurfDomNodeType(this.__d, this.__n); });
+  protoGet("nodeName", function () { return host.__ironsurfDomNodeName(this.__d, this.__n); });
+  protoAccessor(
+    "nodeValue",
+    function () { return host.__ironsurfDomData(this.__d, this.__n); },
+    function (v) { host.__ironsurfDomSetData(this.__d, this.__n, String(v)); }
+  );
+  protoGet("parentNode", function () {
+    return wrapNode(this.__d, host.__ironsurfDomParent(this.__d, this.__n));
+  });
+  protoGet("parentElement", function () {
+    var p = wrapNode(this.__d, host.__ironsurfDomParent(this.__d, this.__n));
+    return p !== null && p.nodeType === 1 ? p : null;
+  });
+  protoGet("ownerDocument", function () { return document; });
+  protoGet("isConnected", function () {
+    // Connected == still parented somewhere under the document root.
+    var n = this.__n;
+    while (n) {
+      if (n === host.__ironsurfDomRoot(this.__d)) return true;
+      n = host.__ironsurfDomParent(this.__d, n);
+    }
+    return false;
+  });
+  protoGet("childNodes", function () { return makeList(this.__d, 0, this.__n, ""); });
+  protoGet("children", function () {
+    // HTMLCollection of element children; recomputed per access (live).
+    var kids = this.childNodes;
+    var out = [];
+    for (var i = 0, n = kids.length; i < n; i++) {
+      var kid = kids[i];
+      if (kid !== null && kid.nodeType === 1) out.push(kid);
+    }
+    return out;
+  });
+  protoMethod("hasChildNodes", function () {
+    return host.__ironsurfDomChildCount(this.__d, this.__n) > 0;
+  });
+  protoGet("firstChild", function () { return wrapNode(this.__d, host.__ironsurfDomFirstChild(this.__d, this.__n)); });
+  protoGet("lastChild", function () { return wrapNode(this.__d, host.__ironsurfDomLastChild(this.__d, this.__n)); });
+  protoGet("previousSibling", function () { return wrapNode(this.__d, host.__ironsurfDomPrevSibling(this.__d, this.__n)); });
+  protoGet("nextSibling", function () { return wrapNode(this.__d, host.__ironsurfDomNextSibling(this.__d, this.__n)); });
+  protoGet("firstElementChild", function () { return wrapNode(this.__d, host.__ironsurfDomFirstElementChild(this.__d, this.__n)); });
+  protoGet("lastElementChild", function () { return wrapNode(this.__d, host.__ironsurfDomLastElementChild(this.__d, this.__n)); });
+  protoGet("previousElementSibling", function () { return wrapNode(this.__d, host.__ironsurfDomPrevElementSibling(this.__d, this.__n)); });
+  protoGet("nextElementSibling", function () { return wrapNode(this.__d, host.__ironsurfDomNextElementSibling(this.__d, this.__n)); });
+  protoGet("attributes", function () { return makeAttrMap(this.__d, this.__n); });
+  protoAccessor(
+    "textContent",
+    function () {
+      var v = host.__ironsurfDomText(this.__d, this.__n);
+      return v === null ? "" : v;
+    },
+    function (v) { host.__ironsurfDomTextSet(this.__d, this.__n, String(v)); }
+  );
+  protoAccessor(
+    "innerHTML",
+    function () { return host.__ironsurfDomSerialize(this.__d, this.__n, false); },
+    function (v) { host.__ironsurfDomSetInner(this.__d, this.__n, String(v)); }
+  );
+  protoGet("outerHTML", function () { return host.__ironsurfDomSerialize(this.__d, this.__n, true); });
+
+  // ChildNode mutations: the natives validate (throwing NotFoundError
+  // TypeErrors, like DOMExceptions do here) and apply via blitz.
+  function unwrapChild(child) {
+    if (child === null || child === undefined || typeof child !== "object") {
+      throw new TypeError("parameter 1 is not of type 'Node'");
+    }
+    return child;
+  }
+  protoMethod("appendChild", function (child) {
+    unwrapChild(child);
+    if (child.__frag) {
+      // DocumentFragment: move all its children across (and empty it).
+      var kids = child.__frag.slice();
+      child.__frag.length = 0;
+      for (var i = 0; i < kids.length; i++) this.appendChild(kids[i]);
+      return child;
+    }
+    host.__ironsurfDomAppendChild(this.__d, this.__n, child.__n);
+    return child;
+  });
+  protoMethod("insertBefore", function (child, reference) {
+    unwrapChild(child);
+    if (child.__frag) {
+      var kids = child.__frag.slice();
+      child.__frag.length = 0;
+      for (var i = 0; i < kids.length; i++) this.insertBefore(kids[i], reference);
+      return child;
+    }
+    var refId = reference === null || reference === undefined ? 0 : reference.__n;
+    host.__ironsurfDomInsertBefore(this.__d, this.__n, child.__n, refId);
+    return child;
+  });
+  protoMethod("removeChild", function (child) {
+    unwrapChild(child);
+    host.__ironsurfDomRemoveChild(this.__d, this.__n, child.__n);
+    return child;
+  });
+  protoMethod("replaceChild", function (newChild, oldChild) {
+    unwrapChild(newChild);
+    unwrapChild(oldChild);
+    host.__ironsurfDomReplaceChild(this.__d, this.__n, newChild.__n, oldChild.__n);
+    return oldChild;
+  });
+  // ChildNode.remove(): detach from the current parent.
+  protoMethod("remove", function () {
+    host.__ironsurfDomDetach(this.__d, this.__n);
+  });
+  protoMethod("cloneNode", function (deep) {
+    return wrapNode(this.__d, host.__ironsurfDomClone(this.__d, this.__n, !!deep));
+  });
+
+  // Element IDL attribute mirrors (get/set via the id/class attributes).
+  protoAccessor(
+    "id",
+    function () { return host.__ironsurfDomAttr(this.__d, this.__n, "id"); },
+    function (v) { host.__ironsurfDomAttrSet(this.__d, this.__n, "id", String(v)); }
+  );
+  protoAccessor(
+    "className",
+    function () { return host.__ironsurfDomAttr(this.__d, this.__n, "class"); },
+    function (v) { host.__ironsurfDomAttrSet(this.__d, this.__n, "class", String(v)); }
+  );
+
+  protoMethod("getAttribute", function (name) {
+    return host.__ironsurfDomAttr(this.__d, this.__n, String(name));
+  });
+  protoMethod("setAttribute", function (name, value) {
+    host.__ironsurfDomAttrSet(this.__d, this.__n, String(name), String(value));
+  });
+  protoMethod("removeAttribute", function (name) {
+    host.__ironsurfDomAttrRemove(this.__d, this.__n, String(name));
+  });
+  protoMethod("hasAttribute", function (name) {
+    return host.__ironsurfDomAttr(this.__d, this.__n, String(name)) !== null;
+  });
+  // Element-level queries: document-wide match (scoping is a known gap).
+  protoMethod("querySelector", function (selector) {
+    return wrapNode(this.__d, host.__ironsurfDomQuery(this.__d, String(selector)));
+  });
+  protoMethod("querySelectorAll", function (selector) {
+    host.__ironsurfDomQuery(this.__d, String(selector));
+    return makeList(this.__d, 3, 0, String(selector));
+  });
+  protoMethod("addEventListener", function () {});
+  protoMethod("removeEventListener", function () {});
+  protoMethod("dispatchEvent", function () { return true; });
+  // getElementsByClassName on any element (live, like the document one).
+  protoMethod("getElementsByClassName", function (name) {
+    // Not scoped to descendants in this bridge — document-wide live list.
+    return makeList(this.__d, 2, 0, String(name));
+  });
+  protoMethod("getElementsByTagName", function (name) {
+    var tag = String(name).toLowerCase();
+    return makeList(this.__d, tag === "*" ? 4 : 1, 0, tag);
+  });
+
+  // DocumentFragment: no blitz node (blitz has no fragment kind), so the
+  // fragment is a JS list of real nodes (detached on insert).
+  function makeFragment() {
+    var frag = Object.create(NodeProto);
+    Object.defineProperty(frag, "__d", { value: 0 });
+    Object.defineProperty(frag, "__n", { value: 0 });
+    Object.defineProperty(frag, "__frag", { value: [] });
+    return frag;
+  }
+  // Fragment overrides (duck-typed by the __frag marker).
+  var fragOverrides = {
+    nodeType: 11,
+    nodeName: "#document-fragment",
+    childNodes: function () {
+      var kids = this.__frag;
+      var view = { length: kids.length, item: function (i) { return kids[i] === undefined ? null : kids[i]; } };
+      for (var i = 0; i < kids.length; i++) view[String(i)] = kids[i];
+      return view;
+    },
+    hasChildNodes: function () { return this.__frag.length > 0; },
+    appendChild: function (child) {
+      unwrapChild(child);
+      if (child.__frag) {
+        var kids = child.__frag.slice();
+        child.__frag.length = 0;
+        for (var i = 0; i < kids.length; i++) this.appendChild(kids[i]);
+        return this;
+      }
+      host.__ironsurfDomDetach(this.__d, child.__n);
+      this.__frag.push(child);
+      return child;
+    },
+    insertBefore: function (child, reference) {
+      unwrapChild(child);
+      var at = reference === null || reference === undefined ? this.__frag.length : this.__frag.indexOf(reference);
+      if (at < 0) throw new TypeError("NotFoundError: reference is not a child of this fragment");
+      if (child.__frag) {
+        var kids = child.__frag.slice();
+        child.__frag.length = 0;
+        var self = this;
+        kids.forEach(function (k) { self.insertBefore(k, reference); });
+        return this;
+      }
+      host.__ironsurfDomDetach(this.__d, child.__n);
+      this.__frag.splice(at, 0, child);
+      return child;
+    },
+    removeChild: function (child) {
+      var at = this.__frag.indexOf(child);
+      if (at < 0) throw new TypeError("NotFoundError: child is not in this fragment");
+      this.__frag.splice(at, 1);
+      return child;
+    },
+    textContent: function () {
+      var out = "";
+      for (var i = 0; i < this.__frag.length; i++) out += this.__frag[i].textContent;
+      return out;
+    },
+  };
+  // Fragments get their own property bindings (see fragPatch below).
+  function fragPatch(frag) {
+    Object.defineProperty(frag, "nodeType", { value: 11 });
+    Object.defineProperty(frag, "nodeName", { value: "#document-fragment" });
+    Object.defineProperty(frag, "childNodes", { get: fragOverrides.childNodes });
+    Object.defineProperty(frag, "hasChildNodes", { value: fragOverrides.hasChildNodes });
+    Object.defineProperty(frag, "appendChild", { value: fragOverrides.appendChild, writable: true });
+    Object.defineProperty(frag, "insertBefore", { value: fragOverrides.insertBefore, writable: true });
+    Object.defineProperty(frag, "removeChild", { value: fragOverrides.removeChild, writable: true });
+    Object.defineProperty(frag, "textContent", {
+      get: fragOverrides.textContent,
+      set: function (v) {
+        this.__frag.length = 0;
+        if (String(v).length > 0) this.__frag.push(wrapNode(0, host.__ironsurfDomCreateText(0, String(v))));
+      },
+    });
+    Object.defineProperty(frag, "innerHTML", {
+      get: function () {
+        var out = "";
+        for (var i = 0; i < this.__frag.length; i++) out += this.__frag[i].outerHTML;
+        return out;
+      },
+      set: function () { throw new Error("innerHTML is not supported on DocumentFragment"); },
+    });
+    return frag;
+  }
+
+  // The document object. When the tab registers a live blitz document the
+  // accessors below read through it; with no live document (the plain host
+  // snapshot world the bindings tests use) they fall back to host state.
+  function bodyFallback() {
+    return host.__ironsurfHasBody
+      ? { nodeType: 1, textContent: host.__ironsurfBodyText }
+      : null;
+  }
+
   var document = {
     nodeType: 9,
+    __d: 0,
     readyState: "complete",
     visibilityState: "visible",
     hidden: false,
-    documentElement: null,
-    body: host.__ironsurfHasBody
-      ? { nodeType: 1, textContent: host.__ironsurfBodyText }
-      : null,
-    getElementsByTagName: function () { return []; },
-    getElementById: function () { return null; },
-    querySelector: function () { return null; },
-    querySelectorAll: function () { return [];; },
+    get documentElement() {
+      if (!host.__ironsurfDomHasDoc()) return null;
+      return wrapNode(0, host.__ironsurfDomHtml(0));
+    },
+    get head() {
+      if (!host.__ironsurfDomHasDoc()) return null;
+      return wrapNode(0, host.__ironsurfDomHead(0));
+    },
+    get body() {
+      if (!host.__ironsurfDomHasDoc()) return bodyFallback();
+      return wrapNode(0, host.__ironsurfDomBody(0));
+    },
+    doctype: null,
+    getElementsByTagName: function (name) {
+      var tag = String(name).toLowerCase();
+      return makeList(0, tag === "*" ? 4 : 1, 0, tag);
+    },
+    getElementsByClassName: function (name) {
+      return makeList(0, 2, 0, String(name));
+    },
+    getElementById: function (id) {
+      return wrapNode(0, host.__ironsurfDomGetById(0, String(id)));
+    },
+    querySelector: function (selector) {
+      // Invalid selectors raise SyntaxError from the native.
+      return wrapNode(0, host.__ironsurfDomQuery(0, String(selector)));
+    },
+    querySelectorAll: function (selector) {
+      // Browsers validate at call time: run the single-shot query once so an
+      // unparsable selector raises SyntaxError here, then hand back the live
+      // list (which stays in step with the document from then on).
+      host.__ironsurfDomQuery(0, String(selector));
+      return makeList(0, 3, 0, String(selector));
+    },
+    createElement: function (tag) {
+      // Invalid names raise InvalidCharacterError from the native.
+      return wrapNode(0, host.__ironsurfDomCreateElement(0, String(tag)));
+    },
+    createTextNode: function (text) {
+      return wrapNode(0, host.__ironsurfDomCreateText(0, String(text)));
+    },
+    createComment: function (data) {
+      return wrapNode(0, host.__ironsurfDomCreateComment(0, String(data)));
+    },
+    createDocumentFragment: function () {
+      return fragPatch(makeFragment());
+    },
+    createEvent: function () { return {}; },
     addEventListener: function () {},
     removeEventListener: function () {},
     dispatchEvent: function () { return true; },
@@ -601,7 +2349,7 @@ const PRELUDE: &str = r#"
   host.console = console;
   document.defaultView = host;
 })();
-"#;
+"##;
 
 /// Build a fresh boa context for one navigation, with the tiny binding surface
 /// bound to `host`. The context is intentionally thrown away at the next
@@ -766,6 +2514,10 @@ pub fn build_context(host: &HostRef, _timers: &Rc<RefCell<TimerQueue>>) -> Conte
         error!("js binding `clearTimer` failed to install: {err}");
     }
 
+    // DOM bridge natives (`__ironsurfDom*`): all node behaviour lives here;
+    // the prelude's NodeProto/document glue only delegates (design B).
+    register_dom_natives(&mut context);
+
     if let Err(err) = context.eval(Source::from_bytes(PRELUDE)) {
         // Our own glue failing is a bug, not page input: report loudly, keep
         // the globals that did install, and let the tab run.
@@ -839,9 +2591,19 @@ impl JsRuntime {
     /// Evaluate `scripts` in order. Every evaluation is wrapped: an exception
     /// is collected and the next script still runs (contract: script errors
     /// must never kill the tab).
-    pub fn run_scripts(&mut self, scripts: &[ScriptSource]) -> Vec<ScriptError> {
+    ///
+    /// `doc` is the tab's live document: while the scripts run it is
+    /// registered as `docId` 0 in [`LIVE_DOCS`], so the DOM natives can read
+    /// and mutate it (design A). The registration — and with it the raw
+    /// pointer — is gone the moment this call returns.
+    pub fn run_scripts(
+        &mut self,
+        scripts: &[ScriptSource],
+        doc: Option<&mut HtmlDocument>,
+    ) -> Vec<ScriptError> {
         let started = Instant::now();
         let _active = self.activate();
+        let _live_doc = doc.map(register_live_doc);
         let mut errors = Vec::new();
         for script in scripts {
             trace!(
@@ -873,17 +2635,35 @@ impl JsRuntime {
         self.context.eval(Source::from_bytes(source))
     }
 
+    /// Evaluate one snippet with `doc` registered as the live document
+    /// (docId 0) — the DOM bridge tests run in exactly this world.
+    #[cfg(test)]
+    pub(crate) fn eval_with_doc(
+        &mut self,
+        source: &str,
+        doc: &mut HtmlDocument,
+    ) -> Result<JsValue, boa_engine::JsError> {
+        let _active = self.activate();
+        let _live_doc = register_live_doc(doc);
+        self.context.eval(Source::from_bytes(source))
+    }
+
     /// Execute every timer callback due at `now`, in due order. Exceptions
     /// are caught **per callback** (reported like any script error: origin
     /// `"timer"`) and never stop the remaining callbacks or later firings.
     /// Side effects stay in the host cell — the tab turns them into IPC
     /// exactly like [`JsRuntime::run_scripts`] does.
-    pub fn run_due_timers(&mut self, now: Instant) -> Vec<ScriptError> {
+    pub fn run_due_timers(
+        &mut self,
+        now: Instant,
+        doc: Option<&mut HtmlDocument>,
+    ) -> Vec<ScriptError> {
         let due = self.timers.borrow_mut().take_due(now);
         if due.is_empty() {
             return Vec::new();
         }
         let _active = self.activate();
+        let _live_doc = doc.map(register_live_doc);
         let mut errors = Vec::new();
         for entry in due {
             self.host.borrow_mut().timers_fired += 1;
@@ -1132,12 +2912,12 @@ mod tests {
 
         let now = Instant::now();
         // The loop polls before the deadline: nothing fires early.
-        assert!(runtime.run_due_timers(now).is_empty());
+        assert!(runtime.run_due_timers(now, None).is_empty());
         assert_eq!(host.borrow().title_assigned, None);
 
         // 20 ms later the poll loop catches the due callback …
         let later = now + Duration::from_millis(20);
-        let errors = runtime.run_due_timers(later);
+        let errors = runtime.run_due_timers(later, None);
         assert!(errors.is_empty(), "{errors:?}");
         let borrowed = host.borrow();
         assert_eq!(borrowed.title_assigned.as_deref(), Some("timer-fired"));
@@ -1146,7 +2926,7 @@ mod tests {
 
         // … and a one-shot never re-arms.
         assert!(!runtime.has_timers());
-        assert!(runtime.run_due_timers(later + Duration::from_secs(5)).is_empty());
+        assert!(runtime.run_due_timers(later + Duration::from_secs(5), None).is_empty());
         assert_eq!(host.borrow().timers_fired, 1);
     }
 
@@ -1162,14 +2942,14 @@ mod tests {
 
         let now = Instant::now();
         // First fire, and the interval re-arms itself for the next poll.
-        assert!(runtime.run_due_timers(now + Duration::from_millis(10)).is_empty());
+        assert!(runtime.run_due_timers(now + Duration::from_millis(10), None).is_empty());
         assert_eq!(host.borrow().title_assigned.as_deref(), Some("tick-1"));
         assert!(runtime.has_timers(), "intervals stay scheduled until cleared");
 
         // clearInterval cancels: no further callback, even much later.
         runtime.eval("clearInterval(intervalId)").expect("clearInterval");
         assert!(!runtime.has_timers());
-        assert!(runtime.run_due_timers(now + Duration::from_secs(60)).is_empty());
+        assert!(runtime.run_due_timers(now + Duration::from_secs(60), None).is_empty());
         assert_eq!(
             runtime.eval("ticks").expect("read ticks").as_i32(),
             Some(1),
@@ -1189,7 +2969,7 @@ mod tests {
             )
             .expect("scheduling");
 
-        let errors = runtime.run_due_timers(Instant::now() + Duration::from_millis(50));
+        let errors = runtime.run_due_timers(Instant::now() + Duration::from_millis(50), None);
         assert_eq!(errors.len(), 1, "the throwing callback is caught …");
         assert_eq!(errors[0].origin, "timer");
         assert!(errors[0].message.contains("callback boom"), "{errors:?}");
@@ -1206,9 +2986,9 @@ mod tests {
             .eval("requestAnimationFrame(function (t) { document.title = 'raf-' + (typeof t); })")
             .expect("requestAnimationFrame");
         // Not due immediately: rAF waits a frame (16 ms).
-        assert!(runtime.run_due_timers(Instant::now()).is_empty());
+        assert!(runtime.run_due_timers(Instant::now(), None).is_empty());
         assert!(host.borrow().title_assigned.is_none());
-        let errors = runtime.run_due_timers(Instant::now() + Duration::from_millis(20));
+        let errors = runtime.run_due_timers(Instant::now() + Duration::from_millis(20), None);
         assert!(errors.is_empty(), "{errors:?}");
         assert_eq!(
             host.borrow().title_assigned.as_deref(),
@@ -1232,7 +3012,7 @@ mod tests {
             },
         ];
         let mut runtime = JsRuntime::new(Rc::clone(&host));
-        let errors = runtime.run_scripts(&scripts);
+        let errors = runtime.run_scripts(&scripts, None);
         assert_eq!(errors.len(), 1);
         assert_eq!(errors[0].origin, "inline");
         assert!(errors[0].message.contains("nope"), "{:?}", errors[0]);
@@ -1256,7 +3036,7 @@ mod tests {
             origin: "inline".to_string(),
         }];
         let mut runtime = JsRuntime::new(Rc::clone(&host));
-        let errors = runtime.run_scripts(&scripts);
+        let errors = runtime.run_scripts(&scripts, None);
         assert_eq!(errors.len(), 1, "syntax errors never abort the tab");
         assert!(!errors[0].message.is_empty());
     }
@@ -1265,10 +3045,13 @@ mod tests {
     fn contexts_are_isolated_between_navigations() {
         let first = sample_host();
         let mut first_runtime = JsRuntime::new(Rc::clone(&first));
-        first_runtime.run_scripts(&[ScriptSource {
-            code: "var leaked = 1; document.title = 'one';".to_string(),
-            origin: "inline".to_string(),
-        }]);
+        first_runtime.run_scripts(
+            &[ScriptSource {
+                code: "var leaked = 1; document.title = 'one';".to_string(),
+                origin: "inline".to_string(),
+            }],
+            None,
+        );
         let second = Rc::new(RefCell::new(HostState::new("https://example.test/2", None, None)));
         // The second navigation gets a fresh realm: `leaked` is gone.
         assert_eq!(
@@ -1417,5 +3200,390 @@ mod tests {
         assert!(is_module_type(Some("module")));
         assert!(!is_module_type(Some("text/javascript")));
     }
-}
 
+    // -----------------------------------------------------------------
+    // The DOM bridge: real blitz document behind the JS DOM (design B)
+
+    const DOM_PAGE: &str = r####"<!doctype html>
+<html><head><title>Bridge</title></head>
+<body>
+  <div id="wrap" class="outer">
+    <p id="p1" class="inner first">one</p>
+    <p id="p2">two</p>
+    <span data-x="v">three</span>
+  </div>
+</body></html>"####;
+
+    /// Run `source` against `doc` (registered as the live document) and
+    /// return the completion value; panics with the snippet on JS errors.
+    fn dom_eval(
+        runtime: &mut JsRuntime,
+        doc: &mut blitz_html::HtmlDocument,
+        source: &str,
+    ) -> JsValue {
+        match runtime.eval_with_doc(source, doc) {
+            Ok(value) => value,
+            Err(err) => {
+                let message = first_line(&err);
+                panic!("dom snippet failed: {message}\n--- snippet ---\n{source}")
+            }
+        }
+    }
+
+    /// Fresh runtime + live document for `DOM_PAGE`.
+    fn dom_world() -> (JsRuntime, blitz_html::HtmlDocument) {
+        let runtime = JsRuntime::new(sample_host());
+        let doc = dom(DOM_PAGE);
+        (runtime, doc)
+    }
+
+    /// Evaluate `source` against a fresh DOM world, expecting `true`.
+    fn dom_true(source: &str) {
+        let (mut runtime, mut doc) = dom_world();
+        let value = dom_eval(&mut runtime, &mut doc, source);
+        assert!(value.to_boolean(), "expected truthy for: {source}");
+    }
+
+    #[test]
+    fn dom_document_anchors_point_at_the_real_tree() {
+        let (mut runtime, mut doc) = dom_world();
+        let value = dom_eval(
+            &mut runtime,
+            &mut doc,
+            r#"
+            [
+              document.documentElement.nodeName,
+              document.documentElement.nodeType,
+              document.head !== null,
+              document.body.nodeName,
+              document.body.textContent.indexOf("three") >= 0,
+              document.getElementById("p1").textContent,
+              document.querySelector("span[data-x]").getAttribute("data-x")
+            ].join("|");
+            "#,
+        );
+        let text = value.to_string(&mut runtime.context).expect("string").to_std_string_escaped();
+        assert_eq!(
+            text,
+            "HTML|1|true|BODY|true|one|v",
+            "anchors must resolve through the live document"
+        );
+    }
+
+    #[test]
+    fn dom_node_identity_is_stable() {
+        let (mut runtime, mut doc) = dom_world();
+        let value = dom_eval(
+            &mut runtime,
+            &mut doc,
+            r##"
+            var body = document.body;
+            var p1 = document.getElementById("p1");
+            [
+              document.body === body,
+              document.getElementById("p1") === p1,
+              document.querySelector("#p1") === p1,
+              body.ownerDocument.body === body
+            ].join(",");
+            "##,
+        );
+        assert_eq!(
+            value.to_string(&mut runtime.context).expect("s").to_std_string_escaped(),
+            "true,true,true,true"
+        );
+    }
+
+    #[test]
+    fn dom_child_nodes_list_is_live() {
+        dom_true(
+            r#"
+            var kids = document.body.childNodes;
+            var before = kids.length;
+            document.body.appendChild(document.createElement("i"));
+            var grew = kids.length === before + 1;
+            var lastIsNew = kids[kids.length - 1].nodeName === "I";
+            document.body.removeChild(kids[kids.length - 1]);
+            grew && kids.length === before && document.body.childNodes.length === before;
+            "#,
+        );
+    }
+
+    #[test]
+    fn dom_query_selector_all_is_live_and_rejects_bad_selectors() {
+        dom_true(
+            r#"
+            var list = document.querySelectorAll("p");
+            var before = list.length;
+            var p = document.createElement("p");
+            document.body.appendChild(p);
+            var grew = list.length === before + 1 && list[before] === p;
+            document.body.removeChild(p);
+            var threw = false;
+            try { document.querySelectorAll("div["); } catch (e) { threw = e instanceof SyntaxError; }
+            var emptyOk = document.querySelectorAll("table").length === 0;
+            grew && list.length === before && threw && emptyOk;
+            "#,
+        );
+    }
+
+    #[test]
+    fn dom_attributes_round_trip() {
+        dom_true(
+            r#"
+            var el = document.getElementById("p1");
+            var a1 = el.getAttribute("class") === "inner first";
+            var a2 = el.getAttribute("nope") === null;
+            el.setAttribute("data-k", "a&b");
+            var a3 = el.getAttribute("data-k") === "a&b";
+            var map = el.attributes;
+            var has = map.getNamedItem("data-k").value === "a&b" && map.length >= 3;
+            var indexed = map.item(0).name.length > 0;
+            el.removeAttribute("data-k");
+            var a4 = el.getAttribute("data-k") === null && !el.hasAttribute("data-k");
+            var threw = false;
+            try { el.setAttribute("<bad>", "x"); } catch (e) { threw = e instanceof RangeError; }
+            a1 && a2 && a3 && has && indexed && a4 && threw;
+            "#,
+        );
+    }
+
+    #[test]
+    fn dom_innerhtml_set_and_serialize() {
+        dom_true(
+            r#"
+            var wrap = document.getElementById("wrap");
+            wrap.innerHTML = '<p class="x">hi &amp; <b>bold</b></p><br>';
+            var out = wrap.innerHTML;
+            var b = wrap.querySelector("b");
+            var expected = out === '<p class="x">hi &amp; <b>bold</b></p><br>';
+            expected && b.textContent === "bold" && wrap.children.length === 2;
+            "#,
+        );
+    }
+
+    #[test]
+    fn dom_textcontent_set_replaces_children() {
+        dom_true(
+            r#"
+            var p = document.getElementById("p2");
+            p.appendChild(document.createElement("b"));
+            p.firstChild.textContent = "nested";
+            var had = p.childNodes.length > 1;
+            p.textContent = "plain & done";
+            var only = p.childNodes.length === 1 && p.firstChild.nodeType === 3;
+            only && p.textContent === "plain & done" && had && p.innerHTML === "plain &amp; done";
+            "#,
+        );
+    }
+
+    #[test]
+    fn dom_insert_remove_replace_children() {
+        dom_true(
+            r#"
+            var wrap = document.getElementById("wrap");
+            var p1 = document.getElementById("p1");
+            var span = document.querySelector("span");
+            var marker = document.createElement("em");
+            wrap.insertBefore(marker, p1);
+            var first = wrap.firstElementChild === marker;
+            var tail = document.createElement("u");
+            wrap.insertBefore(tail, null);
+            var last = wrap.lastElementChild === tail;
+            wrap.removeChild(tail);
+            var gone = wrap.lastElementChild !== tail;
+            var b2 = document.createElement("b");
+            var old = wrap.replaceChild(b2, span);
+            var swapped = old === span && wrap.querySelector("b") !== null && span.parentNode !== wrap;
+            first && last && gone && swapped;
+            "#,
+        );
+    }
+
+    #[test]
+    fn dom_mutations_validate_their_arguments() {
+        let (mut runtime, mut doc) = dom_world();
+        // Removing a node that is not a child must raise (NotFoundError —
+        // the DOMException family maps onto TypeError in this bridge).
+        let err = runtime
+            .eval_with_doc(
+                r#"
+                var other = document.createElement("div");
+                document.body.removeChild(other);
+                "#,
+                &mut doc,
+            )
+            .expect_err("removing a non-child must throw");
+        assert!(first_line(&err).contains("NotFoundError"), "{err}");
+
+        let threw = dom_eval(
+            &mut runtime,
+            &mut doc,
+            r#"
+            var ok = false;
+            try { document.body.appendChild(42); } catch (e) { ok = e instanceof TypeError; }
+            ok;
+            "#,
+        );
+        assert!(threw.to_boolean(), "non-node child must be a TypeError");
+    }
+
+    #[test]
+    fn dom_clone_node_shallow_vs_deep() {
+        dom_true(
+            r#"
+            var p1 = document.getElementById("p1");
+            p1.appendChild(document.createElement("i"));
+            var deep = p1.cloneNode(true);
+            var shallow = p1.cloneNode(false);
+            var idCopies = deep.getAttribute("id") === "p1";
+            deep.setAttribute("id", "copy");
+            var kidsOk = deep.children.length === 1 && shallow.children.length === 0;
+            var textOk = deep.textContent === p1.textContent;
+            // Clones are detached: parentNode is null until inserted.
+            var detached = deep.parentNode === null && shallow.parentNode === null;
+            var live = p1.parentNode !== null;
+            idCopies && kidsOk && textOk && detached && live;
+            "#,
+        );
+    }
+
+    #[test]
+    fn dom_document_fragment_moves_all_children() {
+        dom_true(
+            r#"
+            var frag = document.createDocumentFragment();
+            var a = document.createElement("a");
+            var b = document.createElement("b");
+            frag.appendChild(a);
+            frag.appendChild(b);
+            var inFrag = frag.childNodes.length === 2 && a.parentNode === null;
+            var list = document.body.childNodes;
+            var before = list.length;
+            document.body.appendChild(frag);
+            var moved = frag.childNodes.length === 0 &&
+                        document.body.querySelectorAll("a").length === 1 &&
+                        a.parentNode === document.body &&
+                        list.length === before + 2;
+            document.body.removeChild(a);
+            document.body.removeChild(b);
+            inFrag && moved;
+            "#,
+        );
+    }
+
+    #[test]
+    fn dom_getelementsbytagname_reads_the_tree() {
+        dom_true(
+            r#"
+            var ps = document.getElementsByTagName("p");
+            var before = ps.length;
+            var p = document.createElement("p");
+            p.setAttribute("class", "inner");
+            document.body.appendChild(p);
+            var after = ps.length;
+            var cls = document.getElementsByClassName("inner");
+            var liveCls = cls.length === 2;
+            document.body.removeChild(p);
+            var star = document.getElementsByTagName("*").length > ps.length;
+            (after === before + 1 || after === before) && liveCls && star;
+            "#,
+        );
+    }
+
+    #[test]
+    fn dom_missing_nodes_read_as_null() {
+        dom_true(
+            r##"
+            document.getElementById("nope") === null &&
+            document.querySelector("#nope") === null &&
+            document.body.getAttribute("nope") === null;
+            "##,
+        );
+    }
+
+    #[test]
+    fn dom_invalid_names_throw_range_error() {
+        let (mut runtime, mut doc) = dom_world();
+        let err = runtime
+            .eval_with_doc(r#"document.createElement("<div>")"#, &mut doc)
+            .expect_err("invalid tag name must throw");
+        assert!(first_line(&err).contains("InvalidCharacterError"), "{err}");
+        let ok = dom_eval(
+            &mut runtime,
+            &mut doc,
+            r#"
+            var r1 = false;
+            try { document.createElement("<div>"); } catch (e) { r1 = e instanceof RangeError; }
+            var r2 = false;
+            try { document.body.setAttribute("", "x"); } catch (e) { r2 = e instanceof RangeError; }
+            r1 && r2;
+            "#,
+        );
+        assert!(ok.to_boolean());
+    }
+
+    #[test]
+    fn dom_siblings_and_comments() {
+        dom_true(
+            r##"
+            var p2 = document.getElementById("p2");
+            var prev = p2.previousElementSibling;
+            var next = p2.nextElementSibling;
+            var sibs = prev.id === "p1" && next.nodeName === "SPAN" &&
+                       next.previousElementSibling === p2 &&
+                       next.nextElementSibling === null;
+            var c = document.createComment(" hi ");
+            var cOk = c.nodeType === 8 && c.nodeName === "#comment" && c.nodeValue === " hi ";
+            c.nodeValue = "bye";
+            var mutated = c.nodeValue === "bye";
+            document.body.appendChild(c);
+            var appended = document.body.lastChild === c && c.parentNode !== null;
+            document.body.removeChild(c);
+            sibs && cOk && mutated && appended;
+            "##,
+        );
+    }
+
+    #[test]
+    fn dom_bridge_survives_the_script_batch() {
+        // The tab's real entry point: page scripts run through run_scripts
+        // with the document registered, and DOM mutations are visible to
+        // later scripts in the same batch.
+        let host = sample_host();
+        let mut runtime = JsRuntime::new(Rc::clone(&host));
+        let mut doc = dom(DOM_PAGE);
+        let scripts = [
+            ScriptSource {
+                code: r#"var d = document.createElement("div");
+                         d.id = "built";
+                         d.textContent = "by script one";
+                         document.body.appendChild(d);"#
+                    .to_string(),
+                origin: "inline".to_string(),
+            },
+            ScriptSource {
+                code: r#"document.title = document.getElementById("built").textContent.toUpperCase();
+                         window.sawDom = true;"#
+                    .to_string(),
+                origin: "inline".to_string(),
+            },
+        ];
+        let errors = runtime.run_scripts(&scripts, Some(&mut doc));
+        assert!(errors.is_empty(), "{errors:?}");
+        assert_eq!(
+            host.borrow().title_assigned.as_deref(),
+            Some("BY SCRIPT ONE")
+        );
+        // The mutation landed in the real document, not a JS-only shadow.
+        assert!(doc.query_selector("#built").expect("valid selector").is_some());
+        let text = dom_eval(
+            &mut runtime,
+            &mut doc,
+            "document.getElementById('built').textContent",
+        );
+        assert_eq!(
+            text.to_string(&mut runtime.context).expect("s").to_std_string_escaped(),
+            "by script one"
+        );
+    }
+}
