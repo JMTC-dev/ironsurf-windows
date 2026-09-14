@@ -8,6 +8,7 @@
 //! semantics land in task 7d). The standalone render spike ([`spike`]) is
 //! kept behind `--spike`.
 
+mod headless;
 mod js;
 mod netmod;
 mod runtime;
@@ -20,6 +21,7 @@ fn usage() -> String {
     "usage: ironsurf-tab --tab-id N --container-id N --profile-dir PATH \
      [--url URL] [--offline-fixtures DIR] [--managed-net] [--no-sandbox] [--log LEVEL|-v|-vv]\n\
      \x20      ironsurf-tab --spike --url <file:///...> --out <out.ppm> [--size WxH] [--out-rgba out.rgba]\n\
+     \x20      ironsurf-tab --headless --url URL [--wait MS] [--body-out FILE] [--shot out.ppm] [--size WxH]\n\
      \x20      log LEVEL: off|error|warn|info|debug|trace (default info; also IRONSURF_LOG)"
         .to_owned()
 }
@@ -29,7 +31,17 @@ fn main() {
     // Logging first: every line after this goes to stderr (never stdout, which
     // is the IPC channel). `runtime::run` relabels the lines with the tab id.
     logging::init("tab", logging::level_from_args(&args));
-    let code = if args.iter().any(|a| a == "--spike") {
+    let code = if args.iter().any(|a| a == "--headless") {
+        // One-shot ACID-test harness: navigate, wait, dump body HTML + PPM,
+        // summary on stderr, stdout unused (see `crate::headless`).
+        match headless::run(&args) {
+            Ok(()) => 0,
+            Err(err) => {
+                error!("headless run failed: {err}");
+                1
+            }
+        }
+    } else if args.iter().any(|a| a == "--spike") {
         match spike::run(&args) {
             Ok(()) => 0,
             Err(err) => {

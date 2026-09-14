@@ -463,15 +463,26 @@ pub struct Tab {
 }
 
 /// stdout side of the IPC: one persistent BufWriter, flushed per frame.
+/// In headless harness mode the sink is `/dev/null` instead (see
+/// [`Tab::new_headless`]) so the process never speaks the protocol.
 struct TabOut {
-    writer: BufWriter<StdoutLock<'static>>,
+    writer: Box<dyn Write>,
     broken: bool,
 }
 
 impl TabOut {
     fn new() -> Self {
+        let stdout: StdoutLock<'static> = io::stdout().lock();
         TabOut {
-            writer: BufWriter::with_capacity(1 << 20, io::stdout().lock()),
+            writer: Box::new(BufWriter::with_capacity(1 << 20, stdout)),
+            broken: false,
+        }
+    }
+
+    /// Discarding sink (headless mode): `send` keeps working, frames go nowhere.
+    fn null() -> Self {
+        TabOut {
+            writer: Box::new(BufWriter::new(io::sink())),
             broken: false,
         }
     }
@@ -488,6 +499,17 @@ impl TabOut {
 }
 
 impl Tab {
+    /// A tab wired exactly like a live one (same net provider, hooks, jar,
+    /// cache, script pipeline) but with the shell sink discarded: used by the
+    /// `--headless` ACID-test harness, which navigates once, waits, and dumps
+    /// DOM text + a screenshot instead of streaming frames (see
+    /// [`crate::headless`]).
+    pub(crate) fn new_headless(args: &TabArgs, pipe: Arc<SelfPipe>) -> Self {
+        let mut tab = Tab::new(args, pipe);
+        tab.out = TabOut::null();
+        tab
+    }
+
     fn new(args: &TabArgs, pipe: Arc<SelfPipe>) -> Self {
         let store = ContainerStore::from_profile_dir(args.container_id, &args.profile_dir);
         // The tab drives main-document fetches with its own jar/cache; the
@@ -1347,7 +1369,7 @@ impl Tab {
         false
     }
 
-    fn persist(&mut self) {
+    pub(crate) fn persist(&mut self) {
         // Best-effort: both jar handles (main-doc + subresource) live inside
         // the sandbox-writable profile dir.
         debug!("persisting cookie jars to profile dir");
@@ -1361,6 +1383,35 @@ impl Tab {
 
     fn flush_stdout(&mut self) {
         let _ = self.out.writer.flush();
+    }
+
+    /// One harness pump: drain a pending navigation request, else settle
+    /// (resolve + document messages) and refresh the title/url caches. Timers
+    /// and subresource completions land through here while `--wait` runs.
+    pub(crate) fn headless_pump(&mut self) {
+        if self.drain_nav_hook() {
+            return;
+        }
+        self.settle();
+        self.check_meta();
+    }
+
+    /// The live document, for harness-side DOM/serializer access.
+    pub(crate) fn document_mut(&mut self) -> Option<&mut blitz_html::HtmlDocument> {
+        self.doc.as_mut()
+    }
+
+    /// Title with the `check_meta` precedence (JS assignment > blitz flush >
+    /// `<title>` node poll), resolved on demand for the harness summary.
+    pub(crate) fn title_now(&mut self) -> Option<String> {
+        let js = self.js_title.clone();
+        let hooked = self.shell.title.lock().expect("title mutex").clone();
+        let polled = self
+            .doc
+            .as_ref()
+            .and_then(|doc| doc.find_title_node())
+            .map(|node| node.text_content());
+        js.or(hooked).or(polled)
     }
 }
 
