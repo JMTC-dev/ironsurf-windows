@@ -77,8 +77,11 @@ impl TabState {
                 }
             }
             FromTab::ConsoleLog { .. } => false,
-            // An action for the pump (spawn a new tab), not per-tab state.
+            // Actions for the pump (spawn a new tab, open the context menu,
+            // file the copy into the session clipboard), not per-tab state.
             FromTab::OpenLinkInNewTab { .. } => false,
+            FromTab::ContextMenu { .. } => false,
+            FromTab::ClipboardText { .. } => false,
             FromTab::Frame { .. } => false,
             FromTab::Closed => {
                 if self.closed {

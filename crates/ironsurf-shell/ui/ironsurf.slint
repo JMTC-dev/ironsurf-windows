@@ -24,6 +24,12 @@ export struct ContainerInfo {
     isDefault: bool,
 }
 
+/// One context-menu row (labels only; Rust keeps the matching actions and
+/// maps the picked index back onto them).
+export struct MenuItem {
+    label: string,
+}
+
 /// A tiny borderless toolbar button (cheaper than styled Buttons in rows).
 component MiniButton inherits Rectangle {
     in property <string> label: "";
@@ -119,6 +125,14 @@ export component AppWindow inherits Window {
     // page area size, read by Rust to send ToTab::Resize
     out property <length> page-width: page.width;
     out property <length> page-height: page.height;
+    // right-click context menu (task: context menu): opened by Rust when a
+    // tab reports `FromTab::ContextMenu`; (menu-x, menu-y) is in page-area
+    // coordinates, items are labels only — Rust maps the picked index onto
+    // the real action.
+    in property <bool> menu-open: false;
+    in property <length> menu-x: 0px;
+    in property <length> menu-y: 0px;
+    in property <[MenuItem]> menu-items;
 
     // ------------------------------------------------------------------
     // intents surfaced to Rust
@@ -145,6 +159,9 @@ export component AppWindow inherits Window {
     // kind: 0 move, 1 down, 2 up, 4 out — button: 0 left, 1 right, 2 middle
     callback page-pointer(x: length, y: length, kind: int, button: int);
     callback page-wheel(x: length, y: length, delta-x: length, delta-y: length);
+    // context-menu intents (index into `menu-items`)
+    callback menu-pick(idx: int);
+    callback menu-close();
 
     // fixed palette; index also addresses `palette-color` for add/rename
     function palette-color(idx: int) -> color {
@@ -316,6 +333,54 @@ export component AppWindow inherits Window {
                     scroll-event(ev) => {
                         root.page-wheel(ta.mouse-x, ta.mouse-y, ev.delta-x, ev.delta-y);
                         return EventResult.accept;
+                    }
+                }
+
+                // ---- context menu -----------------------------------------
+                // An in-page overlay, not a PopupWindow: the LinuxKMS backend
+                // has no popups, so — exactly like the container manager —
+                // the menu is drawn on top of the page frame. Declared after
+                // `ta` ⇒ on top of it: the scrim swallows page clicks while
+                // the menu is open, and every item row (declared later than
+                // the scrim) keeps its own click.
+                Rectangle {
+                    visible: root.menu-open;
+                    x: 0; y: 0;
+                    width: parent.width; height: parent.height;
+                    menu-scrim := TouchArea {
+                        clicked => { root.menu-close(); }
+                    }
+                    Rectangle {
+                        x: Math.max(2px, Math.min(root.menu-x, parent.width - self.width - 2px));
+                        y: Math.max(2px, Math.min(root.menu-y, parent.height - self.height - 2px));
+                        width: 232px;
+                        height: menu-list.preferred-height + 10px;
+                        background: #2a2a2a;
+                        border-radius: 6px;
+                        border-width: 1px;
+                        border-color: #4a4a4a;
+                        menu-list := VerticalLayout {
+                            padding: 4px;
+                            spacing: 1px;
+                            for mi[i] in root.menu-items: Rectangle {
+                                height: 26px;
+                                mibgr := Rectangle {
+                                    background: mita.has-hover ? #3d3d3d : transparent;
+                                    border-radius: 4px;
+                                }
+                                mitxt := Text {
+                                    text: mi.label;
+                                    color: #e8e8e8;
+                                    x: 10px;
+                                    vertical-alignment: center;
+                                    max-width: parent.width - 18px;
+                                    overflow: elide;
+                                }
+                                mita := TouchArea {
+                                    clicked => { root.menu-pick(i); }
+                                }
+                            }
+                        }
                     }
                 }
             }

@@ -72,6 +72,22 @@ pub enum FromTab {
     OpenLinkInNewTab {
         url: String,
     },
+    /// Right-click on the page: the tab has hit-tested the element under the
+    /// cursor ([`ContextTarget`]); the shell opens the context menu at
+    /// (`x`, `y`) — logical px in the page viewport, the same space as
+    /// `ToTab::Resize`. Menu choices come back as `ToTab::ContextAction`
+    /// (engine-side actions) or are handled by the shell itself (open in
+    /// new tab, clipboard, navigation).
+    ContextMenu {
+        x: f32,
+        y: f32,
+        target: ContextTarget,
+    },
+    /// The page copied text (Ctrl+C / Ctrl+X / editor cut — surfaced through
+    /// blitz's `ShellProvider`): the shell stores it in the session clipboard.
+    ClipboardText {
+        text: String,
+    },
     ConsoleLog {
         level: String,
         message: String,
@@ -112,8 +128,58 @@ pub enum ToTab {
     Pointer(PointerEvent),
     Key(KeyEvent),
     Scroll(ScrollEvent),
+    /// Replace the tab-side clipboard cache the editors' Ctrl+V reads (blitz
+    /// asks its `ShellProvider`, which answers from this cache). The tab
+    /// process cannot reach the session clipboard itself; the shell pushes the
+    /// current contents just before relaying a Ctrl+V keystroke.
+    Clipboard {
+        text: String,
+    },
+    /// The user picked an entry in a context menu that the *engine* services
+    /// (paste, video play/pause); shell-side entries never reach the tab.
+    ContextAction(ContextAction),
     Destroy,
 }
+
+/// What the cursor was over when the user right-clicked. Every field is
+/// "under the cursor at right-click time"; the shell decides from these
+/// which menu entries exist (Firefox-style: link/image/video/selection
+/// entries only when the thing is there).
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct ContextTarget {
+    /// Nearest `<a href>`, resolved against the document URL.
+    pub link: Option<String>,
+    /// `<img src>` (resolved), if over an image.
+    pub image: Option<String>,
+    /// `<video src>` (resolved, may be empty if the element has no `src`),
+    /// if over a video.
+    pub video: Option<String>,
+    /// Whether that `<video>` is currently playing (`Pause video` vs `Play video`).
+    pub video_playing: bool,
+    /// Selected page text (bounded by [`MAX_CONTEXT_TEXT`]), if any.
+    pub selection: Option<String>,
+    /// Whether a text control (the one under the cursor or the focused one)
+    /// can take a paste.
+    pub editable: bool,
+}
+
+/// Context-menu entries the tab process services (engine state lives there:
+/// the editor caret, the media players).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub enum ContextAction {
+    /// Insert `text` at the focused text control's caret (the tab feeds the
+    /// clipboard cache to blitz and synthesizes Ctrl+V).
+    Paste {
+        text: String,
+    },
+    /// Play/pause the `<video>` that was under the cursor at right-click
+    /// (the tab keeps that element's player around until the next click).
+    ToggleVideo,
+}
+
+/// Cap for text carried in context-menu messages (`ContextTarget::selection`)
+/// — the selection is a convenience copy path, not an exfil channel.
+pub const MAX_CONTEXT_TEXT: usize = 256 * 1024;
 
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct PointerEvent {
@@ -387,6 +453,24 @@ mod tests {
         frame_round_trip(FromTab::ConsoleLog { level: "warn".into(), message: "m".into() });
         frame_round_trip(FromTab::Closed);
         frame_round_trip(FromTab::Error { message: "boom".into() });
+        frame_round_trip(FromTab::ContextMenu {
+            x: 120.5,
+            y: 64.25,
+            target: ContextTarget {
+                link: Some("https://example.com/a".into()),
+                image: Some("https://example.com/i.png".into()),
+                video: Some("https://example.com/v.mp4".into()),
+                video_playing: true,
+                selection: Some("selected words".into()),
+                editable: true,
+            },
+        });
+        frame_round_trip(FromTab::ContextMenu {
+            x: 0.0,
+            y: 0.0,
+            target: ContextTarget::default(),
+        });
+        frame_round_trip(FromTab::ClipboardText { text: "copied".into() });
     }
 
     #[test]
@@ -418,6 +502,9 @@ mod tests {
         }
         frame_round_trip(ToTab::Key(key_event()));
         frame_round_trip(ToTab::Scroll(scroll_event()));
+        frame_round_trip(ToTab::Clipboard { text: "clip".into() });
+        frame_round_trip(ToTab::ContextAction(ContextAction::Paste { text: "hi".into() }));
+        frame_round_trip(ToTab::ContextAction(ContextAction::ToggleVideo));
         frame_round_trip(ToTab::Destroy);
     }
 

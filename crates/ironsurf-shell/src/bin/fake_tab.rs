@@ -7,7 +7,8 @@
 use std::io::BufReader;
 
 use ironsurf_common::{
-    read_frame, write_frame, ContainerId, FromTab, TabId, ToTab,
+    read_frame, write_frame, ContextAction, ContextTarget, ContainerId, FromTab, MouseButton,
+    PointerKind, TabId, ToTab,
 };
 
 fn main() {
@@ -81,7 +82,35 @@ fn main() {
             ToTab::Back | ToTab::Forward | ToTab::Stop => {
                 emit(FromTab::HistoryChanged { can_go_back: false, can_go_forward: false });
             }
-            ToTab::Pointer(_) | ToTab::Key(_) | ToTab::Scroll(_) | ToTab::SetVisible { .. } => {}
+            // A right-click release reports a fixed scripted target so the
+            // shell's context-menu logic is testable without an engine
+            // (task: context menu).
+            ToTab::Pointer(p) => {
+                if p.button == MouseButton::Right && p.kind == PointerKind::Up {
+                    emit(FromTab::ContextMenu {
+                        x: p.x,
+                        y: p.y,
+                        target: ContextTarget {
+                            link: Some(format!("{url}/menu-link")),
+                            image: None,
+                            video: None,
+                            video_playing: false,
+                            selection: Some("fake selection".into()),
+                            editable: true,
+                        },
+                    });
+                }
+            }
+            ToTab::Key(_) | ToTab::Scroll(_) | ToTab::SetVisible { .. } => {}
+            ToTab::Clipboard { .. } => {} // cache push: nothing to edit here
+            ToTab::ContextAction(ContextAction::Paste { text }) => {
+                emit(FromTab::StatusText {
+                    text: Some(format!("pasted:{text}")),
+                });
+            }
+            ToTab::ContextAction(ContextAction::ToggleVideo) => emit(FromTab::StatusText {
+                text: Some("video-toggled".into()),
+            }),
             ToTab::SetZoom { .. } => {} // no real layout to rescale
             ToTab::Destroy => break,
         }

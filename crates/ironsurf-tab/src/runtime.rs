@@ -62,7 +62,9 @@ use std::time::{Duration, Instant};
 
 use anyrender::{render_to_buffer, PaintScene};
 use anyrender_vello_cpu::VelloCpuImageRenderer;
-use blitz_dom::{Document as _, DocumentConfig, NodeId};
+use blitz_dom::{
+    Document as _, DocumentConfig, ElementData, LocalName, NodeId,
+};
 use blitz_html::HtmlDocument;
 use blitz_paint::paint_scene;
 use blitz_traits::events::{
@@ -70,10 +72,10 @@ use blitz_traits::events::{
     MouseEventButton, MouseEventButtons, Point, PointerCoords, PointerDetails, UiEvent,
 };
 use blitz_traits::navigation::{NavigationOptions, NavigationProvider};
-use blitz_traits::shell::{ColorScheme, ShellProvider, Viewport};
+use blitz_traits::shell::{ClipboardError, ColorScheme, ShellProvider, Viewport};
 use ironsurf_common::{
-    read_frame, write_frame, ContainerId, FromTab, KeyEvent, Modifiers, PointerEvent, PointerKind,
-    ScrollEvent, TabId, ToTab,
+    read_frame, write_frame, ContextAction, ContextTarget, ContainerId, FromTab, KeyEvent,
+    Modifiers, PointerEvent, PointerKind, ScrollEvent, TabId, ToTab, MAX_CONTEXT_TEXT,
 };
 use keyboard_types::{Code, Key, Location, Modifiers as KMods};
 use kurbo::{Affine, Rect, Size};
@@ -264,6 +266,14 @@ impl SelfPipe {
 struct ShellHook {
     pipe: Arc<SelfPipe>,
     title: Mutex<Option<String>>,
+    /// Session clipboard *into* the editors (blitz asks `get_clipboard_text`
+    /// on Ctrl+V; the shell pushes contents with `ToTab::Clipboard` right
+    /// before relaying the keystroke — the sandboxed tab cannot reach the
+    /// clipboard itself).
+    clipboard: Mutex<String>,
+    /// Session clipboard *out of* the editors (Ctrl+C / Ctrl+X / editor cut):
+    /// queued here, drained into `FromTab::ClipboardText` by the poll loop.
+    copied: Mutex<Option<String>>,
 }
 
 impl ShellProvider for ShellHook {
@@ -274,6 +284,19 @@ impl ShellProvider for ShellHook {
         debug!("document title flushed by blitz: {title:?}");
         *self.title.lock().expect("title mutex") = Some(title);
         self.pipe.wake();
+    }
+    fn get_clipboard_text(&self) -> Result<String, ClipboardError> {
+        Ok(self.clipboard.lock().expect("clipboard mutex").clone())
+    }
+    fn set_clipboard_text(&self, text: String) -> Result<(), ClipboardError> {
+        let text = match text.char_indices().nth(MAX_CONTEXT_TEXT) {
+            Some((at, _)) => text[..at].to_owned(),
+            None => text,
+        };
+        debug!("clipboard: page copied {} char(s)", text.chars().count());
+        *self.copied.lock().expect("clipboard mutex") = Some(text);
+        self.pipe.wake();
+        Ok(())
     }
 }
 
@@ -522,6 +545,10 @@ pub struct Tab {
     /// A submit-control press armed on mouse-down and finalised on release
     /// (a JS `click` handler may cancel it; task: `<form>`).
     form_press: Option<FormPress>,
+    /// The `<video>` under the cursor at the last right-click (task: context
+    /// menu); `ContextAction::ToggleVideo` plays/pauses exactly that element.
+    /// Cleared with the document it points into.
+    context_video: Option<NodeId>,
     /// Last hover-reported link target (`StatusText`), for change-detection so
     /// a moving mouse only emits when the target actually changes.
     hover_status: Option<String>,
@@ -615,6 +642,8 @@ impl Tab {
             shell: Arc::new(ShellHook {
                 pipe: Arc::clone(&pipe),
                 title: Mutex::new(None),
+                clipboard: Mutex::new(String::new()),
+                copied: Mutex::new(None),
             }),
             nav: Arc::new(NavHook {
                 pipe: Arc::clone(&pipe),
@@ -635,6 +664,7 @@ impl Tab {
             hover_status: None,
             pending_form: None,
             form_press: None,
+            context_video: None,
             media: Vec::new(),
             media_inflight: HashSet::new(),
             media_results: Arc::new(Mutex::new(Vec::new())),
@@ -877,6 +907,8 @@ impl Tab {
         // The new document has nothing under the cursor yet; the next hover
         // transition must be allowed to report again.
         self.hover_status = None;
+        // …and no right-click into it survives either (task: context menu).
+        self.context_video = None;
         // The previous document's players die with it (their widgets die with
         // its node tree; their decode threads end when the players drop).
         self.reset_media();
@@ -1472,6 +1504,13 @@ impl Tab {
             ev @ (ToTab::Pointer(_) | ToTab::Key(_) | ToTab::Scroll(_)) => {
                 self.handle_input(&ev);
             }
+            ToTab::Clipboard { text } => {
+                // The shell pushes the session clipboard just before it
+                // relays Ctrl+V; blitz's editors read it back through
+                // `ShellProvider::get_clipboard_text`.
+                *self.shell.clipboard.lock().expect("clipboard mutex") = text;
+            }
+            ToTab::ContextAction(action) => self.handle_context_action(action),
             ToTab::Destroy => {
                 self.persist();
                 return Some(0);
@@ -1546,6 +1585,140 @@ impl Tab {
             node_id = node.parent?;
         }
         None
+    }
+
+    /// Hit-test a right-click at (`x`, `y`) — logical px, divided by zoom
+    /// into blitz's CSS-px viewport space — and gather everything the shell
+    /// needs to build the context menu (task: context menu). Ancestors are
+    /// walked to the nearest interesting element, the same way
+    /// [`Self::hover_link`] finds `<a href>`. Returns the context alongside
+    /// the `<video>` node (if any) so `ContextAction::ToggleVideo` can find
+    /// the very same player.
+    fn context_target(&self, x: f32, y: f32) -> (ContextTarget, Option<NodeId>) {
+        let mut target = ContextTarget::default();
+        let Some(doc) = self.doc.as_ref() else {
+            return (target, None);
+        };
+        let z = self.zoom();
+        let mut video_node = None;
+        if let Some(start) = doc.element_from_point(x / z, y / z) {
+            let mut node_id = start;
+            while let Some(node) = doc.get_node(node_id) {
+                if let Some(el) = node.element_data() {
+                    let name = el.name.local.clone();
+                    if name == blitz_dom::local_name!("a") && target.link.is_none() {
+                        target.link = resolved_attr(doc, el, blitz_dom::local_name!("href"));
+                    }
+                    if name == blitz_dom::local_name!("img") && target.image.is_none() {
+                        target.image = resolved_attr(doc, el, blitz_dom::local_name!("src"));
+                    }
+                    if name == blitz_dom::local_name!("video") && video_node.is_none() {
+                        video_node = Some(node_id);
+                        // A `src`-less `<video>` is still a video (its player
+                        // exists); report the empty URL rather than nothing.
+                        target.video =
+                            Some(resolved_attr(doc, el, blitz_dom::local_name!("src")).unwrap_or_default());
+                    }
+                    if !target.editable && is_editable_element(el) {
+                        target.editable = true;
+                    }
+                }
+                node_id = match node.parent {
+                    Some(p) => p,
+                    None => break,
+                };
+            }
+        }
+        if let Some(video) = video_node {
+            target.video_playing = self
+                .media
+                .iter()
+                .find(|entry| entry.node_id == video)
+                .map(|entry| entry.player.borrow().is_playing())
+                .unwrap_or(false);
+        }
+        // Page text selection (the menu's Copy entry); whitespace-only and
+        // over-cap selections are no selection at all.
+        target.selection = doc
+            .get_selected_text()
+            .filter(|text| !text.trim().is_empty())
+            .map(|mut text| {
+                if text.len() > MAX_CONTEXT_TEXT {
+                    let mut cut = MAX_CONTEXT_TEXT;
+                    while !text.is_char_boundary(cut) {
+                        cut -= 1;
+                    }
+                    text.truncate(cut);
+                }
+                text
+            });
+        // A paste also makes sense with the cursor over anything at all, as
+        // long as a text control currently holds focus.
+        if !target.editable {
+            target.editable = doc
+                .get_focussed_node_id()
+                .and_then(|id| doc.get_node(id))
+                .and_then(|node| node.element_data())
+                .is_some_and(is_editable_element);
+        }
+        (target, video_node)
+    }
+
+    /// A context-menu choice the *engine* services (task: context menu).
+    fn handle_context_action(&mut self, action: ContextAction) {
+        match action {
+            ContextAction::Paste { text } => {
+                // Load the cache the editors read, then hand blitz a Ctrl+V:
+                // its focused-input path inserts the clipboard verbatim
+                // (blitz-dom node/text.rs), caret/selection semantics and all.
+                *self.shell.clipboard.lock().expect("clipboard mutex") = text;
+                let pressed = BlitzKeyEvent {
+                    key: Key::Character("v".to_string()),
+                    code: Code::KeyV,
+                    modifiers: KMods::CONTROL,
+                    location: Location::Standard,
+                    is_auto_repeating: false,
+                    is_composing: false,
+                    state: KeyState::Pressed,
+                    text: None,
+                };
+                self.feed_ui_event(UiEvent::KeyDown(pressed.clone()));
+                self.feed_ui_event(UiEvent::KeyUp(BlitzKeyEvent {
+                    state: KeyState::Released,
+                    ..pressed
+                }));
+                debug!("context menu: pasted into the focused control");
+                self.needs_paint = true;
+                self.resolve_and_maybe_paint();
+            }
+            ContextAction::ToggleVideo => {
+                let Some(video) = self.context_video else {
+                    debug!("context menu: no video under the last right-click");
+                    return;
+                };
+                if let Some(entry) = self.media.iter().find(|e| e.node_id == video) {
+                    let mut player = entry.player.borrow_mut();
+                    if player.is_playing() {
+                        player.pause();
+                        debug!("context menu: video paused");
+                    } else {
+                        player.play();
+                        debug!("context menu: video playing");
+                    }
+                    self.needs_paint = true;
+                }
+            }
+        }
+    }
+
+    /// Surface whatever the page copied (Ctrl+C / Ctrl+X / editor cut) through
+    /// the `ShellProvider` hook as `FromTab::ClipboardText` — the shell owns
+    /// the session clipboard (task: context menu).
+    fn drain_copied(&mut self) {
+        let copied = self.shell.copied.lock().expect("clipboard mutex").take();
+        if let Some(text) = copied {
+            self.emit(FromTab::ClipboardText { text });
+        }
     }
 
     /// Emit `FromTab::StatusText` when the hovered link target changes (and
@@ -1653,6 +1826,19 @@ impl Tab {
                 self.emit(FromTab::OpenLinkInNewTab { url });
                 return true;
             }
+        }
+
+        // Right-click release → report what the cursor is over (link / image /
+        // video / selection / editable) so the shell can open its context
+        // menu; the event itself keeps flowing to blitz like any other, the
+        // menu is a pure side channel. Menu choices come back as
+        // `ToTab::ContextAction` or are serviced by the shell alone.
+        if matches!(ev.kind, PointerKind::Up) && ev.button == MouseButton::Right {
+            let (x, y) = (ev.x, ev.y);
+            let (target, video) = self.context_target(x, y);
+            self.context_video = video;
+            debug!("context menu at ({x:.0},{y:.0}): {target:?}");
+            self.emit(FromTab::ContextMenu { x, y, target });
         }
 
         // blitz synthesises enter/over/out/leave *DOM events* from
@@ -2661,6 +2847,42 @@ fn fetch_media_bytes(
 /// Translate the ironsurf modifier bits (`ironsurf_common::Modifiers`, its own
 /// `u8` layout) into `keyboard_types::Modifiers` — the two bit layouts differ,
 /// so this must never be a cast (`docs/BLITZ_API_NOTES.md` §4).
+/// The element's `href`/`src` attribute resolved against the document URL
+/// (context-menu targets, task: context menu) — the same fallback
+/// [`Tab::hover_link`] uses: an attribute that will not resolve is reported
+/// trimmed and verbatim, empty attributes report no target at all.
+fn resolved_attr(doc: &HtmlDocument, el: &ElementData, name: LocalName) -> Option<String> {
+    let raw = el.attr(name).map(str::trim).filter(|v| !v.is_empty())?;
+    Some(
+        doc.url()
+            .join(raw)
+            .map(|u| u.to_string())
+            .unwrap_or_else(|_| raw.to_owned()),
+    )
+}
+
+/// Can this element take a caret (and therefore a paste)? Exactly the
+/// textish `<input>`s plus `<textarea>` — this engine has no
+/// `contenteditable` (blitz beta.2), and button/checkbox/radio-style inputs
+/// have no editor to paste into.
+fn is_editable_element(el: &ElementData) -> bool {
+    if el.name.local == blitz_dom::local_name!("textarea") {
+        return true;
+    }
+    if el.name.local != blitz_dom::local_name!("input") {
+        return false;
+    }
+    !matches!(
+        el.attr(blitz_dom::local_name!("type"))
+            .map(|t| t.trim().to_ascii_lowercase())
+            .as_deref(),
+        Some(
+            "button" | "checkbox" | "color" | "file" | "hidden" | "image" | "radio" | "range"
+            | "reset" | "submit"
+        )
+    )
+}
+
 fn to_blitz_mods(m: Modifiers) -> KMods {
     let mut k = KMods::empty();
     if m.ctrl() {
@@ -3074,6 +3296,10 @@ pub fn run(args: TabArgs) -> i32 {
         if tab.drain_nav_hook() {
             continue;
         }
+
+        // 2a. Page copies (Ctrl+C/X, editor cut) surface to the shell here
+        // (the shell owns the session clipboard; task: context menu).
+        tab.drain_copied();
 
         // 2b. JS timers: execute every callback due since the last poll
         // (setTimeout/setInterval/rAF), settle, and repaint coalesced exactly
@@ -3489,6 +3715,156 @@ mod tests {
             .and_then(|doc| text_of(doc, "#out"))
             .unwrap_or_default();
         assert_eq!(out_text, "clicked:hi", "<button> click handler must run with the live value");
+    }
+
+    // ------------------------------------------------------------------
+    // Context menu (task: right-click menu)
+    // ------------------------------------------------------------------
+
+    const CONTEXT_PAGE: &str = r#"<!doctype html>
+<html><head><title>C</title></head>
+<body style="margin:0">
+  <a href="next.html"><img src="pic.png" style="display:block;width:200px;height:100px"></a>
+  <video src="v.mp4" width="320" height="160" style="display:block"></video>
+  <input id="i" style="display:block;width:200px;height:40px">
+</body></html>"#;
+
+    fn context_tab(dir: &std::path::Path) -> (Tab, url::Url) {
+        let page = dir.join("c.html");
+        std::fs::write(&page, CONTEXT_PAGE).expect("write page");
+        let mut tab = form_tab(dir);
+        tab.handle_to_tab(ToTab::Resize {
+            width: 800,
+            height: 600,
+            scale: 1.0,
+        });
+        let base = url::Url::from_file_path(&page).expect("file url");
+        tab.navigate(base.as_str(), NavHistory::Fresh);
+        (tab, base)
+    }
+
+    #[test]
+    fn a_right_click_reports_the_link_image_and_video_under_the_cursor() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (tab, base) = context_tab(dir.path());
+
+        // Over the image — which sits inside the link: both are targets.
+        let (target, video) = tab.context_target(100.0, 50.0);
+        assert!(video.is_none(), "no video up there");
+        assert_eq!(
+            target.image.as_deref(),
+            Some(base.join("pic.png").expect("join").as_str())
+        );
+        assert_eq!(
+            target.link.as_deref(),
+            Some(base.join("next.html").expect("join").as_str()),
+            "the ancestor <a href> is part of the context too"
+        );
+        assert!(!target.editable);
+
+        // Over the video: its (resolved) src, no player running yet, and
+        // the node identity a ToggleVideo action later looks the player up by.
+        let (target, video) = tab.context_target(100.0, 180.0);
+        assert!(video.is_some(), "the video node is reported alongside");
+        assert_eq!(
+            target.video.as_deref(),
+            Some(base.join("v.mp4").expect("join").as_str())
+        );
+        assert!(!target.video_playing, "nothing plays before the menu is used");
+
+        // Over the input: an editable target, nothing else.
+        let (target, _) = tab.context_target(100.0, 280.0);
+        assert!(target.editable, "<input> can take a paste");
+        assert!(target.link.is_none() && target.image.is_none() && target.video.is_none());
+
+        // Over the blank page: the empty menu, and no stale target.
+        let (target, _) = tab.context_target(600.0, 500.0);
+        assert!(
+            target == ContextTarget::default(),
+            "plain page must not invent targets: {target:?}"
+        );
+    }
+
+    #[test]
+    fn the_context_paste_lands_in_the_focused_input() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (mut tab, _base) = context_tab(dir.path());
+
+        // Focus the input the way a user does: a left click in its box.
+        tab.handle_to_tab(ptr(100.0, 280.0, PointerKind::Move));
+        tab.handle_to_tab(ptr(100.0, 280.0, PointerKind::Down));
+        tab.handle_to_tab(ptr(100.0, 280.0, PointerKind::Up));
+        assert!(
+            tab.document_mut()
+                .and_then(focused_tag)
+                .is_some_and(|t| t == blitz_dom::local_name!("input")),
+            "the input is focused before the paste"
+        );
+
+        // The menu's Paste row: the shell hands the clipboard text over and
+        // the tab drives it through blitz's own Ctrl+V path.
+        tab.handle_context_action(ContextAction::Paste {
+            text: "pasted words".into(),
+        });
+        assert_eq!(
+            tab.document_mut().and_then(focused_input_value).as_deref(),
+            Some("pasted words"),
+            "the paste went into the focused editor"
+        );
+
+        // The clipboard cache is what blitz's Ctrl+V reads: a later real
+        // Ctrl+V keystroke must insert the same text again.
+        tab.handle_to_tab(ToTab::Clipboard { text: "via chord".into() });
+        tab.handle_to_tab(ToTab::Key(KeyEvent {
+            key: "v".into(),
+            code: "KeyV".into(),
+            text: Some("v".into()),
+            repeat: false,
+            mods: Modifiers::NONE.with_ctrl(),
+        }));
+        assert_eq!(
+            tab.document_mut().and_then(focused_input_value).as_deref(),
+            Some("pasted wordsvia chord"),
+            "menu paste then Ctrl+V, one editor"
+        );
+    }
+
+    #[test]
+    fn shell_copies_surface_as_clipboard_text_and_toggle_video_is_safe_alone() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (mut tab, _base) = context_tab(dir.path());
+
+        // The ShellProvider copy slot drains empty-safe…
+        tab.drain_copied();
+        assert!(tab.shell.copied.lock().expect("copied").is_none());
+        // …and drains the page copy blitz queued (what a real Ctrl+C does).
+        let copied = ShellProvider::set_clipboard_text(&*tab.shell, "from the page".into());
+        assert!(copied.is_ok(), "the copy hook must accept the page's copy");
+        assert_eq!(
+            tab.shell.copied.lock().expect("copied").as_deref(),
+            Some("from the page")
+        );
+        tab.drain_copied(); // emits FromTab::ClipboardText (headless: /dev/null)
+        assert!(tab.shell.copied.lock().expect("copied").is_none(), "drained exactly once");
+
+        // ToggleVideo with no right-clicked video is a no-op, and with an
+        // unloaded (Idle) player `play()` cannot start anything — neither
+        // may panic.
+        tab.handle_context_action(ContextAction::ToggleVideo);
+        tab.context_video = tab
+            .doc
+            .as_ref()
+            .and_then(|doc| {
+                doc.tree().iter().find_map(|(id, node)| {
+                    let el = node.element_data()?;
+                    (el.name.local == blitz_dom::local_name!("video")).then_some(id)
+                })
+            });
+        tab.handle_context_action(ContextAction::ToggleVideo);
+        assert!(
+            tab.media.iter().all(|e| !e.player.borrow().is_playing()),
+            "an Idle player (unfetched src) must not pretend to play"
+        );
     }
 
     // ------------------------------------------------------------------

@@ -1,4 +1,10 @@
 # Task log
+## #28 Right-click context menu + session clipboard: tab hit-tests the cursor (link/image/video+playing/selection
+/caret → FromTab::ContextMenu{x,y,ContextTarget}); shell renders a Slint overlay menu whose rows are the pure
+context_menu_items matrix (Back/Forward/Reload, open link/image in new tab, Copy selection/link/image/video/page
+address, Play/Pause video, Paste only editable+non-empty clipboard). Sandbox-safe clipboard: ShellProvider
+copy→FromTab::ClipboardText→shell store, Ctrl+V preceded by ToTab::Clipboard push; Paste/ToggleVideo ride
+ToTab::ContextAction. common round-trips + shell unit matrix + context_menu e2e green; workspace suites green.
 ## #27 Crashed tabs are loud: dead child (try_wait poll in every drain tick) or broken-pipe send now pins
 "Tab N has crashed" on the status line (tab kept in strip, last frame; further commands dropped, ✕ closes),
 tab stderr is captured (bounded 16K tail, was /dev/null) + RUST_BACKTRACE=full for children + tab panic hook

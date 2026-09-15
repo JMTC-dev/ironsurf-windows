@@ -12,7 +12,9 @@ use std::time::{Duration, Instant};
 use std::sync::mpsc::{channel, Receiver, Sender};
 
 use ironsurf_common::{debug, error, info, trace, warn};
-use ironsurf_common::{default_url, ContainerId, FromTab, TabId, ToTab};
+use ironsurf_common::{
+    default_url, ContextAction, ContextTarget, ContainerId, FromTab, TabId, ToTab,
+};
 use ironsurf_storage::default_data_root;
 use slint::{
     Color, ComponentHandle, Image, ModelRc, Rgba8Pixel, SharedPixelBuffer, SharedString, Timer,
@@ -24,7 +26,7 @@ use crate::keymap::{self, Shortcut};
 use crate::state::TabState;
 use crate::tabs::{PumpedMessage, TabProc};
 use crate::uisettings::UiSettings;
-use crate::{AppWindow, ContainerInfo, TabInfo};
+use crate::{AppWindow, ContainerInfo, MenuItem, TabInfo};
 
 /// Fixed palette — **keep in sync** with `palette-color()` in ui/ironsurf.slint.
 pub const PALETTE: [&str; 7] = [
@@ -84,6 +86,14 @@ pub struct Core {
     /// for at most one tick).
     last_move_at: Cell<Option<Instant>>,
     pending_move: Cell<Option<(f32, f32)>>,
+    /// The session clipboard (task: context menu). Tabs cannot reach a
+    /// system clipboard from inside the sandbox, so every copy — menu
+    /// entries, page Ctrl+C/X — funnels here, and every paste source (menu
+    /// Paste, Ctrl+V) is pushed back out through `ToTab::Clipboard`.
+    clipboard: RefCell<String>,
+    /// The actions behind the currently-open context menu, index-aligned
+    /// with the Slint `menu-items` model.
+    menu_items: RefCell<Vec<MenuAction>>,
 }
 
 /// The assembled application: core + the timers that drive it (owned so
@@ -122,6 +132,8 @@ impl App {
             last_page: Cell::new((0.0, 0.0)),
             last_move_at: Cell::new(None),
             pending_move: Cell::new(None),
+            clipboard: RefCell::new(String::new()),
+            menu_items: RefCell::new(Vec::new()),
         });
 
         core.attach_callbacks(ui);
@@ -431,6 +443,8 @@ impl Core {
                 return;
             }
             Some(Shortcut::PageFocus) => {
+                // Escape also dismisses an open context menu.
+                self.close_context_menu();
                 if let Some(ui) = self.ui() {
                     let t = ui.get_focus_page_token() + 1;
                     ui.set_focus_page_token(t);
@@ -438,6 +452,15 @@ impl Core {
                 return;
             }
             None => {}
+        }
+        // Ctrl+V: the sandboxed tab cannot read the session clipboard, so
+        // push it in before the keystroke is relayed (blitz's editors pull
+        // the paste from `ShellProvider::get_clipboard_text`, which answers
+        // from this cache).
+        if is_paste_chord(text, ctrl, alt, meta) {
+            let clip = self.clipboard.borrow().clone();
+            debug!("clipboard: pushed {} char(s) ahead of Ctrl+V", clip.chars().count());
+            self.send_active(ToTab::Clipboard { text: clip });
         }
         let ev = keymap::to_ipc_key(text, ctrl, shift, alt, meta, repeat);
         self.send_active(ToTab::Key(ev));
@@ -527,6 +550,95 @@ impl Core {
 
     fn page_wheel(&self, x: f32, y: f32, delta_x: f32, delta_y: f32) {
         self.send_active(ToTab::Scroll(ironsurf_common::ScrollEvent { x, y, delta_x, delta_y }));
+    }
+
+    // ---- context menu --------------------------------------------------------
+
+    /// A tab reported a right-click: build the menu for what the cursor
+    /// found (plus the tab's history state and the session clipboard) and
+    /// open it at the click point, in page-area coordinates.
+    fn open_context_menu(&self, x: f32, y: f32, target: &ContextTarget) {
+        let Some(ui) = self.ui() else { return };
+        let (url, can_back, can_forward) = match self.active_proc_index() {
+            Some(i) => {
+                let procs = self.procs.borrow();
+                let p = &procs[i];
+                (p.state.url.clone(), p.state.can_back, p.state.can_forward)
+            }
+            None => (None, false, false),
+        };
+        let clipboard_empty = self.clipboard.borrow().is_empty();
+        let items = context_menu_items(target, url.as_deref(), can_back, can_forward, clipboard_empty);
+        debug!("context menu: {} entries", items.len());
+        self.menu_items
+            .replace(items.iter().map(|(_, a)| a.clone()).collect());
+        ui.set_menu_items(ModelRc::from(Rc::new(VecModel::from(
+            items
+                .into_iter()
+                .map(|(label, _)| MenuItem { label: label.into() })
+                .collect::<Vec<_>>(),
+        ))));
+        ui.set_menu_x(x);
+        ui.set_menu_y(y);
+        ui.set_menu_open(true);
+    }
+
+    fn close_context_menu(&self) {
+        if let Some(ui) = self.ui() {
+            ui.set_menu_open(false);
+        }
+    }
+
+    /// A context-menu row was picked (or the menu was closed): run the
+    /// stored action. Shell-side entries never reach the tab; engine-side
+    /// ones go over as `ToTab::ContextAction`.
+    fn menu_pick(&self, idx: usize) {
+        let action = self.menu_items.borrow().get(idx).cloned();
+        self.close_context_menu();
+        let Some(action) = action else {
+            debug!("context menu pick {idx} has no action (stale menu?)");
+            return;
+        };
+        debug!("context menu: {action:?}");
+        match action {
+            MenuAction::Back => self.send_active(ToTab::Back),
+            MenuAction::Forward => self.send_active(ToTab::Forward),
+            MenuAction::Reload => self.send_active(ToTab::Reload),
+            MenuAction::OpenNewTab(url) => {
+                // Same container as the requesting tab, per the middle-click
+                // rule the tab already follows for links.
+                let container = self
+                    .active_proc_index()
+                    .map(|i| self.procs.borrow()[i].tab.container);
+                if let Some(container) = container {
+                    self.open_tab(container, Some(&url));
+                }
+            }
+            MenuAction::CopyText(text) => self.clipboard_set(&text),
+            MenuAction::Paste => {
+                let text = self.clipboard.borrow().clone();
+                if !text.is_empty() {
+                    // One stdin batch, two messages: the tab loads the
+                    // clipboard into its engine, then synthesizes the Ctrl+V
+                    // that consumes it.
+                    self.send_active(ToTab::Clipboard { text: text.clone() });
+                    self.send_active(ToTab::ContextAction(ContextAction::Paste { text }));
+                }
+            }
+            MenuAction::ToggleVideo => {
+                self.send_active(ToTab::ContextAction(ContextAction::ToggleVideo))
+            }
+        }
+    }
+
+    /// Put text on the session clipboard. An empty copy is dropped — the
+    /// clipboard keeps whatever it held, as every browser does.
+    fn clipboard_set(&self, text: &str) {
+        if text.is_empty() {
+            return;
+        }
+        info!("clipboard: copied {} char(s)", text.chars().count());
+        *self.clipboard.borrow_mut() = text.to_owned();
     }
 
     // ---- container manager -----------------------------------------------------
@@ -736,6 +848,14 @@ impl Core {
                 FromTab::OpenLinkInNewTab { url } => {
                     info!("tab {tid} middle-click: opening {url} in a new tab")
                 }
+                FromTab::ContextMenu { x, y, target } => {
+                    info!("tab {tid} right-click at ({x:.0},{y:.0}): {target:?}")
+                }
+                FromTab::ClipboardText { text } => {
+                    // Page copy (Ctrl+C/X, editor cut): the shell owns the
+                    // session clipboard (task: context menu).
+                    self.clipboard_set(text);
+                }
                 other => debug!("tab {tid} → {other:?}"),
             }
             if let FromTab::Frame { width, height, ref rgba, .. } = msg {
@@ -788,6 +908,11 @@ impl Core {
                 if let Some(container) = container {
                     self.open_tab(container, Some(url));
                 }
+            }
+            // Right-click → the context menu opens over the page at the
+            // click point (task: context menu).
+            if let FromTab::ContextMenu { x, y, target } = &msg {
+                self.open_context_menu(*x, *y, target);
             }
         }
 
@@ -1036,7 +1161,118 @@ impl Core {
             let c = self.clone();
             ui.on_page_wheel(move |x, y, dx, dy| c.page_wheel(x, y, dx, dy));
         }
+        {
+            let c = self.clone();
+            ui.on_menu_pick(move |idx| {
+                if idx >= 0 {
+                    c.menu_pick(idx as usize);
+                }
+            });
+        }
+        bind0!(on_menu_close, |c: &Rc<Core>| c.close_context_menu());
     }
+}
+
+// ---------------------------------------------------------------------------
+// context menu (task: context menu)
+
+/// What a context-menu row does when picked. Clipboard, new-tab and history
+/// entries are serviced by the shell alone; the engine-side ones (paste,
+/// video play/pause) travel to the tab as `ToTab::ContextAction`.
+#[derive(Clone, Debug, PartialEq)]
+pub enum MenuAction {
+    Back,
+    Forward,
+    Reload,
+    /// Same container as the requesting tab (the middle-click rule).
+    OpenNewTab(String),
+    CopyText(String),
+    Paste,
+    ToggleVideo,
+}
+
+/// The menu for one right-click, in display order. Entries exist exactly
+/// when their thing is there: link rows only over a link, video rows only
+/// over a video, Paste only next to a caret *and* a non-empty clipboard.
+/// Pure (labels + actions), so the entry matrix is unit-testable headless.
+pub fn context_menu_items(
+    target: &ContextTarget,
+    url: Option<&str>,
+    can_back: bool,
+    can_forward: bool,
+    clipboard_empty: bool,
+) -> Vec<(String, MenuAction)> {
+    let mut items: Vec<(String, MenuAction)> = Vec::new();
+    if can_back {
+        items.push(("← Back".into(), MenuAction::Back));
+    }
+    if can_forward {
+        items.push(("→ Forward".into(), MenuAction::Forward));
+    }
+    items.push(("⟳ Reload".into(), MenuAction::Reload));
+    if let Some(link) = &target.link {
+        items.push((
+            "Open link in new tab".into(),
+            MenuAction::OpenNewTab(link.clone()),
+        ));
+    }
+    if let Some(image) = &target.image {
+        items.push((
+            "Open image in new tab".into(),
+            MenuAction::OpenNewTab(image.clone()),
+        ));
+    }
+    if let Some(selection) = &target.selection {
+        items.push(("Copy".into(), MenuAction::CopyText(selection.clone())));
+    }
+    if let Some(link) = &target.link {
+        items.push((
+            "Copy link address".into(),
+            MenuAction::CopyText(link.clone()),
+        ));
+    }
+    if let Some(image) = &target.image {
+        items.push((
+            "Copy image address".into(),
+            MenuAction::CopyText(image.clone()),
+        ));
+    }
+    if target.video.is_some() {
+        items.push((
+            if target.video_playing {
+                "❚❚ Pause video"
+            } else {
+                "▶ Play video"
+            }
+            .into(),
+            MenuAction::ToggleVideo,
+        ));
+        // A `src`-less `<video>` has no address to copy.
+        if target.video.as_deref().is_some_and(|v| !v.is_empty()) {
+            items.push((
+                "Copy video address".into(),
+                MenuAction::CopyText(target.video.clone().unwrap_or_default()),
+            ));
+        }
+    }
+    if target.editable && !clipboard_empty {
+        items.push(("Paste".into(), MenuAction::Paste));
+    }
+    if let Some(page) = url {
+        if !page.is_empty() {
+            items.push((
+                "Copy page address".into(),
+                MenuAction::CopyText(page.to_owned()),
+            ));
+        }
+    }
+    items
+}
+
+/// A Ctrl+V key press (Slint delivers control characters for chords, so
+/// both spellings count).
+pub fn is_paste_chord(text: &str, ctrl: bool, alt: bool, meta: bool) -> bool {
+    (ctrl || meta) && !alt && matches!(text, "v" | "V" | "\u{16}")
 }
 
 // ---------------------------------------------------------------------------
@@ -1120,5 +1356,157 @@ mod tests {
         let t0 = Instant::now();
         assert!(move_due(t0, None), "gate opens for the first move");
         assert!(!move_due(t0, Some(t0)), "gate closes again inside a frame");
+    }
+
+    // ---- context menu (task: right-click menu) ------------------------------
+
+    fn target(
+        link: Option<&str>,
+        image: Option<&str>,
+        video: Option<&str>,
+        selection: Option<&str>,
+        editable: bool,
+    ) -> ContextTarget {
+        ContextTarget {
+            link: link.map(String::from),
+            image: image.map(String::from),
+            video: video.map(String::from),
+            video_playing: false,
+            selection: selection.map(String::from),
+            editable,
+        }
+    }
+
+    #[test]
+    fn the_plain_page_menu_is_history_reload_and_address() {
+        let items = context_menu_items(&target(None, None, None, None, false), Some("https://example.com/"), true, false, true);
+        let labels: Vec<&str> = items.iter().map(|(l, _)| l.as_str()).collect();
+        assert_eq!(labels, ["← Back", "⟳ Reload", "Copy page address"]);
+        assert_eq!(items[2].1, MenuAction::CopyText("https://example.com/".into()));
+    }
+
+    #[test]
+    fn a_link_earns_its_own_row_and_its_address_row() {
+        let items = context_menu_items(
+            &target(Some("https://example.com/a"), None, None, None, false),
+            Some("https://example.com/"),
+            false,
+            false,
+            true,
+        );
+        let labels: Vec<&str> = items.iter().map(|(l, _)| l.as_str()).collect();
+        assert_eq!(
+            labels,
+            ["⟳ Reload", "Open link in new tab", "Copy link address", "Copy page address"]
+        );
+        assert_eq!(
+            items[1].1,
+            MenuAction::OpenNewTab("https://example.com/a".into())
+        );
+    }
+
+    #[test]
+    fn selection_image_and_video_entries_only_appear_over_their_own_thing() {
+        let items = context_menu_items(
+            &target(
+                None,
+                Some("https://example.com/i.png"),
+                Some("https://example.com/v.mp4"),
+                Some("selected words"),
+                true,
+            ),
+            Some("https://example.com/"),
+            false,
+            true,
+            false,
+        );
+        let labels: Vec<&str> = items.iter().map(|(l, _)| l.as_str()).collect();
+        assert_eq!(
+            labels,
+            [
+                "→ Forward",
+                "⟳ Reload",
+                "Open image in new tab",
+                "Copy",
+                "Copy image address",
+                "▶ Play video",
+                "Copy video address",
+                "Paste",
+                "Copy page address",
+            ]
+        );
+        assert_eq!(items[3].1, MenuAction::CopyText("selected words".into()));
+        assert_eq!(items[7].1, MenuAction::Paste);
+
+        // …and a plain right-click has none of them.
+        let bare = context_menu_items(
+            &target(None, None, None, None, false),
+            None,
+            false,
+            false,
+            true,
+        );
+        assert_eq!(bare.len(), 1, "just Reload when there is nothing else");
+    }
+
+    #[test]
+    fn a_playing_video_offers_pause_and_a_src_less_one_no_address() {
+        let mut t = target(None, None, Some("https://example.com/v.mp4"), None, false);
+        t.video_playing = true;
+        let items = context_menu_items(&t, None, false, false, true);
+        assert!(items.iter().any(|(l, _)| l == "❚❚ Pause video"));
+
+        t.video = Some(String::new());
+        t.video_playing = false;
+        let items = context_menu_items(&t, None, false, false, true);
+        assert!(items.iter().any(|(l, _)| l == "▶ Play video"));
+        assert!(
+            !items.iter().any(|(l, _)| l == "Copy video address"),
+            "a src-less <video> has no address to copy"
+        );
+    }
+
+    #[test]
+    fn paste_waits_for_a_caret_and_a_non_empty_clipboard() {
+        let editable_empty_clip = context_menu_items(
+            &target(None, None, None, None, true),
+            None,
+            false,
+            false,
+            true,
+        );
+        assert!(
+            !editable_empty_clip.iter().any(|(l, _)| l == "Paste"),
+            "nothing copied yet — nothing to paste"
+        );
+        let editable_full_clip = context_menu_items(
+            &target(None, None, None, None, true),
+            None,
+            false,
+            false,
+            false,
+        );
+        assert!(editable_full_clip.iter().any(|(l, _)| l == "Paste"));
+        let clip_without_caret = context_menu_items(
+            &target(None, None, None, None, false),
+            None,
+            false,
+            false,
+            false,
+        );
+        assert!(
+            !clip_without_caret.iter().any(|(l, _)| l == "Paste"),
+            "no caret — the menu must not promise a paste"
+        );
+    }
+
+    #[test]
+    fn the_paste_chord_is_detected_whichever_way_the_backend_spells_it() {
+        assert!(is_paste_chord("v", true, false, false));
+        assert!(is_paste_chord("V", true, false, false));
+        assert!(is_paste_chord("\u{16}", true, false, false));
+        assert!(!is_paste_chord("v", false, false, false), "a bare v types");
+        assert!(!is_paste_chord("v", true, true, false), "Alt+V is not paste");
+        assert!(!is_paste_chord("x", true, false, false));
     }
 }
