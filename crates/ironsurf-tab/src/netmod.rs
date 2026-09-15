@@ -1191,6 +1191,11 @@ pub struct BlitzNetProvider {
     /// when a fetch settles, so nothing extra is needed to make the drain
     /// timely.
     net_events: Arc<Mutex<Vec<NetEvent>>>,
+    /// DevTools **console** entries raised by the fetch threads — today the
+    /// wrong-`Content-Type` seam for `.css` responses (see
+    /// [`crate::logging::css_content_type_warning`]); drained by the tab loop
+    /// exactly like `net_events` (same wake, same tick).
+    console_events: crate::logging::ConsoleQueue,
 }
 
 impl BlitzNetProvider {
@@ -1204,6 +1209,7 @@ impl BlitzNetProvider {
             cache: Arc::new(Mutex::new(cache)),
             waker: Arc::new(Mutex::new(None)),
             net_events: Arc::new(Mutex::new(Vec::new())),
+            console_events: crate::logging::console_queue(),
         }
     }
 
@@ -1211,6 +1217,12 @@ impl BlitzNetProvider {
     /// every poll tick and emits one `FromTab::NetworkEvent` per entry.
     pub fn net_events(&self) -> Arc<Mutex<Vec<NetEvent>>> {
         Arc::clone(&self.net_events)
+    }
+
+    /// The DevTools console queue (fetch-thread side): drained every poll
+    /// tick into `FromTab::ConsoleLog` entries (source `"css"` today).
+    pub fn console_events(&self) -> crate::logging::ConsoleQueue {
+        Arc::clone(&self.console_events)
     }
 
     /// A locally served subresource answered as an instant 200.
@@ -1285,6 +1297,7 @@ impl BlitzNetProvider {
         let cache = Arc::clone(&self.cache);
         let waker = self.waker.lock().expect("waker mutex poisoned").clone();
         let events = Arc::clone(&self.net_events);
+        let console = Arc::clone(&self.console_events);
         debug!(
             "subresource GET {url} (doc {doc_id}, {})",
             if managed { "managed" } else { "passthrough" }
@@ -1331,6 +1344,15 @@ impl BlitzNetProvider {
                         o.status,
                         o.body.len()
                     );
+                    // DevTools console seam: a `.css` response that is not
+                    // `text/css` is the one CSS problem this side of blitz
+                    // can see (stylesheet parse errors are invisible —
+                    // src/logging.rs documents the gap).
+                    if let Some(entry) =
+                        crate::logging::css_content_type_warning(&o.final_url, o.status, &o.headers)
+                    {
+                        console.lock().expect("console events mutex").push(entry);
+                    }
                     deliver(Some(handler), o.final_url.to_string(), o.body)
                 }
                 Ok(o) if aborted => {

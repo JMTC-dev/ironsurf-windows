@@ -1,4 +1,5 @@
 # Task log
+## #32 DevTools console on the wire: ironsurf-tab now emits FromTab::ConsoleLog for every JS console.* line (all four levels, page order, source "js"), every uncaught script exception (source "js", or "dom" when a native __ironsurfDom* threw — the registration macro records native Errs into HostState::dom_throws and JsRuntime::classify_throw matches the eval-time message with boa's (native)/(at :l:c) Display suffix stripped; reported exactly once, StatusText unchanged), and a NEW src/logging.rs CSS seam: <style> bodies + inline style="" re-parsed through stylo's real ParseErrorReporter (blitz passes None upstream — gap documented in-code) plus wrong-Content-Type .css responses from BlitzNetProvider; tests/console_log.rs (5 localhost wire tests: levels+order, broken script + tab alive, dom-once, css seams, content-type ±control) + js/logging units; tab 176u + all suites green.
 ## #31 Network requests ride the IPC (DevTools Network panel): one FromTab::NetworkEvent per settled/failed
 request — method, URL, status, bytes, duration_ms; docs report every redirect hop (*_report fetch variants),
 NetProvider subresources + <script src> push into net_events drained per poll tick; failures error Some/status
@@ -51,20 +52,6 @@ HttpOnly persisted+sent normally, scripts have zero cookie access; per-container
 cross-host, Passthrough nav), runtime ptr_eq shared-jar test; ARCH cookie rules+net layer updated; workspace green,
 live example.com real_tab ok.
 
-## #18 DONE — real DOM for Boa (Acid3 foundation): thread-local LIVE_DOCS registry (raw ptr, only live during
-one eval; LiveDocGuard<'a> + PhantomData keeps the &mut borrow exclusive) + ~44 __ironsurfDom* natives (tree,
-attrs, mutate via DocumentMutator+flush, query w/ SyntaxError, RangeError names, clone shallow/deep, serialize)
-+ PRELUDE glue: one NodeProto over {__d,__n} wrappers, realm-side __ironsurfNodeCache for identity, Proxy-based
-LIVE NodeList/HTMLCollection/NamedNodeMap (re-read per access), JS DocumentFragment, id/className; run_scripts/
-run_due_timers take Option<&mut HtmlDocument>, tab registers live doc + settles after scripts; --body-out now
-shares that serializer. 16 bridge tests (identity, liveness, innerHTML round-trip, NotFound/Range/Syntax) +
-headless smoke (script-built red div ⇒ >5k pure-red px in PPM, markup in --body-out); 72u/4 headless green,
-workspace green. Known gaps: element-scoped queries are document-wide; no events/style/CSSOM yet.
-## #16 GPU acceleration — slint built with backend-linuxkms-noseat (DRM/KMS + EGL/GBM FemtoVG; bare-VT GPU path);
-main.rs force-software hack replaced by GPU-first policy: auto = winit/LinuxKMS FemtoVG with Slint's automatic
-software fallback (--software pins old path, --linuxkms pins KMS, SLINT_BACKEND wins; pure backend_choice + test);
-box has no GPU: FemtoVG still initializes via Mesa llvmpipe (libGL loaded, verified) — on real GPUs it binds vendor
-drivers. KMS libs are LINKED not dlopen'd: build -dev pkgs + runtime sonames documented in BUILD_DEBIAN/
 ## #19 FIX container manager "New" dead — row's selta TouchArea was declared AFTER the row content:
 last-declared TouchArea wins hit-testing (proven with scratch slint/test-backend repro), so it swallowed
 New/Move tab/Delete/Ren clicks (only ever fired mgr-select). selta moved first in the row (bottom z) ⇒

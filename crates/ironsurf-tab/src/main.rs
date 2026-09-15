@@ -11,12 +11,15 @@
 mod forms;
 mod headless;
 mod js;
+mod logging;
 mod media;
 mod netmod;
 mod runtime;
 mod spike;
 
-use ironsurf_common::logging;
+// (The stderr logger arrives under an alias: `logging` is this crate's own
+// DevTools-console module — src/logging.rs.)
+use ironsurf_common::logging as stderr_logging;
 use ironsurf_common::error;
 
 fn usage() -> String {
@@ -49,7 +52,7 @@ fn main() {
     let args: Vec<String> = std::env::args().collect();
     // Logging first: every line after this goes to stderr (never stdout, which
     // is the IPC channel). `runtime::run` relabels the lines with the tab id.
-    logging::init("tab", logging::level_from_args(&args));
+    stderr_logging::init("tab", stderr_logging::level_from_args(&args));
     let code = if args.iter().any(|a| a == "--headless") {
         // One-shot ACID-test harness: navigate, wait, dump body HTML + PPM,
         // summary on stderr, stdout unused (see `crate::headless`).

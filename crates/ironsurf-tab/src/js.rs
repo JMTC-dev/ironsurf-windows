@@ -14,7 +14,12 @@
 //!   `body.textContent` as a read-only snapshot of the parsed body,
 //!   no-op listeners,
 //! - `console.log/info/warn/error` — tab stderr **and** the per-navigation
-//!   capture the tab turns into `FromTab::StatusText`,
+//!   capture the tab turns into `FromTab::ConsoleLog` (source `"js"`) plus a
+//!   `FromTab::StatusText`,
+//! - every thrown DOM native (`__ironsurfDom*`: bad selector, dead node …)
+//!   is recorded in [`HostState::dom_throws`] so the tab can report the
+//!   escaped exception as `FromTab::ConsoleLog` with source `"dom"` (see
+//!   [`ScriptError::source`]).
 //! - `setTimeout`/`setInterval`/`clearTimeout`/`clearInterval`/
 //!   `requestAnimationFrame`/`cancelAnimationFrame` — **real timers**: the
 //!   natives append entries to a [`TimerQueue`] owned by the [`JsRuntime`],
@@ -261,6 +266,16 @@ pub struct HostState {
     pub title_assigned: Option<String>,
     /// Captured `console.*` output (level + already stringified message).
     pub console: Vec<(ConsoleLevel, String)>,
+    /// Messages of JS exceptions thrown **by the native DOM bindings**
+    /// (`__ironsurfDom*`) while these scripts ran — recorded by the
+    /// `native!` registration macro on every native `Err`. The runtime uses
+    /// this to classify a script error as DOM-originated
+    /// ([`ScriptError::source`] == `"dom"`) instead of plain `"js"`. The
+    /// generic script-error path reports the throw exactly once (with the
+    /// native's DOM-prefixed message, e.g. `"NotFoundError: parent is gone"`),
+    /// so there is no double-report; a page that `catch`es a DOM throw and
+    /// rethrows it verbatim still reads as `"dom"` (the message match).
+    pub dom_throws: Vec<String>,
     /// Human-readable notes raised by the bindings (timer calls) — the runtime
     /// shows the newest as `FromTab::StatusText`.
     pub notes: Vec<String>,
@@ -932,15 +947,52 @@ fn arg_i64(args: &[JsValue], index: usize, context: &mut Context) -> Result<i64,
         .unwrap_or(-1))
 }
 
+/// Wrap one DOM native so its **error path** records the throw (first line,
+/// e.g. `"Uncaught NotFoundError: parent is gone"`) into the live host's
+/// `dom_throws` before it propagates. The explicit `F: Fn…` bound is what
+/// pins the native closures' otherwise-ambiguous error type; the wrapper
+/// itself stays `Copy` (boa's requirement).
+fn record_dom_throw<F>(body: F) -> impl Fn(&JsValue, &[JsValue], &mut Context) -> Result<JsValue, boa_engine::JsError> + Copy + 'static
+where
+    F: Fn(&JsValue, &[JsValue], &mut Context) -> Result<JsValue, boa_engine::JsError>
+        + Copy
+        + 'static,
+{
+    move |this, args, context| {
+        let result = body(this, args, context);
+        if let Err(err) = &result {
+            let message = err
+                .to_string()
+                .lines()
+                .next()
+                .unwrap_or("DOM error")
+                .to_string();
+            with_host(|host| {
+                // Bounded: a pathological page throwing in a loop must not
+                // grow the host cell without limit.
+                if host.dom_throws.len() < 256 {
+                    host.dom_throws.push(message);
+                }
+            });
+        }
+        result
+    }
+}
+
 /// Install every DOM native on `context` (design: all behaviour is native;
 /// the JS glue only delegates — see the PRELUDE).
 fn register_dom_natives(context: &mut Context) {
+    // Every DOM native is wrapped: a native `Err` (SyntaxError on a bad
+    // selector, NotFoundError on a dead node, …) records its first line in
+    // `HostState::dom_throws` before it propagates, so the tab can report the
+    // escaped exception over IPC as `FromTab::ConsoleLog { source: "dom" }`
+    // instead of a generic `"js"` script error (see `JsRuntime::classify_throw`).
     macro_rules! native {
         ($name:expr, $len:expr, $body:expr) => {
             if let Err(err) = context.register_global_builtin_callable(
                 JsString::from($name),
                 $len,
-                NativeFunction::from_copy_closure($body),
+                NativeFunction::from_copy_closure(record_dom_throw($body)),
             ) {
                 error!("js dom binding `{}` failed to install: {err}", $name);
             }
@@ -3283,11 +3335,18 @@ pub fn build_context(host: &HostRef, _timers: &Rc<RefCell<TimerQueue>>) -> Conte
 }
 
 /// A script that threw (parse errors included). Reported to the shell as
-/// `FromTab::StatusText`; never fatal to the tab.
+/// `FromTab::StatusText` **and** as `FromTab::ConsoleLog`; never fatal to the
+/// tab.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ScriptError {
     pub origin: String,
     pub message: String,
+    /// DevTools console origin: `"js"` for engine/script errors, `"dom"`
+    /// when the throw came out of a native DOM binding (matched against the
+    /// [`HostState::dom_throws`] recorded during the very evaluation that
+    /// failed). A small honest overlap is accepted: a DOM throw whose message
+    /// a page also throws as plain JS reads as `"dom"` for that turn.
+    pub source: &'static str,
 }
 
 /// The JavaScript side of one document: **one `boa_engine::Context` for the
@@ -3321,6 +3380,32 @@ impl JsRuntime {
         &self.host
     }
 
+    /// Did a native DOM binding throw during the evaluation that just failed
+    /// with `message` (given the DOM-throw log had `dom_before` entries when
+    /// the evaluation started)? A message match against the newest recorded
+    /// native error keeps a page's own `throw new SyntaxError(...)` on the
+    /// `"js"` side even when a DOM native threw earlier in the same turn.
+    fn classify_throw(&self, dom_before: usize, message: &str) -> &'static str {
+        let host = self.host.borrow();
+        if host.dom_throws.len() > dom_before {
+            if let Some(last) = host.dom_throws.last() {
+                if message.contains(last.as_str())
+                    || last.contains(message)
+                    // Boa appends a position suffix to every error — `(native)`
+                    // at the binding's catch, `(unknown at :1:23)` (or `(at …)`)
+                    // at the eval catch — so the two reports of the SAME throw
+                    // differ by that suffix alone. Compare them with it stripped.
+                    || (crate::js::without_engine_suffix(message)
+                        == crate::js::without_engine_suffix(last)
+                        && !without_engine_suffix(message).is_empty())
+                {
+                    return "dom";
+                }
+            }
+        }
+        "js"
+    }
+
     /// Take the navigation this document's scripts queued since the last turn
     /// (`location.href=`/`assign`/`replace`/`reload`). The tab calls this
     /// after every JS turn and follows it through its own navigation entry
@@ -3341,6 +3426,7 @@ impl JsRuntime {
     ) -> Result<Option<String>, ScriptError> {
         let _active = self.activate();
         let _live_doc = doc.map(register_live_doc);
+        let dom_before = self.host.borrow().dom_throws.len();
         match self.context.eval(Source::from_bytes(source)) {
             Ok(value) => {
                 if value.is_undefined() || value.is_null() {
@@ -3360,10 +3446,12 @@ impl JsRuntime {
             }
             Err(err) => {
                 let message = first_line(&err);
+                let source = self.classify_throw(dom_before, &message);
                 error!("javascript error in javascript: URL: {message}");
                 Err(ScriptError {
                     origin: "javascript:".to_string(),
                     message,
+                    source,
                 })
             }
         }
@@ -3415,14 +3503,17 @@ impl JsRuntime {
                 script.code.len(),
                 started.elapsed().as_millis()
             );
+            let dom_before = self.host.borrow().dom_throws.len();
             match self.context.eval(Source::from_bytes(script.code.as_str())) {
                 Ok(_) => {}
                 Err(err) => {
                     let message = first_line(&err);
+                    let source = self.classify_throw(dom_before, &message);
                     error!("javascript error in {origin}: {message}", origin = script.origin);
                     errors.push(ScriptError {
                         origin: script.origin.clone(),
                         message,
+                        source,
                     });
                 }
             }
@@ -3513,12 +3604,15 @@ impl JsRuntime {
             // Non-callables cannot be scheduled by the natives, so `None`
             // here is unreachable; treat it as a skipped callback anyway.
             if let Some(callback) = entry.callback.as_object() {
+                let dom_before = self.host.borrow().dom_throws.len();
                 if let Err(err) = callback.call(&JsValue::undefined(), &args, &mut self.context) {
                     let message = first_line(&err);
+                    let source = self.classify_throw(dom_before, &message);
                     error!("javascript error in timer callback: {message}");
                     errors.push(ScriptError {
                         origin: "timer".to_string(),
                         message,
+                        source,
                     });
                 }
             }
@@ -3541,6 +3635,20 @@ impl Drop for ActiveGuard {
 /// First line of a boa error (its Display adds a shadow-stack backtrace).
 fn first_line(err: &boa_engine::JsError) -> String {
     err.to_string().lines().next().unwrap_or("script error").to_string()
+}
+
+/// Boa appends a parenthesised source-position suffix to every error's
+/// Display ("(native)", "(unknown at :1:23)", "(at file:1:2)"). Stripping it
+/// leaves the thrower's own text — the stable comparison key between a
+/// binding-level catch and the eval-level catch ([`JsRuntime::classify_throw`]).
+pub(crate) fn without_engine_suffix(message: &str) -> &str {
+    let trimmed = message.trim_end();
+    if trimmed.ends_with(')') {
+        if let Some(open) = trimmed.rfind('(') {
+            return trimmed[..open].trim_end();
+        }
+    }
+    trimmed
 }
 
 /// Text to surface as `FromTab::StatusText` for these script errors
@@ -3958,6 +4066,56 @@ mod tests {
         let errors = runtime.run_scripts(&scripts, None);
         assert_eq!(errors.len(), 1, "syntax errors never abort the tab");
         assert!(!errors[0].message.is_empty());
+    }
+
+    /// The DevTools console classification (task: JS/CSS/DOM sources): an
+    /// uncaught throw out of a native DOM binding reports `source: "dom"`,
+    /// while the page's own throws — even a hand-thrown `SyntaxError` with a
+    /// DOM throw in the history — stay `source: "js"`.
+    #[test]
+    fn script_errors_carry_their_console_source() {
+        let (mut runtime, mut doc) = dom_world();
+        let errors = runtime.run_scripts(
+            &[ScriptSource {
+                code: "document.querySelector('[');".to_string(),
+                origin: "inline".to_string(),
+            }],
+            Some(&mut doc),
+        );
+        assert_eq!(errors.len(), 1, "the invalid-selector throw escapes once");
+        assert_eq!(
+            errors[0].source, "dom",
+            "a native DOM throw is a dom console entry ({errors:?})"
+        );
+        assert!(
+            errors[0].message.contains("SyntaxError"),
+            "the message keeps the DOM-prefixed text: {:?}",
+            errors[0].message
+        );
+
+        // The page's own `SyntaxError` is NOT a native throw — even with the
+        // recorded DOM error above, the message-based match keeps it on the
+        // `js` side.
+        let errors = runtime.run_scripts(
+            &[ScriptSource {
+                code: "throw new SyntaxError('mine-not-the-native');".to_string(),
+                origin: "inline".to_string(),
+            }],
+            Some(&mut doc),
+        );
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0].source, "js", "hand-thrown errors are js ({errors:?})");
+
+        // A plain engine error (TypeError-ish) is js too.
+        let errors = runtime.run_scripts(
+            &[ScriptSource {
+                code: "null.x;".to_string(),
+                origin: "inline".to_string(),
+            }],
+            Some(&mut doc),
+        );
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0].source, "js");
     }
 
     #[test]
@@ -4656,3 +4814,4 @@ mod tests {
         );
     }
 }
+

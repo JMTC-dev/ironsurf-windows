@@ -94,6 +94,7 @@ use crate::js::{self, HostRef};
 use crate::media::player::{MediaPlayer, PlayerEvent, PlayerState, MAX_VIDEO_BYTES};
 use crate::media::widget::VideoWidget;
 use crate::media::MediaError;
+use crate::logging::{ConsoleQueue, CssScanState};
 use crate::netmod::{self, BlitzNetProvider, MainDocPost, NetPolicy};
 
 /// Default page size until the shell sends `ToTab::Resize` (physical px).
@@ -570,6 +571,13 @@ pub struct Tab {
     /// the drain timely). Navigation events are emitted inline (the fetch is
     /// synchronous on the tab thread).
     net_events: Arc<Mutex<Vec<NetEvent>>>,
+    /// The fetch threads' DevTools **console** queue (source `"css"` today:
+    /// wrong-`Content-Type` stylesheets — see `src/logging.rs`); drained
+    /// every poll tick exactly like `net_events`.
+    console_events: ConsoleQueue,
+    /// Per-document bookkeeping for the CSS re-parse seam (content hashes of
+    /// already-reported `<style>` bodies / `style="…"` attributes).
+    css_scan: CssScanState,
     /// Master switch mirroring `TabArgs::media_enabled`.
     media_enabled: bool,
     /// When the media steps must next run even with no events at all; `None`
@@ -636,6 +644,8 @@ impl Tab {
         );
         // Grab the DevTools network queue before `provider` moves into the tab.
         let net_events = provider.net_events();
+        // …and the fetch-side console queue with it (css content-type seam).
+        let console_events = provider.console_events();
         Tab {
             out: TabOut::new(),
             width: DEFAULT_SIZE.0,
@@ -679,6 +689,8 @@ impl Tab {
             media_enabled: args.media_enabled,
             media_next_pump: None,
             net_events,
+            console_events,
+            css_scan: CssScanState::new(),
         }
     }
 
@@ -875,6 +887,7 @@ impl Tab {
                 // External `<script src>` fetches settled during load_html;
                 // ship their network events with the navigation, not a tick late.
                 self.drain_net_events();
+                self.drain_console_events();
                 true
             }
             Err(err) => {
@@ -1049,6 +1062,9 @@ impl Tab {
     /// extraction failures degrade to "no scripts", and every `eval` is caught
     /// inside [`js::JsRuntime::run_scripts`].
     fn run_scripts(&mut self, url: &Url) {
+        // Fresh document: the CSS seam forgets last document's content hashes
+        // so the same sheet on a new page is reported once again.
+        self.css_scan.reset();
         let policy = self_provider_policy(&self.provider);
         let mut extraction = js::Extraction::default();
         let mut body_text = None;
@@ -1240,34 +1256,109 @@ impl Tab {
 
     /// Fold the JS host cell's side effects (console output, notes) and these
     /// script errors into the tab's pending status text, draining what was
-    /// read so the next batch only reports what is new.
+    /// read so the next batch only reports what is new — **and** ship every
+    /// drained item over IPC as `FromTab::ConsoleLog` (task: DevTools console):
+    ///
+    /// * every `console.*` entry → `{ source: "js", level, message }`;
+    /// * every uncaught script exception → `{ source, level: "error" }`, the
+    ///   source `"dom"` when the throw came out of a native DOM binding and
+    ///   `"js"` otherwise (one report per throw — the DOM classification
+    ///   replaces the generic `"js"` line, it never doubles it);
+    /// * then the CSS re-parse seam runs (`scan_css_diagnostics`), reporting
+    ///   anything invalid the document grew since the last JS turn.
+    ///
+    /// The `StatusText` behaviour is unchanged: newest console line and
+    /// newest error still flow to the status bar exactly as before.
     fn consume_js_status(&mut self, extraction_note: Option<String>, errors: &[js::ScriptError]) {
-        let Some(runtime) = self.js.as_ref() else {
-            return;
-        };
-        let (console_last, note) = {
-            let host = runtime.host().borrow_mut();
-            let console_last = host
-                .console
-                .last()
-                .map(|(level, text)| format!("js console {level}: {text}"));
-            let note = host.latest_note().map(str::to_owned).or(extraction_note);
-            (console_last, note)
-        };
-        {
-            // Drain what was just reported: the next batch only shows news.
-            let mut host = runtime.host().borrow_mut();
-            host.console.clear();
-            host.notes.clear();
-            host.repaint = false;
+        let mut console_entries = Vec::new();
+        let mut note = extraction_note;
+        if let Some(runtime) = self.js.as_ref() {
+            let (console, host_note) = {
+                let host = runtime.host().borrow_mut();
+                (host.console.clone(), host.latest_note().map(str::to_owned))
+            };
+            {
+                // Drain what was just reported: the next batch only shows news.
+                let mut host = runtime.host().borrow_mut();
+                host.console.clear();
+                host.notes.clear();
+                // DOM throws are classified into `errors` before this point
+                // (JsRuntime::classify_throw); the log itself is per-batch.
+                host.dom_throws.clear();
+                host.repaint = false;
+            }
+            console_entries = console;
+            if note.is_none() {
+                note = host_note;
+            }
         }
+        // 1. Every `console.*` line of this JS turn, in order, as a DevTools
+        // console entry (the old behaviour only ever showed the newest one).
+        for (level, text) in &console_entries {
+            self.emit(FromTab::ConsoleLog {
+                source: "js".to_string(),
+                level: level.as_str().to_string(),
+                message: text.clone(),
+            });
+        }
+        // 2. Uncaught exceptions (compile errors included): `"dom"` for
+        // natives, `"js"` for everything else; readable message as thrown.
+        for err in errors {
+            self.emit(FromTab::ConsoleLog {
+                source: err.source.to_string(),
+                level: "error".to_string(),
+                message: err.message.clone(),
+            });
+        }
+        // 3. CSS: `<style>`/`style=` re-parse of anything new this document
+        // has (scripts inject sheets at runtime; the scan dedupes by content).
+        self.scan_css_diagnostics();
         // One status text: script errors outrank `console.*` output, which
         // outranks the "skipped script" extraction notes.
+        let console_last = console_entries
+            .last()
+            .map(|(level, text)| format!("js console {level}: {text}"));
         let status = js::status_text_for_errors(errors)
             .or(console_last)
             .or(note);
         if status.is_some() {
             self.js_status = status;
+        }
+    }
+
+    /// The CSS seam of the DevTools console (see `src/logging.rs` for what
+    /// this can and cannot see): re-parse the document's `<style>` bodies and
+    /// inline `style="…"` attributes through Stylo's real error reporter and
+    /// ship each new problem as `FromTab::ConsoleLog { source: "css" }`.
+    fn scan_css_diagnostics(&mut self) {
+        let entries = match self.doc.as_ref() {
+            Some(doc) => {
+                let base = doc.url().clone();
+                crate::logging::scan_css(doc, &base, &mut self.css_scan)
+            }
+            None => return,
+        };
+        for entry in entries {
+            self.emit(FromTab::ConsoleLog {
+                source: entry.source,
+                level: entry.level,
+                message: entry.message,
+            });
+        }
+    }
+
+    /// Ship every console entry the fetch threads queued since the last poll
+    /// (wrong-`Content-Type` `.css` responses — `src/logging.rs`): same
+    /// cadence and same NetWaker wake as the network drain, never a tick late.
+    fn drain_console_events(&mut self) {
+        let entries =
+            std::mem::take(&mut *self.console_events.lock().expect("console events mutex"));
+        for entry in entries {
+            self.emit(FromTab::ConsoleLog {
+                source: entry.source,
+                level: entry.level,
+                message: entry.message,
+            });
         }
     }
 
@@ -2235,6 +2326,7 @@ impl Tab {
             return;
         }
         self.run_due_timers();
+        self.drain_console_events();
         self.settle();
         self.check_meta();
     }
@@ -3360,6 +3452,10 @@ pub fn run(args: TabArgs) -> i32 {
         // 2a′. Network: every request that settled since the last poll
         // becomes one FromTab::NetworkEvent (DevTools network panel).
         tab.drain_net_events();
+
+        // 2a″. Console: fetch-side CSS diagnostics (wrong `Content-Type` on a
+        // `.css` response) join the DevTools console here (src/logging.rs).
+        tab.drain_console_events();
 
         // 2b. JS timers: execute every callback due since the last poll
         // (setTimeout/setInterval/rAF), settle, and repaint coalesced exactly

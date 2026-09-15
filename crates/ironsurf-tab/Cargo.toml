@@ -32,6 +32,14 @@ peniko = "0.6"
 # Input event types (task 7d): same versions blitz 0.3.0-beta.2 uses.
 keyboard-types = "0.7"
 atomic_refcell = "0.1"
+# CSS diagnostics (task: DevTools console): the very `stylo` blitz aliases as
+# `style` (already locked and compiled by the engine graph) re-parses the
+# document's CSS behind a real ParseErrorReporter (see src/logging.rs).
+# `cssparser`/`selectors` are the same locked versions providing the reporter
+# trait's argument types — zero extra compilation.
+style = { version = "0.20.0", package = "stylo" }
+cssparser = "0.37"
+selectors = "0.40"
 
 # Video (task: playback) — pure Rust software decoders, no C, no GPU.
 rusty_h264-decoder = "0.16"
