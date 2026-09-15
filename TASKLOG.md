@@ -108,3 +108,4 @@ handle_wheel → scroll_chain_by feeds ScrollAmount::By{-x,-y}), so that extra f
 now passes delta-x/delta-y verbatim; convention pinned in common::ScrollEvent docs + ARCH ToTab section and
 by the new tab test wheel_down_scrolls_the_document_down_and_wheel_up_back_up (pixel deltas, 20px notch, clamp
 at the top); workspace green.
+## mp4.rs demuxer compile-clean — handler match guard moved into body (Audio arm exhaustive, same first-audio-label behavior), read_stsz/stsc/stts calls in TrackTable::read use .ok()? (fn returns Option), read_ctts let-Some (was let-Ok on mapped Option), ftyp fixture byte escape \2->\x02, dropped unused byte::self import + needless mut, ParsedMp4 derives Debug (test expect/expect_err need it). cargo check -p ironsurf-tab [plain + --tests] show ZERO demux/mp4.rs diagnostics; module tests deferred to later task (crate still red elsewhere).
