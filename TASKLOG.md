@@ -1,5 +1,4 @@
 # Task log
-## codec.rs green (jpeg-decoder 0.3 / vp9dec 0.1.1 / rustc fixes): AVI fourcc via Vec-trim match (NULs only, spaces kept; VP80->Vp8 honest, refused as UnsupportedCodec), AvcC SPS/PPS len binding typed [u8;2], vp9 to_rgba -> free fn vp9_to_rgba (E0116), JPEG rewritten to Decoder::new(Cursor)+decode()+info() with L8/L16(HB)/RGB24/CMYK32->RGBA; cargo check -p ironsurf-tab shows ZERO codec.rs diagnostics (player/widget remain broken, other tasks).
 ## #25 JS-driven navigation implemented (was: refused) — location.href=/assign/replace/reload queue
 js::PendingNav on HostState via __ironsurfNavigate (glue location also gained real protocol/host/
 hostname/pathname/search/hash getters); Tab::drain_nav_hook follows it after every JS turn (relative
@@ -22,51 +21,6 @@ HttpOnly persisted+sent normally, scripts have zero cookie access; per-container
 cross-host, Passthrough nav), runtime ptr_eq shared-jar test; ARCH cookie rules+net layer updated; workspace green,
 live example.com real_tab ok.
 
-## #12 docs/BUILD_DEBIAN.md — apt prereqs proven from cargo tree/build.rs/objdump: build-essential, pkg-config,
-git/curl/ca-certs, libssl-dev (native-tls←reqwest0.13←blitz-net), libfontconfig-dev (usvg/fontique); X11/Wayland/GL
-are dlopen'd so NO -dev headers; runtime lib list in that doc; Servo-era deps dropped from README+AGENTS.
-## #13 stderr diagnostics everywhere — NEW ironsurf_common::logging (no deps): Off<Error<Warn<Info<Debug<Trace>,
-error!/warn!/info!/debug!/trace!, level = `--log LVL|-v|-vv` → IRONSURF_LOG → RUST_LOG → info; lines
-`[hh:mm:ss.mmm] LVL ctx mod: msg` (UTC; ctx `shell`/`tab 3`). Covered: tab startup+sandbox, navigate+fetch
-(status/bytes/ms), parse/settle/script timings, page console.* AT THE PAGE'S LEVEL, url/title/loading, cookie +
-protocol errors; netmod req/resp/cache/Set-Cookie/https-upgrade; shell spawn/destroy/reap, FromTab reduction,
-address bar, shortcuts. stdout stays IPC-only ⇒ frames+input are TRACE-only (volume contract: nobody reads a tab's
-stderr pipe) and a child inherits stderr only when debug+a-terminal (TabStderr, --tab-stderr, IRONSURF_TAB_STDERR).
-docs §F + README; 133 tests green.
-## #14 FIX: tab panic on real desktops — RLIMIT_NPROC is per-UID on Linux; absolute 128 < uid's live
-tasks ⇒ every pthread_create EAGAIN ⇒ reqwest tokio build panicked (netmod.rs). Now NPROC = current
-task count (from /proc Threads: for our euid) + max_processes headroom, never below live usage;
-notes explain; ARCHITECTURE comment extended; +unit test + examples/nproc_check reproducer.
-## #15 data: URLs are MIME-aware — netmod::parse_data_url (DataUrl{mime,charset,base64,bytes}) decodes
-both RFC 2397 forms; data:text/javascript;base64,… typed/navigated to renders as INERT escaped source titled
-by media type (render_document, between fetch and HtmlDocument::from_html) instead of being parsed as HTML —
-executing it would be a javascript: URL by another name; markup (html/xhtml/svg/xml) parses as before, and
-<script src="data:…"> still runs. Shell: scheme match case-insensitive + javascript: passed to the tab.
-## #13 middle-click = open link in new tab — common: FromTab::OpenLinkInNewTab{url} (+round-trip, ARCH updated);
-tab: middle Up over <a href> swallowed (no DOM click/nav hook), emits OpenLinkInNewTab; shell drain: spawns
-sibling tab in same container via open_tab; state.reduce treats it as an action (no state change). UI already
-forwarded button=2 (middle). cargo test --workspace green.
-## #16 built-in start page ironsurf://welcome (was https://example.com) — common: WELCOME_URL +
-default_url(); tab: netmod INTERNAL_SCHEME answered 100% locally (welcome page self-contained,
-unknown page = honest internal 404, URL escaped not injected; main-doc + subresource paths),
-status line shows full internal URL; shell classify: ironsurf:// pass-through (no-dot host
-would've become a search); gui test + ARCH updated. Live: tab loads it, title "Welcome to
-IronSurf"; workspace green.
-## #17 ACID3 testing started — plan queued (#72–#79): acid3.acidtests.org fetched OK (self-contained 183KB page;
-score lands in #score firstChild; tests run in setTimeout buckets; every CSS/selector test uses iframe#selectors
-contentDocument+doc.write). Queue order: headless --headless harness → real timers → DOM bridge (identity-cached
-wrappers {__d,__n}, LIVE NodeList, mutator-backed create/append/remove/query via blitz-dom) → getComputedStyle+el.style
-→ DOM Events → contentDocument+write → acid3 measure+fix top misses → harden+docs. Baseline pre-queue: JS cannot
-bootstrap acid3 at all (no createElement/timers). Design refs: docs/ACID3_STATUS.md will hold repro + score.
-## #17b real JS timers in ironsurf-tab (unblocks ACID3 bucket queue step 2): js.rs TimerQueue
-(ids start at 1, due-asc, intervals re-arm before run so clearInterval-inside works) + JsRuntime
-(Context+host+queue alive for the document's life; thread-local scope stack); real
-setTimeout/setInterval/clearAll/raf(16ms one-shot w/ timestamp) natives replace counted-only stub
-(count kept in stats); live poll slice clamped by earliest deadline + run_due_timers (settle,
-<=30fps repaint, throwing callback never kills tab); headless --wait pumps same queue. Fixed latent
-take_due bug (dropped future entries) + next_id=0. Tests: 4 unit + e2e TitleChanged("timer-title") +
-headless title=timer-fired. 56u/11 e2e/3 headless/3 idle/1 spike green; acid3 local mirror boots
-without timer errors (buckets still need DOM bridge, next queue steps).
 ## #18 DONE — real DOM for Boa (Acid3 foundation): thread-local LIVE_DOCS registry (raw ptr, only live during
 one eval; LiveDocGuard<'a> + PhantomData keeps the &mut borrow exclusive) + ~44 __ironsurfDom* natives (tree,
 attrs, mutate via DocumentMutator+flush, query w/ SyntaxError, RangeError names, clone shallow/deep, serialize)
@@ -109,3 +63,8 @@ now passes delta-x/delta-y verbatim; convention pinned in common::ScrollEvent do
 by the new tab test wheel_down_scrolls_the_document_down_and_wheel_up_back_up (pixel deltas, 20px notch, clamp
 at the top); workspace green.
 ## mp4.rs demuxer compile-clean — handler match guard moved into body (Audio arm exhaustive, same first-audio-label behavior), read_stsz/stsc/stts calls in TrackTable::read use .ok()? (fn returns Option), read_ctts let-Some (was let-Ok on mapped Option), ftyp fixture byte escape \2->\x02, dropped unused byte::self import + needless mut, ParsedMp4 derives Debug (test expect/expect_err need it). cargo check -p ironsurf-tab [plain + --tests] show ZERO demux/mp4.rs diagnostics; module tests deferred to later task (crate still red elsewhere).
+## player.rs compile-clean — VecDeque/Vec bridge: decode/flush emit into a local Vec then buffered.extend
+(out) (VecDeque::append no longer takes &mut Vec); present_due holds an early frame as Some((pts, frame));
+test hooks: set_test_metadata drops needless .clone() (E0716), seek test asserts player.current_pts() (Frame
+has no pts), open_bytes expect_err→.err().expect (VideoTrack: !Debug). cargo check -p ironsurf-tab [plain +
+--tests] show ZERO media/player.rs diagnostics (crate still red elsewhere).
