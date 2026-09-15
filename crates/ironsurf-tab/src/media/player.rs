@@ -346,6 +346,9 @@ pub struct MediaPlayer {
     ready: Option<(f64, Frame)>,
     /// A request is waiting to be answered.
     in_flight: bool,
+    /// `canplay` is a once-per-load event: it fires when the pipeline has
+    /// produced the first picture the page could render.
+    canplay_sent: bool,
     /// Discard pictures until one is at or after this time (set by a seek).
     skip_until: Option<f64>,
     generation: u64,
@@ -382,6 +385,7 @@ impl MediaPlayer {
             painted: (0.0, 0.0),
             ready: None,
             in_flight: false,
+            canplay_sent: false,
             skip_until: None,
             generation: 0,
             error: None,
@@ -481,6 +485,7 @@ impl MediaPlayer {
         self.current_pts = 0.0;
         self.ready = None;
         self.in_flight = false;
+        self.canplay_sent = false;
         self.skip_until = None;
         self.last_update = 0.0;
         self.generation = self.generation.wrapping_add(1);
@@ -674,8 +679,11 @@ impl MediaPlayer {
         match self.state {
             PlayerState::Playing | PlayerState::Loading => true,
             PlayerState::Ready | PlayerState::Paused | PlayerState::Ended => {
-                // A seek while paused still has to come to the screen.
-                self.in_flight || self.skip_until.is_some()
+                // A seek while paused still has to come to the screen; an
+                // in-flight decode (the poster-less first frame, or one frame
+                // of pipeline slack) does not — the page does not need a
+                // frame clock until something actually changes.
+                self.skip_until.is_some()
             }
             PlayerState::Idle | PlayerState::Failed => false,
         }
@@ -703,6 +711,12 @@ impl MediaPlayer {
             return false;
         }
         let frame = outcome.frame.expect("a frame when not at the end");
+        if !self.canplay_sent {
+            // The first picture the page could render: `canplay`, the way a
+            // poster-less `<video>` fires it once there is something to show.
+            self.canplay_sent = true;
+            self.push_event(PlayerEvent::CanPlay);
+        }
         self.ready = Some((outcome.pts, frame));
         false
     }
@@ -712,6 +726,7 @@ impl MediaPlayer {
         let mut presented = false;
         while let Some((pts, frame)) = self.ready.take() {
             // A seek decodes through the pictures before its target.
+            let seeking = self.skip_until.is_some();
             if let Some(target) = self.skip_until {
                 if pts + 1.0 / 1_000_000.0 < target {
                     self.request_next();
@@ -719,6 +734,13 @@ impl MediaPlayer {
                 }
                 self.skip_until = None;
                 self.push_event(PlayerEvent::Seeked);
+            }
+            if !self.is_playing() && !seeking && self.current.is_some() {
+                // Paused with no seek in flight: the frozen clock owns the
+                // screen. Only the first frame (the poster-less case above)
+                // comes to it unbidden; pipeline slack waits for play().
+                self.ready = Some((pts, frame));
+                break;
             }
             if self.is_playing() && self.position() + 1.0 / 240.0 < pts {
                 // Not due yet: hold it, the clock will catch up.

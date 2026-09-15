@@ -50,11 +50,13 @@
 //! still fetches and runs (`docs/ENGINE_INTEGRATION.md` §G).
 
 use std::cell::RefCell;
+use std::collections::{HashMap, HashSet};
 use std::error::Error;
 use std::io::{self, BufWriter, Read, StdoutLock, Write};
 use std::os::fd::AsRawFd;
 use std::os::fd::RawFd;
 use std::path::PathBuf;
+use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -87,6 +89,9 @@ use url::Url;
 
 use crate::forms::{self, FormMethod, FormSubmission};
 use crate::js::{self, HostRef};
+use crate::media::player::{MediaPlayer, PlayerEvent, PlayerState, MAX_VIDEO_BYTES};
+use crate::media::widget::VideoWidget;
+use crate::media::MediaError;
 use crate::netmod::{self, BlitzNetProvider, MainDocPost, NetPolicy};
 
 /// Default page size until the shell sends `ToTab::Resize` (physical px).
@@ -95,6 +100,10 @@ const DEFAULT_SIZE: (u32, u32) = (1024, 768);
 const FRAME_INTERVAL: Duration = Duration::from_millis(33);
 /// Idle poll cadence — stdin/wake events still arrive immediately via poll().
 const IDLE_TICK: Duration = Duration::from_millis(250);
+/// Media cadence: the poll loop never sleeps past this while a video is
+/// alive, so players keep advancing (~25×/s) with no other events — the
+/// `RUNNING_POLL_INTERVAL` role of the JS-timer cap, for media.
+const MEDIA_TICK: Duration = Duration::from_millis(40);
 
 // ---------------------------------------------------------------------------
 // CLI
@@ -110,6 +119,10 @@ pub struct TabArgs {
     pub offline_fixtures: Option<PathBuf>,
     pub net_policy: NetPolicy,
     pub no_sandbox: bool,
+    /// Video master switch (`--no-media` turns it off): with it off the tab
+    /// never attaches a widget, never fetches a `<video src>`, and every
+    /// media step of the poll loop returns before touching anything.
+    pub media_enabled: bool,
 }
 
 impl TabArgs {
@@ -121,6 +134,7 @@ impl TabArgs {
         let mut offline_fixtures = None;
         let mut managed = false;
         let mut no_sandbox = false;
+        let mut no_media = false;
 
         let mut it = args.iter().skip(1);
         while let Some(arg) = it.next() {
@@ -139,6 +153,7 @@ impl TabArgs {
                 }
                 "--managed-net" => managed = true,
                 "--no-sandbox" => no_sandbox = true,
+                "--no-media" => no_media = true,
                 // Verbosity flags: the level itself is read from argv by
                 // `logging::level_from_args` in `run`; they are accepted here so
                 // passing them is not a fatal "unexpected argument".
@@ -171,6 +186,7 @@ impl TabArgs {
                 NetPolicy::Passthrough
             },
             no_sandbox,
+            media_enabled: !no_media,
         })
     }
 }
@@ -509,6 +525,23 @@ pub struct Tab {
     /// Last hover-reported link target (`StatusText`), for change-detection so
     /// a moving mouse only emits when the target actually changes.
     hover_status: Option<String>,
+    /// Video (task: playback): one player per `<video>` element, in attach
+    /// order. The blitz widget on the element shares the very same
+    /// `Rc<RefCell<MediaPlayer>>`, so the tab pumps the clock and the widget
+    /// paints it without ever touching the document. Dropped with its
+    /// document on every navigation.
+    media: Vec<MediaEntry>,
+    /// Resolved hrefs being fetched right now (dedupe: two elements with one
+    /// `src` cost one fetch — every waiter gets the bytes when they land).
+    media_inflight: HashSet<String>,
+    /// Completion queue from the fetch threads; the shared self-pipe wakes
+    /// the loop the moment one arrives (the NavHook/NetWaker pattern).
+    media_results: Arc<Mutex<Vec<MediaLoaded>>>,
+    /// Master switch mirroring `TabArgs::media_enabled`.
+    media_enabled: bool,
+    /// When the media steps must next run even with no events at all; `None`
+    /// = no live players, and the loop may idle (`media_poll_tick`).
+    media_next_pump: Option<Instant>,
 }
 
 /// stdout side of the IPC: one persistent BufWriter, flushed per frame.
@@ -602,6 +635,11 @@ impl Tab {
             hover_status: None,
             pending_form: None,
             form_press: None,
+            media: Vec::new(),
+            media_inflight: HashSet::new(),
+            media_results: Arc::new(Mutex::new(Vec::new())),
+            media_enabled: args.media_enabled,
+            media_next_pump: None,
         }
     }
 
@@ -839,6 +877,9 @@ impl Tab {
         // The new document has nothing under the cursor yet; the next hover
         // transition must be allowed to report again.
         self.hover_status = None;
+        // The previous document's players die with it (their widgets die with
+        // its node tree; their decode threads end when the players drop).
+        self.reset_media();
         let config = DocumentConfig {
             base_url: Some(url.as_str().to_owned()),
             viewport: Some(self.viewport()),
@@ -868,6 +909,10 @@ impl Tab {
         );
         // JavaScript runs on the settled DOM (ARCHITECTURE §JavaScript (Boa)).
         self.run_scripts(url);
+        // Video (task: playback): every `<video>` gets its widget and its
+        // fetch before the first frame; ones scripts create later are picked
+        // up by the poll loop's media cadence (see `pump_media`).
+        self.attach_video_widgets();
 
         match history {
             NavHistory::Fresh => {
@@ -1980,6 +2025,639 @@ impl Tab {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Video plumbing (task: playback)
+//
+// The engine (`crate::media`) owns demux/decode/clock; this section owns the
+// three things only the tab can do:
+//
+// 1. **Attach** — every `<video>` element gets a [`VideoWidget`] via blitz's
+//    `set_custom_widget` (blitz 0.3's custom-widget entry point; the DOM
+//    traversal has no CSS box sizes — layout has not necessarily run — so
+//    the widget's size hint comes from the element's `width`/`height`
+//    attributes, 640×360 otherwise, exactly as `media/widget.rs` documents).
+// 2. **Fetch** — `src=` is resolved against the document URL and pulled on
+//    a worker thread through the tab's own network layer (container cookies,
+//    cache, https policy — the same rules every main-document load obeys),
+//    delivered over the shared self-pipe like every other wake source.
+// 3. **Pump** — once per poll iteration (capped to `MEDIA_TICK` while any
+//    player is alive) every player advances, its widget repaints through the
+//    shared handle, `PlayerEvent`s are replayed into the page as DOM events
+//    via `__ironsurfFire`, and the per-element [`MediaSnapshot`] the page's
+//    `v.currentTime`-style reads go through is refreshed.
+//
+// `MediaHost` is the JS side of that contract: page writes (`v.play()`,
+// `v.currentTime = 5`) queue [`MediaCommand`]s the poll loop applies; page
+// reads see the snapshot the last pump wrote.
+
+/// One `<video>` element's player (the widget holds the same `Rc`).
+struct MediaEntry {
+    node_id: NodeId,
+    /// The href the bytes were fetched for; `Some` once a fetch was started
+    /// for this element (also dedupes multi-element one-clip pages: every
+    /// entry sharing an href gets the delivered bytes).
+    href: Option<String>,
+    player: Rc<RefCell<MediaPlayer>>,
+}
+
+/// A media fetch's outcome, as delivered to the loop over the self-pipe.
+/// `Err` is a user-facing [`MediaError`] (rendered into the widget's failure
+/// placeholder and `v.mediaError`), never a panic or a stack trace.
+struct MediaLoaded {
+    node_id: NodeId,
+    href: String,
+    outcome: Result<Vec<u8>, MediaError>,
+}
+
+/// What page JavaScript asked the players to do (`v.play()`, `v.currentTime
+/// = 5`, `v.muted = true`); applied by the poll loop between pumps.
+#[derive(Clone, Debug, PartialEq)]
+pub enum MediaCommand {
+    Play { node: u64 },
+    Pause { node: u64 },
+    Seek { node: u64, seconds: f64 },
+    SetRate { node: u64, rate: f64 },
+    SetMuted { node: u64, muted: bool },
+}
+
+/// The per-element values the page reads through `HTMLMediaElement` glue
+/// (js.rs); rewritten from the real players on every pump, so JS is stale by
+/// at most one media tick.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct MediaSnapshot {
+    pub duration: f64,
+    pub current_time: f64,
+    pub paused: bool,
+    pub ended: bool,
+    pub rate: f64,
+    pub muted: bool,
+    pub width: u32,
+    pub height: u32,
+    pub error: Option<String>,
+}
+
+impl MediaSnapshot {
+    fn of(player: &MediaPlayer) -> Self {
+        let (width, height) = player.natural_size().unwrap_or((0, 0));
+        MediaSnapshot {
+            duration: player.duration(),
+            current_time: player.position(),
+            paused: player.is_paused(),
+            ended: player.state() == PlayerState::Ended,
+            rate: player.rate(),
+            muted: player.is_muted(),
+            width,
+            height,
+            error: player.error().map(|err| err.to_string()),
+        }
+    }
+}
+
+/// The media cell living inside [`js::HostState`]: snapshots out (reads),
+/// commands in (writes). The tab owns both ends and keeps them in step.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct MediaHost {
+    /// Node raw id → last-pumped snapshot.
+    pub snapshots: HashMap<u64, MediaSnapshot>,
+    /// Page writes awaiting application, in order.
+    pub commands: Vec<MediaCommand>,
+}
+
+impl MediaHost {
+    pub fn snapshot(&self, node: u64) -> Option<&MediaSnapshot> {
+        self.snapshots.get(&node)
+    }
+
+    pub fn enqueue(&mut self, command: MediaCommand) {
+        self.commands.push(command);
+    }
+
+    pub fn take_commands(&mut self) -> Vec<MediaCommand> {
+        std::mem::take(&mut self.commands)
+    }
+}
+
+/// Decode one `__ironsurfMediaCmd` call into a [`MediaCommand`] (`None` for
+/// unknown ops — the native then queues nothing).
+pub fn media_command_from_js(node: u64, op: &str, arg: f64) -> Option<MediaCommand> {
+    match op {
+        "play" => Some(MediaCommand::Play { node }),
+        "pause" => Some(MediaCommand::Pause { node }),
+        "seek" if arg.is_finite() && arg >= 0.0 => Some(MediaCommand::Seek { node, seconds: arg }),
+        "rate" if arg.is_finite() && arg > 0.0 => Some(MediaCommand::SetRate { node, rate: arg }),
+        "muted" => Some(MediaCommand::SetMuted {
+            node,
+            muted: arg != 0.0,
+        }),
+        _ => None,
+    }
+}
+
+/// The DOM event name a [`PlayerEvent`] becomes — every engine event has a
+/// standard DOM counterpart (`canplay` is included: pages legitimately wait
+/// on it before `play()`).
+fn media_event_name(event: &PlayerEvent) -> Option<&'static str> {
+    Some(match event {
+        PlayerEvent::LoadedMetadata => "loadedmetadata",
+        PlayerEvent::LoadedData => "loadeddata",
+        PlayerEvent::CanPlay => "canplay",
+        PlayerEvent::Play => "play",
+        PlayerEvent::Pause => "pause",
+        PlayerEvent::Seeking => "seeking",
+        PlayerEvent::Seeked => "seeked",
+        PlayerEvent::TimeUpdate { .. } => "timeupdate",
+        PlayerEvent::RateChange => "ratechange",
+        PlayerEvent::MutedChange => "volumechange",
+        PlayerEvent::Ended => "ended",
+        PlayerEvent::Error { .. } => "error",
+    })
+}
+
+/// Run one media step where a panic must never escape the poll loop (the
+/// engine's own contract is panic-free; this is the unwind boundary).
+fn media_guard(what: &str, f: impl FnOnce()) {
+    if std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).is_err() {
+        error!("media step `{what}` panicked; the tab keeps running");
+    }
+}
+
+impl Tab {
+    /// Drop every player of the outgoing document (navigation) and the
+    /// snapshots/commands that referenced them. Cheap with no media; the
+    /// whole point of the `media_enabled` guard is that feature-off tabs
+    /// never grow a player in the first place, so every step below is a
+    /// branch on an empty Vec.
+    fn reset_media(&mut self) {
+        self.media.clear();
+        self.media_inflight.clear();
+        self.media_next_pump = None;
+        // Whatever queue existed for the old document dies with it.
+        if let Ok(mut results) = self.media_results.lock() {
+            results.clear();
+        }
+        if let Some(js) = self.js.as_ref() {
+            let mut host = js.host().borrow_mut();
+            host.media.snapshots.clear();
+            host.media.commands.clear();
+        }
+    }
+
+    /// Every `<video>` element without a widget gets one — and with it the
+    /// player the whole media path hangs off. The traversal is the document
+    /// node map (there is no CSS box to consult at this point); the widget's
+    /// size hint is the element's `width`/`height` attributes, falling back
+    /// to 640×360, per `media/widget.rs`.
+    pub fn attach_video_widgets(&mut self) {
+        if !self.media_enabled {
+            return;
+        }
+        media_guard("attach", || self.attach_video_widgets_inner());
+    }
+
+    fn attach_video_widgets_inner(&mut self) {
+        {
+            // Collect first (the borrow of `self.doc` for reads must end
+            // before `set_custom_widget` takes it mutably again).
+            let mut late_src: Vec<NodeId> = Vec::new();
+            let candidates: Vec<(NodeId, f32, f32)> = {
+                let Some(doc) = self.doc.as_ref() else { return };
+                doc.tree()
+                    .iter()
+                    .filter_map(|(id, node)| {
+                        let el = node.element_data()?;
+                        if el.name.local != blitz_dom::local_name!("video") {
+                            return None;
+                        }
+                        if el.custom_widget_data().is_some() {
+                            return None; // already a player's window
+                        }
+                        // The attributes are the only sizes the traversal can
+                        // see (no CSS box here); parse leniently.
+                        let width = el
+                            .attr(blitz_dom::local_name!("width"))
+                            .and_then(|v| v.trim().parse::<f32>().ok())
+                            .filter(|v| *v > 0.0 && v.is_finite())
+                            .unwrap_or(640.0);
+                        let height = el
+                            .attr(blitz_dom::local_name!("height"))
+                            .and_then(|v| v.trim().parse::<f32>().ok())
+                            .filter(|v| *v > 0.0 && v.is_finite())
+                            .unwrap_or(360.0);
+                        Some((id, width, height))
+                    })
+                    .collect()
+            };
+            let mut attached = 0;
+            if !candidates.is_empty() {
+                let doc = self.doc.as_mut().expect("doc checked above");
+                for (node_id, width, height) in candidates {
+                    let player = Rc::new(RefCell::new(MediaPlayer::new()));
+                    let widget =
+                        VideoWidget::with_size_hint(Rc::clone(&player), width, height);
+                    // blitz 0.3's custom-widget entry point (the `Node::Widget`
+                    // insertion of the design doc, in the API the engine ships).
+                    doc.set_custom_widget(node_id, Box::new(widget));
+                    self.media.push(MediaEntry {
+                        node_id,
+                        href: None,
+                        player,
+                    });
+                    attached += 1;
+                }
+            }
+            if attached > 0 {
+                debug!("media: attached {attached} video widget(s)");
+                // Restyle so the new replaced-element boxes are laid out
+                // before the first frame (cheap when nothing changed).
+                self.settle();
+            }
+            // Elements whose `src` appeared *after* attach (a script setting
+            // `v.src` on a parser-created element): players still Idle.
+            for entry in &self.media {
+                if entry.href.is_none() && entry.player.borrow().state() == PlayerState::Idle
+                {
+                    late_src.push(entry.node_id);
+                }
+            }
+            for node_id in late_src {
+                self.fetch_media(node_id);
+            }
+            // Elements removed from the tree take their players with them.
+            if let Some(doc) = self.doc.as_ref() {
+                self.media.retain(|entry| doc.tree().contains_key(entry.node_id));
+            }
+        }
+    }
+
+    /// Queue the fetch of one element's `src` (the media counterpart of the
+    /// image/net path): resolve against the document URL, dedupe in-flight
+    /// hrefs, pull the bytes on a worker thread through the tab's own
+    /// network layer (container cookies/cache/policy apply exactly as they
+    /// do to documents), and hand `Vec<u8>` back over the self-pipe. Only
+    /// 2xx responses with at most `MAX_VIDEO_BYTES` of body ever reach the
+    /// decoder; everything else arrives as a `MediaError`.
+    pub fn fetch_media(&mut self, node_id: NodeId) {
+        if !self.media_enabled {
+            return;
+        }
+        let Some(node_idx) = self.media.iter().position(|e| e.node_id == node_id) else {
+            return;
+        };
+        // Resolve `src` against the document URL (the `enqueue_image_load`
+        // pattern: `base.join_str(&src)`; blitz 0.3 gives `Url::join`).
+        let Some(url) = self.doc.as_ref().and_then(|doc| {
+            let el = doc.get_node(node_id)?.element_data()?;
+            let src = el.attr(blitz_dom::local_name!("src"))?.trim().to_owned();
+            if src.is_empty() {
+                return None;
+            }
+            match doc.url().join(&src) {
+                Ok(url) => Some(url),
+                Err(err) => {
+                    warn!("media src {src:?} did not resolve against {}: {err}", doc.url());
+                    None
+                }
+            }
+        }) else {
+            return; // no (or unresolvable) src — the placeholder waits
+        };
+        let href = url.to_string();
+        self.media_inflight.insert(href.clone());
+        self.media[node_idx].href = Some(href.clone());
+        self.media[node_idx]
+            .player
+            .borrow_mut()
+            .begin_load(); // spinner on the element while bytes travel
+        // Keep the loop ticking at the media cadence so the load placeholder
+        // animates and the completion is noticed even without wake-ups.
+        self.media_next_pump = Some(Instant::now() + MEDIA_TICK);
+
+        let slot = Arc::clone(&self.media_results);
+        let pipe = Arc::clone(&self.pipe);
+        let jar = Arc::clone(&self.jar);
+        let policy = self_provider_policy(&self.provider);
+        let worker_href = href.clone();
+        let spawn = std::thread::Builder::new()
+            .name("ironsurf-media-fetch".to_string())
+            .spawn(move || {
+                let href = worker_href;
+                let outcome = fetch_media_bytes(&url, policy, jar, &href);
+                match outcome {
+                    Ok(bytes) => {
+                        debug!("media: {href} fetched ({} B)", bytes.len());
+                        slot.lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner())
+                            .push(MediaLoaded {
+                                node_id,
+                                href,
+                                outcome: Ok(bytes),
+                            });
+                    }
+                    Err(err) => {
+                        warn!("media: {href} failed: {err}");
+                        slot.lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner())
+                            .push(MediaLoaded {
+                                node_id,
+                                href,
+                                outcome: Err(err),
+                            });
+                    }
+                }
+                // The one cross-thread signal the loop already listens for.
+                pipe.wake();
+            });
+        if let Err(err) = spawn {
+            // Thread exhaustion: fail honestly rather than spin a spinner.
+            self.media_inflight.remove(&href);
+            self.media[node_idx]
+                .player
+                .borrow_mut()
+                .fail(MediaError::Unreachable {
+                    detail: format!("could not start the fetch worker: {err}"),
+                });
+        }
+    }
+
+    /// Land fetched bytes: demux through the engine (`open_bytes` applies
+    /// `MAX_VIDEO_BYTES` again as the last line of defence), start playback,
+    /// or fail the player with the user-facing reason. The widget shares the
+    /// player, so there is nothing to "set" on it — it repaints from the
+    /// state it already points at; `request_paint_of_element` on this engine
+    /// is a document repaint, which is what the frame throttle coalesces.
+    fn drain_media_loaded(&mut self) {
+        if !self.media_enabled {
+            return;
+        }
+        let loaded = std::mem::take(
+            &mut *self
+                .media_results
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+        );
+        for item in loaded {
+            self.media_inflight.remove(&item.href);
+            media_guard("load", || {
+                let mut landed = false;
+                for entry in &mut self.media {
+                    // Deliver to every element waiting on this href (the
+                    // dedupe delivered one fetch to all of them).
+                    let waiting = entry.node_id == item.node_id
+                        || entry.href.as_deref() == Some(item.href.as_str());
+                    if !waiting {
+                        continue;
+                    }
+                    entry.href.get_or_insert_with(|| item.href.clone());
+                    match &item.outcome {
+                        Ok(bytes) => {
+                            let mut player = entry.player.borrow_mut();
+                            match crate::media::player::open_bytes(Arc::new(
+                                bytes.clone(),
+                            )) {
+                                Ok(track) => {
+                                    info!(
+                                        "media: {} — {}",
+                                        item.href,
+                                        track.info().describe()
+                                    );
+                                    player.load(track);
+                                    player.play();
+                                }
+                                Err(err) => {
+                                    warn!("media: {} refused: {err}", item.href);
+                                    player.fail(err);
+                                }
+                            }
+                        }
+                        Err(err) => entry.player.borrow_mut().fail(err.clone()),
+                    }
+                    landed = true;
+                }
+                if landed {
+                    self.needs_paint = true; // the element repainted itself
+                }
+            });
+        }
+    }
+
+    /// Apply the page's media writes from the JS turn(s) since the last pump.
+    fn drain_media_js_commands(&mut self) {
+        let commands = match self.js.as_ref() {
+            Some(js) => js.host().borrow_mut().media.take_commands(),
+            None => return,
+        };
+        if commands.is_empty() {
+            return;
+        }
+        media_guard("commands", || {
+            for command in commands {
+                let node = match command {
+                    MediaCommand::Play { node }
+                    | MediaCommand::Pause { node }
+                    | MediaCommand::Seek { node, .. }
+                    | MediaCommand::SetRate { node, .. }
+                    | MediaCommand::SetMuted { node, .. } => node,
+                };
+                let Some(entry) = self.media.iter().find(|e| e.node_id.as_u64() == node)
+                else { continue };
+                let mut player = entry.player.borrow_mut();
+                match command {
+                    MediaCommand::Play { .. } => player.play(),
+                    MediaCommand::Pause { .. } => player.pause(),
+                    MediaCommand::Seek { seconds, .. } => player.seek(seconds),
+                    MediaCommand::SetRate { rate, .. } => player.set_rate(rate),
+                    MediaCommand::SetMuted { muted, .. } => player.set_muted(muted),
+                }
+            }
+        });
+    }
+
+    /// Replay player events into the page through the glue's own event
+    /// system (`__ironsurfFire`, the same path form presses and blitz
+    /// interactions take), so `v.addEventListener("timeupdate", …)` works.
+    fn fire_media_events(&mut self, events: Vec<(NodeId, PlayerEvent)>) {
+        if events.is_empty() || !self.media_enabled {
+            return;
+        }
+        if self.js.is_none() || self.doc.is_none() {
+            return;
+        }
+        media_guard("events", || {
+            for (node, event) in events {
+                let Some(name) = media_event_name(&event) else { continue };
+                let init = match &event {
+                    PlayerEvent::TimeUpdate { position } => {
+                        format!("{{ position: {position} }}")
+                    }
+                    PlayerEvent::Error { detail } => {
+                        format!("{{ message: {} }}", js_string_lit(detail))
+                    }
+                    _ => "{}".to_string(),
+                };
+                if let (Some(js), Some(doc)) = (self.js.as_mut(), self.doc.as_mut()) {
+                    js.fire_event(doc, Some(node), name, &init);
+                }
+            }
+        });
+    }
+
+    /// Rewrite the snapshots the page's `HTMLMediaElement` properties read.
+    fn refresh_media_snapshots(&mut self) {
+        let Some(js) = self.js.as_ref() else { return };
+        let mut host = js.host().borrow_mut();
+        host.media.snapshots.clear();
+        for entry in &self.media {
+            let player = entry.player.borrow();
+            host.media
+                .snapshots
+                .insert(entry.node_id.as_u64(), MediaSnapshot::of(&player));
+        }
+    }
+
+    /// One media step of the poll loop (task: playback). Called after every
+    /// event the loop handles, and on its own at least every `MEDIA_TICK`
+    /// while any player is alive (the loop must not idle-block past it).
+    /// Every media call runs inside [`media_guard`]: nothing here may panic
+    /// out of the tab thread.
+    pub fn pump_media(&mut self) {
+        if !self.media_enabled {
+            return;
+        }
+        // (Also the per-tick `attach_video_widgets` pass: widgets for
+        // `<video>`s the parser or a script created since last time.)
+        self.attach_video_widgets();
+        self.drain_media_loaded();
+        self.drain_media_js_commands();
+
+        let mut repaint = false;
+        let mut fired: Vec<(NodeId, PlayerEvent)> = Vec::new();
+        for entry in &self.media {
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(
+                || {
+                    let mut player = entry.player.borrow_mut();
+                    let presented = player.pump();
+                    let events = player.take_events();
+                    let needs = player.needs_repaint();
+                    (presented, events, needs)
+                },
+            ));
+            match outcome {
+                Ok((presented, events, needs)) => {
+                    // The widget reads the frame through the shared player —
+                    // `set_frame`/`set_state` are the widget's own views into
+                    // this same object, so a presented frame plus a repaint
+                    // request is everything it needs.
+                    if presented || needs {
+                        repaint = true;
+                    }
+                    fired.extend(events.into_iter().map(|event| (entry.node_id, event)));
+                }
+                Err(_) => error!(
+                    "media: player for node {} panicked; element abandoned",
+                    entry.node_id.as_u64()
+                ),
+            }
+        }
+        // The cadence anchor: alive while anything is pumping or waiting on
+        // bytes; silent once every player is parked.
+        self.media_next_pump = if self.media.is_empty() {
+            None
+        } else if self.media.iter().any(|entry| {
+            let player = entry.player.borrow();
+            player.needs_repaint() || matches!(player.state(), PlayerState::Loading | PlayerState::Playing)
+        }) {
+            Some(Instant::now() + MEDIA_TICK)
+        } else {
+            // A failed/ended/parked document needs no clock at all — but
+            // keep one slow tick while a fetch is still in flight.
+            if self.media_inflight.is_empty() {
+                None
+            } else {
+                Some(Instant::now() + MEDIA_TICK)
+            }
+        };
+
+        if repaint {
+            self.needs_paint = true;
+        }
+        self.fire_media_events(fired);
+        media_guard("snapshots", || self.refresh_media_snapshots());
+    }
+
+    /// Cap the poll timeout by the next media step (the `timer_poll_tick`
+    /// shape, for media): with no live players this returns `base` — the
+    /// media feature costs an empty `Vec` check.
+    fn media_poll_tick(&self, base: Duration) -> Duration {
+        match self.media_next_pump {
+            Some(due) => base.min(due.saturating_duration_since(Instant::now())),
+            None => base,
+        }
+    }
+}
+
+/// A throwaway temp dir for one media fetch's private cache (unique per
+/// href per process — the dedupe guarantees one fetch per href).
+fn private_media_cache_dir(href: &str) -> PathBuf {
+    // FNV-1a — a temp-dir name needs uniqueness, not cryptography.
+    let mut hash: u64 = 0xcbf2_9ce3_4ea2_7b17;
+    for byte in href.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0100_0000_01b3);
+    }
+    std::env::temp_dir().join(format!(
+        "ironsurf-media-{}-{hash:016x}",
+        std::process::id()
+    ))
+}
+
+/// The media fetch worker (runs off the tab thread): the tab's own document
+/// fetcher for the resolved URL (so container cookies, the cache, and the
+/// https policy apply to media exactly as they do to pages), accepting only
+/// 2xx bodies of at most `MAX_VIDEO_BYTES`. Errors come back as the engine's
+/// user-facing [`MediaError`]s, which is what the element paints and
+/// `v.mediaError` reports.
+fn fetch_media_bytes(
+    url: &Url,
+    policy: NetPolicy,
+    jar: Arc<Mutex<CookieJar>>,
+    href: &str,
+) -> Result<Vec<u8>, MediaError> {
+    // The tab's own disk cache stays on the tab thread (NetCache is not
+    // shareable); this worker gets a private temp cache for its one URL,
+    // deleted before it returns — media never touches the container cache.
+    let cache_dir = private_media_cache_dir(href);
+    let fetched = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let mut jar = jar
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut cache = NetCache::with_limits(cache_dir.clone(), 1, MAX_VIDEO_BYTES * 2);
+        netmod::fetch_document(url, policy, &mut jar, &mut cache, netmod::now_unix())
+    }));
+    let _ = std::fs::remove_dir_all(&cache_dir);
+    let outcome = fetched.map_err(|_| MediaError::Unreachable {
+        detail: format!("{href}: the fetch worker panicked"),
+    })?;
+    match outcome {
+        Ok(fetch) => {
+            if !(200..=299).contains(&fetch.status) {
+                return Err(MediaError::Unreachable {
+                    detail: format!("{href}: HTTP {}", fetch.status),
+                });
+            }
+            if fetch.body.len() > MAX_VIDEO_BYTES {
+                return Err(MediaError::TooLarge {
+                    bytes: fetch.body.len(),
+                    limit: MAX_VIDEO_BYTES,
+                });
+            }
+            Ok(fetch.body)
+        }
+        Err(err) => Err(MediaError::Unreachable {
+            detail: err.to_string(),
+        }),
+    }
+}
+
 /// Translate the ironsurf modifier bits (`ironsurf_common::Modifiers`, its own
 /// `u8` layout) into `keyboard_types::Modifiers` — the two bit layouts differ,
 /// so this must never be a cast (`docs/BLITZ_API_NOTES.md` §4).
@@ -2364,8 +3042,9 @@ pub fn run(args: TabArgs) -> i32 {
         } else {
             IDLE_TICK
         };
-        // Never sleep past the earliest JS timer deadline (task: real timers).
-        let tick = tab.timer_poll_tick(tick);
+        // Never sleep past the earliest JS timer deadline (task: real timers),
+        // nor past the media cadence while a video is alive (task: playback).
+        let tick = tab.media_poll_tick(tab.timer_poll_tick(tick));
         poll_inputs(stdin_fd, wake_fd, tick);
         // Wake-ups from ShellProvider::request_redraw / the NetWaker.
         let woken = pipe.drain() > 0;
@@ -2400,6 +3079,11 @@ pub fn run(args: TabArgs) -> i32 {
         // (setTimeout/setInterval/rAF), settle, and repaint coalesced exactly
         // like the input path above.
         tab.run_due_timers();
+
+        // 2c. Video: deliver fetched bytes, attach late `<video>`s, advance
+        // every player, forward page events, and refresh the snapshots the
+        // page's media properties read (task: playback).
+        tab.pump_media();
 
         // 3. Settle net completions / redraw requests and coalesce frames.
         //    Invisible tabs stay idle — repaints resume on SetVisible(true).
@@ -2652,6 +3336,7 @@ mod tests {
             offline_fixtures: None,
             net_policy: NetPolicy::Managed,
             no_sandbox: true,
+            media_enabled: true,
         };
         let pipe = Arc::new(SelfPipe::new().expect("pipe"));
         let tab = Tab::new_headless(&args, pipe);
@@ -2684,6 +3369,7 @@ mod tests {
             offline_fixtures: None,
             net_policy: NetPolicy::Passthrough,
             no_sandbox: true,
+            media_enabled: true,
         };
         let pipe = Arc::new(SelfPipe::new().expect("pipe"));
         Tab::new_headless(&args, pipe)
@@ -2847,6 +3533,7 @@ mod tests {
             offline_fixtures: None,
             net_policy: NetPolicy::Passthrough,
             no_sandbox: true,
+            media_enabled: true,
         };
         let pipe = Arc::new(SelfPipe::new().expect("pipe"));
         let mut tab = Tab::new_headless(&args, pipe);
@@ -2987,5 +3674,142 @@ mod tests {
         tab.handle_to_tab(wheel(1000.0));
         tab.settle();
         assert_eq!(scroll_y(&mut tab), 0.0, "scrolling up clamps at the top");
+    }
+
+    // -------------------------------------------------------------------
+    // Video wiring (task: playback) — headless, local files only
+
+    /// One `<video>` with a `src` that does not exist on disk (the fetch is
+    /// spawned and fails on its own thread; the test never waits for the
+    /// network — and needs none).
+    const VIDEO_PAGE: &str = r#"<!doctype html>
+<html><head><title>Tube</title></head>
+<body>
+  <video id="v" src="x.mp4" width="320" height="240"></video>
+  <p>caption</p>
+</body></html>"#;
+
+    fn write_page(dir: &std::path::Path, html: &str) -> String {
+        std::fs::write(dir.join("index.html"), html).expect("write page");
+        format!("file://{}", dir.join("index.html").display())
+    }
+
+    /// (videos, widget-carrying elements) over the live document tree —
+    /// the same traversal `attach_video_widgets` performs.
+    fn count_videos_and_widgets(tab: &mut Tab) -> (usize, usize) {
+        let doc = tab.document_mut().expect("document loaded");
+        let mut videos = 0;
+        let mut widgets = 0;
+        for (_id, node) in doc.tree().iter() {
+            if let Some(el) = node.element_data() {
+                if el.name.local == blitz_dom::local_name!("video") {
+                    videos += 1;
+                }
+                if el.custom_widget_data().is_some() {
+                    widgets += 1;
+                }
+            }
+        }
+        (videos, widgets)
+    }
+
+    #[test]
+    fn a_video_document_gets_exactly_one_widget() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut tab = form_tab(dir.path());
+        let url = write_page(dir.path(), VIDEO_PAGE);
+        assert!(tab.navigate(&url, NavHistory::Fresh), "local page loads");
+        let (videos, widgets) = count_videos_and_widgets(&mut tab);
+        assert_eq!(videos, 1, "the page has one <video>");
+        assert_eq!(
+            widgets, 1,
+            "exactly the <video> carries a widget — nothing else"
+        );
+        assert_eq!(tab.media.len(), 1, "one player for one element");
+        assert_eq!(
+            tab.media_inflight.len(),
+            1,
+            "the src fetch was queued for the element"
+        );
+        // And the pump tolerates the pending fetch (no panic escapes).
+        tab.pump_media();
+    }
+
+    #[test]
+    fn a_plain_document_attaches_nothing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut tab = form_tab(dir.path());
+        let url = write_page(
+            dir.path(),
+            "<!doctype html><html><body><p>no media here</p></body></html>",
+        );
+        assert!(tab.navigate(&url, NavHistory::Fresh));
+        let (videos, widgets) = count_videos_and_widgets(&mut tab);
+        assert_eq!((videos, widgets), (0, 0));
+        assert!(tab.media.is_empty());
+        tab.pump_media(); // feature on, no media: a walk that attaches zero
+    }
+
+    #[test]
+    fn media_off_attaches_no_widget_even_for_a_video_page() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let args = TabArgs {
+            tab_id: TabId(1),
+            container_id: ContainerId(1),
+            profile_dir: dir.path().to_path_buf(),
+            url: "about:blank".into(),
+            offline_fixtures: None,
+            net_policy: NetPolicy::Passthrough,
+            no_sandbox: true,
+            media_enabled: false,
+        };
+        let pipe = Arc::new(SelfPipe::new().expect("pipe"));
+        let mut tab = Tab::new_headless(&args, pipe);
+        let url = write_page(dir.path(), VIDEO_PAGE);
+        assert!(tab.navigate(&url, NavHistory::Fresh));
+        let (videos, widgets) = count_videos_and_widgets(&mut tab);
+        assert_eq!(videos, 1, "the page still has its <video>");
+        assert_eq!(widgets, 0, "--no-media: no widget, no fetch, no player");
+        assert!(tab.media.is_empty());
+        assert!(tab.media_inflight.is_empty());
+    }
+
+    /// The stock fixture decodes for real: demux reports H.264 (the flower
+    /// clip is 960×540 — the asserted size is the demuxer's own reading, and
+    /// the natural size agrees), and the player presents frames from the
+    /// software decoder. Skips (not fails) when the fixture is not on disk.
+    #[test]
+    fn flower_fixture_demuxes_as_h264_and_decodes() {
+        let path = std::path::Path::new("/tmp/vid/flower.mp4");
+        if !path.exists() {
+            eprintln!("skipping: /tmp/vid/flower.mp4 is not present");
+            return;
+        }
+        let bytes = Arc::new(std::fs::read(path).expect("fixture readable"));
+        let track = crate::media::player::open_bytes(Arc::clone(&bytes)).expect("demuxes");
+        let info = track.info();
+        assert!(
+            matches!(info.codec, crate::media::codec::VideoCodec::H264),
+            "codec {:?}",
+            info.codec
+        );
+        assert_eq!((info.width, info.height), (960, 540), "{}", info.describe());
+
+        let mut player = MediaPlayer::new();
+        player.load(track);
+        player.play();
+        let mut presented = 0usize;
+        for _ in 0..80 {
+            if player.pump() {
+                presented += 1;
+            }
+            if presented >= 2 {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        assert!(presented >= 1, "the software decoder presented no frames");
+        assert_eq!(player.natural_size(), Some((960, 540)));
+        assert!(!player.is_paused());
     }
 }

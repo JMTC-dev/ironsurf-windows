@@ -151,6 +151,10 @@ impl VideoCodec {
                     b"RGBA" | b"rgb3" | b"ARGB" => VideoCodec::Raw(RawFormat::Rgba32),
                     b"MJPG" | b"jpeg" | b"mjpg" | b"MJFJ" | b"1MJG" => VideoCodec::Mjpeg,
                     b"H264" | b"h264" | b"X264" | b"avc1" => VideoCodec::H264,
+                    // MPEG-4 Part 2 (DivX/Xvid-class AVI handlers): named,
+                    // never decoded — there is no pure-Rust decoder wired in.
+                    b"XVID" | b"DIVX" | b"divx" | b"DX50" | b"DX51" | b"MP42" | b"MP43"
+                    | b"MPG3" | b"mp4v" => VideoCodec::Unknown("MPEG-4 Part 2".to_string()),
                     b"VP90" => VideoCodec::Vp9,
                     // VP8 is named honestly; `make_decoder` refuses it with
                     // MediaError::UnsupportedCodec (no pure-Rust VP8 decoder).
@@ -735,7 +739,8 @@ mod tests {
             height: 180,
             codec_private: None,
         };
-        let err = make_decoder(&params).expect_err("VP8 must be refused");
+        // The Ok side (Box<dyn PictureDecoder>) is !Debug; take the error side.
+        let err = make_decoder(&params).err().expect("VP8 must be refused");
         assert_eq!(
             err,
             MediaError::UnsupportedCodec {

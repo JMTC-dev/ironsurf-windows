@@ -17,7 +17,9 @@ reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"
 blitz-dom = "0.3.0-beta.2"
 blitz-html = "0.3.0-beta.2"
 blitz-net = "0.3.0-beta.2"
-blitz-paint = "0.3.0-beta.2"
+# `custom-widget` is what lets a `<video>` element be painted by the tab's own
+# decode pipeline (see src/media/widget.rs); blitz-dom has it on by default.
+blitz-paint = { version = "0.3.0-beta.2", features = ["custom-widget"] }
 blitz-traits = "0.3.0-beta.2"
 # JavaScript (task 8): pure Rust, no mozjs/spidermonkey in the tree.
 boa_engine = "0.22"
@@ -31,5 +33,16 @@ peniko = "0.6"
 keyboard-types = "0.7"
 atomic_refcell = "0.1"
 
+# Video (task: playback) — pure Rust software decoders, no C, no GPU.
+rusty_h264-decoder = "0.16"
+vp9dec = "0.1"
+jpeg-decoder = "0.3"
+
 [dev-dependencies]
 tempfile = "3"
+# Only for tests: the `stylo` crate blitz aliases as `style` (same version the
+# engine graph already locks), needed to build the initial `ComputedValues`
+# blitz hands to `Widget::paint` — it has no `Default`.
+style = { version = "0.20.0", package = "stylo" }
+# `BlitzPointerEvent::active_pointers` is an `Arc<AtomicRefCell<Vec<_>>>`.
+atomic_refcell = "0.1"

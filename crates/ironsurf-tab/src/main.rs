@@ -11,6 +11,7 @@
 mod forms;
 mod headless;
 mod js;
+mod media;
 mod netmod;
 mod runtime;
 mod spike;

@@ -68,3 +68,10 @@ at the top); workspace green.
 test hooks: set_test_metadata drops needless .clone() (E0716), seek test asserts player.current_pts() (Frame
 has no pts), open_bytes expect_err→.err().expect (VideoTrack: !Debug). cargo check -p ironsurf-tab [plain +
 --tests] show ZERO media/player.rs diagnostics (crate still red elsewhere).
+## ironsurf-tab GREEN — full test suite 0 failed (161 bin + 18 other targets, timing suites stable ×3); cargo check plain + --no-default-features 0 errors.
+player.rs: canplay fires once per load at first decoded picture; paused freezes pipeline slack (only first
+frame or seek target reaches screen); paused needs_repaint = seek-await only, not in-flight decode.
+widget.rs: kurbo/stylo call-shape (from_rgb8/rgba8, one-point BezPath, RoundedRect::from_rect, Alpha);
+strip click at x==width seeks 1.0, picture area stays half-open. Demux fixtures made spec-shaped (stsc/stco
+fields, plain strh/strf chunks, canonical EBML varints, RIFF movi children); XVID-class → "MPEG-4 Part 2".
+## video wired — media engine live in the tab. runtime.rs: attach_video_widgets (blitz set_custom_widget + width/height attrs → VideoWidget::with_size_hint, 640×360 fallback, per-tick re-scan for late <video>), fetch worker threads (SelfPipe + results queue, container cookies/policy, 2xx + MAX_VIDEO_BYTES only), pump_media after run_due_timers with MEDIA_TICK=40ms capping the poll sleep, PlayerEvent→DOM events via __ironsurfFire, catch_unwind media_guard on every step; --no-media master switch. js.rs: __ironsurfMediaGet/MediaCmd natives + NodeProto HTMLMediaElement glue (currentTime/duration/paused/ended/playbackRate/muted/videoWidth/videoHeight/mediaError, play/pause/canPlayType, instanceof HTMLMediaElement), page writes queue MediaCommands the loop applies (MediaHost cell in HostState). Spec APIs adapted to shipped blitz 0.3 (set_custom_widget not Node::Widget; SelfPipe not to_main; std::thread not tokio); /tmp/vid/flower.mp4 is 960×540 (tests assert the demuxer's own reading). cargo test -p ironsurf-tab 190 green; cargo check --workspace clean (ironsurf-net/-session/-ironsurf are not packages in this tree).

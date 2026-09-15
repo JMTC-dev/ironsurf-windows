@@ -77,7 +77,8 @@ impl Iterator for Boxes<'_> {
             self.at = self.end;
             return Some(Err(corrupt_msg("box size runs past the end of its parent")));
         }
-        let kind = self.data[self.at..self.at + 4].try_into().expect("4 bytes");
+        // ISO BMFF: size(4) then type(4) — the kind is AFTER the size field.
+        let kind = self.data[self.at + 4..self.at + 8].try_into().expect("4 bytes");
         let body = self.at + header;
         self.at += size;
         Some(Ok(BoxRef {
@@ -679,7 +680,10 @@ mod tests {
         }
 
         // Chunk layout: everything in one chunk.
+        // One entry: first_chunk=1, samples_per_chunk=N, desc index 1 —
+        // everything in one chunk. (The entry needs all three fields.)
         let mut stsc = vec![0, 0, 0, 0];
+        stsc.extend_from_slice(&1u32.to_be_bytes());
         stsc.extend_from_slice(&1u32.to_be_bytes());
         stsc.extend_from_slice(&(sample_count as u32).to_be_bytes());
         stsc.extend_from_slice(&1u32.to_be_bytes());
@@ -705,8 +709,14 @@ mod tests {
             put(&mut body, b"stss", &stss);
             put(&mut body, b"stsz", &stsz);
             put(&mut body, b"stsc", &stsc);
-            // stco patched after the length is known: placeholder now.
-            put(&mut body, b"stco", &1u32.to_be_bytes());
+            // stco: version/flags(4) + entry_count(4) + one placeholder
+            // offset, patched once the length (and so `mdat`'s position) is
+            // known. Skipping version/flags here used to make the patch land
+            // past the box's end, scribbling over `mdat`'s size field.
+            let mut stco = vec![0u8; 8];
+            stco[4..8].copy_from_slice(&1u32.to_be_bytes());
+            stco.extend_from_slice(&0u32.to_be_bytes());
+            put(&mut body, b"stco", &stco);
             body
         };
         let mut minf = Vec::new();
@@ -763,8 +773,10 @@ mod tests {
         assert_eq!(parsed.info.codec, VideoCodec::H264);
         assert_eq!(parsed.info.sample_count, 5);
         assert!(parsed.info.codec_private.as_deref().unwrap().starts_with(&[1, 100]));
-        // 3000 ticks at 90 kHz = 33.3 ms per frame.
-        assert!((parsed.info.duration.unwrap() - 0.1333).abs() < 0.01);
+        // 3000 ticks at 90 kHz = 33.3 ms per frame, five of them: the whole
+        // movie is 15000/90000 = 0.1667 s (the old expected 0.1333 — that is
+        // four intervals, one frame short of the fixture's five).
+        assert!((parsed.info.duration.unwrap() - 0.1667).abs() < 0.01);
         assert_eq!(parsed.samples.len(), 5);
         assert_eq!(parsed.samples[0].len, 8);
         assert!((parsed.samples[2].pts - 0.0666).abs() < 0.01);
@@ -816,8 +828,9 @@ mod tests {
     #[test]
     fn sniffing_recognises_the_usual_brands() {
         assert!(looks_like_mp4(b"\0\0\0\x20ftypisom"));
-        assert!(looks_like_mp4(b"\0\0\x02moov"));
+        assert!(looks_like_mp4(b"\0\0\0\x02moov"));
         assert!(!looks_like_mp4(b"RIFFjunkAVI "));
         assert!(!looks_like_mp4(b""));
     }
 }
+

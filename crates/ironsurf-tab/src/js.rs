@@ -280,6 +280,12 @@ pub struct HostState {
     pub body_text: Option<String>,
     /// URL the bindings report through `location.href`.
     pub url: String,
+    /// Video (task: playback): the `<video>` half of the host. Page reads
+    /// (`v.currentTime`, `v.duration`, …) see the snapshot the tab's last
+    /// media pump wrote; page writes (`v.play()`, `v.currentTime = 5`, …)
+    /// queue commands the poll loop applies to the real players. The type
+    /// lives in `runtime` — the tab owns both ends of this cell.
+    pub media: crate::runtime::MediaHost,
 }
 
 impl HostState {
@@ -1914,6 +1920,8 @@ mod native {
     pub(super) const SET_INTERVAL: &str = "__ironsurfSetInterval";
     pub(super) const RAF: &str = "__ironsurfRaf";
     pub(super) const TIMER_CLEAR: &str = "__ironsurfClearTimer";
+    pub(super) const MEDIA_GET: &str = "__ironsurfMediaGet";
+    pub(super) const MEDIA_CMD: &str = "__ironsurfMediaCmd";
 }
 
 /// One-shot delay used for `requestAnimationFrame` (~60 Hz; the tab has no
@@ -2887,6 +2895,99 @@ const PRELUDE: &str = r##"
     },
   };
 
+  // ---------------------------------------------------------------------
+  // HTMLMediaElement glue for <video> (video task)
+  //
+  // The engine side lives in runtime.rs: the tab attaches a player to every
+  // <video>, pumps it, and refreshes a snapshot per element. These are the
+  // page-visible members: reads go through __ironsurfMediaGet (the last
+  // snapshot the tab pumped), writes through __ironsurfMediaCmd (a command
+  // the poll loop applies between pumps) — the location.href= pattern. They
+  // sit on the wrapper prototype like every other member, so
+  // document.querySelector("video").currentTime just works; on a non-media
+  // element the host is never consulted and the members read as if there
+  // were no media (paused true, NaN duration), like a real element with no
+  // source.
+  // ---------------------------------------------------------------------
+  function mediaTag(self) {
+    var name = self.nodeName;
+    name = typeof name === "string" ? name.toLowerCase() : "";
+    return name === "video" || name === "audio" ? name : "";
+  }
+  function mediaGet(self, prop) {
+    if (!mediaTag(self)) return undefined;
+    return host.__ironsurfMediaGet(self.__n, prop);
+  }
+  function mediaCmd(self, op, arg) {
+    if (!mediaTag(self)) return undefined;
+    host.__ironsurfMediaCmd(self.__n, op, arg === undefined ? 0 : arg);
+  }
+  function mediaNum(value, fallback) {
+    return typeof value === "number" && value === value ? value : fallback;
+  }
+  function mediaAccessor(name, get, set) {
+    Object.defineProperty(NodeProto, name, {
+      get: get, set: set, enumerable: false, configurable: true
+    });
+  }
+  // The interface the media members belong to: the wrapper prototype carries
+  // them (this bridge has no deeper prototype chain), and it is exported
+  // (globalThis.HTMLMediaElement, visible as host.HTMLMediaElement too) as a
+  // callable sentinel whose prototype is the wrapper prototype, so the
+  // real-DOM check `v instanceof HTMLMediaElement` holds for element wrappers.
+  function HTMLMediaElement() {}
+  HTMLMediaElement.prototype = NodeProto;
+  mediaAccessor("currentTime",
+    function () { return mediaNum(mediaGet(this, "currentTime"), NaN); },
+    function (value) {
+      var seconds = Number(value);
+      if (isFinite(seconds) && seconds >= 0) mediaCmd(this, "seek", seconds);
+    });
+  mediaAccessor("duration",
+    function () { return mediaNum(mediaGet(this, "duration"), NaN); });
+  // An element with no attached player reads as paused; with one, the
+  // tab's snapshot answers.
+  mediaAccessor("paused",
+    function () { return mediaGet(this, "paused") !== false; });
+  mediaAccessor("ended",
+    function () { return mediaGet(this, "ended") === true; });
+  mediaAccessor("playbackRate",
+    function () { return mediaNum(mediaGet(this, "playbackRate"), 1); },
+    function (value) {
+      var rate = Number(value);
+      if (isFinite(rate) && rate > 0) mediaCmd(this, "rate", rate);
+    });
+  mediaAccessor("muted",
+    function () { return mediaGet(this, "muted") === true; },
+    function (value) { mediaCmd(this, "muted", value ? 1 : 0); });
+  mediaAccessor("videoWidth",
+    function () { return mediaNum(mediaGet(this, "videoWidth"), 0); });
+  mediaAccessor("videoHeight",
+    function () { return mediaNum(mediaGet(this, "videoHeight"), 0); });
+  // IronSurf addition (the plan's `mediaError`): the user-facing failure
+  // reason the engine produced (codec / too-large / unreachable …) or null.
+  mediaAccessor("mediaError",
+    function () {
+      var value = mediaGet(this, "mediaError");
+      return value == null ? null : String(value);
+    });
+  function mediaMethod(name, fn) {
+    Object.defineProperty(NodeProto, name, {
+      value: fn, writable: true, enumerable: false, configurable: true
+    });
+  }
+  mediaMethod("play", function () { mediaCmd(this, "play"); });
+  mediaMethod("pause", function () { mediaCmd(this, "pause"); });
+  // load() needs no plumbing: a src change on the element attribute is
+  // noticed by the tab's per-tick attach pass.
+  mediaMethod("load", function () {});
+  mediaMethod("canPlayType", function (type) {
+    type = String(type).toLowerCase();
+    return /mp4|webm|avi|matroska|h264|avc1|vp8|vp9/.test(type) ? "probably" : "";
+  });
+  // Export the interface name (checks like `v instanceof HTMLMediaElement`).
+  globalThis.HTMLMediaElement = HTMLMediaElement;
+
   function makeConsole(level) {
     return function () {
       // Array.prototype.join applies JavaScript's ToString to every argument.
@@ -3064,6 +3165,92 @@ pub fn build_context(host: &HostRef, _timers: &Rc<RefCell<TimerQueue>>) -> Conte
         {
             error!("js binding `{name}` failed to install: {err}");
         }
+    }
+    // Video (task: playback) reads: `__ironsurfMediaGet(nodeId, prop)` reads
+    // the snapshot the tab's last media pump wrote (`null` = the tab has no
+    // player for that node — the prelude's `HTMLMediaElement` glue maps the
+    // props to their no-media readings from there).
+    if let Err(err) = context.register_global_builtin_callable(
+        JsString::from(native::MEDIA_GET),
+        2,
+        NativeFunction::from_copy_closure(|_this, args, context| {
+            let node = args
+                .first()
+                .map(|value| value.to_number(context).map(|n| n as u64))
+                .transpose()?
+                .unwrap_or(0);
+            let prop = args
+                .get(1)
+                .cloned()
+                .unwrap_or(JsValue::undefined())
+                .to_string(context)?
+                .to_std_string_escaped();
+            let value = with_host(|host| {
+                host.media.snapshot(node).map(|snap| {
+                    use crate::runtime::MediaSnapshot;
+                    let MediaSnapshot {
+                        duration,
+                        current_time,
+                        paused,
+                        ended,
+                        rate,
+                        muted,
+                        width,
+                        height,
+                        ref error,
+                    } = *snap;
+                    match prop.as_str() {
+                        "duration" => JsValue::from(duration),
+                        "currentTime" => JsValue::from(current_time),
+                        "paused" => JsValue::from(paused),
+                        "ended" => JsValue::from(ended),
+                        "playbackRate" => JsValue::from(rate),
+                        "muted" => JsValue::from(muted),
+                        "videoWidth" => JsValue::from(f64::from(width)),
+                        "videoHeight" => JsValue::from(f64::from(height)),
+                        "mediaError" => match error {
+                            Some(text) => JsValue::from(JsString::from(text.as_str())),
+                            None => JsValue::null(),
+                        },
+                        _ => JsValue::undefined(),
+                    }
+                })
+            });
+            Ok(value.flatten().unwrap_or(JsValue::null()))
+        }),
+    ) {
+        error!("js binding `mediaGet` failed to install: {err}");
+    }
+    // Video writes: `__ironsurfMediaCmd(nodeId, op, arg)` queues one
+    // `MediaCommand`; the poll loop applies it to the player between pumps
+    // (the `location.href=` pattern — JS never touches the player directly).
+    if let Err(err) = context.register_global_builtin_callable(
+        JsString::from(native::MEDIA_CMD),
+        3,
+        NativeFunction::from_copy_closure(|_this, args, context| {
+            let node = args
+                .first()
+                .map(|value| value.to_number(context).map(|n| n as u64))
+                .transpose()?
+                .unwrap_or(0);
+            let op = args
+                .get(1)
+                .cloned()
+                .unwrap_or(JsValue::undefined())
+                .to_string(context)?
+                .to_std_string_escaped();
+            let arg = args
+                .get(2)
+                .map(|value| value.to_number(context))
+                .transpose()?
+                .unwrap_or(0.0);
+            if let Some(command) = crate::runtime::media_command_from_js(node, &op, arg) {
+                with_host(|host| host.media.enqueue(command));
+            }
+            Ok(JsValue::undefined())
+        }),
+    ) {
+        error!("js binding `mediaCmd` failed to install: {err}");
     }
     // clearTimeout/clearInterval/cancelAnimationFrame: cancel by id.
     if let Err(err) = context.register_global_builtin_callable(
@@ -4316,6 +4503,156 @@ mod tests {
         assert_eq!(
             text.to_string(&mut runtime.context).expect("s").to_std_string_escaped(),
             "by script one"
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // HTMLMediaElement glue (task: playback) — the player is stubbed by a
+    // seeded snapshot, exactly what the tab's pump writes each tick.
+
+    const MEDIA_PAGE: &str = r####"<!doctype html>
+<html><head><title>Tube</title></head>
+<body><video id="v" src="flower.mp4" width="320" height="240"></video></body></html>"####;
+
+    /// Runtime + live `MEDIA_PAGE` + host, with a stubbed player: the
+    /// snapshot a real pump would have written for the `<video>` node.
+    fn media_world() -> (JsRuntime, blitz_html::HtmlDocument, HostRef, u64) {
+        let host = sample_host();
+        let mut doc = dom(MEDIA_PAGE);
+        let raw = {
+            let base: &blitz_dom::BaseDocument = &doc;
+            base.tree()
+                .iter()
+                .find(|(_id, node)| {
+                    node.element_data()
+                        .is_some_and(|el| el.name.local == blitz_dom::local_name!("video"))
+                })
+                .map(|(id, _node)| id.as_u64())
+                .expect("the page has a <video>")
+        };
+        host.borrow_mut().media.snapshots.insert(
+            raw,
+            crate::runtime::MediaSnapshot {
+                duration: 10.5,
+                current_time: 2.25,
+                paused: false,
+                ended: false,
+                rate: 1.5,
+                muted: true,
+                width: 320,
+                height: 240,
+                error: Some("unsupported codec".to_string()),
+            },
+        );
+        let runtime = JsRuntime::new(Rc::clone(&host));
+        // Registering the document happens inside dom_eval; hand back the
+        // pieces so tests can both eval and inspect the host.
+        (runtime, doc, host, raw)
+    }
+
+    fn js_text(runtime: &mut JsRuntime, value: JsValue) -> String {
+        value
+            .to_string(&mut runtime.context)
+            .expect("string")
+            .to_std_string_escaped()
+    }
+
+    #[test]
+    fn video_properties_read_the_pumped_snapshot_with_the_right_types() {
+        let (mut runtime, mut doc, _host, _raw) = media_world();
+        let value = dom_eval(
+            &mut runtime,
+            &mut doc,
+            r#"
+            var v = document.querySelector("video");
+            [
+              typeof v.currentTime, typeof v.duration, typeof v.paused,
+              typeof v.ended, typeof v.playbackRate, typeof v.muted,
+              typeof v.videoWidth, typeof v.videoHeight,
+              v.currentTime, v.duration, v.paused, v.playbackRate,
+              v.muted, v.videoWidth, v.videoHeight, v.mediaError,
+              v instanceof HTMLMediaElement, v.canPlayType("video/mp4")
+            ].join("|");
+            "#,
+        );
+        assert_eq!(
+            js_text(&mut runtime, value),
+            "number|number|boolean|boolean|number|boolean|number|number\
+             |2.25|10.5|false|1.5|true|320|240|unsupported codec|true|probably"
+        );
+    }
+
+    #[test]
+    fn video_writes_become_media_commands_for_the_poll_loop() {
+        let (mut runtime, mut doc, host, raw) = media_world();
+        dom_eval(
+            &mut runtime,
+            &mut doc,
+            r#"
+            var v = document.querySelector("video");
+            v.play();
+            v.pause();
+            v.currentTime = 7.25;
+            v.muted = false;
+            v.playbackRate = 2;
+            "#,
+        );
+        use crate::runtime::MediaCommand;
+        let commands = host.borrow().media.commands.clone();
+        assert_eq!(
+            commands,
+            vec![
+                MediaCommand::Play { node: raw },
+                MediaCommand::Pause { node: raw },
+                MediaCommand::Seek {
+                    node: raw,
+                    seconds: 7.25
+                },
+                MediaCommand::SetMuted {
+                    node: raw,
+                    muted: false
+                },
+                MediaCommand::SetRate { node: raw, rate: 2.0 },
+            ],
+            "writes queue commands in order; nothing happens until the loop applies them"
+        );
+        // The reads still report the last pumped snapshot, not the writes.
+        let value = dom_eval(
+            &mut runtime,
+            &mut doc,
+            "document.querySelector('video').currentTime",
+        );
+        assert_eq!(value.as_number().expect("number"), 2.25);
+    }
+
+    #[test]
+    fn non_media_elements_never_consult_the_host() {
+        let host = sample_host();
+        let mut runtime = JsRuntime::new(Rc::clone(&host));
+        let mut doc = dom(DOM_PAGE);
+        let value = dom_eval(
+            &mut runtime,
+            &mut doc,
+            r#"
+            var d = document.getElementById("p1");
+            d.play(); // a media method on a <p>: a no-op, not an exception
+            d.currentTime = 5;
+            d.muted = true;
+            [
+              typeof d.paused, d.paused, typeof d.duration, isNaN(d.duration),
+              d.videoWidth, d.mediaError === null
+            ].join("|");
+            "#,
+        );
+        assert_eq!(
+            js_text(&mut runtime, value),
+            "boolean|true|number|true|0|true",
+            "non-media elements read the no-media defaults"
+        );
+        let host = host.borrow();
+        assert!(
+            host.media.commands.is_empty(),
+            "media writes on non-media elements must not reach the host"
         );
     }
 }
