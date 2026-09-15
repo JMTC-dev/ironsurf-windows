@@ -1,4 +1,5 @@
 # Task log
+## codec.rs green (jpeg-decoder 0.3 / vp9dec 0.1.1 / rustc fixes): AVI fourcc via Vec-trim match (NULs only, spaces kept; VP80->Vp8 honest, refused as UnsupportedCodec), AvcC SPS/PPS len binding typed [u8;2], vp9 to_rgba -> free fn vp9_to_rgba (E0116), JPEG rewritten to Decoder::new(Cursor)+decode()+info() with L8/L16(HB)/RGB24/CMYK32->RGBA; cargo check -p ironsurf-tab shows ZERO codec.rs diagnostics (player/widget remain broken, other tasks).
 ## #25 JS-driven navigation implemented (was: refused) — location.href=/assign/replace/reload queue
 js::PendingNav on HostState via __ironsurfNavigate (glue location also gained real protocol/host/
 hostname/pathname/search/hash getters); Tab::drain_nav_hook follows it after every JS turn (relative
