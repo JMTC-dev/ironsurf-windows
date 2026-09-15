@@ -376,6 +376,24 @@ in `ironsurf-tab/src/netmod.rs` and pass `Arc<OurProvider>` as `DocumentConfig.n
   URL — page names are user text, never markup.
 - Container isolation holds even in Passthrough: one process = one container; its on-disk
   state lives under the sandbox-visible profile dir only.
+- **DevTools network reporting**: one `FromTab::NetworkEvent` per settled or failed page
+  request — main documents (every followed redirect hop, via the reporting fetch variants)
+  and provider subresources (`<img>`, `<script src>`, CSS) alike. A completed request carries
+  method/status/bytes/duration; a failed one carries `error: Some(…)`, `status: None` — never
+  both. `data:` and unsupported schemes report nothing (no-spam); revalidated cache hits
+  report the cached entry's status/size. The shell appends these into the per-tab network log.
+
+### DevTools CSS seam (`src/logging.rs`)
+
+Blitz parses CSS through Stylo with `None` as Stylo's `ParseErrorReporter`, so upstream every
+stylesheet parse error is silently dropped. The tab therefore **re-parses** the document's CSS
+with Stylo itself behind a real reporter: every `<style>` element body and every inline
+`style="…"` attribute (as a synthetic rule) become `ConsoleLog { source: "css", level:
+"error" }` with line/column, plus a `source: "css"` warning for `.css` responses served with
+the wrong `Content-Type` (raised by the `BlitzNetProvider`). Honest gaps: `<link
+rel=stylesheet>` *content* is fetched by blitz and never exists as DOM text, so its parse
+errors are invisible to the seam (its load failures and wrong content types are reported),
+and `@import` bodies are not followed.
 
 ### JavaScript (Boa)
 After parse & resolve, extract `<script>` elements from the DOM (`document.root_element()`
@@ -384,8 +402,12 @@ order in **one** `boa_engine::Context` per tab (per navigation: rebuild context)
 are a deliberately tiny surface (no engine-internal DOM mutation yet):
 - `window` (eventTarget-ish no-ops), `document.title` get/set (set → `FromTab::TitleChanged`
   and repaint), `document.body.textContent` read-only snapshot,
-  `console.log/info/warn/error` → tab stderr + `FromTab::StatusText`.
-- Script exceptions must never kill the tab: catch, report via StatusText, continue.
+  `console.log/info/warn/error` → tab stderr + `FromTab::StatusText` **and** a
+  `FromTab::ConsoleLog { source: "js", level, message }` per line (all four levels, page order).
+- Script exceptions must never kill the tab: catch, report via StatusText, continue. Every
+  uncaught exception is also a `ConsoleLog { source: "js", level: "error" }` — or `source:
+  "dom"` when a native `__ironsurfDom*` binding threw (the registration macro records native
+  `Err`s; reported **exactly once**, never duplicated on the generic script-error path).
 - **JS-driven navigation is implemented**: `location.href=`/`assign`/`replace`/`reload` queue a
   real navigation (`HostState::pending_nav`) that the tab's poll loop follows through its single
   navigation entry point after each JS turn — `assign`/`href=` push history, `replace`/`reload`
@@ -489,9 +511,23 @@ Process/tab management (`src/tabs.rs`):
   frame, and logs the exit status plus the captured stderr/panic backtrace; further commands to it are
   dropped with the crash message standing (✕ still closes it).
 
+### Developer tools (F12 / Ctrl-I)
+
+Per tab, a bottom-docked overlay (Console + Network panes, see the UI bullet above) fed by
+the tab's `ConsoleLog`/`NetworkEvent` stream: Console shows JS/CSS/DOM entries (`[source]
+message`, level icon + colour); Network shows Method | URL | Status | Size | Time per
+request, failures in red with their error text. Screenshots: `docs/screenshots/devtools.png`
+(Console) and `devtools-network.png`, reproducible with `scripts/demo.sh` (launches the real
+browser on `$DISPLAY` against a localhost fixture and drives it through synthetic xdotool
+input). Known limitation inherited from the tab: parse errors inside `<link>`-fetched
+stylesheets never reach the console (see §ironsurf-tab DevTools CSS seam).
+
 Tests (headless CI-safe): tab-proc message pump logic + `FromTab` state reduction tested
 against a **fake tab process** (a small test bin that scripts `FromTab` sequences) so shell
-logic runs without the engine (Blitz) or X. GUI smoke test gated behind `$DISPLAY` + `IRONSURF_SMOKE=1`.
+logic runs without the engine (Blitz) or X. `tests/devtools_e2e.rs` drives the **real**
+ironsurf-tab through the shell's `TabProc` pump against a localhost fixture and asserts the
+full DevTools feed (console sources js/css/dom + document/image `NetworkEvent`s with sane
+method/status/size). GUI smoke test gated behind `$DISPLAY` + `IRONSURF_SMOKE=1`.
 
 ---
 

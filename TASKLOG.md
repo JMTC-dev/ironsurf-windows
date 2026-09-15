@@ -1,4 +1,10 @@
 # Task log
+## #34 DevTools verified end to end + docs/screenshots: new crates/ironsurf-shell/tests/devtools_e2e.rs spawns the REAL ironsurf-tab
+  through the shell TabProc pump on a std::net localhost fixture — asserts the full console feed (js log/error, broken script + tab
+  alive, dom + css source entries) and NetworkEvents (document + <img> valid-PNG, exact bytes, method/status/duration sane, status⊕error)
+  and clean Destroy. cargo test --workspace green (incl. the new test); release green (rustc needed RUST_MIN_STACK for vp9dec).
+  scripts/demo.sh reproduces docs/screenshots/devtools{,-network}.png on :2.0 (xdotool --window coords, URL bar, F12); README
+  §Developer tools + ARCH §Developer tools, §DevTools CSS seam and tab emission/NetworkEvent notes.
 ## #33 DevTools panel UI in the shell (Slint): bottom-docked overlay Rectangle over the page (no PopupWindow — LinuxKMS), F12 (U+F70F, U+F70B also) / Ctrl-I toggle it per tab
   (keymap `Shortcut::ToggleDevTools`, consumed, page-focus only); header [Console n | Network n | ✕], Console rows (icon+colour per level, `[source] message`) + Network table
   (Method|URL|Status|Size|Time, unknown `—`, failures show the error text in red). Pure view-models `TabState::console_rows/net_rows` + `format_size/duration`; app.rs keeps the

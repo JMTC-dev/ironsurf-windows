@@ -36,5 +36,27 @@ load start/finish, tab spawn/exit and page `console.*`/JS errors are all there �
 `docs/ENGINE_INTEGRATION.md` §F lists every site and why the noisy ones sit at
 `trace` (a tab's stderr is a pipe nobody reads).
 
+## Developer tools
+
+`F12` or `Ctrl-I` toggles a per-tab DevTools panel docked over the bottom of the page:
+
+![IronSurf DevTools console](docs/screenshots/devtools.png)
+
+- **Console** — `console.log/info/warn/error`, uncaught JS exceptions, invalid CSS, and
+  native DOM binding throws, each line tagged with its source (`[js]`, `[css]`, `[dom]`)
+  and coloured by level.
+- **Network** — one row per request the page made: method, URL, status, size and time
+  (`—` where the engine could not measure something; failed requests show their error text
+  in red instead of a status). Redirect hops appear as separate rows.
+  ![Network pane](docs/screenshots/devtools-network.png)
+
+Honest limitations: Blitz hands Stylo no parse-error reporter, so the console's CSS entries
+come from the tab re-parsing `<style>` blocks and inline `style` attributes itself —
+parse errors *inside* `<link rel=stylesheet>` files (and `@import` bodies) are invisible
+today (their load failures and wrong `Content-Type`s do show up). Font/bidi traces stay on
+stderr (`--log trace`), not in the panel.
+
+`scripts/demo.sh` reproduces both screenshots on a headless X display with a localhost fixture.
+
 Feel free to help out, fork, spend some tokens on it. The initial Proof of Concept build (this repo) is built entirely from locally-hosted Qwen 3.8 Flash Next.
 
