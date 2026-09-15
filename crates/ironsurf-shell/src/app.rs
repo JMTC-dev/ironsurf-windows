@@ -17,8 +17,8 @@ use ironsurf_common::{
 };
 use ironsurf_storage::default_data_root;
 use slint::{
-    Color, ComponentHandle, Image, ModelRc, Rgba8Pixel, SharedPixelBuffer, SharedString, Timer,
-    TimerMode, VecModel, Weak,
+    Color, ComponentHandle, Image, Model, ModelRc, Rgba8Pixel, SharedPixelBuffer, SharedString,
+    Timer, TimerMode, VecModel, Weak,
 };
 
 use crate::classify::classify_input;
@@ -27,6 +27,9 @@ use crate::state::TabState;
 use crate::tabs::{PumpedMessage, TabProc};
 use crate::uisettings::UiSettings;
 use crate::{AppWindow, ContainerInfo, MenuItem, TabInfo};
+// The Slint-side row structs the DevTools panel renders (`state`'s own
+// view-models of the same name are converted into these).
+use crate::{ConsoleRow, NetRow};
 
 /// Fixed palette — **keep in sync** with `palette-color()` in ui/ironsurf.slint.
 pub const PALETTE: [&str; 7] = [
@@ -45,6 +48,37 @@ struct Proc {
     /// a broken pipe. The tab stays in the strip showing its last frame;
     /// `state.error` carries the “has crashed” status-line message.
     crashed: bool,
+    /// DevTools panel open for *this* tab (F12 / Ctrl-`I`). Per tab, like the
+    /// zoom factor: switching tabs switches the panel to the new tab's feed,
+    /// and a freshly opened tab starts closed.
+    devtools_open: bool,
+    /// Which pane the panel shows for this tab (Console / Network).
+    devtools_view: DevToolsView,
+}
+
+/// Which DevTools pane the panel shows. Kept as an index (`view_index`) for
+/// the Slint property, so the UI stays a number and Rust keeps the names.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum DevToolsView {
+    #[default]
+    Console,
+    Network,
+}
+
+impl DevToolsView {
+    pub fn index(self) -> i32 {
+        match self {
+            DevToolsView::Console => 0,
+            DevToolsView::Network => 1,
+        }
+    }
+
+    pub fn from_index(idx: i32) -> Self {
+        match idx {
+            1 => DevToolsView::Network,
+            _ => DevToolsView::Console,
+        }
+    }
 }
 
 /// A tab process that is gone: log it loudly (with whatever stderr — hence
@@ -94,6 +128,11 @@ pub struct Core {
     /// The actions behind the currently-open context menu, index-aligned
     /// with the Slint `menu-items` model.
     menu_items: RefCell<Vec<MenuAction>>,
+    /// The DevTools console table. Shared with the window (`console-rows`), so
+    /// it is patched in place instead of rebuilt per drain tick.
+    dt_console: Rc<VecModel<ConsoleRow>>,
+    /// The DevTools network table (same reason).
+    dt_net: Rc<VecModel<NetRow>>,
 }
 
 /// The assembled application: core + the timers that drive it (owned so
@@ -134,6 +173,8 @@ impl App {
             pending_move: Cell::new(None),
             clipboard: RefCell::new(String::new()),
             menu_items: RefCell::new(Vec::new()),
+            dt_console: Rc::new(VecModel::default()),
+            dt_net: Rc::new(VecModel::default()),
         });
 
         core.attach_callbacks(ui);
@@ -182,6 +223,16 @@ impl Core {
     /// Snapshot of the per-tab states (integration tests / debugging).
     pub fn tab_snapshot(&self) -> Vec<TabState> {
         self.procs.borrow().iter().map(|p| p.state.clone()).collect()
+    }
+
+    /// The DevTools panel as the tabs have it: `(open, pane)` per tab, in strip
+    /// order. The flag is per tab, so this is what survives switching tabs.
+    pub fn devtools_state(&self) -> Vec<(bool, DevToolsView)> {
+        self.procs
+            .borrow()
+            .iter()
+            .map(|p| (p.devtools_open, p.devtools_view))
+            .collect()
     }
 
     fn ui(&self) -> Option<AppWindow> {
@@ -291,7 +342,14 @@ impl Core {
                 let (w, h) = self.page_size();
                 {
                     let mut procs = self.procs.borrow_mut();
-                    procs.push(Proc { tab, state: TabState::default(), zoom: 1.0, crashed: false });
+                    procs.push(Proc {
+                        tab,
+                        state: TabState::default(),
+                        zoom: 1.0,
+                        crashed: false,
+                        devtools_open: false,
+                        devtools_view: DevToolsView::default(),
+                    });
                     self.active.set(procs.len() - 1);
                 }
                 if w > 0.0 && h > 0.0 {
@@ -442,6 +500,14 @@ impl Core {
                 self.apply_zoom(1.0);
                 return;
             }
+            Some(Shortcut::ToggleDevTools) => {
+                // Page focus only: the chord arrives from the page's `FocusScope`.
+                // Catching it while the URL bar is focused would need a second
+                // `FocusScope` wrapped around the `LineEdit`, which risks
+                // swallowing ordinary typing — and the panel is a page tool.
+                self.toggle_devtools();
+                return;
+            }
             Some(Shortcut::PageFocus) => {
                 // Escape also dismisses an open context menu.
                 self.close_context_menu();
@@ -495,6 +561,85 @@ impl Core {
             }
         }
         self.sync_ui();
+    }
+
+    // ---- DevTools panel --------------------------------------------------------
+
+    /// F12 / Ctrl-`I`: flip the DevTools panel of the active tab. The flag sits
+    /// on the tab record (like the zoom factor), so switching tabs switches the
+    /// panel to the new tab's feed and a freshly spawned tab starts closed.
+    fn toggle_devtools(&self) {
+        let Some(i) = self.active_proc_index() else {
+            debug!("DevTools toggle dropped: no active tab");
+            return;
+        };
+        let mut procs = self.procs.borrow_mut();
+        let p = &mut procs[i];
+        p.devtools_open = !p.devtools_open;
+        let (id, open) = (p.tab.id, p.devtools_open);
+        drop(procs);
+        info!("DevTools {} on tab {id}", if open { "opened" } else { "closed" });
+        self.sync_ui();
+    }
+
+    /// The panel's “✕” row (and nothing else) closes it for the active tab.
+    fn close_devtools(&self) {
+        let Some(i) = self.active_proc_index() else { return };
+        {
+            let mut procs = self.procs.borrow_mut();
+            if !procs[i].devtools_open {
+                return;
+            }
+            procs[i].devtools_open = false;
+        }
+        self.sync_ui();
+    }
+
+    /// A header row picked a pane (Console / Network).
+    fn set_devtools_view(&self, view: DevToolsView) {
+        let Some(i) = self.active_proc_index() else { return };
+        {
+            let mut procs = self.procs.borrow_mut();
+            if procs[i].devtools_view == view {
+                return;
+            }
+            procs[i].devtools_view = view;
+        }
+        self.sync_ui();
+    }
+
+    /// Write the panel's whole view-model (pane, counts, rows) for the active
+    /// tab. Called from `sync_ui`, and again from the drain tick whenever a
+    /// console/network message landed: those never report `changed` (they must
+    /// not dirty the frame), so nothing else would push them while open.
+    fn write_devtools(&self, ui: &AppWindow, procs: &[Proc]) {
+        let active = self.active.get().min(procs.len().saturating_sub(1));
+        let Some(p) = procs.get(active) else {
+            ui.set_devtools_open(false);
+            ui.set_console_count(0);
+            ui.set_network_count(0);
+            return;
+        };
+        ui.set_devtools_open(p.devtools_open);
+        ui.set_devtools_view(p.devtools_view.index());
+
+        // The models are shared (`Rc<VecModel>` installed once): appending the
+        // few rows that arrived keeps the list's scroll position, which a fresh
+        // model per tick would throw away.
+        sync_model(&self.dt_console, &p.state.console_rows().into_iter().map(|r| ConsoleRow {
+            level: r.level.into(),
+            text: r.text.into(),
+        }).collect::<Vec<_>>());
+        sync_model(&self.dt_net, &p.state.net_rows().into_iter().map(|r| NetRow {
+            method: r.method.into(),
+            url: r.url.into(),
+            status: r.status.into(),
+            size: r.size.into(),
+            time: r.time.into(),
+            failed: r.failed,
+        }).collect::<Vec<_>>());
+        ui.set_console_count(self.dt_console.row_count() as i32);
+        ui.set_network_count(self.dt_net.row_count() as i32);
     }
 
     fn page_pointer(&self, x: f32, y: f32, kind: i32, button: i32) {
@@ -703,9 +848,18 @@ impl Core {
             let old = {
                 let mut procs = self.procs.borrow_mut();
                 let zoom = procs[at].zoom;
+                let (devtools_open, devtools_view) =
+                    (procs[at].devtools_open, procs[at].devtools_view);
                 std::mem::replace(
                     &mut procs[at],
-                    Proc { tab, state: TabState::default(), zoom, crashed: false },
+                    Proc {
+                        tab,
+                        state: TabState::default(),
+                        zoom,
+                        crashed: false,
+                        devtools_open,
+                        devtools_view,
+                    },
                 )
             };
             if w > 0.0 && h > 0.0 {
@@ -818,6 +972,10 @@ impl Core {
         }
         let active = self.active_tab_id();
         let mut dirty = false;
+        // Console/network messages arrived this tick: `reduce` reports `false`
+        // for them on purpose (they must never dirty the frame), so the open
+        // panel needs its own nudge below.
+        let mut devtools_feed = false;
         let mut newest_frame: Option<Image> = None;
 
         for (tid, msg) in msgs {
@@ -832,10 +990,12 @@ impl Core {
                 ),
                 FromTab::Error { message } => error!("tab {tid} error: {message}"),
                 FromTab::ConsoleLog { source, level, message } => {
+                    devtools_feed = true;
                     info!("tab {tid} console[{source}:{level}]: {message}")
                 }
-                // DevTools network panel: logged for now, not per-tab state.
-                FromTab::NetworkEvent { .. } => {}
+                // DevTools network panel: the row data is the reduced per-tab
+                // log (`TabState::network`); nothing to log per message.
+                FromTab::NetworkEvent { .. } => devtools_feed = true,
                 FromTab::UrlChanged { url } => {
                     info!("tab {tid} url → {}", url.as_deref().unwrap_or("<none>"))
                 }
@@ -939,6 +1099,14 @@ impl Core {
 
         if dirty {
             self.sync_ui();
+        } else if devtools_feed {
+            // Panel open or not, keep the table current: pushing into a panel
+            // nobody looks at is cheap, and it means the pane is complete the
+            // instant F12 opens it.
+            let procs = self.procs.borrow();
+            if let Some(ui) = self.ui() {
+                self.write_devtools(&ui, &procs);
+            }
         }
         if let (Some(img), Some(ui)) = (newest_frame, self.ui()) {
             ui.set_page_image(img);
@@ -1051,6 +1219,9 @@ impl Core {
             ui.set_status_text(status.into());
         }
         ui.set_active_index(active as i32);
+        // The DevTools panel renders the active tab too (pane, counts, rows):
+        // toggling, switching tabs and closing it all land here.
+        self.write_devtools(&ui, &procs);
         // The spinner must react to LoadingChanged immediately, not on the next
         // tick of the spinner timer — a click on a link should start turning
         // the moment the tab says it is loading.
@@ -1172,6 +1343,36 @@ impl Core {
             });
         }
         bind0!(on_menu_close, |c: &Rc<Core>| c.close_context_menu());
+
+        // DevTools panel: the models are installed once and patched in place
+        // (see `write_devtools`), the two intents come back to the core.
+        ui.set_console_rows(ModelRc::from(self.dt_console.clone()));
+        ui.set_net_rows(ModelRc::from(self.dt_net.clone()));
+        {
+            let c = self.clone();
+            ui.on_devtools_select_view(move |view| c.set_devtools_view(DevToolsView::from_index(view)));
+        }
+        bind0!(on_devtools_close, |c: &Rc<Core>| c.close_devtools());
+    }
+}
+
+/// Grow, shrink and patch a shared Slint model in place. Appending only the
+/// rows that arrived keeps the list's scroll position (a fresh `VecModel` per
+/// tick would throw it away, so a page's log would jump to the bottom every
+/// 33 ms while the user read the middle of it).
+fn sync_model<T: Clone + PartialEq + 'static>(model: &VecModel<T>, want: &[T]) {
+    let have = model.row_count();
+    let shared = have.min(want.len());
+    for i in 0..shared {
+        if model.row_data(i).map_or(true, |row| row != want[i]) {
+            model.set_row_data(i, want[i].clone());
+        }
+    }
+    for i in shared..want.len() {
+        model.push(want[i].clone());
+    }
+    while model.row_count() > want.len() {
+        model.remove(model.row_count() - 1);
     }
 }
 
@@ -1499,6 +1700,43 @@ mod tests {
         assert!(
             !clip_without_caret.iter().any(|(l, _)| l == "Paste"),
             "no caret — the menu must not promise a paste"
+        );
+    }
+
+    #[test]
+    fn the_devtools_table_grows_in_place_and_shrinks_on_a_tab_switch() {
+        let model: Rc<VecModel<ConsoleRow>> = Rc::new(VecModel::default());
+        let row = |t: &str| ConsoleRow {
+            level: "log".into(),
+            text: t.into(),
+        };
+        sync_model(&model, &[row("a"), row("b")]);
+        assert_eq!(model.row_count(), 2);
+        // The usual tick: the log got longer, the old rows stay where they are
+        // (patching, not resetting, is what keeps the list's scroll position).
+        sync_model(&model, &[row("a"), row("b"), row("c")]);
+        assert_eq!(model.row_count(), 3);
+        assert_eq!(model.row_data(0).unwrap().text.as_str(), "a");
+        assert_eq!(model.row_data(2).unwrap().text.as_str(), "c");
+        // Another tab's log: patched in place, surplus dropped.
+        sync_model(&model, &[row("z")]);
+        assert_eq!(model.row_count(), 1);
+        assert_eq!(model.row_data(0).unwrap().text.as_str(), "z");
+        sync_model(&model, &[]);
+        assert_eq!(model.row_count(), 0);
+    }
+
+    #[test]
+    fn devtools_pane_indices_round_trip() {
+        assert_eq!(DevToolsView::default(), DevToolsView::Console);
+        assert_eq!(DevToolsView::Console.index(), 0);
+        assert_eq!(DevToolsView::Network.index(), 1);
+        assert_eq!(DevToolsView::from_index(1), DevToolsView::Network);
+        assert_eq!(DevToolsView::from_index(0), DevToolsView::Console);
+        assert_eq!(
+            DevToolsView::from_index(7),
+            DevToolsView::Console,
+            "an unknown pane falls back to Console"
         );
     }
 

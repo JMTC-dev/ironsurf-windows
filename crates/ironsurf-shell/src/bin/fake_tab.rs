@@ -18,6 +18,7 @@ fn main() {
     let mut url = "about:blank".to_string();
     let mut size = (400u32, 300u32);
     let mut crash = false;
+    let mut devtools_feed = false;
 
     let mut it = args.iter().skip(1);
     while let Some(arg) = it.next() {
@@ -39,6 +40,10 @@ fn main() {
                 size = (w.parse().unwrap_or(400), h.parse().unwrap_or(300));
             }
             "--crash" => crash = true,
+            // Scripted DevTools feed (console + network) so the shell's panel is
+            // testable without an engine: one batch at startup, one more after
+            // every Reload.
+            "--devtools-feed" => devtools_feed = true,
             _ => {} // tolerate the real tab's flags
         }
     }
@@ -52,6 +57,10 @@ fn main() {
     emit(FromTab::Ready { tab_id });
     announce(&mut emit, &url, false);
     emit(frame(size)); // like the real tab: a first frame without any Resize
+
+    if devtools_feed {
+        emit_feed(&mut emit, 1);
+    }
 
     if crash {
         // Stand in for a panicking `ironsurf-tab`: the panic line + backtrace
@@ -74,7 +83,12 @@ fn main() {
                 url = new;
                 announce(&mut emit, &url, true);
             }
-            ToTab::Reload => announce(&mut emit, &url, true),
+            ToTab::Reload => {
+                announce(&mut emit, &url, true);
+                if devtools_feed {
+                    emit_feed(&mut emit, 2);
+                }
+            }
             ToTab::Resize { width, height, .. } => {
                 size = (width.clamp(16, 4096), height.clamp(16, 4096));
                 emit(frame(size));
@@ -116,6 +130,61 @@ fn main() {
         }
     }
     std::process::exit(0);
+}
+
+/// A scripted DevTools feed: batch 1 is what the page said while it loaded (a
+/// log line, a CSS warning, one answered request, one that never got anywhere),
+/// batch 2 adds an error line and a redirect. Shapes mirror the real tab:
+/// `error` is `Some` exactly when `status` is `None`.
+fn emit_feed(emit: &mut impl FnMut(FromTab), batch: u8) {
+    if batch == 1 {
+        emit(FromTab::ConsoleLog {
+            source: "js".into(),
+            level: "log".into(),
+            message: "fake tab awake".into(),
+        });
+        emit(FromTab::ConsoleLog {
+            source: "css".into(),
+            level: "warn".into(),
+            message: "unsupported property zoom".into(),
+        });
+        emit(FromTab::NetworkEvent {
+            event: ironsurf_common::NetEvent {
+                method: "GET".into(),
+                url: "https://example.com/".into(),
+                status: Some(200),
+                response_bytes: Some(1234),
+                duration_ms: Some(42),
+                error: None,
+            },
+        });
+        emit(FromTab::NetworkEvent {
+            event: ironsurf_common::NetEvent {
+                method: "POST".into(),
+                url: "https://api.invalid/upload".into(),
+                status: None,
+                response_bytes: None,
+                duration_ms: Some(7),
+                error: Some("dns failure".into()),
+            },
+        });
+    } else {
+        emit(FromTab::ConsoleLog {
+            source: "js".into(),
+            level: "error".into(),
+            message: "reloaded and upset".into(),
+        });
+        emit(FromTab::NetworkEvent {
+            event: ironsurf_common::NetEvent {
+                method: "GET".into(),
+                url: "https://example.com/next".into(),
+                status: Some(301),
+                response_bytes: Some(0),
+                duration_ms: Some(1500),
+                error: None,
+            },
+        });
+    }
 }
 
 fn announce(emit: &mut impl FnMut(FromTab), url: &str, with_nav_history: bool) {

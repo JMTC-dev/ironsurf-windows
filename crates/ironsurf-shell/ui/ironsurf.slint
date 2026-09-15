@@ -9,7 +9,7 @@
 // cannot declare custom properties — so the two focus() watchers live in
 // the small custom components `UrlBar` and `PageSurface` instead.
 
-import { LineEdit } from "std-widgets.slint";
+import { LineEdit, ListView } from "std-widgets.slint";
 
 export struct TabInfo {
     id: int,
@@ -28,6 +28,24 @@ export struct ContainerInfo {
 /// maps the picked index back onto them).
 export struct MenuItem {
     label: string,
+}
+
+/// One DevTools console row, already reduced by `state::TabState::console_rows`
+/// (`level` drives the icon/colour, `text` is `"[source] message"`).
+export struct ConsoleRow {
+    level: string,
+    text: string,
+}
+
+/// One DevTools network row: pre-formatted columns (`—` for values the engine
+/// never sent); `failed` paints the status cell red with the error text in it.
+export struct NetRow {
+    method: string,
+    url: string,
+    status: string,
+    size: string,
+    time: string,
+    failed: bool,
 }
 
 /// A tiny borderless toolbar button (cheaper than styled Buttons in rows).
@@ -93,6 +111,45 @@ component PageSurface inherits FocusScope {
     }
 }
 
+/// One row (or the caption row) of the DevTools network table: Method | URL |
+/// Status | Size | Time, laid out with explicit geometry so captions and data
+/// lines up, and the URL is the column that absorbs the window's width.
+component NetRowCells inherits Rectangle {
+    in property <string> method: "";
+    in property <string> url: "";
+    in property <string> status: "";
+    in property <string> bytes: "";
+    in property <string> time: "";
+    in property <color> cell-color: #cfcfcf;
+    in property <color> status-color: root.cell-color;
+
+    m := Text {
+        x: 8px; width: 56px; height: parent.height;
+        text: root.method; color: root.cell-color;
+        vertical-alignment: center; overflow: elide;
+    }
+    u := Text {
+        x: 70px; width: Math.max(60px, parent.width - 320px); height: parent.height;
+        text: root.url; color: root.cell-color;
+        vertical-alignment: center; overflow: elide;
+    }
+    s := Text {
+        x: parent.width - 236px; width: 100px; height: parent.height;
+        text: root.status; color: root.status-color;
+        vertical-alignment: center; overflow: elide;
+    }
+    sz := Text {
+        x: parent.width - 132px; width: 66px; height: parent.height;
+        text: root.bytes; color: root.cell-color;
+        vertical-alignment: center; overflow: elide;
+    }
+    t := Text {
+        x: parent.width - 62px; width: 54px; height: parent.height;
+        text: root.time; color: root.cell-color;
+        vertical-alignment: center; overflow: elide;
+    }
+}
+
 export component AppWindow inherits Window {
     title: "IronSurf";
     background: #1f1f1f;
@@ -134,6 +191,17 @@ export component AppWindow inherits Window {
     in property <length> menu-y: 0px;
     in property <[MenuItem]> menu-items;
 
+    // DevTools panel (task: DevTools UI): bottom-docked over the page area of
+    // the *active* tab. Rust owns the open/closed flag (per tab) and the view
+    // choice, and pushes the reduced console/network rows on every drain tick
+    // while the panel is open.
+    in property <bool> devtools-open: false;
+    in property <int> devtools-view: 0; // 0 = Console, 1 = Network
+    in property <int> console-count: 0;
+    in property <int> network-count: 0;
+    in property <[ConsoleRow]> console-rows;
+    in property <[NetRow]> net-rows;
+
     // ------------------------------------------------------------------
     // intents surfaced to Rust
     // ------------------------------------------------------------------
@@ -162,6 +230,24 @@ export component AppWindow inherits Window {
     // context-menu intents (index into `menu-items`)
     callback menu-pick(idx: int);
     callback menu-close();
+    // DevTools intents: pick a pane (0 console / 1 network) or close the panel.
+    callback devtools-select-view(view: int);
+    callback devtools-close();
+
+    // Console severity: icon + colour (error red, warn yellow, info/log grey).
+    function devtools-level-icon(level: string) -> string {
+        if (level == "error") { return "\u{2715}"; }
+        if (level == "warn") { return "⚠"; }
+        if (level == "info") { return "i"; }
+        return "\u{203A}";
+    }
+
+    function devtools-level-color(level: string) -> color {
+        if (level == "error") { return #ef5350; }
+        if (level == "warn") { return #e6c07b; }
+        if (level == "info") { return #b8b8b8; }
+        return #9a9a9a;
+    }
 
     // fixed palette; index also addresses `palette-color` for add/rename
     function palette-color(idx: int) -> color {
@@ -333,6 +419,123 @@ export component AppWindow inherits Window {
                     scroll-event(ev) => {
                         root.page-wheel(ta.mouse-x, ta.mouse-y, ev.delta-x, ev.delta-y);
                         return EventResult.accept;
+                    }
+                }
+
+                // ---- DevTools panel -----------------------------------------
+                // Bottom-docked over the page frame, and — exactly like the
+                // context menu and the container manager — an in-window
+                // overlay Rectangle, not a PopupWindow (the LinuxKMS backend
+                // has no popups). Declared after the page's `ta` ⇒ on top of
+                // it: the scrim swallows page clicks and wheel events while
+                // the panel is open, and the ListView scrolls instead.
+                Rectangle {
+                    visible: root.devtools-open;
+                    x: 0;
+                    y: parent.height - self.height;
+                    width: parent.width;
+                    height: Math.min(240px, parent.height * 0.65);
+                    background: #171717;
+                    clip: true;
+                    dt-scrim := TouchArea { }
+                    // separator from the page above
+                    Rectangle { x: 0; y: 0; width: parent.width; height: 1px; background: #4a4a4a; }
+
+                    VerticalLayout {
+                        padding-left: 8px;
+                        padding-right: 8px;
+                        padding-bottom: 6px;
+                        spacing: 4px;
+
+                        // ---- header: pane buttons (with entry counts) + close
+                        Rectangle {
+                            height: 32px;
+                            HorizontalLayout {
+                                x: 0; width: parent.width; height: parent.height;
+                                cross-axis-alignment: center;
+                                spacing: 6px;
+                                MiniButton {
+                                    label: "Console" + (root.console-count > 0 ? " " + root.console-count : "");
+                                    tint: root.devtools-view == 0 ? #3a3a3a : #262626;
+                                    clicked => { root.devtools-select-view(0); }
+                                }
+                                MiniButton {
+                                    label: "Network" + (root.network-count > 0 ? " " + root.network-count : "");
+                                    tint: root.devtools-view == 1 ? #3a3a3a : #262626;
+                                    clicked => { root.devtools-select-view(1); }
+                                }
+                                Rectangle { horizontal-stretch: 1; }
+                                MiniButton { label: "✕"; clicked => { root.devtools-close(); } }
+                            }
+                        }
+
+                        // ---- console view -------------------------------------
+                        if root.devtools-view == 0: ListView {
+                            vertical-stretch: 1;
+                            for dtc[i] in root.console-rows: Rectangle {
+                                height: 22px;
+                                dtcbg := Rectangle { background: dtcta.has-hover ? #262626 : Math.mod(i, 2) == 0 ? transparent : #1b1b1b; }
+                                Text {
+                                    x: 8px;
+                                    width: 18px;
+                                    height: parent.height;
+                                    text: root.devtools-level-icon(dtc.level);
+                                    color: root.devtools-level-color(dtc.level);
+                                    horizontal-alignment: center;
+                                    vertical-alignment: center;
+                                }
+                                Text {
+                                    x: 30px;
+                                    max-width: Math.max(0px, parent.width - 38px);
+                                    height: parent.height;
+                                    text: dtc.text;
+                                    color: root.devtools-level-color(dtc.level);
+                                    vertical-alignment: center;
+                                    overflow: elide;
+                                }
+                                dtcta := TouchArea { }
+                            }
+                        }
+
+                        // ---- network view --------------------------------------
+                        if root.devtools-view == 1: VerticalLayout {
+                            vertical-stretch: 1;
+                            spacing: 2px;
+                            // column captions
+                            Rectangle {
+                                height: 20px;
+                                head := NetRowCells {
+                                    width: parent.width;
+                                    height: parent.height;
+                                    cell-color: #8a8a8a;
+                                    method: "Method";
+                                    url: "URL";
+                                    status: "Status";
+                                    bytes: "Size";
+                                    time: "Time";
+                                }
+                            }
+                            ListView {
+                                vertical-stretch: 1;
+                                for dtn[i] in root.net-rows: Rectangle {
+                                    height: 22px;
+                                    net-row-bg := Rectangle { background: netrowta.has-hover ? #262626 : Math.mod(i, 2) == 0 ? transparent : #1b1b1b; }
+                                    NetRowCells {
+                                        x: 0; y: 0;
+                                        width: parent.width;
+                                        height: parent.height;
+                                        method: dtn.method;
+                                        url: dtn.url;
+                                        status: dtn.status;
+                                        bytes: dtn.size;
+                                        time: dtn.time;
+                                        cell-color: dtn.failed ? #ef5350 : #cfcfcf;
+                                        status-color: dtn.failed ? #ef5350 : #cfcfcf;
+                                    }
+                                    netrowta := TouchArea { }
+                                }
+                            }
+                        }
                     }
                 }
 

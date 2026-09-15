@@ -5,7 +5,7 @@
 //! private-use code points from the Slint key table). We map those to the
 //! DOM `key`/`code` strings the tab hands to Servo, and we detect browser
 //! chords (Ctrl-L / Ctrl-W / Ctrl-R / Ctrl-T / Ctrl-Tab / Esc / Ctrl-+ / Ctrl--
-//! / Ctrl-0) here so the logic stays pure and testable.
+//! / Ctrl-0 / F12 / Ctrl-I) here so the logic stays pure and testable.
 
 use ironsurf_common::{KeyEvent, Modifiers};
 
@@ -28,6 +28,8 @@ pub enum Shortcut {
     ZoomOut,
     /// Ctrl-`0`: reset zoom to 100%.
     ZoomReset,
+    /// F12 / Ctrl-`I`: toggle the DevTools panel of the active tab.
+    ToggleDevTools,
     /// Esc: return keyboard focus to the page.
     PageFocus,
 }
@@ -78,6 +80,14 @@ pub fn shortcut_for(text: &str, ctrl: bool, alt: bool, meta: bool) -> Option<Sho
     if c == '\u{1b}' {
         return Some(Shortcut::PageFocus);
     }
+    // F12 needs no modifier (Slint sends function keys as unicode private-use
+    // code points, F1 = U+F704 … F12 = U+F70F — see `i-slint-common`
+    // `key_codes.rs`, which the table in `named_key` mirrors). Some backends
+    // hand over the Apple-VPK-spaced form instead, so U+F70B is accepted on
+    // the same chord: the only cost is F8, which no page we ship needs.
+    if matches!(c, '\u{F70F}' | '\u{F70B}') && !alt && !meta {
+        return Some(Shortcut::ToggleDevTools);
+    }
     if !ctrl || alt || meta {
         return None;
     }
@@ -92,6 +102,11 @@ pub fn shortcut_for(text: &str, ctrl: bool, alt: bool, meta: bool) -> Option<Sho
         '=' | '+' | '\u{1d}' => Some(Shortcut::ZoomIn),
         '-' | '_' | '\u{1f}' => Some(Shortcut::ZoomOut),
         '0' => Some(Shortcut::ZoomReset),
+        // Ctrl-`I` (and Ctrl-Shift-`I`, which arrives as the same code point
+        // with shift ignored here). The control-character spelling of this
+        // chord is `\t`, which already means Ctrl-Tab, so only the letter form
+        // — what Slint actually delivers for KeyI — toggles DevTools.
+        'i' | 'I' => Some(Shortcut::ToggleDevTools),
         _ => None,
     }
 }
@@ -219,6 +234,33 @@ mod tests {
             Some(Shortcut::ZoomOut)
         );
         assert_eq!(shortcut_for("0", true, false, false), Some(Shortcut::ZoomReset));
+    }
+
+    #[test]
+    fn devtools_chords_are_detected() {
+        // F12 = U+F70F (Slint's own table: F1 = U+F704 + 11).
+        assert_eq!(shortcut_for("\u{F70F}", false, false, false), Some(Shortcut::ToggleDevTools));
+        // The alternate spelling the task brief reports from the backend.
+        assert_eq!(shortcut_for("\u{F70B}", false, false, false), Some(Shortcut::ToggleDevTools));
+        // Ctrl-I, and Ctrl-Shift-I (`shortcut_for` takes no shift flag: the
+        // shifted form simply arrives as the uppercase letter).
+        assert_eq!(shortcut_for("i", true, false, false), Some(Shortcut::ToggleDevTools));
+        assert_eq!(shortcut_for("I", true, false, false), Some(Shortcut::ToggleDevTools));
+    }
+
+    #[test]
+    fn devtools_chords_do_not_steal_other_keys() {
+        // Bare `i` types into the page; Ctrl-Tab stays the tab cycle even
+        // though it is Ctrl-I's control-character spelling.
+        assert_eq!(shortcut_for("i", false, false, false), None);
+        assert_eq!(shortcut_for("\t", true, false, false), Some(Shortcut::CycleTab));
+        // Alt/Meta function-key combos stay with the window manager.
+        assert_eq!(shortcut_for("\u{F70F}", false, true, false), None);
+        assert_eq!(shortcut_for("i", true, true, false), None);
+        assert_eq!(shortcut_for("i", true, false, true), None);
+        // Neighbouring function keys are not DevTools.
+        assert_eq!(shortcut_for("\u{F70E}", false, false, false), None);
+        assert_eq!(shortcut_for("\u{F70C}", false, false, false), None);
     }
 
     #[test]

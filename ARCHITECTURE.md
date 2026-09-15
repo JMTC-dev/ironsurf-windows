@@ -453,6 +453,12 @@ UI (`crates/ironsurf-shell/ui/ironsurf.slint`):
   respawn tab process keeping URL), "New tab in container".
 - Status bar: status text + loading spinner (timer animation) + https/lock indicator
   (⛬ / http warning).
+- DevTools panel (F12 / Ctrl-I toggle, per tab): bottom-docked overlay Rectangle over the
+  page area (never a `PopupWindow` — LinuxKMS has no popups), header [Console ‹n› |
+  Network ‹n› | ✕] plus a Console view (level icon + colour, `[source] message`) and a
+  Network table (Method | URL | Status | Size | Time; unknown values `—`; a failed request
+  shows its error text in red instead of the status). Fed by the per-tab bounded logs
+  (`TabState::console` / `network`), re-pushed on every drain tick while open.
 - Menu (native or in-toolbar): New Window(v1: new tab), Close Tab (Ctrl-W), Tab Next/Prev
   (Ctrl-Tab), Open Container Manager, Clear Container Data.
 
@@ -463,7 +469,8 @@ Process/tab management (`src/tabs.rs`):
   via `slint::Weak<AppWindow>` invoke; throttle Frame messages: coalesce to newest).
 - `Frame` → `slint::Image` from raw RGBA buffer (`slint::Image::from_rgba8_slab`/PixelBuffer API — verify name).
 - Keyboard focus routing: Slint focus on page area → forward keys; Ctrl-L focuses URL bar;
-  Esc unfocuses.
+  Esc unfocuses; F12 / Ctrl-I toggle the DevTools panel (consumed by the shell, never sent
+  to the page; they act on the focused page, i.e. not while the URL bar holds focus).
 - Default start page: `ironsurf://welcome` (the tab-rendered built-in welcome page —
   `default_url()`), then URL bar typing does search-or-navigate: contains dot
   → `https://host` (upgrading typed `host/path` to HTTPS), else → `https://html.duckduckgo.com/html/?q=`.

@@ -148,6 +148,108 @@ impl TabState {
     }
 }
 
+// ---- DevTools panel view-models ---------------------------------------------
+//
+// The panel (ui/ironsurf.slint) paints plain `Text` cells, so everything the
+// renderer needs is pre-formatted here: this is the reduction the panel shows,
+// kept pure (no Slint) so it is unit-testable headless and drives the UI through
+// `app::Core::sync_ui`.
+
+/// Placeholder for "the engine never said" cells in the panel tables (an em
+/// dash, like Firefox's network table).
+pub const MISSING: &str = "\u{2014}";
+
+/// One rendered DevTools console row.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ConsoleRow {
+    /// Severity label (`"log"` | `"info"` | `"warn"` | `"error"`): drives the
+    /// panel's level icon and colour.
+    pub level: String,
+    /// `"[source] message"`, exactly as the panel paints it.
+    pub text: String,
+}
+
+/// One rendered DevTools network row: every column pre-formatted, missing
+/// values [`MISSING`].
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct NetRow {
+    pub method: String,
+    pub url: String,
+    /// Status code, or the failure text when the request never answered.
+    pub status: String,
+    pub size: String,
+    pub time: String,
+    /// `true` ⇒ the request failed ([`NetEvent::error`] is `Some`) and the
+    /// panel paints `status` in red.
+    pub failed: bool,
+}
+
+impl TabState {
+    /// Console rows for the panel, in arrival order.
+    pub fn console_rows(&self) -> Vec<ConsoleRow> {
+        self.console
+            .iter()
+            .map(|e| ConsoleRow {
+                level: e.level.clone(),
+                text: format!("[{}] {}", e.source, e.message),
+            })
+            .collect()
+    }
+
+    /// Network rows for the panel, in arrival order.
+    pub fn net_rows(&self) -> Vec<NetRow> {
+        self.network
+            .iter()
+            .map(|e| NetRow {
+                method: e.method.clone(),
+                url: e.url.clone(),
+                // A failed request has no status: say *why* instead (the panel
+                // paints the whole cell red when `failed`).
+                status: match (&e.status, &e.error) {
+                    (Some(status), _) => status.to_string(),
+                    (None, Some(err)) => err.clone(),
+                    (None, None) => MISSING.to_string(),
+                },
+                size: format_size(e.response_bytes),
+                time: format_duration(e.duration_ms),
+                failed: e.error.is_some(),
+            })
+            .collect()
+    }
+}
+
+/// Response size for the panel: bytes below 1 KiB, then decimal units
+/// (`1.4 kB`, `2.0 MB`). Unknown (`None`) is [`MISSING`].
+pub fn format_size(bytes: Option<u64>) -> String {
+    const UNITS: [&str; 5] = ["B", "kB", "MB", "GB", "TB"];
+    match bytes {
+        None => MISSING.to_string(),
+        Some(b) => {
+            let mut value = b as f64;
+            let mut unit = 0;
+            while value >= 1024.0 && unit + 1 < UNITS.len() {
+                value /= 1024.0;
+                unit += 1;
+            }
+            if unit == 0 {
+                format!("{b} B")
+            } else {
+                format!("{value:.1} {}", UNITS[unit])
+            }
+        }
+    }
+}
+
+/// Request duration for the panel: whole ms below a second, seconds above.
+/// Never measured (`None`) is [`MISSING`].
+pub fn format_duration(ms: Option<u64>) -> String {
+    match ms {
+        None => MISSING.to_string(),
+        Some(ms) if ms < 1000 => format!("{ms} ms"),
+        Some(ms) => format!("{:.2} s", ms as f64 / 1000.0),
+    }
+}
+
 /// Append `item`, dropping the oldest front entries until the vec is at most
 /// `cap` long. Shared by the console and network logs.
 fn push_bounded<T>(log: &mut Vec<T>, item: T, cap: usize) {
@@ -390,6 +492,77 @@ mod tests {
             duration_ms: status.map(|_| 42),
             error,
         }
+    }
+
+    #[test]
+    fn console_rows_carry_the_level_and_a_bracketed_source() {
+        let mut s = TabState::default();
+        s.reduce(&FromTab::ConsoleLog {
+            source: "js".into(),
+            level: "error".into(),
+            message: "boom".into(),
+        });
+        s.reduce(&FromTab::ConsoleLog {
+            source: "css".into(),
+            level: "warn".into(),
+            message: "bad selector".into(),
+        });
+        assert_eq!(
+            s.console_rows(),
+            vec![
+                ConsoleRow { level: "error".into(), text: "[js] boom".into() },
+                ConsoleRow { level: "warn".into(), text: "[css] bad selector".into() },
+            ]
+        );
+    }
+
+    #[test]
+    fn net_rows_pre_format_every_column() {
+        let mut s = TabState::default();
+        s.reduce(&FromTab::NetworkEvent {
+            event: net_event("GET", "https://example.com", Some(200), None),
+        });
+        s.reduce(&FromTab::NetworkEvent {
+            event: ironsurf_common::NetEvent {
+                method: "POST".into(),
+                url: "https://api.example/upload".into(),
+                status: None,
+                response_bytes: None,
+                duration_ms: Some(1500),
+                error: Some("dns failed".into()),
+            },
+        });
+        let rows = s.net_rows();
+        assert_eq!(
+            rows[0],
+            NetRow {
+                method: "GET".into(),
+                url: "https://example.com".into(),
+                status: "200".into(),
+                // the fixture event is 1234 B / 42 ms
+                size: "1.2 kB".into(),
+                time: "42 ms".into(),
+                failed: false,
+            }
+        );
+        // A failure speaks for itself in the status column, in red.
+        assert_eq!(rows[1].status, "dns failed");
+        assert!(rows[1].failed);
+        assert_eq!(rows[1].size, MISSING);
+        assert_eq!(rows[1].time, "1.50 s");
+    }
+
+    #[test]
+    fn panel_formatters_cover_missing_values_and_units() {
+        assert_eq!(format_size(None), MISSING);
+        assert_eq!(format_size(Some(0)), "0 B");
+        assert_eq!(format_size(Some(999)), "999 B");
+        assert_eq!(format_size(Some(1024)), "1.0 kB");
+        assert_eq!(format_size(Some(5 * 1024 * 1024)), "5.0 MB");
+        assert_eq!(format_duration(None), MISSING);
+        assert_eq!(format_duration(Some(0)), "0 ms");
+        assert_eq!(format_duration(Some(999)), "999 ms");
+        assert_eq!(format_duration(Some(1000)), "1.00 s");
     }
 
     #[test]
