@@ -1,4 +1,8 @@
 # Task log
+## #30 Shell-side DevTools state reduction: TabState now carries a bounded console log (Vec<ConsoleEntry{source,level,
+message}>, cap MAX_CONSOLE_ENTRIES=500) and a running network log (Vec<NetEvent>, cap MAX_NETWORK_ENTRIES=500, never
+cleared on nav), both appended oldest-dropped-first via push_bounded and never dirtying the frame (reduce returns false).
+5 state.rs unit tests cover append order, ring caps, success+failure net events; ironsurf-shell --lib 37 + full suite green.
 ## #29 DevTools IPC contract: FromTab::ConsoleLog gained `source` ("js"|"css"|"dom"|"page") and there is a new
 FromTab::NetworkEvent { event: NetEvent } — NetEvent{method,url,status,response_bytes,duration_ms,error}
 (error is Some exactly when the request failed, status then None). Shell console log carries the source, both
@@ -83,11 +87,6 @@ handle_wheel → scroll_chain_by feeds ScrollAmount::By{-x,-y}), so that extra f
 now passes delta-x/delta-y verbatim; convention pinned in common::ScrollEvent docs + ARCH ToTab section and
 by the new tab test wheel_down_scrolls_the_document_down_and_wheel_up_back_up (pixel deltas, 20px notch, clamp
 at the top); workspace green.
-## player.rs compile-clean — VecDeque/Vec bridge: decode/flush emit into a local Vec then buffered.extend
-(out) (VecDeque::append no longer takes &mut Vec); present_due holds an early frame as Some((pts, frame));
-test hooks: set_test_metadata drops needless .clone() (E0716), seek test asserts player.current_pts() (Frame
-has no pts), open_bytes expect_err→.err().expect (VideoTrack: !Debug). cargo check -p ironsurf-tab [plain +
---tests] show ZERO media/player.rs diagnostics (crate still red elsewhere).
 ## ironsurf-tab GREEN — full test suite 0 failed (161 bin + 18 other targets, timing suites stable ×3); cargo check plain + --no-default-features 0 errors.
 player.rs: canplay fires once per load at first decoded picture; paused freezes pipeline slack (only first
 frame or seek target reaches screen); paused needs_repaint = seek-await only, not in-flight decode.

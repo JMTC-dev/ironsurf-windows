@@ -5,7 +5,27 @@
 //! `Frame` messages never touch the state — they are handed to the frame
 //! compositor directly (coalesced to the newest per tab).
 
-use ironsurf_common::FromTab;
+use ironsurf_common::{FromTab, NetEvent};
+
+/// Cap on retained DevTools console entries per tab: the oldest are dropped
+/// once the ring is full, so a chatty page cannot grow shell memory forever.
+pub const MAX_CONSOLE_ENTRIES: usize = 500;
+/// Cap on retained DevTools network entries per tab (oldest dropped first).
+/// The running log is never cleared on navigation — like Firefox's unticked
+/// "Persist logs", it accumulates for the tab's lifetime.
+pub const MAX_NETWORK_ENTRIES: usize = 500;
+
+/// One DevTools console entry, reduced from [`FromTab::ConsoleLog`]. Stored
+/// on [`TabState::console`] in arrival order; the (future) panel reads it.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ConsoleEntry {
+    /// Origin subsystem: `"js"` | `"css"` | `"dom"` | `"page"`.
+    pub source: String,
+    /// Severity label as the engine emitted it (`"log"`, `"warn"`, …).
+    pub level: String,
+    /// Rendered message text.
+    pub message: String,
+}
 
 /// Everything the shell renders about one tab, minus the frame itself.
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -19,6 +39,10 @@ pub struct TabState {
     pub ready: bool,
     pub closed: bool,
     pub error: Option<String>,
+    /// DevTools console feed (bounded by [`MAX_CONSOLE_ENTRIES`]).
+    pub console: Vec<ConsoleEntry>,
+    /// DevTools network feed (bounded by [`MAX_NETWORK_ENTRIES`]).
+    pub network: Vec<NetEvent>,
 }
 
 impl TabState {
@@ -76,10 +100,25 @@ impl TabState {
                     true
                 }
             }
-            // DevTools feed (console + network): the shell has no panel yet,
-            // so neither message touches per-tab state.
-            FromTab::ConsoleLog { .. } => false,
-            FromTab::NetworkEvent { .. } => false,
+            // DevTools feed (console + network): appended to bounded per-tab
+            // logs the (future) panel reads. They never dirty the frame, so
+            // reduce always reports `false` here regardless of acceptance.
+            FromTab::ConsoleLog { source, level, message } => {
+                push_bounded(
+                    &mut self.console,
+                    ConsoleEntry {
+                        source: source.clone(),
+                        level: level.clone(),
+                        message: message.clone(),
+                    },
+                    MAX_CONSOLE_ENTRIES,
+                );
+                false
+            }
+            FromTab::NetworkEvent { event } => {
+                push_bounded(&mut self.network, event.clone(), MAX_NETWORK_ENTRIES);
+                false
+            }
             // Actions for the pump (spawn a new tab, open the context menu,
             // file the copy into the session clipboard), not per-tab state.
             FromTab::OpenLinkInNewTab { .. } => false,
@@ -106,6 +145,15 @@ impl TabState {
     /// a warning for plain http, nothing for `about:`/`file:`/etc.
     pub fn security(&self) -> Security {
         Security::of(self.url.as_deref().unwrap_or(""))
+    }
+}
+
+/// Append `item`, dropping the oldest front entries until the vec is at most
+/// `cap` long. Shared by the console and network logs.
+fn push_bounded<T>(log: &mut Vec<T>, item: T, cap: usize) {
+    log.push(item);
+    if let Some(excess) = log.len().checked_sub(cap) {
+        log.drain(..excess);
     }
 }
 
@@ -204,6 +252,144 @@ mod tests {
         assert!(s.reduce(&FromTab::Error { message: "boom".into() }));
         assert_eq!(s.error.as_deref(), Some("boom"));
         assert!(!s.loading);
+    }
+
+    #[test]
+    fn console_logs_append_in_order_and_never_dirty_the_frame() {
+        let mut s = TabState::default();
+        assert!(s.console.is_empty());
+        for (i, src) in ["js", "css", "dom", "page"].iter().enumerate() {
+            assert!(
+                !s.reduce(&FromTab::ConsoleLog {
+                    source: (*src).into(),
+                    level: "warn".into(),
+                    message: format!("m{i}"),
+                }),
+                "console logs must not dirty the frame"
+            );
+        }
+        // Appended in arrival order, all fields carried through verbatim.
+        assert_eq!(s.console.len(), 4);
+        assert_eq!(
+            s.console,
+            vec![
+                ConsoleEntry {
+                    source: "js".into(),
+                    level: "warn".into(),
+                    message: "m0".into()
+                },
+                ConsoleEntry {
+                    source: "css".into(),
+                    level: "warn".into(),
+                    message: "m1".into()
+                },
+                ConsoleEntry {
+                    source: "dom".into(),
+                    level: "warn".into(),
+                    message: "m2".into()
+                },
+                ConsoleEntry {
+                    source: "page".into(),
+                    level: "warn".into(),
+                    message: "m3".into()
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn console_log_ring_drops_oldest_at_the_cap() {
+        let mut s = TabState::default();
+        for i in 0..(MAX_CONSOLE_ENTRIES + 25) {
+            s.reduce(&FromTab::ConsoleLog {
+                source: "js".into(),
+                level: "log".into(),
+                message: format!("{i}"),
+            });
+        }
+        assert_eq!(s.console.len(), MAX_CONSOLE_ENTRIES, "cap must be enforced");
+        // The 25 oldest were dropped; the tail is the freshest entries.
+        assert_eq!(s.console.first().unwrap().message, "25");
+        assert_eq!(
+            s.console.last().unwrap().message,
+            (MAX_CONSOLE_ENTRIES + 24).to_string()
+        );
+    }
+
+    #[test]
+    fn network_events_append_and_never_dirty_the_frame() {
+        let mut s = TabState::default();
+        assert!(s.network.is_empty());
+        // A success event, then a failure event — both must land on the log.
+        assert!(
+            !s.reduce(&FromTab::NetworkEvent {
+                event: net_event("GET", "https://example.com", Some(200), None)
+            }),
+            "network events must not dirty the frame"
+        );
+        assert!(!s.reduce(&FromTab::NetworkEvent {
+            event: net_event("GET", "https://evil.test", None, Some("dns failed".into()))
+        }));
+        assert_eq!(s.network.len(), 2);
+        assert_eq!(s.network[0].url, "https://example.com");
+        assert_eq!(s.network[0].status, Some(200));
+        assert_eq!(s.network[0].error, None);
+        assert_eq!(s.network[1].status, None);
+        assert_eq!(s.network[1].error.as_deref(), Some("dns failed"));
+    }
+
+    #[test]
+    fn network_log_ring_drops_oldest_at_the_cap() {
+        let mut s = TabState::default();
+        for i in 0..(MAX_NETWORK_ENTRIES + 10) {
+            s.reduce(&FromTab::NetworkEvent {
+                event: net_event("GET", &format!("https://e.test/{i}"), Some(200), None),
+            });
+        }
+        assert_eq!(s.network.len(), MAX_NETWORK_ENTRIES, "cap must be enforced");
+        assert_eq!(s.network.first().unwrap().url, "https://e.test/10");
+        assert_eq!(
+            s.network.last().unwrap().url,
+            format!("https://e.test/{}", MAX_NETWORK_ENTRIES + 9)
+        );
+    }
+
+    #[test]
+    fn devtools_feed_runs_alongside_normal_state() {
+        // DevTools messages must leave the rest of the reduce behaviour intact
+        // (title/loading/status unchanged) while still accumulating.
+        let mut s = TabState::default();
+        s.reduce(&FromTab::Ready { tab_id: TabId(1) });
+        s.reduce(&FromTab::UrlChanged { url: Some("https://example.com".into()) });
+        s.reduce(&FromTab::ConsoleLog {
+            source: "js".into(),
+            level: "error".into(),
+            message: "boom".into(),
+        });
+        s.reduce(&FromTab::NetworkEvent {
+            event: net_event("POST", "https://example.com/api", Some(204), None),
+        });
+        assert!(s.ready);
+        assert_eq!(s.url.as_deref(), Some("https://example.com"));
+        assert_eq!(s.console.len(), 1);
+        assert_eq!(s.network.len(), 1);
+        assert_eq!(s.network[0].method, "POST");
+    }
+
+    fn net_event(
+        method: &str,
+        url: &str,
+        status: Option<u16>,
+        error: Option<String>,
+    ) -> ironsurf_common::NetEvent {
+        ironsurf_common::NetEvent {
+            method: method.into(),
+            url: url.into(),
+            status,
+            response_bytes: status.map(|_| 1234),
+            duration_ms: status.map(|_| 42),
+            error,
+        }
     }
 
     #[test]
