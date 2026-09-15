@@ -38,6 +38,17 @@ use crate::media::player::{MediaPlayer, PlayerState};
 const CONTROLS_HEIGHT: f32 = 22.0;
 /// Height of the position bar inside the strip.
 const BAR_HEIGHT: f32 = 5.0;
+/// The play/pause glyph's zone at the left edge of the control strip (the
+/// glyph itself is drawn centred at `x = 12`, and the position bar starts at
+/// `x = 30`): a click here toggles playback. Kept in step with
+/// [`draw_controls`] — the whole strip used to be the scrub bar, which made
+/// the drawn play button *seek a few frames* instead of playing anything.
+const PLAY_ZONE_WIDTH: f32 = 30.0;
+/// Where the position bar starts (x) and how far it stops short of the right
+/// edge; `draw_controls` and [`VideoWidget::click_action`] share them so the
+/// hit-test can never drift from the pixels.
+const BAR_X: f32 = 30.0;
+const BAR_RIGHT_MARGIN: f32 = 10.0;
 
 /// The picture's box inside an element box, aspect-preserving (`object-fit:
 /// contain`, centred) — CSS `object-position` defaults we do not override.
@@ -152,9 +163,16 @@ impl VideoWidget {
         }
         let strip_top = f64::from(height) - f64::from(CONTROLS_HEIGHT);
         if y >= strip_top {
-            // Inside the strip the far right edge counts as the end of the
-            // position bar (fraction 1.0), so `x` may equal `width` here.
-            let played = (x / f64::from(width)).clamp(0.0, 1.0);
+            // The play/pause glyph owns the left end of the strip; anywhere
+            // else in the strip is the position bar. Inside the strip the far
+            // right edge counts as the end of the bar (fraction 1.0), so `x`
+            // may equal `width` here.
+            if x < f64::from(PLAY_ZONE_WIDTH) {
+                return Click::TogglePlay;
+            }
+            let bar_x = f64::from(BAR_X);
+            let bar_width = (f64::from(width) - bar_x - f64::from(BAR_RIGHT_MARGIN)).max(1.0);
+            let played = ((x - bar_x) / bar_width).clamp(0.0, 1.0);
             return Click::Seek { fraction: played };
         }
         // The picture area stays a half-open box: at exactly `x == width`
@@ -453,9 +471,16 @@ fn draw_controls(
         }
     }
 
-    // Position bar: track, then the played part.
+    // Position bar: track, then the played part. The geometry constants are
+    // the ones `click_action` hit-tests against (see `BAR_X`/`BAR_RIGHT_MARGIN`).
     let bar_top = top + f64::from(CONTROLS_HEIGHT) / 2.0 - f64::from(BAR_HEIGHT) / 2.0;
-    let track = Rect::from_origin_size((30.0, bar_top), ((w - 40.0).max(1.0), f64::from(BAR_HEIGHT)));
+    let track = Rect::from_origin_size(
+        (f64::from(BAR_X), bar_top),
+        (
+            (w - f64::from(BAR_X) - f64::from(BAR_RIGHT_MARGIN)).max(1.0),
+            f64::from(BAR_HEIGHT),
+        ),
+    );
     // A bare f64 converts into the uniform RoundedRectRadii kurbo wants.
     let radius = f64::from(BAR_HEIGHT) / 2.0;
     let rounded = kurbo::RoundedRect::from_rect(track, radius);
@@ -515,17 +540,18 @@ mod tests {
 
     #[test]
     fn the_control_strip_takes_the_bottom_edge_and_seeks_by_position() {
-        // 400×300 element: the strip is the last 22 px.
+        // 400×300 element: the strip is the last 22 px; the bar runs from
+        // x = 30 to x = width - 10, so a click maps onto *that* track.
         assert_eq!(
-            VideoWidget::click_action(400.0, 300.0, (100.0, 290.0)),
-            Click::Seek { fraction: 0.25 }
+            VideoWidget::click_action(400.0, 300.0, (210.0, 290.0)),
+            Click::Seek { fraction: 0.5 }
         );
         assert_eq!(
-            VideoWidget::click_action(400.0, 300.0, (400.0, 290.0)),
+            VideoWidget::click_action(400.0, 300.0, (390.0, 290.0)),
             Click::Seek { fraction: 1.0 }
         );
         assert_eq!(
-            VideoWidget::click_action(400.0, 300.0, (0.0, 278.5)),
+            VideoWidget::click_action(400.0, 300.0, (30.0, 278.5)),
             Click::Seek { fraction: 0.0 }
         );
         // Above the strip, it is play/pause.
@@ -537,6 +563,21 @@ mod tests {
         // And outside is nothing at all.
         assert_eq!(VideoWidget::click_action(400.0, 300.0, (-1.0, 10.0)), Click::Nothing);
         assert_eq!(VideoWidget::click_action(400.0, 300.0, (400.0, 10.0)), Click::Nothing);
+    }
+
+    #[test]
+    fn the_drawn_play_button_in_the_strip_toggles_and_never_seeks() {
+        // The glyph is drawn centred at x = 12 inside the strip: clicking it
+        // must toggle playback (the whole-strip-seek mapping made the visible
+        // play button look dead — it sought ~0.04 instead).
+        assert_eq!(VideoWidget::click_action(400.0, 300.0, (12.0, 290.0)), Click::TogglePlay);
+        assert_eq!(VideoWidget::click_action(400.0, 300.0, (0.0, 290.0)), Click::TogglePlay);
+        assert_eq!(VideoWidget::click_action(400.0, 300.0, (29.9, 290.0)), Click::TogglePlay);
+        // From x = 30 the bar takes over, fraction 0.0 at its left edge.
+        assert_eq!(
+            VideoWidget::click_action(400.0, 300.0, (30.0, 290.0)),
+            Click::Seek { fraction: 0.0 }
+        );
     }
 
     #[test]

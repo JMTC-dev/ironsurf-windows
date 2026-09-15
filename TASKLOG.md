@@ -1,4 +1,9 @@
 # Task log
+## #26 FIX video play button dead — widget drew the play/pause glyph INSIDE the control strip (x=12, bottom 22px)
+but click_action mapped the whole strip to Seek: the visible button only sought ~4% (nothing visible). Strip left zone
+(PLAY_ZONE_WIDTH=30) now toggles, bar maps onto its drawn track (BAR_X/BAR_RIGHT_MARGIN shared with paint); strip test
+updated + new unit test; tests/video_play_button.rs spawns the real tab on file:///tmp/vid/flower.mp4 (fixture MP4 is
+actually 960×540) and proves strip-click pause/resume from the pixel stream; tab 169u+14e2e+4+3+1+1, workspace green.
 ## #25 JS-driven navigation implemented (was: refused) — location.href=/assign/replace/reload queue
 js::PendingNav on HostState via __ironsurfNavigate (glue location also gained real protocol/host/
 hostname/pathname/search/hash getters); Tab::drain_nav_hook follows it after every JS turn (relative
