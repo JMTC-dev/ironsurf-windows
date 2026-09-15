@@ -460,6 +460,12 @@ Process/tab management (`src/tabs.rs`):
   page (never a fetch, never a history entry), instead of silently becoming a search.
 - Container default from registry; per-container "remember last chosen container for new tabs"
   in `~/.local/share/ironsurf/ui.json` (best-effort).
+- **Crashed tabs are loud, never silent**: child stderr is captured (bounded tail; `RUST_BACKTRACE=full`
+  is set for children and the tab binary force-prints a backtrace on panic), the drain tick polls every
+  child (`try_wait`), and a process that dies without `Closed` — or a send that fails (broken pipe, os
+  error 32) — pins “Tab N has crashed” on that tab's status line, keeps the tab in the strip on its last
+  frame, and logs the exit status plus the captured stderr/panic backtrace; further commands to it are
+  dropped with the crash message standing (✕ still closes it).
 
 Tests (headless CI-safe): tab-proc message pump logic + `FromTab` state reduction tested
 against a **fake tab process** (a small test bin that scripts `FromTab` sequences) so shell

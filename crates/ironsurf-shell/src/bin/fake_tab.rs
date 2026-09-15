@@ -1,7 +1,8 @@
 //! fake_tab — a scripted stand-in for `ironsurf-tab` used by the shell's
 //! headless pump tests (and as an escape hatch when the engine build is not
 //! available). Speaks the same framing: `FromTab` on stdout, `ToTab` on
-//! stdin; exits 0 on `Destroy` or EOF.
+//! stdin; exits 0 on `Destroy` or EOF. `--crash` exits 101 right after the
+//! preamble with a fake panic + backtrace on stderr (crash-report tests).
 
 use std::io::BufReader;
 
@@ -15,6 +16,7 @@ fn main() {
     let mut _container = ContainerId(1);
     let mut url = "about:blank".to_string();
     let mut size = (400u32, 300u32);
+    let mut crash = false;
 
     let mut it = args.iter().skip(1);
     while let Some(arg) = it.next() {
@@ -35,6 +37,7 @@ fn main() {
                 let (w, h) = v.split_once('x').unwrap_or(("400", "300"));
                 size = (w.parse().unwrap_or(400), h.parse().unwrap_or(300));
             }
+            "--crash" => crash = true,
             _ => {} // tolerate the real tab's flags
         }
     }
@@ -48,6 +51,15 @@ fn main() {
     emit(FromTab::Ready { tab_id });
     announce(&mut emit, &url, false);
     emit(frame(size)); // like the real tab: a first frame without any Resize
+
+    if crash {
+        // Stand in for a panicking `ironsurf-tab`: the panic line + backtrace
+        // go to stderr (which the shell captures), then a crash exit code.
+        eprintln!("thread 'main' panicked at src/bin/fake_tab.rs:99:10:\ncrash requested");
+        eprintln!("tab process {} crashing: crash requested", std::process::id());
+        eprintln!("stack backtrace:\n   0: fake_backtrace_frame_0\n   1: fake_backtrace_frame_1");
+        std::process::exit(101);
+    }
 
     let stdin = std::io::stdin();
     let mut reader = BufReader::new(stdin.lock());

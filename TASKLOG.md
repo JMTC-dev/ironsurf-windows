@@ -1,4 +1,9 @@
 # Task log
+## #27 Crashed tabs are loud: dead child (try_wait poll in every drain tick) or broken-pipe send now pins
+"Tab N has crashed" on the status line (tab kept in strip, last frame; further commands dropped, ✕ closes),
+tab stderr is captured (bounded 16K tail, was /dev/null) + RUST_BACKTRACE=full for children + tab panic hook
+force-prints backtrace, so the log carries exit status + panic + backtrace; fake_tab --crash; pump + gui-level
+crash tests; shell suite green (26u + pump 2 + gui + real_tab + tab_crash).
 ## #26 FIX video play button dead — widget drew the play/pause glyph INSIDE the control strip (x=12, bottom 22px)
 but click_action mapped the whole strip to Seek: the visible button only sought ~4% (nothing visible). Strip left zone
 (PLAY_ZONE_WIDTH=30) now toggles, bar maps onto its drawn track (BAR_X/BAR_RIGHT_MARGIN shared with paint); strip test

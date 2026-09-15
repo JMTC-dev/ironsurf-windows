@@ -28,7 +28,24 @@ fn usage() -> String {
         .to_owned()
 }
 
+/// Crash loudly: the default hook only prints a “run with RUST_BACKTRACE=1”
+/// hint when the env is unset, and the shell captures (rather than shows) our
+/// stderr — so without this a panicking tab would look like it died silently.
+/// The backtrace lands on stderr, which the shell keeps as the crash report.
+fn install_crash_hook() {
+    let default = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        default(info);
+        eprintln!("tab process {} crashing: {info}", std::process::id());
+        eprintln!(
+            "stack backtrace:\n{}",
+            std::backtrace::Backtrace::force_capture()
+        );
+    }));
+}
+
 fn main() {
+    install_crash_hook();
     let args: Vec<String> = std::env::args().collect();
     // Logging first: every line after this goes to stderr (never stdout, which
     // is the IPC channel). `runtime::run` relabels the lines with the tab id.

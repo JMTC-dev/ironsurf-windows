@@ -6,12 +6,12 @@
 //! with a Slint timer (see `app.rs`). No Slint types are used here so the
 //! pump can be (and is) tested headless against a scripted fake tab.
 
-use std::io::{BufReader, IsTerminal};
+use std::io::{BufReader, IsTerminal, Read};
 use std::path::Path;
-use std::process::{Child, ChildStdin, Command, Stdio};
+use std::process::{Child, ChildStdin, Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicI8, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::thread;
 
 use ironsurf_common::logging::{self, Level};
@@ -60,15 +60,23 @@ pub fn stderr_inherit() -> bool {
     }
 }
 
+/// How much of a tab's captured stderr to keep around for crash reports
+/// (the tail — i.e. the panic message + backtrace — is what matters).
+const STDERR_TAIL_BYTES: usize = 16 * 1024;
+
 /// A running tab child process with its stdin (mutexed: writes come from
 /// the UI thread only, but frames must never interleave).
 /// The reader thread owns the child's stdout; dropping `TabProc` closes
 /// stdin (EOF ⇒ the tab exits per its contract) and reaps the child.
+/// When the child's stderr is not inherited it is piped into a bounded
+/// tail buffer, so a crash leaves the panic + backtrace on record instead
+/// of vanishing into `/dev/null`.
 pub struct TabProc {
     pub id: TabId,
     pub container: ContainerId,
     child: Child,
     stdin: Option<Mutex<ChildStdin>>,
+    stderr_tail: Arc<Mutex<String>>,
 }
 
 /// Envelope tagging each message with the tab it came from.
@@ -99,18 +107,47 @@ impl TabProc {
         let inherit = stderr_inherit();
         cmd.args(extra_args)
             .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(if inherit { Stdio::inherit() } else { Stdio::null() });
+            .stdout(Stdio::piped());
+        if inherit {
+            cmd.stderr(Stdio::inherit());
+        } else {
+            // Not `/dev/null`: nobody reads the log lines, but the *tail* is
+            // kept so a crashed tab's backtrace survives for the report.
+            cmd.stderr(Stdio::piped());
+        }
+        // A child panic must leave a backtrace behind even when the shell was
+        // started without `RUST_BACKTRACE` (the tab's own panic hook force-
+        // captures one; this also covers aborts and hooks we did not install).
+        if std::env::var_os("RUST_BACKTRACE").is_none() {
+            cmd.env("RUST_BACKTRACE", "full");
+        }
         debug!(
             "spawning {} (tab {id} container {container}, stderr {})",
             bin.display(),
-            if inherit { "inherited" } else { "null" }
+            if inherit { "inherited" } else { "captured" }
         );
         let mut child = cmd.spawn().map_err(|err| {
             error!("cannot spawn {} for tab {id}: {err}", bin.display());
             err
         })?;
-        info!("tab {id} spawned in container {container} (stderr {})", if inherit { "inherited" } else { "null" });
+        info!("tab {id} spawned in container {container} (stderr {})", if inherit { "inherited" } else { "captured" });
+
+        let stderr_tail = Arc::new(Mutex::new(String::new()));
+        if !inherit {
+            if let Some(pipe) = child.stderr.take() {
+                let buf = Arc::clone(&stderr_tail);
+                thread::spawn(move || {
+                    let mut reader = BufReader::new(pipe);
+                    let mut chunk = [0u8; 8 * 1024];
+                    loop {
+                        match reader.read(&mut chunk) {
+                            Ok(0) | Err(_) => break, // EOF or closed pipe
+                            Ok(n) => append_stderr_tail(&buf, &chunk[..n]),
+                        }
+                    }
+                });
+            }
+        }
 
         let stdin = child.stdin.take().expect("piped stdin");
         let stdout = child.stdout.take().expect("piped stdout");
@@ -125,12 +162,13 @@ impl TabProc {
                     return;
                 }
             }
-            // EOF or corrupt stream: the reaper in app.rs notices the tab
-            // never says more; Closed or child exit handling covers it.
+            // EOF or corrupt stream: either the tab said `Closed` (the pump
+            // reaps it) or it died — `Core::check_crashes` notices via
+            // `try_wait_status` and surfaces the crash in the UI.
             debug!("tab {id} message stream ended after {messages} messages");
         });
 
-        Ok(TabProc { id, container, child, stdin: Some(Mutex::new(stdin)) })
+        Ok(TabProc { id, container, child, stdin: Some(Mutex::new(stdin)), stderr_tail })
     }
 
     /// Send one command to the tab.
@@ -142,6 +180,29 @@ impl TabProc {
             .ok_or_else(|| std::io::Error::other("tab stdin closed"))?;
         let mut guard = stdin.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         write_frame(&mut *guard, &msg)
+    }
+
+    /// `try_wait` for the child: `Some(status)` once it has exited (and reaped,
+    /// per `Drop`). A tab whose process died without saying `Closed` is a
+    /// crash — the caller reports it (see `stderr_tail` for the backtrace).
+    pub fn try_wait_status(&mut self) -> Option<ExitStatus> {
+        match self.child.try_wait() {
+            Ok(Some(status)) => {
+                self.stdin = None; // the pipe is worthless now
+                Some(status)
+            }
+            _ => None,
+        }
+    }
+
+    /// The captured tail of the child's stderr (panic message + backtrace on
+    /// crash). Empty when the child inherited our stderr — then the lines went
+    /// straight to the terminal.
+    pub fn stderr_tail(&self) -> String {
+        self.stderr_tail
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
     }
 
     /// Access to the raw child (for reaping in tests).
@@ -183,6 +244,20 @@ impl Drop for TabProc {
             let _ = self.child.kill();
         }
         let _ = self.child.wait();
+    }
+}
+
+/// Append to the bounded stderr tail, keeping the last [`STDERR_TAIL_BYTES`]
+/// on a `char` boundary (the log stream is UTF-8, chunks are not).
+fn append_stderr_tail(buf: &Mutex<String>, bytes: &[u8]) {
+    let mut buf = buf.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    buf.push_str(&String::from_utf8_lossy(bytes));
+    if buf.len() > STDERR_TAIL_BYTES {
+        let mut cut = buf.len() - STDERR_TAIL_BYTES;
+        while !buf.is_char_boundary(cut) {
+            cut += 1;
+        }
+        buf.drain(..cut);
     }
 }
 

@@ -58,6 +58,76 @@ fn pump_with_fake_tab_process() {
     assert_eq!(status.code(), Some(0));
 }
 
+/// A tab child that dies (panics) without saying `Closed`: the shell must
+/// notice via `try_wait_status`, capture the stderr (panic + backtrace) it
+/// would otherwise `/dev/null`, and the dead stdin must fail loudly — never
+/// silently swallow commands destined for the corpse.
+#[test]
+fn crashed_tab_reports_exit_status_and_backtrace() {
+    let dir = tempfile::tempdir().unwrap();
+    let bin = env!("CARGO_BIN_EXE_fake_tab");
+    let mut pump = Pump::new();
+
+    let mut proc = TabProc::spawn(
+        Path::new(bin),
+        TabId(7),
+        ContainerId(1),
+        dir.path(),
+        Some("about:blank"),
+        &["--crash"],
+        &pump.sender(),
+    )
+    .unwrap();
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+
+    // 1. The broken pipe the user reported: commands keep working while the
+    //    child is alive and must fail with EPIPE the moment it is gone —
+    //    exactly what `Core::send_active` turns into a “Tab N has crashed”
+    //    status line (while stdin is still open, hence polled first).
+    let err = loop {
+        match proc.send(ToTab::Reload) {
+            Ok(()) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            Ok(()) => panic!("the crashing tab never refused a command"),
+            Err(err) => break err,
+        }
+    };
+    assert_eq!(err.raw_os_error(), Some(32), "expected EPIPE (broken pipe), got {err}");
+
+    // 2. The crash poll `Core::check_crashes` runs every drain tick.
+    let status = loop {
+        if let Some(status) = proc.try_wait_status() {
+            break status;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the crashing tab never exited"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    };
+    assert_eq!(status.code(), Some(101));
+
+    // 3. The captured stderr tail carries the panic message and the backtrace
+    //    (the crash report the shell prints instead of letting tabs die quiet).
+    let tail = wait_for_stderr_tail(&proc);
+    assert!(tail.contains("panicked"), "no panic line in captured stderr: {tail:?}");
+    assert!(tail.contains("backtrace"), "no backtrace in captured stderr: {tail:?}");
+}
+
+/// The stderr pump thread may lag the exit slightly — poll the tail buffer.
+fn wait_for_stderr_tail(proc: &TabProc) -> String {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        let tail = proc.stderr_tail();
+        if !tail.is_empty() || std::time::Instant::now() > deadline {
+            return tail;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
 fn wait_until(pump: &mut Pump, pred: impl Fn(&[PumpedMessage]) -> bool) -> Vec<PumpedMessage> {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
     let mut acc = Vec::new();

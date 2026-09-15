@@ -39,6 +39,27 @@ struct Proc {
     /// Page zoom factor (Ctrl-`+`/`-`/`0`, shell-owned policy; see
     /// `keymap::zoom_in`/`zoom_out`). Sent to the tab as `ToTab::SetZoom`.
     zoom: f32,
+    /// The child process died without saying `Closed` (crash) or a send hit
+    /// a broken pipe. The tab stays in the strip showing its last frame;
+    /// `state.error` carries the “has crashed” status-line message.
+    crashed: bool,
+}
+
+/// A tab process that is gone: log it loudly (with whatever stderr — hence
+/// panic message + backtrace — the shell captured) and put the crash on the
+/// tab's status line. `detail` says how the death was noticed.
+fn note_tab_crash(p: &mut Proc, detail: std::fmt::Arguments<'_>) {
+    let id = p.tab.id;
+    p.crashed = true;
+    p.state.loading = false;
+    p.state.error = Some(format!("Tab {} has crashed \u{2014} {detail}", id.0));
+    error!("tab {id} has crashed: {detail}");
+    let tail = p.tab.stderr_tail();
+    if tail.trim().is_empty() {
+        error!("tab {id} left no stderr behind (it inherited the terminal's, or crashed before logging)");
+    } else {
+        error!("tab {id} stderr (backtrace if it panicked):\n{tail}");
+    }
 }
 
 /// Shared runtime core (one per window; kept in an `Rc`).
@@ -174,13 +195,38 @@ impl Core {
             debug!("dropped {msg:?}: no active tab");
             return;
         };
-        let procs = self.procs.borrow();
-        if let Some(p) = procs.iter().find(|p| p.tab.id == id) {
-            if let Err(err) = p.tab.send(msg) {
-                // `msg` is consumed by send(); the command itself is already
-                // on the record via `tabs::TabProc::send`'s trace line.
-                warn!("tab {id} could not receive a command: {err}");
+        let mut crashed = false;
+        {
+            let mut procs = self.procs.borrow_mut();
+            if let Some(p) = procs.iter_mut().find(|p| p.tab.id == id) {
+                if p.crashed {
+                    // Already reported dead: the status line says so; do not
+                    // re-log the same crash for every keystroke.
+                    debug!("dropped {msg:?}: tab {id} has crashed");
+                    return;
+                }
+                if let Err(err) = p.tab.send(msg) {
+                    // `msg` is consumed by send(); the command itself is
+                    // already on the record via `tabs::TabProc::send`'s trace
+                    // line. A write error means the child is gone (broken
+                    // pipe): say so on the tab's status line — never silently.
+                    let status = p.tab.try_wait_status();
+                    match status {
+                        Some(status) => note_tab_crash(
+                            p,
+                            format_args!("the process exited ({status}) after a command failed to reach it: {err}"),
+                        ),
+                        None => note_tab_crash(
+                            p,
+                            format_args!("its stdin is dead ({err}) — the process is no longer reachable"),
+                        ),
+                    }
+                    crashed = true;
+                }
             }
+        }
+        if crashed {
+            self.sync_ui();
         }
     }
 
@@ -233,7 +279,7 @@ impl Core {
                 let (w, h) = self.page_size();
                 {
                     let mut procs = self.procs.borrow_mut();
-                    procs.push(Proc { tab, state: TabState::default(), zoom: 1.0 });
+                    procs.push(Proc { tab, state: TabState::default(), zoom: 1.0, crashed: false });
                     self.active.set(procs.len() - 1);
                 }
                 if w > 0.0 && h > 0.0 {
@@ -547,7 +593,7 @@ impl Core {
                 let zoom = procs[at].zoom;
                 std::mem::replace(
                     &mut procs[at],
-                    Proc { tab, state: TabState::default(), zoom },
+                    Proc { tab, state: TabState::default(), zoom, crashed: false },
                 )
             };
             if w > 0.0 && h > 0.0 {
@@ -649,6 +695,10 @@ impl Core {
     pub fn drain(&self) {
         // Superseded hover moves go out here, one per tick at the latest.
         self.flush_pending_move();
+        // A child can die between messages (panic, kill): without a poll the
+        // tab would go silent and the shell would keep painting its stale
+        // frame as if nothing happened.
+        self.check_crashes();
         let msgs: Vec<PumpedMessage> = self.rx.borrow_mut().try_iter().collect();
         if msgs.is_empty() {
             self.check_resize();
@@ -766,6 +816,29 @@ impl Core {
         if let (Some(img), Some(ui)) = (newest_frame, self.ui()) {
             ui.set_page_image(img);
             ui.window().request_redraw();
+        }
+    }
+
+    /// Notice tab processes that died without saying `Closed` (crash, kill):
+    /// log the exit + captured backtrace and pin “Tab N has crashed” onto each
+    /// victim's status line. Crashed tabs are kept in the strip (their frame
+    /// is the last thing the user asked for); ✕ still closes them.
+    fn check_crashes(&self) {
+        let mut crashed = false;
+        {
+            let mut procs = self.procs.borrow_mut();
+            for p in procs.iter_mut() {
+                if p.crashed || p.state.closed {
+                    continue;
+                }
+                if let Some(status) = p.tab.try_wait_status() {
+                    note_tab_crash(p, format_args!("the process exited ({status}) without closing cleanly"));
+                    crashed = true;
+                }
+            }
+        }
+        if crashed {
+            self.sync_ui();
         }
     }
 
