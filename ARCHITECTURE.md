@@ -97,7 +97,10 @@ pub enum FromTab {
     HistoryChanged   { can_go_back: bool, can_go_forward: bool },
     StatusText       { text: Option<String> },
     OpenLinkInNewTab { url: String },      // middle-click a link → shell opens url in a new tab (same container)
-    ConsoleLog       { level: String, message: String },
+    // source: "js" | "css" | "dom" | "page" — which DevTools panel the entry belongs to
+    ConsoleLog       { source: String, level: String, message: String },
+    // one finished (or failed) page request → DevTools network panel
+    NetworkEvent     { event: NetEvent },
     Closed,
     Error            { message: String },
 }
@@ -135,6 +138,18 @@ pub struct KeyEvent {
 
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ScrollEvent { pub x: f32, pub y: f32, pub delta_x: f32, pub delta_y: f32 }
+
+/// One page request, reported once when it finishes (or fails).
+/// Completed ⇒ `status` set, `error` None; failed ⇒ `status` None, `error` Some.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct NetEvent {
+    pub method: String,
+    pub url: String,
+    pub status: Option<u16>,
+    pub response_bytes: Option<u64>,
+    pub duration_ms: Option<u64>,
+    pub error: Option<String>,
+}
 
 /// Framing: u32 LE length prefix + bincode payload, over stdin/stdout pipes.
 pub fn write_frame<W: std::io::Write, T: serde::Serialize>(w: &mut W, msg: &T) -> std::io::Result<()>;

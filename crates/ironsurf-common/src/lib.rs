@@ -88,9 +88,21 @@ pub enum FromTab {
     ClipboardText {
         text: String,
     },
+    /// DevTools console entry. `source` names the subsystem the entry came
+    /// from: `"js"` (script `console.*` / engine JS diagnostics), `"css"`
+    /// (stylesheet parse/style problems), `"dom"` (markup/DOM diagnostics)
+    /// or `"page"` (anything else about the document itself).
     ConsoleLog {
+        /// `"js"` | `"css"` | `"dom"` | `"page"`.
+        source: String,
         level: String,
         message: String,
+    },
+    /// DevTools network entry: one request the tab made for the page
+    /// (document, subresource, XHR, media…). Emitted once per request when
+    /// it finishes (or fails); `NetEvent::error` carries the failure.
+    NetworkEvent {
+        event: NetEvent,
     },
     Closed,
     Error {
@@ -180,6 +192,31 @@ pub enum ContextAction {
 /// Cap for text carried in context-menu messages (`ContextTarget::selection`)
 /// — the selection is a convenience copy path, not an exfil channel.
 pub const MAX_CONTEXT_TEXT: usize = 256 * 1024;
+
+/// One network request observed by the tab, reported to the shell as
+/// [`FromTab::NetworkEvent`] (DevTools network panel).
+///
+/// A request that *completed* carries `status` (and `response_bytes` /
+/// `duration_ms` when the engine measured them) and `error == None`. A
+/// request that *failed* (DNS, TLS, connection refused, blocked by policy,
+/// …) has `status == None` and `error == Some(reason)` — never both.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct NetEvent {
+    /// HTTP method (`"GET"`, `"POST"`, …), upper-cased by the engine.
+    pub method: String,
+    /// Request URL after the engine resolved it (redirects are separate
+    /// events, one per hop).
+    pub url: String,
+    /// Response status code; `None` when no response arrived (see `error`).
+    pub status: Option<u16>,
+    /// Response body size in bytes, when known.
+    pub response_bytes: Option<u64>,
+    /// Wall-clock duration of the request in milliseconds, when measured.
+    pub duration_ms: Option<u64>,
+    /// Failure reason; `Some` exactly when the request failed (`status` is
+    /// then `None`).
+    pub error: Option<String>,
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct PointerEvent {
@@ -450,7 +487,21 @@ mod tests {
         frame_round_trip(FromTab::OpenLinkInNewTab {
             url: "https://example.com/link".into()
         });
-        frame_round_trip(FromTab::ConsoleLog { level: "warn".into(), message: "m".into() });
+        frame_round_trip(FromTab::ConsoleLog {
+            source: "js".into(),
+            level: "warn".into(),
+            message: "m".into(),
+        });
+        frame_round_trip(FromTab::NetworkEvent {
+            event: NetEvent {
+                method: "GET".into(),
+                url: "https://example.com/".into(),
+                status: Some(301),
+                response_bytes: Some(0),
+                duration_ms: Some(7),
+                error: None,
+            },
+        });
         frame_round_trip(FromTab::Closed);
         frame_round_trip(FromTab::Error { message: "boom".into() });
         frame_round_trip(FromTab::ContextMenu {
@@ -471,6 +522,64 @@ mod tests {
             target: ContextTarget::default(),
         });
         frame_round_trip(FromTab::ClipboardText { text: "copied".into() });
+    }
+
+    /// `source` is one of the four documented DevTools origins; every one of
+    /// them must survive the frame codec with `level`/`message` intact.
+    #[test]
+    fn console_log_source_round_trips() {
+        for source in ["js", "css", "dom", "page"] {
+            let msg = frame_round_trip(FromTab::ConsoleLog {
+                source: source.into(),
+                level: "error".into(),
+                message: "unclosed string".into(),
+            });
+            match msg {
+                FromTab::ConsoleLog { source: s, level, message } => {
+                    assert_eq!(s, source);
+                    assert_eq!(level, "error");
+                    assert_eq!(message, "unclosed string");
+                }
+                other => panic!("unexpected message: {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn network_event_round_trips() {
+        // A completed request: status + sizes, no error.
+        frame_round_trip(FromTab::NetworkEvent {
+            event: NetEvent {
+                method: "GET".into(),
+                url: "https://example.com/style.css".into(),
+                status: Some(200),
+                response_bytes: Some(4096),
+                duration_ms: Some(42),
+                error: None,
+            },
+        });
+        // A failed request: no status, an error instead.
+        frame_round_trip(FromTab::NetworkEvent {
+            event: NetEvent {
+                method: "POST".into(),
+                url: "https://example.com/api".into(),
+                status: None,
+                response_bytes: None,
+                duration_ms: None,
+                error: Some("connection refused".into()),
+            },
+        });
+        // A bare minimum event (only method + url known).
+        frame_round_trip(FromTab::NetworkEvent {
+            event: NetEvent {
+                method: "HEAD".into(),
+                url: "ironsurf://welcome".into(),
+                status: None,
+                response_bytes: None,
+                duration_ms: None,
+                error: None,
+            },
+        });
     }
 
     #[test]

@@ -698,7 +698,20 @@ impl Tab {
                 info!("loading {}", if *loading { "started" } else { "finished" })
             }
             FromTab::Error { message } => error!("to shell: {message}"),
-            FromTab::ConsoleLog { level, message } => info!("to shell: console[{level}] {message}"),
+            FromTab::ConsoleLog { source, level, message } => {
+                info!("to shell: console[{source}:{level}] {message}")
+            }
+            FromTab::NetworkEvent { event } => {
+                debug!(
+                    "to shell: net {} {} {}",
+                    event.method,
+                    event.url,
+                    event
+                        .status
+                        .map(|s| s.to_string())
+                        .unwrap_or_else(|| event.error.clone().unwrap_or_default())
+                )
+            }
             other => debug!("to shell: {other:?}"),
         }
         self.out.send(msg);

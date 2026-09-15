@@ -76,7 +76,10 @@ impl TabState {
                     true
                 }
             }
+            // DevTools feed (console + network): the shell has no panel yet,
+            // so neither message touches per-tab state.
             FromTab::ConsoleLog { .. } => false,
+            FromTab::NetworkEvent { .. } => false,
             // Actions for the pump (spawn a new tab, open the context menu,
             // file the copy into the session clipboard), not per-tab state.
             FromTab::OpenLinkInNewTab { .. } => false,

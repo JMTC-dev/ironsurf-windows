@@ -831,9 +831,11 @@ impl Core {
                     rgba.len()
                 ),
                 FromTab::Error { message } => error!("tab {tid} error: {message}"),
-                FromTab::ConsoleLog { level, message } => {
-                    info!("tab {tid} console[{level}]: {message}")
+                FromTab::ConsoleLog { source, level, message } => {
+                    info!("tab {tid} console[{source}:{level}]: {message}")
                 }
+                // DevTools network panel: logged for now, not per-tab state.
+                FromTab::NetworkEvent { .. } => {}
                 FromTab::UrlChanged { url } => {
                     info!("tab {tid} url → {}", url.as_deref().unwrap_or("<none>"))
                 }

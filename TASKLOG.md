@@ -1,4 +1,9 @@
 # Task log
+## #29 DevTools IPC contract: FromTab::ConsoleLog gained `source` ("js"|"css"|"dom"|"page") and there is a new
+FromTab::NetworkEvent { event: NetEvent } — NetEvent{method,url,status,response_bytes,duration_ms,error}
+(error is Some exactly when the request failed, status then None). Shell console log carries the source, both
+messages are no-ops for TabState (state.rs arms added), tab logs a net one-liner; ARCH §ironsurf-common snippet
+synced; common round-trips (all four sources, success/failure/bare events), common 22 + shell --lib 32 + pump green.
 ## #28 Right-click context menu + session clipboard: tab hit-tests the cursor (link/image/video+playing/selection
 /caret → FromTab::ContextMenu{x,y,ContextTarget}); shell renders a Slint overlay menu whose rows are the pure
 context_menu_items matrix (Back/Forward/Reload, open link/image in new tab, Copy selection/link/image/video/page
@@ -78,7 +83,6 @@ handle_wheel → scroll_chain_by feeds ScrollAmount::By{-x,-y}), so that extra f
 now passes delta-x/delta-y verbatim; convention pinned in common::ScrollEvent docs + ARCH ToTab section and
 by the new tab test wheel_down_scrolls_the_document_down_and_wheel_up_back_up (pixel deltas, 20px notch, clamp
 at the top); workspace green.
-## mp4.rs demuxer compile-clean — handler match guard moved into body (Audio arm exhaustive, same first-audio-label behavior), read_stsz/stsc/stts calls in TrackTable::read use .ok()? (fn returns Option), read_ctts let-Some (was let-Ok on mapped Option), ftyp fixture byte escape \2->\x02, dropped unused byte::self import + needless mut, ParsedMp4 derives Debug (test expect/expect_err need it). cargo check -p ironsurf-tab [plain + --tests] show ZERO demux/mp4.rs diagnostics; module tests deferred to later task (crate still red elsewhere).
 ## player.rs compile-clean — VecDeque/Vec bridge: decode/flush emit into a local Vec then buffered.extend
 (out) (VecDeque::append no longer takes &mut Vec); present_due holds an early frame as Some((pts, frame));
 test hooks: set_test_metadata drops needless .clone() (E0716), seek test asserts player.current_pts() (Frame
