@@ -45,6 +45,45 @@ use url::Url;
 // that silently broke a load (transport failures, dropped subresources) reach
 // `warn`, so a normal page stays quiet at the default level.
 use ironsurf_common::{debug, trace, warn};
+use ironsurf_common::NetEvent;
+
+// ---------------------------------------------------------------------------
+// DevTools network reporting (`FromTab::NetworkEvent`)
+
+/// Sink for network events: called exactly once per *completed or failed*
+/// request (redirect hops count as their own events; a response served
+/// entirely from [`NetCache`] without touching the wire is not a request and
+/// stays silent). `None` keeps the fetcher quiet — every call site that does
+/// not care about the DevTools network panel passes `None`.
+pub type NetReport<'a> = Option<&'a (dyn Fn(NetEvent) + Send + Sync)>;
+
+/// A completed request: status + size + measured wall clock, no error.
+fn net_ok(method: &str, url: &Url, status: u16, response_bytes: u64, duration_ms: u64) -> NetEvent {
+    NetEvent {
+        method: method.to_owned(),
+        url: url.as_str().to_owned(),
+        status: Some(status),
+        response_bytes: Some(response_bytes),
+        duration_ms: Some(duration_ms),
+        error: None,
+    }
+}
+
+/// A failed request: `status == None`, `error == Some(reason)`.
+fn net_failed(method: &str, url: &Url, duration_ms: u64, error: String) -> NetEvent {
+    NetEvent {
+        method: method.to_owned(),
+        url: url.as_str().to_owned(),
+        status: None,
+        response_bytes: None,
+        duration_ms: Some(duration_ms),
+        error: Some(error),
+    }
+}
+
+fn elapsed_ms(started: std::time::Instant) -> u64 {
+    started.elapsed().as_millis() as u64
+}
 
 /// A loggable rendering of `url`: `data:` URLs are reduced to their length so
 /// a 2 MB inline asset cannot spray itself across stderr.
@@ -813,13 +852,28 @@ fn build_request(
 /// Plain (`Passthrough`) HTTP fetch (GET, or a form `POST` with `post`):
 /// our User-Agent plus whatever the Blitz `Request` carried; no cookies, no
 /// cache — and a POST never consults the cache either.
+#[allow(dead_code)] // quiet convenience wrapper (the live paths report; tests use it)
 pub fn plain_http_fetch(
     client: &reqwest::blocking::Client,
     url: &Url,
     extra: Option<&HeaderMap>,
     post: Option<&MainDocPost>,
 ) -> Result<FetchOutcome, String> {
+    plain_http_fetch_report(client, url, extra, post, None)
+}
+
+/// [`plain_http_fetch`] with the DevTools reporter attached: one event for
+/// the finished request (reqwest's automatic redirects mean only the final
+/// response is visible here) or one failure event naming the failure.
+pub fn plain_http_fetch_report(
+    client: &reqwest::blocking::Client,
+    url: &Url,
+    extra: Option<&HeaderMap>,
+    post: Option<&MainDocPost>,
+    report: NetReport,
+) -> Result<FetchOutcome, String> {
     let verb = if post.is_some() { "POST" } else { "GET" };
+    let started = std::time::Instant::now();
     let mut req = build_request(client, url, post).header("User-Agent", USER_AGENT);
     if let Some(headers) = extra {
         if !headers.is_empty() {
@@ -828,16 +882,26 @@ pub fn plain_http_fetch(
     }
     let response = req.send().map_err(|e| {
         warn!("passthrough {verb} {url} failed: {e}");
-        format!("fetch {url}: {e}")
+        let message = format!("fetch {url}: {e}");
+        if let Some(report) = report {
+            report(net_failed(verb, url, elapsed_ms(started), message.clone()));
+        }
+        message
     })?;
     let status = response.status().as_u16();
     let final_url = response.url().clone();
     let headers = collect_headers(response.headers());
-    let body = response
-        .bytes()
-        .map(|b| b.to_vec())
-        .map_err(|e| format!("body {url}: {e}"))?;
+    let body = response.bytes().map(|b| b.to_vec()).map_err(|e| {
+        let message = format!("body {url}: {e}");
+        if let Some(report) = report {
+            report(net_failed(verb, &final_url, elapsed_ms(started), message.clone()));
+        }
+        message
+    })?;
     debug!("{verb} {url} -> {status} ({} B, passthrough)", body.len());
+    if let Some(report) = report {
+        report(net_ok(verb, &final_url, status, body.len() as u64, elapsed_ms(started)));
+    }
     Ok(FetchOutcome {
         final_url,
         status,
@@ -865,6 +929,7 @@ const MAX_MANAGED_REDIRECTS: u32 = 10;
 /// [`NetCache`] entries are stored under the original `url` — but only when
 /// `cacheable` (a `POST` is never cached, look up or store). `extra` (from
 /// the Blitz `Request`) never overrides our `Cookie` header.
+#[allow(dead_code)] // quiet convenience wrapper (the live paths report; tests use it)
 pub fn managed_http_fetch(
     client: &reqwest::blocking::Client,
     url: &Url,
@@ -875,8 +940,30 @@ pub fn managed_http_fetch(
     post: Option<&MainDocPost>,
     cacheable: bool,
 ) -> Result<FetchOutcome, String> {
+    managed_http_fetch_report(client, url, jar, cache, now, extra, post, cacheable, None)
+}
+
+/// [`managed_http_fetch`] with the DevTools reporter attached. Exactly one
+/// event per completed or failed request: every followed redirect hop gets
+/// its own event (that hop's method, URL, 3xx status, declared body size),
+/// the terminating response gets the final event, and a send/body failure
+/// gets a single failure event (`status: None`). A response served entirely
+/// from [`NetCache`] without touching the wire is not a request and emits
+/// nothing (the caller sees `from_cache` and may report it itself).
+pub fn managed_http_fetch_report(
+    client: &reqwest::blocking::Client,
+    url: &Url,
+    jar: &mut CookieJar,
+    cache: &NetCache,
+    now: i64,
+    extra: Option<&HeaderMap>,
+    post: Option<&MainDocPost>,
+    cacheable: bool,
+    report: NetReport,
+) -> Result<FetchOutcome, String> {
     let is_post = post.is_some();
     let cacheable = cacheable && !is_post;
+    let started = std::time::Instant::now();
     let cached = if cacheable {
         let cached = cache.lookup(url.as_str());
         if cached.is_some() {
@@ -891,7 +978,7 @@ pub fn managed_http_fetch(
     let mut method = post; // POST -> GET conversions happen on redirect
     let mut first_hop = true;
     let mut hops_left = MAX_MANAGED_REDIRECTS;
-    let (status, final_url, headers, body) = loop {
+    let (verb, status, final_url, headers, body) = loop {
         let mut req = build_request(client, &current, method).header("User-Agent", USER_AGENT);
         if let Some(extra_headers) = extra {
             for (name, value) in extra_headers {
@@ -917,9 +1004,19 @@ pub fn managed_http_fetch(
             }
         }
         let verb = if method.is_some() { "POST" } else { "GET" };
+        let hop_start = std::time::Instant::now();
         let response = req.send().map_err(|e| {
             warn!("{verb} {current} failed: {e}");
-            format!("fetch {current}: {e}")
+            let message = format!("fetch {current}: {e}");
+            if let Some(report) = report {
+                report(net_failed(
+                    verb,
+                    &current,
+                    elapsed_ms(hop_start),
+                    message.clone(),
+                ));
+            }
+            message
         })?;
         let status = response.status().as_u16();
 
@@ -951,6 +1048,24 @@ pub fn managed_http_fetch(
             match location {
                 Some(target) if hops_left > 0 => {
                     debug!("{verb} {current} -> {status} redirect to {target} ({hops_left} hops left)");
+                    // DevTools sees the hop as its own completed request; the
+                    // hop body is never read, so the declared size is the
+                    // honest answer (0 when the server declared none).
+                    if let Some(report) = report {
+                        let declared = response
+                            .headers()
+                            .get(reqwest::header::CONTENT_LENGTH)
+                            .and_then(|v| v.to_str().ok())
+                            .and_then(|v| v.trim().parse::<u64>().ok())
+                            .unwrap_or(0);
+                        report(net_ok(
+                            verb,
+                            &current,
+                            status,
+                            declared,
+                            elapsed_ms(hop_start),
+                        ));
+                    }
                     // 303 always retries with GET; 301/302 convert a POST.
                     // 307/308 keep the method and body.
                     if status == 303 || (matches!(status, 301 | 302) && method.is_some()) {
@@ -969,11 +1084,19 @@ pub fn managed_http_fetch(
         }
 
         let headers = collect_headers(response.headers());
-        let body = response
-            .bytes()
-            .map(|b| b.to_vec())
-            .map_err(|e| format!("body {current}: {e}"))?;
-        break (status, current.clone(), headers, body);
+        let body = response.bytes().map(|b| b.to_vec()).map_err(|e| {
+            let message = format!("body {current}: {e}");
+            if let Some(report) = report {
+                report(net_failed(
+                    verb,
+                    &current,
+                    elapsed_ms(hop_start),
+                    message.clone(),
+                ));
+            }
+            message
+        })?;
+        break (verb, status, current.clone(), headers, body);
     };
 
     let (etag, last_modified) = validators(&headers);
@@ -998,6 +1121,18 @@ pub fn managed_http_fetch(
                 entry.body.len(),
                 entry.cached_at
             );
+            // The 304 exchange reported its own event; the document the
+            // caller actually gets is the cached one, so the DevTools entry
+            // carries the cache entry's status/size, not the 304.
+            if let Some(report) = report {
+                report(net_ok(
+                    verb,
+                    &final_url,
+                    entry.status,
+                    entry.body.len() as u64,
+                    elapsed_ms(started),
+                ));
+            }
             Ok(FetchOutcome {
                 final_url,
                 status: entry.status,
@@ -1014,6 +1149,15 @@ pub fn managed_http_fetch(
                 debug!("POST {url} -> {status} ({} B, never cached)", body.len());
             } else {
                 debug!("managed {url} -> {status} ({} B, not cacheable)", body.len());
+            }
+            if let Some(report) = report {
+                report(net_ok(
+                    verb,
+                    &final_url,
+                    status,
+                    body.len() as u64,
+                    elapsed_ms(started),
+                ));
             }
             Ok(FetchOutcome {
                 final_url,
@@ -1041,6 +1185,12 @@ pub struct BlitzNetProvider {
     jar: Arc<Mutex<CookieJar>>,
     cache: Arc<Mutex<NetCache>>,
     waker: Arc<Mutex<Option<Arc<dyn NetWaker>>>>,
+    /// Completed subresource requests (one [`NetEvent`] each), queued by the
+    /// fetch threads and drained by the tab loop into
+    /// `FromTab::NetworkEvent` messages. The NetWaker already wakes the loop
+    /// when a fetch settles, so nothing extra is needed to make the drain
+    /// timely.
+    net_events: Arc<Mutex<Vec<NetEvent>>>,
 }
 
 impl BlitzNetProvider {
@@ -1053,7 +1203,31 @@ impl BlitzNetProvider {
             jar: Arc::new(Mutex::new(jar)),
             cache: Arc::new(Mutex::new(cache)),
             waker: Arc::new(Mutex::new(None)),
+            net_events: Arc::new(Mutex::new(Vec::new())),
         }
+    }
+
+    /// The queue of finished subresource requests: the tab loop drains this
+    /// every poll tick and emits one `FromTab::NetworkEvent` per entry.
+    pub fn net_events(&self) -> Arc<Mutex<Vec<NetEvent>>> {
+        Arc::clone(&self.net_events)
+    }
+
+    /// A locally served subresource answered as an instant 200.
+    fn report_local(&self, method: &str, url: &Url, status: u16, response_bytes: u64) {
+        self.net_events
+            .lock()
+            .expect("net events mutex")
+            .push(net_ok(method, url, status, response_bytes, 0));
+    }
+
+    /// A locally served subresource that failed: `status: None`, reason in
+    /// `error`.
+    fn report_local_failed(&self, method: &str, url: &Url, error: String) {
+        self.net_events
+            .lock()
+            .expect("net events mutex")
+            .push(net_failed(method, url, 0, error));
     }
 
     /// Ready-to-share (`Arc<dyn NetProvider>`) form for `DocumentConfig`.
@@ -1110,16 +1284,20 @@ impl BlitzNetProvider {
         let jar = Arc::clone(&self.jar);
         let cache = Arc::clone(&self.cache);
         let waker = self.waker.lock().expect("waker mutex poisoned").clone();
+        let events = Arc::clone(&self.net_events);
         debug!(
             "subresource GET {url} (doc {doc_id}, {})",
             if managed { "managed" } else { "passthrough" }
         );
         self.worker.spawn(move || {
             let signal = request.signal.clone();
+            // Every settled request lands in the tab loop's DevTools queue
+            // (redirect hops report individually — same rule as documents).
+            let report = |event: NetEvent| events.lock().expect("net events mutex").push(event);
             let outcome = if managed {
                 let mut jar = jar.lock().expect("jar mutex poisoned");
                 let cache = cache.lock().expect("cache mutex poisoned");
-                managed_http_fetch(
+                managed_http_fetch_report(
                     worker.managed_client(),
                     &url,
                     &mut jar,
@@ -1128,9 +1306,16 @@ impl BlitzNetProvider {
                     None,
                     None,
                     true,
+                    Some(&report),
                 )
             } else {
-                plain_http_fetch(worker.client(), &url, Some(&request.headers), None)
+                plain_http_fetch_report(
+                    worker.client(),
+                    &url,
+                    Some(&request.headers),
+                    None,
+                    Some(&report),
+                )
             };
             // Same as upstream blitz-net: wake the doc thread even on error,
             // and drop the handler when the fetch failed (no error path).
@@ -1183,13 +1368,18 @@ impl NetProvider for BlitzNetProvider {
                     deliver(None, String::new(), Vec::new())
                 }
             },
+            // Local schemes report instant 200s (or the read failure) so the
+            // DevTools panel shows the subresource; `data:` URLs stay silent
+            // — an inline asset is no request, and pages carry many.
             "file" => match read_file_url(&url) {
                 Ok(bytes) => {
                     debug!("subresource {url} read from disk ({} B)", bytes.len());
+                    self.report_local("GET", &url, 200, bytes.len() as u64);
                     deliver(Some(handler), url.to_string(), bytes)
                 }
                 Err(err) => {
                     warn!("subresource {url} unreadable: {err}");
+                    self.report_local_failed("GET", &url, err);
                     deliver(None, String::new(), Vec::new())
                 }
             },
@@ -1199,10 +1389,16 @@ impl NetProvider for BlitzNetProvider {
                         "subresource {url} served from built-ins ({} B)",
                         bytes.len()
                     );
+                    self.report_local("GET", &url, 200, bytes.len() as u64);
                     deliver(Some(handler), url.to_string(), bytes)
                 }
                 None => {
                     debug!("subresource {url}: no built-in page (dropped)");
+                    self.report_local_failed(
+                        "GET",
+                        &url,
+                        "no built-in page for this about: URL".to_owned(),
+                    );
                     deliver(None, String::new(), Vec::new())
                 }
             },
@@ -1212,10 +1408,16 @@ impl NetProvider for BlitzNetProvider {
                         "subresource {url} served from internal pages ({} B)",
                         bytes.len()
                     );
+                    self.report_local("GET", &url, 200, bytes.len() as u64);
                     deliver(Some(handler), url.to_string(), bytes)
                 }
                 None => {
                     debug!("subresource {url}: no internal page (dropped)");
+                    self.report_local_failed(
+                        "GET",
+                        &url,
+                        "no internal page for this ironsurf: URL".to_owned(),
+                    );
                     deliver(None, String::new(), Vec::new())
                 }
             },
@@ -1330,6 +1532,19 @@ pub fn fetch_document(
     fetch_document_post(url, None, policy, jar, cache, now)
 }
 
+/// [`fetch_document`] with the DevTools reporter attached (see
+/// [`fetch_document_post_report`]).
+pub fn fetch_document_report(
+    url: &Url,
+    policy: NetPolicy,
+    jar: &mut CookieJar,
+    cache: &NetCache,
+    now: i64,
+    report: NetReport,
+) -> Result<DocFetch, NetError> {
+    fetch_document_post_report(url, None, policy, jar, cache, now, report)
+}
+
 /// [`fetch_document`] with an HTML form submission's POST body attached
 /// (`post = Some(..)`): only http(s) accepts a POST; every local scheme
 /// (`file:`/`about:`/`data:`/`ironsurf:`) is answered as GET and refuses a
@@ -1343,10 +1558,30 @@ pub fn fetch_document_post(
     cache: &NetCache,
     now: i64,
 ) -> Result<DocFetch, NetError> {
-    let worker = shared_worker();
-    fetch_document_with_worker(url, post, policy, jar, cache, now, &worker)
+    fetch_document_post_report(url, post, policy, jar, cache, now, None)
 }
 
+/// [`fetch_document_post`] with the DevTools reporter attached: one
+/// [`NetEvent`] per completed or failed main-document request, including one
+/// per followed redirect hop (the redirect chain is followed inside
+/// [`managed_http_fetch_report`]). Local-scheme loads (`file:`/`about:`/
+/// `ironsurf:`/`data:`) are reported as instant 200s; an https-upgrade that
+/// gets blocked is reported against the **requested** URL with the policy
+/// reason, and a transport failure against the URL that was tried.
+pub fn fetch_document_post_report(
+    url: &Url,
+    post: Option<&MainDocPost>,
+    policy: NetPolicy,
+    jar: &mut CookieJar,
+    cache: &NetCache,
+    now: i64,
+    report: NetReport,
+) -> Result<DocFetch, NetError> {
+    let worker = shared_worker();
+    fetch_document_with_worker_report(url, post, policy, jar, cache, now, &worker, report)
+}
+
+#[allow(dead_code)] // quiet convenience wrapper (tests drive it; the runtime reports)
 fn fetch_document_with_worker(
     url: &Url,
     post: Option<&MainDocPost>,
@@ -1356,36 +1591,56 @@ fn fetch_document_with_worker(
     now: i64,
     worker: &FetchWorker,
 ) -> Result<DocFetch, NetError> {
+    fetch_document_with_worker_report(url, post, policy, jar, cache, now, worker, None)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn fetch_document_with_worker_report(
+    url: &Url,
+    post: Option<&MainDocPost>,
+    policy: NetPolicy,
+    jar: &mut CookieJar,
+    cache: &NetCache,
+    now: i64,
+    worker: &FetchWorker,
+    report: NetReport,
+) -> Result<DocFetch, NetError> {
     if post.is_some() && !is_http_scheme(url) {
         // Defensive: a body to a local scheme has nowhere to go.
         warn!("refusing to POST to non-http scheme: {url}");
         return Err(NetError::Unsupported { url: url.clone() });
     }
-    // Local schemes: identical under both policies.
+    // Local schemes: identical under both policies. Reported as instant
+    // 200s — the DevTools network panel lists the document either way.
+    let local_ok = |url: &Url, body: Vec<u8>| {
+        if let Some(report) = report {
+            report(net_ok("GET", url, 200, body.len() as u64, 0));
+        }
+        DocFetch {
+            url: url.clone(),
+            status: 200,
+            body,
+        }
+    };
     match url.scheme() {
         "file" => {
             let body = read_file_url(url).map_err(|e| {
                 warn!("cannot read {url}: {e}");
+                if let Some(report) = report {
+                    report(net_failed("GET", url, 0, e.clone()));
+                }
                 NetError::Io {
                     url: url.clone(),
                     message: e,
                 }
             })?;
             debug!("document {url} read from disk ({} B)", body.len());
-            return Ok(DocFetch {
-                url: url.clone(),
-                status: 200,
-                body,
-            });
+            return Ok(local_ok(url, body));
         }
         "about" => {
             if let Some(body) = builtin_page_bytes(url) {
                 debug!("document {url} served from built-ins ({} B)", body.len());
-                return Ok(DocFetch {
-                    url: url.clone(),
-                    status: 200,
-                    body,
-                });
+                return Ok(local_ok(url, body));
             }
         }
         INTERNAL_SCHEME => {
@@ -1393,21 +1648,13 @@ fn fetch_document_with_worker(
             // the page (welcome or not-found), it is answered from built-ins.
             if let Some(body) = internal_page_bytes(url) {
                 debug!("document {url} served from internal pages ({} B)", body.len());
-                return Ok(DocFetch {
-                    url: url.clone(),
-                    status: 200,
-                    body,
-                });
+                return Ok(local_ok(url, body));
             }
         }
         "data" => {
             if let Some(body) = decode_data_url(url) {
                 debug!("document {} decoded ({} B)", url_for_log(url), body.len());
-                return Ok(DocFetch {
-                    url: url.clone(),
-                    status: 200,
-                    body,
-                });
+                return Ok(local_ok(url, body));
             }
         }
         _ => {}
@@ -1423,18 +1670,8 @@ fn fetch_document_with_worker(
     let cacheable = policy == NetPolicy::Managed;
     match plan_document(policy, url) {
         // Non-http scheme that still reached here (unknown scheme): refuse.
-        Plan::Pass => plain_http_fetch(worker.client(), url, None, post)
-            .map(|o| DocFetch {
-                url: o.final_url,
-                status: o.status,
-                body: o.body,
-            })
-            .map_err(|message| NetError::Transport {
-                url: url.clone(),
-                message,
-            }),
-        Plan::Fetch(target) => {
-            managed_http_fetch(worker.managed_client(), &target, jar, cache, now, None, post, cacheable)
+        Plan::Pass => {
+            plain_http_fetch_report(worker.client(), url, None, post, report)
                 .map(|o| DocFetch {
                     url: o.final_url,
                     status: o.status,
@@ -1445,16 +1682,73 @@ fn fetch_document_with_worker(
                     message,
                 })
         }
+        Plan::Fetch(target) => managed_http_fetch_report(
+            worker.managed_client(),
+            &target,
+            jar,
+            cache,
+            now,
+            None,
+            post,
+            cacheable,
+            report,
+        )
+        .map(|o| DocFetch {
+            url: o.final_url,
+            status: o.status,
+            body: o.body,
+        })
+        .map_err(|message| NetError::Transport {
+            url: url.clone(),
+            message,
+        }),
         Plan::Upgrade(https) => {
             debug!("https-upgrade: {url} -> {https}");
-            match managed_http_fetch(worker.managed_client(), &https, jar, cache, now, None, post, true) {
-                Ok(o) => Ok(DocFetch {
-                    url: o.final_url,
-                    status: o.status,
-                    body: o.body,
-                }),
+            // The upgraded navigation is reported as exactly ONE event named
+            // by the URL the user asked for: success carries the response the
+            // https attempt produced, failure names the policy block (the raw
+            // connect error would only name the upgraded URL, which the user
+            // never asked for). `Managed` `https:` loads and Passthrough
+            // navigations keep the full per-hop reporting above.
+            let started = std::time::Instant::now();
+            let method = if post.is_some() { "POST" } else { "GET" };
+            match managed_http_fetch_report(
+                worker.managed_client(),
+                &https,
+                jar,
+                cache,
+                now,
+                None,
+                post,
+                true,
+                None,
+            ) {
+                Ok(o) => {
+                    if let Some(report) = report {
+                        report(net_ok(
+                            method,
+                            &o.final_url,
+                            o.status,
+                            o.body.len() as u64,
+                            elapsed_ms(started),
+                        ));
+                    }
+                    Ok(DocFetch {
+                        url: o.final_url,
+                        status: o.status,
+                        body: o.body,
+                    })
+                }
                 Err(reason) => {
                     warn!("https upgrade for {url} failed, navigation blocked: {reason}");
+                    if let Some(report) = report {
+                        report(net_failed(
+                            method,
+                            url,
+                            elapsed_ms(started),
+                            format!("https-upgrade to {https} blocked: {reason}"),
+                        ));
+                    }
                     Err(NetError::Blocked {
                         request: url.clone(),
                         https,

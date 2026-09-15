@@ -75,7 +75,7 @@ use blitz_traits::navigation::{NavigationOptions, NavigationProvider};
 use blitz_traits::shell::{ClipboardError, ColorScheme, ShellProvider, Viewport};
 use ironsurf_common::{
     read_frame, write_frame, ContextAction, ContextTarget, ContainerId, FromTab, KeyEvent,
-    Modifiers, PointerEvent, PointerKind, ScrollEvent, TabId, ToTab, MAX_CONTEXT_TEXT,
+    Modifiers, NetEvent, PointerEvent, PointerKind, ScrollEvent, TabId, ToTab, MAX_CONTEXT_TEXT,
 };
 use keyboard_types::{Code, Key, Location, Modifiers as KMods};
 use kurbo::{Affine, Rect, Size};
@@ -562,8 +562,14 @@ pub struct Tab {
     /// `src` cost one fetch — every waiter gets the bytes when they land).
     media_inflight: HashSet<String>,
     /// Completion queue from the fetch threads; the shared self-pipe wakes
-    /// the loop the moment one arrives (the NavHook/NetWaker pattern).
+    /// the loop the moment one arrived (the NavHook/NetWaker pattern).
     media_results: Arc<Mutex<Vec<MediaLoaded>>>,
+    /// DevTools network queue (the provider's own): subresource fetch threads
+    /// push one [`NetEvent`] per settled request here, and the poll loop
+    /// drains it into `FromTab::NetworkEvent` messages (a NetWaker wake makes
+    /// the drain timely). Navigation events are emitted inline (the fetch is
+    /// synchronous on the tab thread).
+    net_events: Arc<Mutex<Vec<NetEvent>>>,
     /// Master switch mirroring `TabArgs::media_enabled`.
     media_enabled: bool,
     /// When the media steps must next run even with no events at all; `None`
@@ -628,6 +634,8 @@ impl Tab {
             BlitzNetProvider::new(args.net_policy, store.cookie_jar(), store.cache())
                 .with_waker(Arc::new(PipeWaker(Arc::clone(&pipe)))),
         );
+        // Grab the DevTools network queue before `provider` moves into the tab.
+        let net_events = provider.net_events();
         Tab {
             out: TabOut::new(),
             width: DEFAULT_SIZE.0,
@@ -670,6 +678,7 @@ impl Tab {
             media_results: Arc::new(Mutex::new(Vec::new())),
             media_enabled: args.media_enabled,
             media_next_pump: None,
+            net_events,
         }
     }
 
@@ -818,17 +827,31 @@ impl Tab {
             "fetching main document {url} (net policy {:?})",
             self_provider_policy(&self.provider)
         );
+        // DevTools network reporting: the document fetch runs synchronously
+        // on the tab thread, so its events (one per completed/failed request,
+        // one per redirect hop) queue locally and ship right after the fetch
+        // — before any subresource event, exactly like Firefox's panel.
+        let doc_events = Mutex::new(Vec::<NetEvent>::new());
         let jar = Arc::clone(&self.jar);
         let mut jar = jar.lock().expect("jar mutex poisoned");
-        let fetch = netmod::fetch_document_post(
+        let fetch = netmod::fetch_document_post_report(
             &url,
             post,
             self_provider_policy(&self.provider),
             &mut jar,
             &self.cache,
             netmod::now_unix(),
+            Some(&|event| {
+                doc_events
+                    .lock()
+                    .expect("doc net events mutex")
+                    .push(event)
+            }),
         );
         drop(jar);
+        for event in doc_events.lock().expect("doc net events mutex").drain(..) {
+            self.emit(FromTab::NetworkEvent { event });
+        }
         match fetch {
             Ok(doc_fetch) => {
                 debug!(
@@ -849,6 +872,9 @@ impl Tab {
                 self.emit(FromTab::StatusText { text: None });
                 // Script output outranks the "load finished" clear (task 8).
                 self.emit_js_status();
+                // External `<script src>` fetches settled during load_html;
+                // ship their network events with the navigation, not a tick late.
+                self.drain_net_events();
                 true
             }
             Err(err) => {
@@ -1031,14 +1057,20 @@ impl Tab {
             // mutably borrows the jar (subresources may also flow through the
             // Blitz provider, which owns its own handle to the same state).
             let jar = Arc::clone(&self.jar);
+            // External `<script src>` bodies ride the document fetcher, so
+            // they report into the same DevTools queue the poll loop drains
+            // (one `FromTab::NetworkEvent` per script, like any subresource).
+            let net_events = Arc::clone(&self.net_events);
             let mut fetch = |script_url: &Url| -> Result<String, String> {
                 let mut jar = jar.lock().expect("jar mutex poisoned");
-                netmod::fetch_document(
+                let events = Arc::clone(&net_events);
+                netmod::fetch_document_report(
                     script_url,
                     policy,
                     &mut jar,
                     &self.cache,
                     netmod::now_unix(),
+                    Some(&|event| events.lock().expect("net events mutex").push(event)),
                 )
                 .map(|script| script.body_text())
                 .map_err(|err| err.to_string())
@@ -1721,6 +1753,17 @@ impl Tab {
                     self.needs_paint = true;
                 }
             }
+        }
+    }
+
+    /// Ship every subresource request that settled since the last poll as
+    /// one `FromTab::NetworkEvent` each (DevTools network panel): the fetch
+    /// threads push into the provider's queue, and the NetWaker wake that
+    /// follows makes this drain immediate — never a tick late.
+    fn drain_net_events(&mut self) {
+        let events = std::mem::take(&mut *self.net_events.lock().expect("net events mutex"));
+        for event in events {
+            self.emit(FromTab::NetworkEvent { event });
         }
     }
 
@@ -3313,6 +3356,10 @@ pub fn run(args: TabArgs) -> i32 {
         // 2a. Page copies (Ctrl+C/X, editor cut) surface to the shell here
         // (the shell owns the session clipboard; task: context menu).
         tab.drain_copied();
+
+        // 2a′. Network: every request that settled since the last poll
+        // becomes one FromTab::NetworkEvent (DevTools network panel).
+        tab.drain_net_events();
 
         // 2b. JS timers: execute every callback due since the last poll
         // (setTimeout/setInterval/rAF), settle, and repaint coalesced exactly

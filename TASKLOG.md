@@ -1,4 +1,9 @@
 # Task log
+## #31 Network requests ride the IPC (DevTools Network panel): one FromTab::NetworkEvent per settled/failed
+request — method, URL, status, bytes, duration_ms; docs report every redirect hop (*_report fetch variants),
+NetProvider subresources + <script src> push into net_events drained per poll tick; failures error Some/status
+None (upgrade block names the requested URL); revalidated cache hits report the entry's status/size, data:/
+unsupported silent (no-spam); localhost wire test tests/network_events.rs + tab 172u + e2e 14 + suite green.
 ## #30 Shell-side DevTools state reduction: TabState now carries a bounded console log (Vec<ConsoleEntry{source,level,
 message}>, cap MAX_CONSOLE_ENTRIES=500) and a running network log (Vec<NetEvent>, cap MAX_NETWORK_ENTRIES=500, never
 cleared on nav), both appended oldest-dropped-first via push_bounded and never dirtying the frame (reduce returns false).
@@ -87,10 +92,4 @@ handle_wheel → scroll_chain_by feeds ScrollAmount::By{-x,-y}), so that extra f
 now passes delta-x/delta-y verbatim; convention pinned in common::ScrollEvent docs + ARCH ToTab section and
 by the new tab test wheel_down_scrolls_the_document_down_and_wheel_up_back_up (pixel deltas, 20px notch, clamp
 at the top); workspace green.
-## ironsurf-tab GREEN — full test suite 0 failed (161 bin + 18 other targets, timing suites stable ×3); cargo check plain + --no-default-features 0 errors.
-player.rs: canplay fires once per load at first decoded picture; paused freezes pipeline slack (only first
-frame or seek target reaches screen); paused needs_repaint = seek-await only, not in-flight decode.
-widget.rs: kurbo/stylo call-shape (from_rgb8/rgba8, one-point BezPath, RoundedRect::from_rect, Alpha);
-strip click at x==width seeks 1.0, picture area stays half-open. Demux fixtures made spec-shaped (stsc/stco
-fields, plain strh/strf chunks, canonical EBML varints, RIFF movi children); XVID-class → "MPEG-4 Part 2".
 ## video wired — media engine live in the tab. runtime.rs: attach_video_widgets (blitz set_custom_widget + width/height attrs → VideoWidget::with_size_hint, 640×360 fallback, per-tick re-scan for late <video>), fetch worker threads (SelfPipe + results queue, container cookies/policy, 2xx + MAX_VIDEO_BYTES only), pump_media after run_due_timers with MEDIA_TICK=40ms capping the poll sleep, PlayerEvent→DOM events via __ironsurfFire, catch_unwind media_guard on every step; --no-media master switch. js.rs: __ironsurfMediaGet/MediaCmd natives + NodeProto HTMLMediaElement glue (currentTime/duration/paused/ended/playbackRate/muted/videoWidth/videoHeight/mediaError, play/pause/canPlayType, instanceof HTMLMediaElement), page writes queue MediaCommands the loop applies (MediaHost cell in HostState). Spec APIs adapted to shipped blitz 0.3 (set_custom_widget not Node::Widget; SelfPipe not to_main; std::thread not tokio); /tmp/vid/flower.mp4 is 960×540 (tests assert the demuxer's own reading). cargo test -p ironsurf-tab 190 green; cargo check --workspace clean (ironsurf-net/-session/-ironsurf are not packages in this tree).
