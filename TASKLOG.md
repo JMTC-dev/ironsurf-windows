@@ -1,4 +1,8 @@
 # Task log
+## #46 Docs-only: README gains §Per-container User-Agent (UA button, Default + 5 presets + Custom, applies to every later
+  request of the active tab's container incl. navigator.userAgent live, persists in containers.json) before Feedback; welcome page
+  (netmod::WELCOME_PAGE) gains §User agent after Containers and loses §Network policy + §Try a form (form, {query} echo, and the
+  query-echo arm of internal_page_bytes removed with them — no test referenced them); tab 196u green.
 ## #45 Per-container UA switcher in the shell (step 4/5): "UA" MiniButton right of "</>" → right-docked overlay (house pattern; manager/US/UA
   never stack). Default row + 5 BUILTIN_USER_AGENTS presets, container value highlighted (pure src/user_agents.rs, 4 units). Mutations via
   Store::set_container_user_agent for the ACTIVE tab's container, broadcast SetUserAgent to THAT container's live tabs only; Copy ⇒ effective
@@ -83,12 +87,7 @@
 request — method, URL, status, bytes, duration_ms; docs report every redirect hop (*_report fetch variants),
 NetProvider subresources + <script src> push into net_events drained per poll tick; failures error Some/status
 None (upgrade block names the requested URL); revalidated cache hits report the entry's status/size, data:/
-unsupported silent (no-spam); localhost wire test tests/network_events.rs + tab 172u + e2e 14 + suite green.
-## #29 DevTools IPC contract: FromTab::ConsoleLog gained `source` ("js"|"css"|"dom"|"page") and there is a new
-FromTab::NetworkEvent { event: NetEvent } — NetEvent{method,url,status,response_bytes,duration_ms,error}
-(error is Some exactly when the request failed, status then None). Shell console log carries the source, both
-messages are no-ops for TabState (state.rs arms added), tab logs a net one-liner; ARCH §ironsurf-common snippet
-synced; common round-trips (all four sources, success/failure/bare events), common 22 + shell --lib 32 + pump green.
+unsupported silent (no-spam); localhost wire test tests/network_events.rs + tab 172u + e2e 14 + suite green (IPC contract: FromTab::NetworkEvent{method,url,status,response_bytes,duration_ms,error}, error Some exactly when failed; ConsoleLog `source`).
 ## #28 Right-click context menu + session clipboard: tab hit-tests the cursor (link/image/video+playing/selection
 /caret → FromTab::ContextMenu{x,y,ContextTarget}); shell renders a Slint overlay menu whose rows are the pure
 context_menu_items matrix (Back/Forward/Reload, open link/image in new tab, Copy selection/link/image/video/page
