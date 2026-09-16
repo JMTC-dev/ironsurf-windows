@@ -453,7 +453,7 @@ and `@import` bodies are not followed.
 After parse & resolve, extract `<script>` elements from the DOM (`document.root_element()`
 walk or `query_selector("script")`), fetch `src=` through our network layer, and execute in
 order in **one** `boa_engine::Context` per tab (per navigation: rebuild context). Bindings
-are a deliberately tiny surface (no engine-internal DOM mutation yet):
+are a small, DOM-shaped surface:
 - `window` (eventTarget-ish no-ops), `document.title` get/set (set → `FromTab::TitleChanged`
   and repaint), `document.body.textContent` read-only snapshot,
   `console.log/info/warn/error` → tab stderr + `FromTab::StatusText` **and** a
@@ -475,6 +475,25 @@ are a deliberately tiny surface (no engine-internal DOM mutation yet):
   uncaught exception is also a `ConsoleLog { source: "js", level: "error" }` — or `source:
   "dom"` when a native `__ironsurfDom*` binding threw (the registration macro records native
   `Err`s; reported **exactly once**, never duplicated on the generic script-error path).
+- **The DOM bridge writes through to the live Blitz tree, and every JS change is reflected.**
+  Reads and mutations go through the native `__ironsurfDom*` bindings, and the tab re-runs its
+  settle (restyle + relayout + coalesced repaint) after every JS turn that can change the
+  document: the initial script batch, **after every userscript run**, every timer batch and
+  every `javascript:` program. The reflection rules that used to be silent gaps:
+  * `document.write(...)`/`writeln(...)` really parse — scripts run after the parse, so the
+    insertion cursor is the end of the tree: the written markup is parsed as a fragment and
+    appended under `<body>` (never replacing the document that is running the script).
+  * `element.style` is a CSSStyleDeclaration view over the `style` content attribute: member
+    writes (`el.style.color = "red"`), `cssText`, `setProperty`/`getPropertyValue`/
+    `removeProperty` and the non-standard whole-string assignment
+    (`document.body.style = "…"`) ALL rewrite the attribute through the same native path as
+    `setAttribute`, so the change restyles on the next resolve (verified against stylo's
+    computed values).
+  * `document.dir`/`document.lang` mirror the `<html>` element's attributes.
+  * JS attribute writes match html5ever's storage — HTML attributes live in the **empty**
+    namespace and blitz's `Attributes::set` compares the full `QualName` — so `setAttribute`
+    on an attribute the parser already put there *replaces it in place* instead of pushing a
+    duplicate that reads then shadow (the bug `document.body.style = "…"` exposed).
 - **Userscripts (`ToTab::SetUserscripts`) run in the page's own realm.** The tab keeps the
   enabled set the shell installed (replace-wholesale; empty clears) and, **once per document**
   (including documents reached by a JS-driven redirect, since the filter uses the current

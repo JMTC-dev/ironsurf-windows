@@ -529,3 +529,61 @@ fn userscripts_apply_again_after_a_js_redirect() {
         "the tab survives the redirect"
     );
 }
+
+/// Every DOM change a userscript makes must land in the REAL document and be
+/// readable through the engine's own APIs afterwards: `document.write` parses
+/// into the live tree, whole-string `element.style = "…"` becomes the `style`
+/// content attribute, and `document.dir` mirrors the `<html>` attribute. The
+/// script verifies its own mutations through the DOM (the same natives the
+/// engine exposes), and the verdicts ride the wire as console lines.
+#[test]
+fn userscript_dom_mutations_reach_the_live_document() {
+    let port = spawn_local_http();
+    let profile = tempfile::tempdir().expect("profile dir");
+    let base = format!("http://127.0.0.1:{port}");
+    let mut tab = spawn_tab(&format!("{base}/plain.html"), profile.path());
+    tab.wait_for("first page loaded", |msg| {
+        matches!(msg, FromTab::LoadingChanged { loading: false })
+    });
+
+    tab.send(ToTab::SetUserscripts {
+        scripts: vec![Userscript {
+            id: 8,
+            name: "DOM reflector".to_string(),
+            patterns: vec![format!("{base}/reflect")],
+            code: r##"
+                document.write("<p id=\"us-written\">written-by-userscript</p>");
+                var w = document.querySelector("#us-written");
+                console.log("written:" + (w === null ? "MISSING" : w.textContent));
+                document.body.style = "color: rgb(1, 2, 3)";
+                console.log("style:" + (document.body.getAttribute("style") === "color: rgb(1, 2, 3)" ? "applied" : "MISSING"));
+                document.dir = "rtl";
+                console.log("dir:" + document.documentElement.getAttribute("dir"));
+            "##
+            .to_string(),
+            enabled: true,
+        }],
+    });
+    tab.send(ToTab::Navigate {
+        url: format!("{base}/reflect"),
+    });
+    for expected in [
+        "DOM reflector: written:written-by-userscript",
+        "DOM reflector: style:applied",
+        "DOM reflector: dir:rtl",
+    ] {
+        tab.wait_for("reflected DOM mutation line", |msg| {
+            matches!(msg, FromTab::ConsoleLog { source, message, .. } if
+                source == "userscript" && message == expected)
+        });
+    }
+    let frames = tab.frames();
+    assert!(
+        frames > 0,
+        "the tab paints after the userscript mutated the DOM: {frames} frames"
+    );
+    assert!(
+        tab.child.try_wait().ok().flatten().is_none(),
+        "the tab survives its own DOM writes"
+    );
+}

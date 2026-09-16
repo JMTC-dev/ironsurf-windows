@@ -1,4 +1,15 @@
 # Task log
+## #41 JS DOM changes now land in the live document, always: every JS turn that can mutate the tree — page-script
+  batch, each userscript run, timer batches, javascript: programs — settles (restyle + relayout + repaint),
+  and the three silent gaps behind the report are closed in js.rs: document.write/writeln really parse (fragment
+  appended under <body> via a new __ironsurfDomDocumentWrite native — never replaces the running document);
+  element.style is a live CSSStyleDeclaration view over the `style` attribute (member writes via Proxy, cssText,
+  set/get/removeProperty, and whole-string `document.body.style = "…"` — all through ATTR_SET, verified against
+  stylo computed values after resolve); document.dir/lang mirror the <html> attrs. Root cause underneath: html5ever
+  stores HTML attrs in the EMPTY namespace while qual_name_for_attr built ns!(html), so JS attribute writes next
+  to a parsed attr PUSHED shadow duplicates (reads kept answering the stale value) — fixed the mapping + regression
+  test. tab 185u (write/style/dir-attr/restyle units) + userscripts e2e “DOM reflector” (write+style+dir over the
+  wire), common/storage green, workspace check clean; ARCH §JavaScript reflection bullet.
 ## #40 Userscript MENU in the shell (step 4/5): glyph-free "US" toolbar button right of ＋ toggles a right-docked overlay (container-manager pattern, never PopupWindow; the two never stack — each closes the other). Rows: enable CheckBox persisted at once via Store::set_userscript_enabled, bold name, dim ", "-joined patterns, ✕ delete; "+ New script" inline editor (name/patterns LineEdits — patterns comma/space-split — multi-line TextInput for code); a rejected Save keeps the draft, shows the StoreError on one line, script NOT added. Broadcast: every mutation AND tab spawn/respawn sends ToTab::SetUserscripts with all ENABLED scripts to every live tab (crashed/closed skipped, send failures ignored — the crash reporter owns those); disabled never sent. Pure src/userscripts.rs (rows, enabled-only payload, parse_patterns, tempdir-Store reopen round-trips); fake_tab --expect-userscripts echoes "userscripts:[ids]" on its status line; tests/userscripts.rs drives save/validate/toggle/re-toggle/delete/seed/manager-exclusion over the real pipe; state.rs console_rows covers "[userscript] Name: msg"; shell 53u + all suites, common 27, storage green; ARCH §ironsurf-shell bullet added.
 ## #39 Userscripts execute in the tab (step 3/5): Tab stores ToTab::SetUserscripts (replace-wholesale; empty clears) and run_scripts ends with run_userscripts(url) —
   once per document (incl. JS-redirect targets), userscripts_for_url filtered at run time, shell store order, same Boa realm via JsRuntime::run_userscript(name, code,

@@ -674,11 +674,17 @@ fn qual_name_for_attr(name: &str) -> Result<QualName, &'static str> {
         Some(_) => return Err("invalid attribute name"),
     };
     let local = local.to_ascii_lowercase();
+    // Unprefixed HTML attributes are stored in the **empty** namespace: that
+    // is how html5ever's tokenizer builds them (`QualName::new(None, ns!(),
+    // name)`) and blitz's `Attributes::set/remove` compare the full QualName.
+    // Mapping them to ns!(html) here would make every JS `setAttribute` (and
+    // every `style` assignment) PUSH a duplicate next to the parsed attribute
+    // instead of replacing it — reads then keep answering the stale original.
     let ns = match prefix.as_deref() {
-        None => blitz_dom::ns!(html),
+        None => blitz_dom::ns!(),
         Some("xml") => blitz_dom::ns!(xml),
         Some("xlink") => blitz_dom::ns!(xlink),
-        Some(_) => blitz_dom::ns!(html),
+        Some(_) => blitz_dom::ns!(),
     };
     Ok(QualName::new(
         prefix.map(Prefix::from),
@@ -853,6 +859,7 @@ mod dom_native {
     pub(super) const TEXT_SET: &str = "__ironsurfDomTextSet";
     pub(super) const SERIALIZE: &str = "__ironsurfDomSerialize";
     pub(super) const SET_INNER: &str = "__ironsurfDomSetInner";
+    pub(super) const DOCUMENT_WRITE: &str = "__ironsurfDomDocumentWrite";
     pub(super) const ATTR: &str = "__ironsurfDomAttr";
     pub(super) const ATTR_SET: &str = "__ironsurfDomAttrSet";
     pub(super) const ATTR_REMOVE: &str = "__ironsurfDomAttrRemove";
@@ -1669,6 +1676,32 @@ fn register_dom_natives(context: &mut Context) {
             Some(Err(err)) => Err(boa_engine::JsError::from_native(err)),
             Some(Ok(())) => Ok(JsValue::undefined()),
         }
+    });
+    // document.write()/writeln(): the insertion cursor into the parse stream.
+    // IronSurf runs every script *after* the document has parsed, so the
+    // cursor sits at the end of the tree: the written markup is really parsed
+    // (the same fragment parser `innerHTML`-set uses) and appended under
+    // `<body>` (falling back to `<html>`, then the document root), landing in
+    // the live DOM where the tab's `settle()` lays it out and paints it like
+    // any other JS mutation. Deliberately never wipes the running document
+    // (the spec's post-load `document.open()` replacement would destroy the
+    // realm the page's scripts — and the userscripts layered on top — live
+    // in), and a silent no-op with no live document (snapshot mode).
+    native!(dom_native::DOCUMENT_WRITE, 2, |_this, args, context| {
+        let doc = arg_doc(args, 0, context)?;
+        let html = arg_string(args, 1, context)?;
+        with_mut(doc, |mutator| {
+            let target = mutator
+                .doc
+                .find_body_node()
+                .map(|node| node.id)
+                .or_else(|| html_element_id(mutator.doc))
+                .unwrap_or_else(|| mutator.doc.root_node().id);
+            blitz_html::DocumentHtmlParser::parse_inner_html_into_mutator(
+                mutator, target, &html,
+            );
+        });
+        Ok(JsValue::undefined())
     });
     native!(dom_native::ATTR, 2, |_this, args, context| {
         let doc = arg_doc(args, 0, context)?;
@@ -2708,6 +2741,112 @@ const PRELUDE: &str = r##"
     function (v) { host.__ironsurfDomCheckedSet(this.__d, this.__n, !!v); }
   );
 
+  // Element.style — a CSSStyleDeclaration view over the `style` content
+  // attribute. cssText, getPropertyValue/setProperty/removeProperty, and
+  // direct member writes (el.style.color = "red", through the same live
+  // Proxy trick the collections use) ALL rewrite the attribute via ATTR_SET,
+  // as does the non-standard-but-ubiquitous whole-string assignment
+  // (document.body.style = "…"): every route invalidates inline style exactly
+  // like setAttribute does, so the tab's settle() restyles and repaints the
+  // change. Declarations are kept verbatim (later ones win on read); a
+  // semicolon inside url()/quoted strings is the usual naive-split limit.
+  function cssName(key) {
+    var s = String(key);
+    if (s === "cssFloat" || s === "styleFloat") return "float";
+    return s
+      .replace(/[A-Z]/g, function (c) { return "-" + c.toLowerCase(); })
+      .toLowerCase();
+  }
+  function declPairs(text) {
+    var pairs = [];
+    var parts = String(text).split(";");
+    for (var i = 0; i < parts.length; i++) {
+      var idx = parts[i].indexOf(":");
+      if (idx < 0) continue;
+      var name = parts[i].slice(0, idx).replace(/^\s+/, "").toLowerCase();
+      var value = parts[i].slice(idx + 1).replace(/^\s+/, "").replace(/\s+$/, "");
+      if (name !== "") pairs.push([name, value]);
+    }
+    return pairs;
+  }
+  function serializeDecls(pairs) {
+    var out = "";
+    for (var i = 0; i < pairs.length; i++) {
+      if (i > 0) out += "; ";
+      out += pairs[i][0] + ": " + pairs[i][1];
+    }
+    return out === "" ? "" : out + ";";
+  }
+  function makeStyle(d, n) {
+    function text() {
+      var v = host.__ironsurfDomAttr(d, n, "style");
+      return v === null ? "" : String(v);
+    }
+    function setText(t) { host.__ironsurfDomAttrSet(d, n, "style", t); }
+    function read(name) {
+      var pairs = declPairs(text());
+      for (var i = pairs.length - 1; i >= 0; i--) {
+        if (pairs[i][0] === name) return pairs[i][1];
+      }
+      return "";
+    }
+    function put(name, value) {
+      var v = value === null || value === undefined ? "" : String(value);
+      var pairs = declPairs(text());
+      var kept = [];
+      for (var i = 0; i < pairs.length; i++) {
+        if (pairs[i][0] !== name) kept.push(pairs[i]);
+      }
+      if (v !== "") kept.push([name, v]);
+      setText(serializeDecls(kept));
+    }
+    var target = {};
+    var handlers = {
+      get: function (t, key) {
+        if (key === "cssText") return text();
+        if (key === "getPropertyValue")
+          return function (name) { return read(cssName(name)); };
+        if (key === "setProperty")
+          return function (name, value) { put(cssName(name), value); };
+        if (key === "removeProperty")
+          return function (name) {
+            var want = cssName(name);
+            var old = read(want);
+            put(want, "");
+            return old;
+          };
+        if (typeof key === "symbol")
+          return key === Symbol.toStringTag ? "CSSStyleDeclaration" : undefined;
+        var v = read(cssName(key));
+        // el.style.color === "red"; an unset member reads undefined, like
+        // the (inherited) property it is on a real CSSStyleDeclaration.
+        return v === "" ? undefined : v;
+      },
+      set: function (t, key, value) {
+        if (key === "cssText") {
+          setText(value === null || value === undefined ? "" : String(value));
+          return true;
+        }
+        if (typeof key !== "symbol") put(cssName(key), value);
+        return true;
+      },
+      has: function (t, key) {
+        if (key === "cssText") return true;
+        if (typeof key !== "string") return false;
+        return read(cssName(key)) !== "";
+      },
+    };
+    return new Proxy(target, handlers);
+  }
+  protoAccessor(
+    "style",
+    function () { return makeStyle(this.__d, this.__n); },
+    // Whole-string assignment — document.body.style = "color: red". The
+    // string lands in the `style` attribute verbatim (like setAttribute), so
+    // the change restyles on the tab's next resolve.
+    function (v) { host.__ironsurfDomAttrSet(this.__d, this.__n, "style", String(v)); }
+  );
+
   // ChildNode mutations: the natives validate (throwing NotFoundError
   // TypeErrors, like DOMExceptions do here) and apply via blitz.
   function unwrapChild(child) {
@@ -2915,6 +3054,18 @@ const PRELUDE: &str = r##"
       : null;
   }
 
+  // document.write/writeln: the insertion cursor into the parse stream.
+  // Scripts run after the parse, so the cursor is the end of the tree — the
+  // native really parses the written markup and appends it to the live
+  // document (visible in the DOM, laid out and painted on the next settle).
+  // With no live document (the snapshot world) this is a no-op.
+  function writeMarkup(args, newline) {
+    var s = "";
+    for (var i = 0; i < args.length; i++) s += String(args[i]);
+    if (newline) s += "\n";
+    if (host.__ironsurfDomHasDoc()) host.__ironsurfDomDocumentWrite(0, s);
+  }
+
   var document = {
     nodeType: 9,
     __d: 0,
@@ -2934,6 +3085,28 @@ const PRELUDE: &str = r##"
       return wrapNode(0, host.__ironsurfDomBody(0));
     },
     doctype: null,
+    // document.dir / document.lang mirror the <html> element's attributes
+    // (per spec they ARE those attributes), so JS setting them — like every
+    // other document-attribute mutation — rides the ATTR_SET native and
+    // restyles on the next settle.
+    get dir() {
+      var el = this.documentElement;
+      var v = el === null ? null : el.getAttribute("dir");
+      return v === null ? "" : v;
+    },
+    set dir(value) {
+      var el = this.documentElement;
+      if (el !== null) el.setAttribute("dir", String(value));
+    },
+    get lang() {
+      var el = this.documentElement;
+      var v = el === null ? null : el.getAttribute("lang");
+      return v === null ? "" : v;
+    },
+    set lang(value) {
+      var el = this.documentElement;
+      if (el !== null) el.setAttribute("lang", String(value));
+    },
     getElementsByTagName: function (name) {
       var tag = String(name).toLowerCase();
       return makeList(0, tag === "*" ? 4 : 1, 0, tag);
@@ -2988,8 +3161,8 @@ const PRELUDE: &str = r##"
       firePath(eventPath(document), event);
       return !event.defaultPrevented;
     },
-    write: function () {},
-    writeln: function () {},
+    write: function () { writeMarkup(arguments, false); },
+    writeln: function () { writeMarkup(arguments, true); },
     get title() {
       return host.__ironsurfTitleGet();
     },
@@ -5008,6 +5181,160 @@ mod tests {
         assert_eq!(
             text.to_string(&mut runtime.context).expect("s").to_std_string_escaped(),
             "by script one"
+        );
+    }
+
+    #[test]
+    fn document_write_lands_in_the_live_dom() {
+        // document.write is a cursor into the parse stream; scripts run after
+        // the parse, so the written markup is parsed and appended to the live
+        // body — visible to every later DOM read, not swallowed.
+        dom_true(
+            r##"
+            var before = document.body.childNodes.length;
+            document.write("<p id=\"w1\">written</p>");
+            document.write("", "<b id=\"w2\">and</b>"); // multi-arg concatenation
+            document.writeln("<i id=\"w3\">line</i>");
+            var p = document.getElementById("w1");
+            var b = document.getElementById("w2");
+            var i = document.getElementById("w3");
+            var appended = p !== null && b !== null && i !== null &&
+                p.parentNode === document.body &&
+                document.body.childNodes.length >= before + 3;
+            var textOk = p.textContent === "written" && i.textContent === "line";
+            // The written tree is queryable like the parsed one.
+            var q = document.querySelector("#w2");
+            var html = document.body.innerHTML.indexOf("w1") >= 0;
+            appended && textOk && q === b && html;
+            "##,
+        );
+    }
+
+    #[test]
+    fn element_style_writes_land_in_the_style_attribute() {
+        // Every route to Element.style rewrites the `style` content attribute
+        // (the DOM's source of truth for inline style): whole-string
+        // assignment, cssText, member writes, setProperty, removeProperty.
+        dom_true(
+            r##"
+            var el = document.getElementById("p1");
+            el.style = "color: red; background:#eee";
+            var assigned = el.getAttribute("style") === "color: red; background:#eee";
+            var member = el.style.color === "red";
+            var cssText = el.style.cssText === "color: red; background:#eee";
+            // camelCase member writes normalise to the dashed property.
+            el.style.backgroundColor = "rgb(0, 128, 0)";
+            var replaced = el.style.getPropertyValue("background-color") === "rgb(0, 128, 0)" &&
+                el.getAttribute("style").indexOf("background-color: rgb(0, 128, 0)") >= 0;
+            var untouched = el.style.color === "red";
+            // Writing "" removes the declaration; removeProperty returns it.
+            el.style.color = "";
+            var cleared = el.style.color === undefined &&
+                el.style.getPropertyValue("color") === "";
+            var old = el.style.removeProperty("background-color");
+            var removed = old === "rgb(0, 128, 0)" &&
+                el.getAttribute("style") === "background: #eee;";
+            assigned && member && cssText && replaced && untouched && cleared && removed;
+            "##,
+        );
+    }
+
+    #[test]
+    fn js_attribute_writes_replace_parsed_ones() {
+        // blitz compares the FULL QualName when setting/removing attributes,
+        // and html5ever stores HTML attributes in the empty namespace — so a
+        // JS write against an attribute the parser already put there must
+        // replace it in place, never push a shadow duplicate.
+        dom_true(
+            r##"
+            var p = document.getElementById("p1"); // parsed with class="inner first"
+            function classCount() {
+                var m = p.attributes, c = 0;
+                for (var i = 0; i < m.length; i++) {
+                    if (m.item(i).name === "class") c++;
+                }
+                return c;
+            }
+            var parsed = classCount() === 1 && p.getAttribute("class") === "inner first";
+            p.setAttribute("class", "solo");
+            var replaced = classCount() === 1 && p.getAttribute("class") === "solo" &&
+                p.className === "solo";
+            p.className = "again";
+            var mirror = classCount() === 1 && p.getAttribute("class") === "again";
+            p.removeAttribute("class");
+            var removed = classCount() === 0 && p.getAttribute("class") === null;
+            parsed && replaced && mirror && removed;
+            "##,
+        );
+    }
+
+    #[test]
+    fn document_dir_and_lang_mirror_the_html_attributes() {
+        dom_true(
+            r##"
+            document.dir = "rtl";
+            var d = document.documentElement.getAttribute("dir") === "rtl" &&
+                document.dir === "rtl";
+            document.lang = "en-GB";
+            var l = document.documentElement.getAttribute("lang") === "en-GB" &&
+                document.lang === "en-GB";
+            d && l;
+            "##,
+        );
+    }
+
+    #[test]
+    fn style_assignment_restyles_on_resolve() {
+        // The full reflection the tab relies on: a script sets inline style
+        // through the JS surface, the runtime's settle() resolves it, and
+        // stylo's computed values on the live node change accordingly.
+        let host = sample_host();
+        let mut runtime = JsRuntime::new(Rc::clone(&host));
+        let mut doc = dom(DOM_PAGE);
+        let bg = |doc: &blitz_html::HtmlDocument| {
+            format!(
+                "{:?}",
+                doc.find_body_node()
+                    .expect("body")
+                    .primary_styles()
+                    .expect("resolved styles")
+                    .get_background()
+                    .background_color
+            )
+        };
+        doc.resolve(0.);
+        let before = bg(&doc);
+        let scripts = [
+            ScriptSource {
+                code: "document.body.style = 'background: rgb(255, 0, 0)';".to_string(),
+                origin: "inline".to_string(),
+            },
+            ScriptSource {
+                // Userscripts run in the same realm after the page's own
+                // scripts — exercise the same mutation through that door.
+                code: "document.querySelector('#p1').style.color = 'rgb(0, 0, 255)';".to_string(),
+                origin: "inline".to_string(),
+            },
+        ];
+        let errors = runtime.run_scripts(&scripts, Some(&mut doc));
+        assert!(errors.is_empty(), "{errors:?}");
+        doc.resolve(0.);
+        assert!(
+            bg(&doc).contains("ColorComponents(1.0, 0.0, 0.0), alpha: 1.0"),
+            "document.body.style = \"…\" must restyle: {before} -> {}",
+            bg(&doc)
+        );
+        let p1_color = format!(
+            "{:?}",
+            doc.get_node(doc.query_selector("#p1").expect("valid").expect("#p1"))
+                .expect("node")
+                .primary_styles()
+                .expect("resolved styles")
+                .clone_color()
+        );
+        assert!(
+            p1_color.contains("ColorComponents(0.0, 0.0, 1.0), alpha: 1.0"),
+            "el.style.color = \"…\" must restyle: {p1_color}"
         );
     }
 
