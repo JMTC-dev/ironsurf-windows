@@ -74,6 +74,20 @@ The `</>` button in the top bar opens the userscript menu:
 - Scripts live in `~/.local/share/ironsurf/userscripts.json` (next to the container
   registry), so they survive restarts; edits reach every open tab immediately.
 
+## Per-container User-Agent
+
+The `UA` button in the top bar (right of `</>`) switches the `User-Agent` **per container**:
+
+- The menu lists *Default (IronSurf)* and the built-in presets — Firefox, Chrome, Bingbot,
+  Googlebot, Android Chrome — with the active container's current choice highlighted; a
+  custom field takes any arbitrary string (shown as *Custom* on the button).
+- The choice belongs to the **active tab's container** only: every later request from tabs
+  in that container — documents, form POSTs, redirect hops, subresources, media — carries
+  that string, and `navigator.userAgent` updates live without a reload. Other containers
+  keep their own value (or the default).
+- It is stored with the container in `~/.local/share/ironsurf/containers.json`, so newly
+  opened (or respawned) tabs in that container launch with it already applied.
+
 ## Feedback
 
 Feel free to help out, fork, spend some tokens on it. The initial Proof of Concept build (this repo) is built entirely from locally-hosted Qwen 3.8 Flash Next.

@@ -391,15 +391,7 @@ pub fn internal_page_bytes(url: &Url) -> Option<Vec<u8>> {
     let page = internal_page_name(url);
     let shown = escape_html_text(url.as_str());
     let html = if page == "welcome" || page.is_empty() {
-        // The welcome page doubles as the form demo: it echoes whatever
-        // query string a GET submission against it carried.
-        let query = match url.query() {
-            Some(q) if !q.is_empty() => escape_html_text(&q.replace('+', " ")),
-            _ => "nothing yet".to_owned(),
-        };
-        WELCOME_PAGE
-            .replace("{url}", &shown)
-            .replace("{query}", &query)
+        WELCOME_PAGE.replace("{url}", &shown)
     } else {
         INTERNAL_NOT_FOUND
             .replace("{page}", &escape_html_text(&page))
@@ -449,29 +441,15 @@ const WELCOME_PAGE: &str = r#"<!doctype html>
      memory, not cookies, not cache. Open the container manager from the tab
      bar to create, color and reassign.</p>
 
-  <h2>Network policy</h2>
-  <p>Typed <code>host/path</code> navigations are upgraded to HTTPS; an upgrade
-     that fails is <em>blocked</em>, not silently downgraded. Internal
-     <code>ironsurf://</code> pages like this one never touch the network.</p>
-
-  <h2>Try a form</h2>
-  <p>HTML forms work end to end &mdash; text fields, selects, checkboxes,
-     radios, textareas, GET and POST. This page answers submissions itself:
-     press Search and the browser builds the entry list and re-navigates with
-     your values as a query string.</p>
-  <form method="get">
-    <p>
-      <input type="text" name="q" value="hello" size="18">
-      <select name="where">
-        <option value="everywhere" selected>everywhere</option>
-        <option value="internal">internal pages</option>
-        <option value="nothing">nowhere</option>
-      </select>
-      <input type="checkbox" name="safe" value="on" checked>
-      <button type="submit">Search</button>
-    </p>
-  </form>
-  <p>You submitted: <code>{query}</code></p>
+  <h2>User agent</h2>
+  <p>Each container can send its own <code>User-Agent</code>. The <kbd>UA</kbd>
+     button in the top bar opens a menu for the active tab's container:
+     <em>Default (IronSurf)</em> plus the built-in presets (Firefox, Chrome,
+     Bingbot, Googlebot, Android Chrome), the current choice highlighted, and a
+     custom string field for anything else. The choice applies to every later
+     request in that container &mdash; documents, form posts, redirects,
+     subresources, media, and <code>navigator.userAgent</code> &mdash; with no
+     reload needed, and it persists with the container.</p>
 
   <p class="foot">You are looking at <code>{url}</code> &mdash; a page built into
      the tab process. It is the default start page.</p>
