@@ -289,7 +289,50 @@ pub fn blocked_error_page(request_url: &Url, https_url: &Url, reason: &str) -> S
 // Local schemes (`file:` / `data:` / `about:`)
 
 /// User-Agent sent on every outbound request (we own the whole stack now).
+/// This is the **default**: a tab launched with `--user-agent`, or fed a
+/// `ToTab::SetUserAgent`, sends that value instead (see [`SharedUserAgent`]).
 pub const USER_AGENT: &str = "Mozilla/5.0 (X11; Linux x86_64; IronSurf/0.1)";
+
+/// The tab's **effective User-Agent** in a shared mutable cell: the runtime
+/// owns it (the `--user-agent` flag seeds it, `ToTab::SetUserAgent` replaces
+/// it), the fetchers read it at request time, and the JS bindings report it
+/// through `navigator.userAgent`. One cell per tab — a change takes effect on
+/// every request issued after it without touching any request builder.
+pub type SharedUserAgent = Arc<Mutex<String>>;
+
+/// Resolve a `ToTab::SetUserAgent` value (and the `--user-agent` flag) to the
+/// effective UA: `Some(v)` is used trimmed, a value that is empty after
+/// trimming resets to the built-in default, and `None` is the default.
+pub fn resolve_user_agent(value: Option<&str>) -> String {
+    match value {
+        Some(raw) => {
+            let trimmed = raw.trim();
+            if trimmed.is_empty() {
+                USER_AGENT.to_owned()
+            } else {
+                trimmed.to_owned()
+            }
+        }
+        None => USER_AGENT.to_owned(),
+    }
+}
+
+/// A fresh effective-UA cell seeded from a launch override (`None`/blank ⇒
+/// the built-in default).
+#[must_use]
+pub fn new_user_agent(initial: Option<&str>) -> SharedUserAgent {
+    Arc::new(Mutex::new(resolve_user_agent(initial)))
+}
+
+/// Read the current value of a UA cell (poison-tolerant: the string is the
+/// whole payload, a poisoned lock still holds the honest last value).
+#[must_use]
+pub fn read_user_agent(user_agent: &SharedUserAgent) -> String {
+    user_agent
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone()
+}
 
 /// Read a `file:` URL from disk (same path semantics as blitz-net: `url.path()`).
 pub fn read_file_url(url: &Url) -> Result<Vec<u8>, String> {
@@ -859,7 +902,7 @@ pub fn plain_http_fetch(
     extra: Option<&HeaderMap>,
     post: Option<&MainDocPost>,
 ) -> Result<FetchOutcome, String> {
-    plain_http_fetch_report(client, url, extra, post, None)
+    plain_http_fetch_report(client, url, extra, post, USER_AGENT, None)
 }
 
 /// [`plain_http_fetch`] with the DevTools reporter attached: one event for
@@ -870,11 +913,12 @@ pub fn plain_http_fetch_report(
     url: &Url,
     extra: Option<&HeaderMap>,
     post: Option<&MainDocPost>,
+    user_agent: &str,
     report: NetReport,
 ) -> Result<FetchOutcome, String> {
     let verb = if post.is_some() { "POST" } else { "GET" };
     let started = std::time::Instant::now();
-    let mut req = build_request(client, url, post).header("User-Agent", USER_AGENT);
+    let mut req = build_request(client, url, post).header("User-Agent", user_agent);
     if let Some(headers) = extra {
         if !headers.is_empty() {
             req = req.headers(headers.clone());
@@ -940,7 +984,9 @@ pub fn managed_http_fetch(
     post: Option<&MainDocPost>,
     cacheable: bool,
 ) -> Result<FetchOutcome, String> {
-    managed_http_fetch_report(client, url, jar, cache, now, extra, post, cacheable, None)
+    managed_http_fetch_report(
+        client, url, jar, cache, now, extra, post, cacheable, USER_AGENT, None,
+    )
 }
 
 /// [`managed_http_fetch`] with the DevTools reporter attached. Exactly one
@@ -959,6 +1005,7 @@ pub fn managed_http_fetch_report(
     extra: Option<&HeaderMap>,
     post: Option<&MainDocPost>,
     cacheable: bool,
+    user_agent: &str,
     report: NetReport,
 ) -> Result<FetchOutcome, String> {
     let is_post = post.is_some();
@@ -979,7 +1026,7 @@ pub fn managed_http_fetch_report(
     let mut first_hop = true;
     let mut hops_left = MAX_MANAGED_REDIRECTS;
     let (verb, status, final_url, headers, body) = loop {
-        let mut req = build_request(client, &current, method).header("User-Agent", USER_AGENT);
+        let mut req = build_request(client, &current, method).header("User-Agent", user_agent);
         if let Some(extra_headers) = extra {
             for (name, value) in extra_headers {
                 if name.as_str().eq_ignore_ascii_case("cookie") {
@@ -1185,6 +1232,10 @@ pub struct BlitzNetProvider {
     jar: Arc<Mutex<CookieJar>>,
     cache: Arc<Mutex<NetCache>>,
     waker: Arc<Mutex<Option<Arc<dyn NetWaker>>>>,
+    /// The tab's effective User-Agent cell (shared with the runtime and the
+    /// JS bindings): read per request, so a `ToTab::SetUserAgent` applies to
+    /// every subresource fetched after it.
+    user_agent: SharedUserAgent,
     /// Completed subresource requests (one [`NetEvent`] each), queued by the
     /// fetch threads and drained by the tab loop into
     /// `FromTab::NetworkEvent` messages. The NetWaker already wakes the loop
@@ -1208,6 +1259,7 @@ impl BlitzNetProvider {
             jar: Arc::new(Mutex::new(jar)),
             cache: Arc::new(Mutex::new(cache)),
             waker: Arc::new(Mutex::new(None)),
+            user_agent: new_user_agent(None),
             net_events: Arc::new(Mutex::new(Vec::new())),
             console_events: crate::logging::console_queue(),
         }
@@ -1264,6 +1316,14 @@ impl BlitzNetProvider {
         self
     }
 
+    /// Builder: share the tab's effective User-Agent cell (the `--user-agent`
+    /// flag / `ToTab::SetUserAgent` value) with subresource fetches.
+    #[must_use]
+    pub fn with_user_agent(mut self, user_agent: SharedUserAgent) -> Self {
+        self.user_agent = user_agent;
+        self
+    }
+
     pub fn policy(&self) -> NetPolicy {
         self.policy
     }
@@ -1298,6 +1358,7 @@ impl BlitzNetProvider {
         let waker = self.waker.lock().expect("waker mutex poisoned").clone();
         let events = Arc::clone(&self.net_events);
         let console = Arc::clone(&self.console_events);
+        let user_agent = Arc::clone(&self.user_agent);
         debug!(
             "subresource GET {url} (doc {doc_id}, {})",
             if managed { "managed" } else { "passthrough" }
@@ -1319,6 +1380,7 @@ impl BlitzNetProvider {
                     None,
                     None,
                     true,
+                    &read_user_agent(&user_agent),
                     Some(&report),
                 )
             } else {
@@ -1327,6 +1389,7 @@ impl BlitzNetProvider {
                     &url,
                     Some(&request.headers),
                     None,
+                    &read_user_agent(&user_agent),
                     Some(&report),
                 )
             };
@@ -1544,6 +1607,7 @@ fn shared_worker() -> Arc<FetchWorker> {
 /// [`NetCache`] service/storage and https-upgrades `http:` navigations —
 /// blocking with [`NetError::Blocked`] (carrying the error page) when the
 /// upgrade fails.
+#[allow(dead_code)] // quiet convenience wrapper (default UA; the live tab reports with its own cell)
 pub fn fetch_document(
     url: &Url,
     policy: NetPolicy,
@@ -1554,6 +1618,12 @@ pub fn fetch_document(
     fetch_document_post(url, None, policy, jar, cache, now)
 }
 
+/// The default effective-UA cell the convenience wrappers below carry (the
+/// built-in [`USER_AGENT`]); the live tab always passes its own cell.
+fn default_user_agent() -> SharedUserAgent {
+    new_user_agent(None)
+}
+
 /// [`fetch_document`] with the DevTools reporter attached (see
 /// [`fetch_document_post_report`]).
 pub fn fetch_document_report(
@@ -1562,9 +1632,10 @@ pub fn fetch_document_report(
     jar: &mut CookieJar,
     cache: &NetCache,
     now: i64,
+    user_agent: &SharedUserAgent,
     report: NetReport,
 ) -> Result<DocFetch, NetError> {
-    fetch_document_post_report(url, None, policy, jar, cache, now, report)
+    fetch_document_post_report(url, None, policy, jar, cache, now, user_agent, report)
 }
 
 /// [`fetch_document`] with an HTML form submission's POST body attached
@@ -1572,6 +1643,7 @@ pub fn fetch_document_report(
 /// (`file:`/`about:`/`data:`/`ironsurf:`) is answered as GET and refuses a
 /// POST body outright, so the caller (the tab's form layer) routes those
 /// before ever calling here.
+#[allow(dead_code)] // quiet convenience wrapper (default UA; the live tab posts through the report form)
 pub fn fetch_document_post(
     url: &Url,
     post: Option<&MainDocPost>,
@@ -1580,7 +1652,16 @@ pub fn fetch_document_post(
     cache: &NetCache,
     now: i64,
 ) -> Result<DocFetch, NetError> {
-    fetch_document_post_report(url, post, policy, jar, cache, now, None)
+    fetch_document_post_report(
+        url,
+        post,
+        policy,
+        jar,
+        cache,
+        now,
+        &default_user_agent(),
+        None,
+    )
 }
 
 /// [`fetch_document_post`] with the DevTools reporter attached: one
@@ -1597,10 +1678,11 @@ pub fn fetch_document_post_report(
     jar: &mut CookieJar,
     cache: &NetCache,
     now: i64,
+    user_agent: &SharedUserAgent,
     report: NetReport,
 ) -> Result<DocFetch, NetError> {
     let worker = shared_worker();
-    fetch_document_with_worker_report(url, post, policy, jar, cache, now, &worker, report)
+    fetch_document_with_worker_report(url, post, policy, jar, cache, now, &worker, user_agent, report)
 }
 
 #[allow(dead_code)] // quiet convenience wrapper (tests drive it; the runtime reports)
@@ -1613,7 +1695,17 @@ fn fetch_document_with_worker(
     now: i64,
     worker: &FetchWorker,
 ) -> Result<DocFetch, NetError> {
-    fetch_document_with_worker_report(url, post, policy, jar, cache, now, worker, None)
+    fetch_document_with_worker_report(
+        url,
+        post,
+        policy,
+        jar,
+        cache,
+        now,
+        worker,
+        &default_user_agent(),
+        None,
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1625,8 +1717,12 @@ fn fetch_document_with_worker_report(
     cache: &NetCache,
     now: i64,
     worker: &FetchWorker,
+    user_agent: &SharedUserAgent,
     report: NetReport,
 ) -> Result<DocFetch, NetError> {
+    // Snapshot the effective UA once per document load: a mid-load
+    // `SetUserAgent` applies to the NEXT request, never mid-flight.
+    let user_agent = read_user_agent(user_agent);
     if post.is_some() && !is_http_scheme(url) {
         // Defensive: a body to a local scheme has nowhere to go.
         warn!("refusing to POST to non-http scheme: {url}");
@@ -1693,7 +1789,7 @@ fn fetch_document_with_worker_report(
     match plan_document(policy, url) {
         // Non-http scheme that still reached here (unknown scheme): refuse.
         Plan::Pass => {
-            plain_http_fetch_report(worker.client(), url, None, post, report)
+            plain_http_fetch_report(worker.client(), url, None, post, &user_agent, report)
                 .map(|o| DocFetch {
                     url: o.final_url,
                     status: o.status,
@@ -1713,6 +1809,7 @@ fn fetch_document_with_worker_report(
             None,
             post,
             cacheable,
+            &user_agent,
             report,
         )
         .map(|o| DocFetch {
@@ -1743,6 +1840,7 @@ fn fetch_document_with_worker_report(
                 None,
                 post,
                 true,
+                &user_agent,
                 None,
             ) {
                 Ok(o) => {
@@ -2787,5 +2885,48 @@ mod tests {
         .expect("navigation 2");
         let echoed = String::from_utf8_lossy(&second.body).to_string();
         assert_eq!(echoed, "back=1", "Passthrough navigation never returned the cookie");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Unit tests — effective User-Agent resolution (task: per-container UA)
+
+#[cfg(test)]
+mod user_agent_tests {
+    use super::*;
+
+    #[test]
+    fn some_value_is_used_verbatim_once_trimmed() {
+        assert_eq!(
+            resolve_user_agent(Some("  IronRaven/12.0 (test)  ")).as_str(),
+            "IronRaven/12.0 (test)"
+        );
+    }
+
+    #[test]
+    fn empty_or_whitespace_some_resets_to_default() {
+        assert_eq!(resolve_user_agent(Some("")), USER_AGENT);
+        assert_eq!(resolve_user_agent(Some("   \t \n")), USER_AGENT);
+    }
+
+    #[test]
+    fn none_is_the_builtin_default() {
+        assert_eq!(resolve_user_agent(None), USER_AGENT);
+    }
+
+    #[test]
+    fn cell_starts_from_the_flag_and_follows_every_write() {
+        let cell = new_user_agent(Some("  Flag/1.0  "));
+        assert_eq!(read_user_agent(&cell), "Flag/1.0");
+        // The flag is resolved exactly like a SetUserAgent: blank ⇒ default.
+        assert_eq!(read_user_agent(&new_user_agent(Some("   "))), USER_AGENT);
+        assert_eq!(read_user_agent(&new_user_agent(None)), USER_AGENT);
+        // A write lands on every later read — the request builders read this
+        // same cell per request, so the next fetch carries the new value.
+        *cell.lock().expect("ua mutex") =
+            resolve_user_agent(Some("Second/2.0"));
+        assert_eq!(read_user_agent(&cell), "Second/2.0");
+        *cell.lock().expect("ua mutex") = resolve_user_agent(None);
+        assert_eq!(read_user_agent(&cell), USER_AGENT);
     }
 }

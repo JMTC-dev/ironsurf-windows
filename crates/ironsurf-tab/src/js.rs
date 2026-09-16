@@ -349,6 +349,12 @@ pub struct HostState {
     /// [`crate::runtime::DialogHost`]); `None` (bare JS tests, the headless
     /// harness) makes `confirm` read `false` and `prompt` read `null`.
     pub dialog: Option<Arc<crate::runtime::DialogHost>>,
+    /// The tab's **effective User-Agent** cell (task: per-container UA):
+    /// `navigator.userAgent` reads it live. Like the dialog host above, the
+    /// tab hands in its own handle — the very same `Arc` the fetchers use —
+    /// so a mid-session `SetUserAgent` reaches scripts with no reload and no
+    /// new context. `None` (bare JS tests) reports [`crate::netmod::USER_AGENT`].
+    pub user_agent: Option<crate::netmod::SharedUserAgent>,
 }
 
 impl HostState {
@@ -2051,6 +2057,7 @@ fn active_dialog() -> Option<Arc<crate::runtime::DialogHost>> {
 /// they are obvious in page stack traces).
 mod native {
     pub(super) const URL: &str = "__ironsurfUrl";
+    pub(super) const USER_AGENT: &str = "__ironsurfUserAgent";
     pub(super) const BODY_TEXT: &str = "__ironsurfBodyText";
     pub(super) const HAS_BODY: &str = "__ironsurfHasBody";
     pub(super) const TITLE_GET: &str = "__ironsurfTitleGet";
@@ -2432,6 +2439,31 @@ const PRELUDE: &str = r##"
   host.outerWidth = 0;
   host.outerHeight = 0;
   host.location = location;
+
+  // ---------------------------------------------------------------------
+  // navigator: `userAgent` reports the tab's EFFECTIVE User-Agent — the very
+  // value every outbound HTTP request carries (`--user-agent` at launch,
+  // replaced by `ToTab::SetUserAgent` mid-session, blank/None back to the
+  // engine default). The getter calls the `__ironsurfUserAgent` native, which
+  // reads the tab's live UA cell, so a change is visible to scripts without
+  // any reload — the same dynamic-host pattern as `location.href`.
+  // ---------------------------------------------------------------------
+  var navigator = {
+    get userAgent() { return host.__ironsurfUserAgent(); },
+    get appVersion() {
+      return String(host.__ironsurfUserAgent()).replace(/^Mozilla\//, "");
+    },
+    appName: "Netscape",
+    platform: "Linux x86_64",
+    vendor: "IronSurf",
+    onLine: true,
+    doNotTrack: null,
+    hardwareConcurrency: 1,
+    maxTouchPoints: 0,
+    language: "en-US",
+    languages: ["en-US"],
+  };
+  host.navigator = navigator;
   host.addEventListener = function (type, fn, options) {
     addListener(host, String(type), fn, options);
   };
@@ -3350,6 +3382,28 @@ pub fn build_context(host: &HostRef, _timers: &Rc<RefCell<TimerQueue>>) -> Conte
         }
     }
 
+    // navigator.userAgent (task: per-container UA): reads the tab's live
+    // effective-UA cell, so a `ToTab::SetUserAgent` changes the answer from
+    // the next read on — no reload, no new Context. Without a tab attached
+    // (bare JS tests) the engine default is reported.
+    if let Err(err) = context.register_global_builtin_callable(
+        JsString::from(native::USER_AGENT),
+        0,
+        NativeFunction::from_copy_closure(|_this, _args, _context| {
+            let user_agent = with_host(|host| {
+                host.user_agent.as_ref().map(|cell| {
+                    cell.lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .clone()
+                })
+            })
+            .flatten()
+            .unwrap_or_else(|| crate::netmod::USER_AGENT.to_owned());
+            Ok(JsValue::from(JsString::from(user_agent)))
+        }),
+    ) {
+        error!("js binding `userAgent` failed to install: {err}");
+    }
     // document.title (get reflects prior sets, set asks for a TitleChanged + repaint).
     if let Err(err) = context.register_global_builtin_callable(
         JsString::from(native::TITLE_GET),
@@ -5489,3 +5543,98 @@ mod tests {
     }
 }
 
+
+#[cfg(test)]
+mod user_agent_tests {
+    use super::*;
+
+    fn fresh_host() -> HostRef {
+        Rc::new(RefCell::new(HostState::new(
+            "https://example.test/ua",
+            None,
+            None,
+        )))
+    }
+
+    /// One fresh document-world (prelude + natives, no page scripts) per call.
+    fn eval_string(source: &str, host: &HostRef) -> String {
+        let mut runtime = JsRuntime::new(Rc::clone(host));
+        let value = runtime
+            .eval(source)
+            .expect("snippet should evaluate");
+        value
+            .as_string()
+            .map(|string| string.to_std_string_escaped())
+            .unwrap_or_else(|| format!("<not a string: {}>", value.display()))
+    }
+
+    /// Without a tab cell attached (bare JS tests, the headless harness),
+    /// `navigator.userAgent` reports the engine default verbatim.
+    #[test]
+    fn navigator_reports_the_engine_default_without_a_cell() {
+        let host = fresh_host();
+        assert!(host.borrow().user_agent.is_none());
+        assert_eq!(
+            eval_string("navigator.userAgent", &host).as_str(),
+            crate::netmod::USER_AGENT
+        );
+    }
+
+    /// With the tab's cell attached, `navigator.userAgent` reports the
+    /// effective UA — and reads the cell LIVE: a `SetUserAgent` mid-session
+    /// (one write to the shared cell) changes what the very next script
+    /// reads, without a new document or Context.
+    #[test]
+    fn navigator_reads_the_live_effective_cell() {
+        let host = fresh_host();
+        let cell = crate::netmod::new_user_agent(Some("  Flag/1.0  "));
+        host.borrow_mut().user_agent = Some(cell.clone());
+        let mut runtime = JsRuntime::new(Rc::clone(&host));
+        let read = |runtime: &mut JsRuntime| -> String {
+            runtime
+                .eval("navigator.userAgent")
+                .expect("navigator.userAgent evaluates")
+                .as_string()
+                .map(|string| string.to_std_string_escaped())
+                .expect("a string")
+        };
+        assert_eq!(read(&mut runtime).as_str(), "Flag/1.0");
+        // The exact write `ToTab::SetUserAgent` performs on the tab's cell:
+        *cell.lock().expect("ua mutex") =
+            crate::netmod::resolve_user_agent(Some("Second/2.0"));
+        assert_eq!(
+            read(&mut runtime).as_str(),
+            "Second/2.0",
+            "the same live context must see the new UA without any reload"
+        );
+        // None ⇒ back to the built-in default.
+        *cell.lock().expect("ua mutex") = crate::netmod::resolve_user_agent(None);
+        assert_eq!(read(&mut runtime).as_str(), crate::netmod::USER_AGENT);
+    }
+
+    /// The whole `navigator` object exists (it was not built before this
+    /// task): the standard static properties answer alongside the live UA.
+    #[test]
+    fn navigator_object_is_present() {
+        let host = fresh_host();
+        assert_eq!(
+            eval_string(
+                "String(typeof navigator === 'object' && typeof navigator.userAgent === 'string')",
+                &host,
+            )
+            .as_str(),
+            "true"
+        );
+        assert_eq!(
+            eval_string("navigator.platform", &host).as_str(),
+            "Linux x86_64"
+        );
+        // appVersion is the UA minus its "Mozilla/" prefix (spec behaviour).
+        assert_eq!(
+            eval_string("navigator.appVersion", &host).as_str(),
+            crate::netmod::USER_AGENT
+                .strip_prefix("Mozilla/")
+                .unwrap_or(crate::netmod::USER_AGENT)
+        );
+    }
+}

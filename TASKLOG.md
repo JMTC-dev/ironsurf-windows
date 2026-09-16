@@ -1,4 +1,9 @@
 # Task log
+## #44 Per-container UA applied in the tab (step 3/5): effective UA cell (netmod::SharedUserAgent=Arc<Mutex<String>>) seeded by new
+  --user-agent (absent/blank⇒USER_AGENT), replaced in place by SetUserAgent (Some(v)⇒v.trim(); empty/None⇒default; no reload). One cell
+  feeds every request — documents (fetch_document* report forms take it; wrappers default), form POSTs, redirect hops, subresources
+  (with_user_agent), media — and navigator.userAgent via live __ironsurfUserAgent over HostState.user_agent (same Arc as .dialog). 9 unit
+  + tests/user_agent.rs 2 wire tests; tab 196u all green, ws check clean.
 ## #43 Per-container User-Agent persisted (step 2/5, storage only): Store::set_container_user_agent(id, Option<&str>) writes Container::user_agent
   into containers.json via the atomic save(), shaped like set_container_color; Some(v) stores v trimmed, all-blank Some("") and None both store
   None (= the tab default); validation precedes mutation (upsert_userscript pattern) so rejects leave memory + the file byte-identical — control

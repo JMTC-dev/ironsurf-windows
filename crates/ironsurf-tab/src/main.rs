@@ -24,7 +24,7 @@ use ironsurf_common::error;
 
 fn usage() -> String {
     "usage: ironsurf-tab --tab-id N --container-id N --profile-dir PATH \
-     [--url URL] [--offline-fixtures DIR] [--managed-net] [--no-sandbox] [--log LEVEL|-v|-vv]\n\
+     [--url URL] [--offline-fixtures DIR] [--user-agent UA] [--managed-net] [--no-sandbox] [--log LEVEL|-v|-vv]\n\
      \x20      ironsurf-tab --spike --url <file:///...> --out <out.ppm> [--size WxH] [--out-rgba out.rgba]\n\
      \x20      ironsurf-tab --headless --url URL [--wait MS] [--body-out FILE] [--shot out.ppm] [--size WxH]\n\
      \x20      log LEVEL: off|error|warn|info|debug|trace (default info; also IRONSURF_LOG)"

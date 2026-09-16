@@ -128,6 +128,11 @@ pub struct TabArgs {
     /// never attaches a widget, never fetches a `<video src>`, and every
     /// media step of the poll loop returns before touching anything.
     pub media_enabled: bool,
+    /// Initial **User-Agent override** (`--user-agent <STRING>`): the tab
+    /// sends it on every request until a `ToTab::SetUserAgent` replaces it.
+    /// `None` (flag absent, or blank after trim) = the built-in default
+    /// [`netmod::USER_AGENT`].
+    pub user_agent: Option<String>,
 }
 
 impl TabArgs {
@@ -140,6 +145,7 @@ impl TabArgs {
         let mut managed = false;
         let mut no_sandbox = false;
         let mut no_media = false;
+        let mut user_agent = None;
 
         let mut it = args.iter().skip(1);
         while let Some(arg) = it.next() {
@@ -159,6 +165,7 @@ impl TabArgs {
                 "--managed-net" => managed = true,
                 "--no-sandbox" => no_sandbox = true,
                 "--no-media" => no_media = true,
+                "--user-agent" => user_agent = Some(value("user-agent")?),
                 // Verbosity flags: the level itself is read from argv by
                 // `logging::level_from_args` in `run`; they are accepted here so
                 // passing them is not a fatal "unexpected argument".
@@ -192,6 +199,7 @@ impl TabArgs {
             },
             no_sandbox,
             media_enabled: !no_media,
+            user_agent,
         })
     }
 }
@@ -570,6 +578,12 @@ pub struct Tab {
     /// Completion queue from the fetch threads; the shared self-pipe wakes
     /// the loop the moment one arrived (the NavHook/NetWaker pattern).
     media_results: Arc<Mutex<Vec<MediaLoaded>>>,
+    /// The tab's **effective User-Agent** cell (task: per-container UA): the
+    /// `--user-agent` flag seeds it, `ToTab::SetUserAgent` replaces its
+    /// contents, and every fetch (documents, subresources, form POSTs,
+    /// media, redirect hops) plus `navigator.userAgent` reads this one cell.
+    /// Changing it never forces a reload.
+    user_agent: netmod::SharedUserAgent,
     /// DevTools network queue (the provider's own): subresource fetch threads
     /// push one [`NetEvent`] per settled request here, and the poll loop
     /// drains it into `FromTab::NetworkEvent` messages (a NetWaker wake makes
@@ -815,9 +829,13 @@ impl Tab {
         // One cookie jar per container per tab: the provider owns it, and
         // the tab holds the same Arc handle for main-document fetches
         // (cookies flow both ways; a single save flushes everything).
+        // The effective UA first: the provider (subresources) and the tab
+        // (documents, media, JS) share this one cell from birth.
+        let user_agent = netmod::new_user_agent(args.user_agent.as_deref());
         let provider = Arc::new(
             BlitzNetProvider::new(args.net_policy, store.cookie_jar(), store.cache())
-                .with_waker(Arc::new(PipeWaker(Arc::clone(&pipe)))),
+                .with_waker(Arc::new(PipeWaker(Arc::clone(&pipe))))
+                .with_user_agent(user_agent.clone()),
         );
         // Grab the DevTools network queue before `provider` moves into the tab.
         let net_events = provider.net_events();
@@ -879,6 +897,7 @@ impl Tab {
             console_events,
             css_scan: CssScanState::new(),
             userscripts: Vec::new(),
+            user_agent,
         }
     }
 
@@ -1041,6 +1060,7 @@ impl Tab {
             &mut jar,
             &self.cache,
             netmod::now_unix(),
+            &self.user_agent,
             Some(&|event| {
                 doc_events
                     .lock()
@@ -1277,6 +1297,7 @@ impl Tab {
                     &mut jar,
                     &self.cache,
                     netmod::now_unix(),
+                    &self.user_agent,
                     Some(&|event| events.lock().expect("net events mutex").push(event)),
                 )
                 .map(|script| script.body_text())
@@ -1307,6 +1328,9 @@ impl Tab {
         // window.alert/confirm/prompt block on the shell through this cell
         // (task: JS dialogs); headless already disabled it.
         host.borrow_mut().dialog = Some(Arc::clone(&self.dialog));
+        // `navigator.userAgent` reads the tab's live effective-UA cell
+        // (same shared-handle pattern as the dialog host above).
+        host.borrow_mut().user_agent = Some(Arc::clone(&self.user_agent));
         debug!(
             "running {} script(s) for {url}; skipped: {:?}",
             extraction.scripts.len(),
@@ -1975,9 +1999,20 @@ impl Tab {
                 );
                 self.userscripts = scripts;
             }
-            // Per-container User-Agent override (`None` = engine default).
-            // implemented in a later step
-            ToTab::SetUserAgent { .. } => {}
+            ToTab::SetUserAgent { user_agent } => {
+                // Replace the cell's contents in place: every request issued
+                // after this point (documents, subresources, form POSTs,
+                // redirect hops) and `navigator.userAgent` carry the new
+                // value; `Some(v)` trims to empty or `None` reset to the
+                // built-in default. The contract says nothing reloads — the
+                // live document stands until the next navigation.
+                let effective = netmod::resolve_user_agent(user_agent.as_deref());
+                info!("user-agent \u{2192} {effective}");
+                *self
+                    .user_agent
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = effective;
+            }
             ToTab::DialogResponse { dialog_id, .. } => {
                 // A reply with no modal open: it either raced the tab-side
                 // cancel (shell quit mid-dialog) or is stale — nothing to
@@ -3113,12 +3148,13 @@ impl Tab {
         let pipe = Arc::clone(&self.pipe);
         let jar = Arc::clone(&self.jar);
         let policy = self_provider_policy(&self.provider);
+        let user_agent = self.user_agent.clone();
         let worker_href = href.clone();
         let spawn = std::thread::Builder::new()
             .name("ironsurf-media-fetch".to_string())
             .spawn(move || {
                 let href = worker_href;
-                let outcome = fetch_media_bytes(&url, policy, jar, &href);
+                let outcome = fetch_media_bytes(&url, policy, jar, user_agent, &href);
                 match outcome {
                     Ok(bytes) => {
                         debug!("media: {href} fetched ({} B)", bytes.len());
@@ -3397,6 +3433,7 @@ fn fetch_media_bytes(
     url: &Url,
     policy: NetPolicy,
     jar: Arc<Mutex<CookieJar>>,
+    user_agent: netmod::SharedUserAgent,
     href: &str,
 ) -> Result<Vec<u8>, MediaError> {
     // The tab's own disk cache stays on the tab thread (NetCache is not
@@ -3408,7 +3445,15 @@ fn fetch_media_bytes(
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let mut cache = NetCache::with_limits(cache_dir.clone(), 1, MAX_VIDEO_BYTES * 2);
-        netmod::fetch_document(url, policy, &mut jar, &mut cache, netmod::now_unix())
+        netmod::fetch_document_report(
+            url,
+            policy,
+            &mut jar,
+            &mut cache,
+            netmod::now_unix(),
+            &user_agent,
+            None,
+        )
     }));
     let _ = std::fs::remove_dir_all(&cache_dir);
     let outcome = fetched.map_err(|_| MediaError::Unreachable {
@@ -4315,6 +4360,7 @@ mod tests {
             net_policy: NetPolicy::Managed,
             no_sandbox: true,
             media_enabled: true,
+            user_agent: None,
         };
         let pipe = Arc::new(SelfPipe::new().expect("pipe"));
         let tab = Tab::new_headless(&args, pipe);
@@ -4348,6 +4394,7 @@ mod tests {
             net_policy: NetPolicy::Passthrough,
             no_sandbox: true,
             media_enabled: true,
+            user_agent: None,
         };
         let pipe = Arc::new(SelfPipe::new().expect("pipe"));
         Tab::new_headless(&args, pipe)
@@ -4662,6 +4709,7 @@ mod tests {
             net_policy: NetPolicy::Passthrough,
             no_sandbox: true,
             media_enabled: true,
+            user_agent: None,
         };
         let pipe = Arc::new(SelfPipe::new().expect("pipe"));
         let mut tab = Tab::new_headless(&args, pipe);
@@ -4890,6 +4938,7 @@ mod tests {
             net_policy: NetPolicy::Passthrough,
             no_sandbox: true,
             media_enabled: false,
+            user_agent: None,
         };
         let pipe = Arc::new(SelfPipe::new().expect("pipe"));
         let mut tab = Tab::new_headless(&args, pipe);
@@ -4939,5 +4988,70 @@ mod tests {
         assert!(presented >= 1, "the software decoder presented no frames");
         assert_eq!(player.natural_size(), Some((960, 540)));
         assert!(!player.is_paused());
+    }
+}
+
+#[cfg(test)]
+mod user_agent_args_tests {
+    use super::*;
+
+    /// Parse a minimal argv (`--tab-id/--container-id/--profile-dir`) plus the
+    /// flags under test; the temp profile dir is created by `parse` itself.
+    fn parse_args(flags: &[&str]) -> Result<TabArgs, Box<dyn Error>> {
+        let dir = tempfile::tempdir().expect("profile dir");
+        let mut args: Vec<String> = vec![
+            "ironsurf-tab".to_string(),
+            "--tab-id".to_string(),
+            "7".to_string(),
+            "--container-id".to_string(),
+            "1".to_string(),
+            "--profile-dir".to_string(),
+            dir.path().to_str().expect("utf-8 path").to_string(),
+        ];
+        args.extend(flags.iter().map(|flag| flag.to_string()));
+        // `dir` stays alive until here; `parse` only records the path.
+        let parsed = TabArgs::parse(&args);
+        drop(dir);
+        parsed
+    }
+
+    #[test]
+    fn user_agent_flag_captures_the_initial_override() {
+        let args = parse_args(&["--user-agent", "UA-TEST/1.0"]).expect("parses");
+        assert_eq!(args.user_agent.as_deref(), Some("UA-TEST/1.0"));
+    }
+
+    #[test]
+    fn user_agent_flag_absent_means_the_builtin_default() {
+        let args = parse_args(&[]).expect("parses");
+        assert_eq!(
+            args.user_agent, None,
+            "no flag ⇒ no override; the tab seeds its cell with netmod::USER_AGENT"
+        );
+        // …and the seeded cell indeed reports the default.
+        assert_eq!(
+            netmod::read_user_agent(&netmod::new_user_agent(args.user_agent.as_deref())),
+            netmod::USER_AGENT
+        );
+    }
+
+    #[test]
+    fn blank_flag_value_seeds_the_default_cell() {
+        // Some("") (and pure whitespace) parse fine but resolve back to the
+        // built-in default — the same reset rule as `SetUserAgent { Some("") }`.
+        let args = parse_args(&["--user-agent", "   "]).expect("parses");
+        assert_eq!(args.user_agent.as_deref(), Some("   "));
+        assert_eq!(
+            netmod::resolve_user_agent(args.user_agent.as_deref()).as_str(),
+            netmod::USER_AGENT
+        );
+    }
+
+    #[test]
+    fn user_agent_flag_requires_a_value() {
+        assert!(
+            parse_args(&["--user-agent"]).is_err(),
+            "--user-agent without a value is a usage error"
+        );
     }
 }
