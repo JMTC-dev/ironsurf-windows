@@ -21,6 +21,10 @@ use slint::{
     Color, ComponentHandle, Image, Model, ModelRc, Rgba8Pixel, SharedPixelBuffer, SharedString,
     Timer, TimerMode, VecModel, Weak,
 };
+// The language's `MouseCursor` enum (the type of the page TouchArea's
+// `mouse-cursor` / the generated `set_page_cursor`): a builtin enum, re-
+// exported for Rust code next to the generated accessors themselves.
+use slint::private_unstable_api::re_exports::MouseCursor;
 
 use crate::classify::classify_input;
 use crate::keymap::{self, Shortcut};
@@ -900,6 +904,27 @@ impl Core {
         self.send_active(ToTab::Scroll(ironsurf_common::ScrollEvent { x, y, delta_x, delta_y }));
     }
 
+    /// Land a tab's hover-cursor report on the UI (task: cursor icon): the
+    /// page's `TouchArea` draws the shape, and — because Slint re-reads an
+    /// item's `mouse-cursor` only *while processing a pointer event*, and the
+    /// mouse may have stopped the very instant the tab answered — pokes a
+    /// synthetic pointer move at the last position over the page so the new
+    /// shape appears without the user moving. The poke is a plain move (a
+    /// press is never synthesised), the rate limiter absorbs it, and the tab
+    /// — same point, same cursor — stays silent, so it cannot loop.
+    fn apply_page_cursor(&self, cursor: ironsurf_common::CursorIcon) {
+        let Some(ui) = self.ui() else { return };
+        ui.set_page_cursor(slint_cursor(cursor));
+        if ui.get_page_pointer_inside() {
+            ui.window().dispatch_event(slint::platform::WindowEvent::PointerMoved {
+                position: slint::LogicalPosition::new(
+                    ui.get_pointer_x_in_window(),
+                    ui.get_pointer_y_in_window(),
+                ),
+            });
+        }
+    }
+
     // ---- context menu --------------------------------------------------------
 
     /// A tab reported a right-click: build the menu for what the cursor
@@ -1288,6 +1313,15 @@ impl Core {
             if let FromTab::DialogRequest { dialog_id, kind, message, default } = &msg {
                 self.open_dialog(tid, *dialog_id, *kind, message, default.as_deref());
             }
+            // Hover cursor (task: cursor icon): the page says what shape the
+            // pointer is over it. Only the active tab ever sees pointer
+            // events, but a background message must not repaint the wrong
+            // page — the per-tab record (state.reduce) still keeps it.
+            if let FromTab::CursorChanged { cursor } = &msg {
+                if Some(tid) == active {
+                    self.apply_page_cursor(*cursor);
+                }
+            }
         }
 
         // Reap closed tabs (dropping a TabProc closes stdin and reaps it).
@@ -1430,6 +1464,10 @@ impl Core {
             ui.set_can_back(p.state.can_back);
             ui.set_can_fwd(p.state.can_forward);
             ui.set_url_text(p.state.url.clone().unwrap_or_default().into());
+            // The tab's hover cursor comes back with the tab (task: cursor
+            // icon) — switching tabs must not leave the previous page's hand
+            // (or I-beam) drawn over this one.
+            ui.set_page_cursor(slint_cursor(p.state.cursor));
             // The status line is *one* message, always the newest: an error is
             // dropped when the next load starts (TabState::reduce), a load
             // with nothing reported yet still says so instead of going blank.
@@ -1750,6 +1788,46 @@ pub fn move_due(now: Instant, last: Option<Instant>) -> bool {
     }
 }
 
+/// IPC cursor shape → the Slint shape the window draws (task: cursor icon).
+/// Every IPC shape but `VerticalText` has a Slint twin (the I-beam is the
+/// nearest stand-in); the mapping is exhaustive so a new engine shape can
+/// never silently render as an arrow… it renders as exactly what was agreed.
+pub fn slint_cursor(cursor: ironsurf_common::CursorIcon) -> MouseCursor {
+    use ironsurf_common::CursorIcon;
+    match cursor {
+        CursorIcon::Default => MouseCursor::Default,
+        CursorIcon::Hidden => MouseCursor::None,
+        CursorIcon::Help => MouseCursor::Help,
+        CursorIcon::Pointer => MouseCursor::Pointer,
+        CursorIcon::Progress => MouseCursor::Progress,
+        CursorIcon::Wait => MouseCursor::Wait,
+        CursorIcon::Crosshair => MouseCursor::Crosshair,
+        CursorIcon::Text => MouseCursor::Text,
+        CursorIcon::VerticalText => MouseCursor::Text,
+        CursorIcon::Alias => MouseCursor::Alias,
+        CursorIcon::Copy => MouseCursor::Copy,
+        CursorIcon::Move => MouseCursor::Move,
+        CursorIcon::NoDrop => MouseCursor::NoDrop,
+        CursorIcon::NotAllowed => MouseCursor::NotAllowed,
+        CursorIcon::Grab => MouseCursor::Grab,
+        CursorIcon::Grabbing => MouseCursor::Grabbing,
+        CursorIcon::ColResize => MouseCursor::ColResize,
+        CursorIcon::RowResize => MouseCursor::RowResize,
+        CursorIcon::NResize => MouseCursor::NResize,
+        CursorIcon::EResize => MouseCursor::EResize,
+        CursorIcon::SResize => MouseCursor::SResize,
+        CursorIcon::WResize => MouseCursor::WResize,
+        CursorIcon::NeResize => MouseCursor::NeResize,
+        CursorIcon::NwResize => MouseCursor::NwResize,
+        CursorIcon::SeResize => MouseCursor::SeResize,
+        CursorIcon::SwResize => MouseCursor::SwResize,
+        CursorIcon::EwResize => MouseCursor::EwResize,
+        CursorIcon::NsResize => MouseCursor::NsResize,
+        CursorIcon::NeswResize => MouseCursor::NeswResize,
+        CursorIcon::NwseResize => MouseCursor::NwseResize,
+    }
+}
+
 /// `#rrggbb` → Color, tolerant of bad input.
 pub fn color_hex(hex: &str) -> Color {
     let h = hex.strip_prefix('#').unwrap_or(hex);
@@ -1989,5 +2067,19 @@ mod tests {
         assert!(!is_paste_chord("v", false, false, false), "a bare v types");
         assert!(!is_paste_chord("v", true, true, false), "Alt+V is not paste");
         assert!(!is_paste_chord("x", true, false, false));
+    }
+
+    #[test]
+    fn cursor_icons_map_onto_slint_shapes() {
+        // Task: hover cursor. The mapping is exhaustive at compile time; these
+        // are the spots where it is a deliberate stand-in rather than a twin.
+        assert_eq!(slint_cursor(ironsurf_common::CursorIcon::Default), MouseCursor::Default);
+        // The pointing hand — the feature's headline shape.
+        assert_eq!(slint_cursor(ironsurf_common::CursorIcon::Pointer), MouseCursor::Pointer);
+        // `cursor: none` is Slint's `None`, not the default arrow.
+        assert_eq!(slint_cursor(ironsurf_common::CursorIcon::Hidden), MouseCursor::None);
+        // Slint cannot draw a vertical I-beam; the horizontal one stands in.
+        assert_eq!(slint_cursor(ironsurf_common::CursorIcon::VerticalText), MouseCursor::Text);
+        assert_eq!(slint_cursor(ironsurf_common::CursorIcon::NwseResize), MouseCursor::NwseResize);
     }
 }

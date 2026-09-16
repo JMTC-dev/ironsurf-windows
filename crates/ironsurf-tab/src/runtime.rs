@@ -65,6 +65,7 @@ use anyrender_vello_cpu::VelloCpuImageRenderer;
 use blitz_dom::{
     Document as _, DocumentConfig, ElementData, LocalName, NodeId,
 };
+use cursor_icon::CursorIcon as BlitzCursorIcon;
 use blitz_html::HtmlDocument;
 use blitz_paint::paint_scene;
 use blitz_traits::events::{
@@ -74,9 +75,9 @@ use blitz_traits::events::{
 use blitz_traits::navigation::{NavigationOptions, NavigationProvider};
 use blitz_traits::shell::{ClipboardError, ColorScheme, ShellProvider, Viewport};
 use ironsurf_common::{
-    read_frame, write_frame, ContextAction, ContextTarget, ContainerId, DialogKind, FromTab,
-    KeyEvent, Modifiers, NetEvent, PointerEvent, PointerKind, ScrollEvent, TabId, ToTab,
-    MAX_CONTEXT_TEXT, MAX_DIALOG_MESSAGE,
+    read_frame, write_frame, ContextAction, ContextTarget, ContainerId, CursorIcon,
+    DialogKind, FromTab, KeyEvent, Modifiers, NetEvent, PointerEvent, PointerKind, ScrollEvent,
+    TabId, ToTab, MAX_CONTEXT_TEXT, MAX_DIALOG_MESSAGE,
 };
 use keyboard_types::{Code, Key, Location, Modifiers as KMods};
 use kurbo::{Affine, Rect, Size};
@@ -553,6 +554,10 @@ pub struct Tab {
     /// Last hover-reported link target (`StatusText`), for change-detection so
     /// a moving mouse only emits when the target actually changes.
     hover_status: Option<String>,
+    /// Last reported pointer shape (`CursorChanged`, task: hover cursor);
+    /// `None` = nothing reported for the current document yet. Change
+    /// detection works exactly like `hover_status`'s.
+    cursor_status: Option<CursorIcon>,
     /// Video (task: playback): one player per `<video>` element, in attach
     /// order. The blitz widget on the element shares the very same
     /// `Rc<RefCell<MediaPlayer>>`, so the tab pumps the clock and the widget
@@ -854,6 +859,7 @@ impl Tab {
             pipe,
             mouse_buttons: MouseEventButtons::None,
             hover_status: None,
+            cursor_status: None,
             pending_form: None,
             form_press: None,
             context_video: None,
@@ -1133,6 +1139,9 @@ impl Tab {
         // The new document has nothing under the cursor yet; the next hover
         // transition must be allowed to report again.
         self.hover_status = None;
+        // …same for the pointer shape, so a stale hand from the old document
+        // gets cleared by the next pointer event (task: hover cursor).
+        self.cursor_status = None;
         // …and no right-click into it survives either (task: context menu).
         self.context_video = None;
         // The previous document's players die with it (their widgets die with
@@ -1864,6 +1873,19 @@ impl Tab {
         // Links announce themselves: hovering an `<a href>` puts its target in
         // the status bar, leaving it clears that again.
         self.report_hover();
+        // …and the pointer takes the shape the page asks for (task: hover
+        // cursor), reported from the very same hover state, only on change.
+        match ev {
+            ToTab::Pointer(pointer) => self.report_cursor(
+                pointer.x,
+                pointer.y,
+                pointer.kind == PointerKind::Out,
+            ),
+            // A scroll moves the page under a stationary pointer: what sits
+            // under the cursor may well have changed with it.
+            ToTab::Scroll(scroll) => self.report_cursor(scroll.x, scroll.y, false),
+            _ => {}
+        }
         if !paint {
             return;
         }
@@ -2061,6 +2083,99 @@ impl Tab {
         }
         self.hover_status = target.clone();
         self.emit(FromTab::StatusText { text: target });
+    }
+
+    /// Emit `FromTab::CursorChanged` when the pointer shape wanted under
+    /// (`x`, `y`) — logical px — changes (task: hover cursor); `left_viewport`
+    /// is the pointer leaving the page (`Default` — the shell's own chrome
+    /// owns the cursor again). Emitted from the same hover state as
+    /// [`Self::report_hover`], and only on change, like `StatusText`.
+    fn report_cursor(&mut self, x: f32, y: f32, left_viewport: bool) {
+        let icon =
+            if left_viewport { CursorIcon::Default } else { self.cursor_under(x, y) };
+        if self.cursor_status == Some(icon) {
+            return;
+        }
+        self.cursor_status = Some(icon);
+        debug!("cursor → {icon:?} at ({x:.0},{y:.0})");
+        self.emit(FromTab::CursorChanged { cursor: icon });
+    }
+
+    /// The pointer shape for the point (`x`, `y`) (logical px). One walk up
+    /// from the hit node, deepest first: a computed CSS `cursor:` keyword
+    /// (inherited, so an explicit one shows up at every descendant) is the
+    /// page speaking and always wins; then this engine's clickability
+    /// affordances — controls a click actuates anyway (so the hand appears
+    /// over a `<button>`'s label too) and the clickable regions of a
+    /// `<video>` widget. Nothing asked ⇒ blitz's general resolution decides
+    /// the leftovers (I-beam over selectable text, hand over ancestor links).
+    fn cursor_under(&self, x: f32, y: f32) -> CursorIcon {
+        let Some(doc) = self.doc.as_ref() else { return CursorIcon::Default };
+        let z = self.zoom();
+        let (cx, cy) = (x / z, y / z);
+        let Some(start) = doc.element_from_point(cx, cy).or_else(|| doc.get_hover_node_id())
+        else {
+            return CursorIcon::Default;
+        };
+        let mut node_id = start;
+        while let Some(node) = doc.get_node(node_id) {
+            if let Some(styles) = node.primary_styles() {
+                if let Some(icon) = css_cursor(&styles) {
+                    return icon;
+                }
+            }
+            if let Some(el) = node.element_data() {
+                if is_clickable_element(el) {
+                    return CursorIcon::Pointer;
+                }
+                if el.name.local == blitz_dom::local_name!("video") {
+                    let icon = self.video_cursor(doc, node_id, cx, cy);
+                    if icon != CursorIcon::Default {
+                        return icon;
+                    }
+                }
+            }
+            node_id = match node.parent {
+                Some(p) => p,
+                None => break,
+            };
+        }
+        match doc.get_cursor() {
+            Some(BlitzCursorIcon::Text) => CursorIcon::Text,
+            Some(BlitzCursorIcon::Pointer) => CursorIcon::Pointer,
+            _ => CursorIcon::Default,
+        }
+    }
+
+    /// What the pointer means over a `<video>` element at viewport point
+    /// (`cx`, `cy`) — CSS px. The element's own widget owns clicks on it,
+    /// so [`VideoWidget::click_action`] answers with exactly the regions a
+    /// click would actuate: the pointing hand over the picture and the
+    /// play/pause glyph, the sideways I-beam over the position bar (dragging
+    /// it scrubs the play head). Falls back to the CSS box while the widget
+    /// has not painted its geometry yet.
+    fn video_cursor(&self, doc: &HtmlDocument, node_id: NodeId, cx: f32, cy: f32) -> CursorIcon {
+        // No box (unstyled/invisible): the element is still a clickable
+        // thing — the hand is the honest answer.
+        let Some(rect) = doc.get_client_bounding_rect(node_id) else {
+            return CursorIcon::Pointer;
+        };
+        let at = (cx - rect.x as f32, cy - rect.y as f32);
+        let painted = self
+            .media
+            .iter()
+            .find(|entry| entry.node_id == node_id)
+            .map(|entry| entry.player.borrow().painted_geometry());
+        let (w, h) = match painted {
+            Some((w, h)) if w > 0.0 && h > 0.0 => (w, h),
+            // Before the first paint the CSS box stands in for the widget's.
+            _ => (rect.width as f32, rect.height as f32),
+        };
+        match VideoWidget::click_action(w, h, at) {
+            crate::media::widget::Click::TogglePlay => CursorIcon::Pointer,
+            crate::media::widget::Click::Seek { .. } => CursorIcon::EwResize,
+            crate::media::widget::Click::Nothing => CursorIcon::Default,
+        }
     }
 
     /// Pointer coordinates (logical px) → blitz `PointerCoords` (CSS px,
@@ -3210,6 +3325,137 @@ fn is_editable_element(el: &ElementData) -> bool {
         Some(
             "button" | "checkbox" | "color" | "file" | "hidden" | "image" | "radio" | "range"
             | "reset" | "submit"
+        )
+    )
+}
+
+/// The page's own computed CSS `cursor:` keyword on this node (task: hover
+/// cursor): `None` for `auto` (nothing said — this engine's heuristics
+/// decide); `cursor: none` reports [`CursorIcon::Hidden`]. Mirrors blitz's
+/// private `stylo_to_cursor_icon` (its `Document::get_cursor` applies the
+/// same mapping, but this tab must consult the keyword *before* deciding
+/// whether its own affordances apply — a `<button>`'s label is selectable
+/// text, and blitz would report the I-beam).
+fn css_cursor(
+    styles: &impl std::ops::Deref<Target = style::servo_arc::Arc<style::properties::ComputedValues>>,
+) -> Option<CursorIcon> {
+    use style::values::computed::ui::CursorKind;
+    match styles.clone_cursor().keyword {
+        CursorKind::Auto => None,
+        CursorKind::None => Some(CursorIcon::Hidden),
+        keyword => Some(ipc_cursor(match keyword {
+            CursorKind::Default => BlitzCursorIcon::Default,
+            CursorKind::Pointer => BlitzCursorIcon::Pointer,
+            CursorKind::Text => BlitzCursorIcon::Text,
+            CursorKind::Wait => BlitzCursorIcon::Wait,
+            CursorKind::Progress => BlitzCursorIcon::Progress,
+            CursorKind::Help => BlitzCursorIcon::Help,
+            CursorKind::Crosshair => BlitzCursorIcon::Crosshair,
+            CursorKind::Alias => BlitzCursorIcon::Alias,
+            CursorKind::Copy => BlitzCursorIcon::Copy,
+            CursorKind::Move => BlitzCursorIcon::Move,
+            CursorKind::NoDrop => BlitzCursorIcon::NoDrop,
+            CursorKind::NotAllowed => BlitzCursorIcon::NotAllowed,
+            CursorKind::Grab => BlitzCursorIcon::Grab,
+            CursorKind::Grabbing => BlitzCursorIcon::Grabbing,
+            CursorKind::ColResize => BlitzCursorIcon::ColResize,
+            CursorKind::RowResize => BlitzCursorIcon::RowResize,
+            CursorKind::NResize => BlitzCursorIcon::NResize,
+            CursorKind::EResize => BlitzCursorIcon::EResize,
+            CursorKind::SResize => BlitzCursorIcon::SResize,
+            CursorKind::WResize => BlitzCursorIcon::WResize,
+            CursorKind::NeResize => BlitzCursorIcon::NeResize,
+            CursorKind::NwResize => BlitzCursorIcon::NwResize,
+            CursorKind::SeResize => BlitzCursorIcon::SeResize,
+            CursorKind::SwResize => BlitzCursorIcon::SwResize,
+            CursorKind::EwResize => BlitzCursorIcon::EwResize,
+            CursorKind::NsResize => BlitzCursorIcon::NsResize,
+            CursorKind::NeswResize => BlitzCursorIcon::NeswResize,
+            CursorKind::NwseResize => BlitzCursorIcon::NwseResize,
+            CursorKind::ContextMenu => BlitzCursorIcon::ContextMenu,
+            CursorKind::Cell => BlitzCursorIcon::Cell,
+            CursorKind::VerticalText => BlitzCursorIcon::VerticalText,
+            CursorKind::AllScroll => BlitzCursorIcon::AllScroll,
+            CursorKind::ZoomIn => BlitzCursorIcon::ZoomIn,
+            CursorKind::ZoomOut => BlitzCursorIcon::ZoomOut,
+            CursorKind::Auto | CursorKind::None => unreachable!("handled above"),
+        })),
+    }
+}
+
+/// Map blitz's `cursor-icon` vocabulary (what the CSS `cursor` property
+/// resolves to, task: hover cursor) onto the IPC [`CursorIcon`]. Slint's
+/// `MouseCursor` cannot draw a handful of the exotic shapes; those fall back
+/// to the plain arrow rather than being mis-drawn.
+fn ipc_cursor(icon: BlitzCursorIcon) -> CursorIcon {
+    match icon {
+        BlitzCursorIcon::Default => CursorIcon::Default,
+        BlitzCursorIcon::Pointer => CursorIcon::Pointer,
+        BlitzCursorIcon::Text => CursorIcon::Text,
+        BlitzCursorIcon::VerticalText => CursorIcon::VerticalText,
+        BlitzCursorIcon::Wait => CursorIcon::Wait,
+        BlitzCursorIcon::Progress => CursorIcon::Progress,
+        BlitzCursorIcon::Help => CursorIcon::Help,
+        BlitzCursorIcon::Crosshair => CursorIcon::Crosshair,
+        BlitzCursorIcon::Alias => CursorIcon::Alias,
+        BlitzCursorIcon::Copy => CursorIcon::Copy,
+        BlitzCursorIcon::Move => CursorIcon::Move,
+        BlitzCursorIcon::NoDrop => CursorIcon::NoDrop,
+        BlitzCursorIcon::NotAllowed => CursorIcon::NotAllowed,
+        BlitzCursorIcon::Grab => CursorIcon::Grab,
+        BlitzCursorIcon::Grabbing => CursorIcon::Grabbing,
+        BlitzCursorIcon::ColResize => CursorIcon::ColResize,
+        BlitzCursorIcon::RowResize => CursorIcon::RowResize,
+        BlitzCursorIcon::NResize => CursorIcon::NResize,
+        BlitzCursorIcon::EResize => CursorIcon::EResize,
+        BlitzCursorIcon::SResize => CursorIcon::SResize,
+        BlitzCursorIcon::WResize => CursorIcon::WResize,
+        BlitzCursorIcon::NeResize => CursorIcon::NeResize,
+        BlitzCursorIcon::NwResize => CursorIcon::NwResize,
+        BlitzCursorIcon::SeResize => CursorIcon::SeResize,
+        BlitzCursorIcon::SwResize => CursorIcon::SwResize,
+        BlitzCursorIcon::EwResize => CursorIcon::EwResize,
+        BlitzCursorIcon::NsResize => CursorIcon::NsResize,
+        BlitzCursorIcon::NeswResize => CursorIcon::NeswResize,
+        BlitzCursorIcon::NwseResize => CursorIcon::NwseResize,
+        // No Slint shape for these (and `None` never reaches here — it means
+        // "no hover node", which the caller treats as "nothing asked").
+        _ => CursorIcon::Default,
+    }
+}
+
+/// Does this element ask to be clicked without the page having said so in
+/// CSS (task: hover cursor)? Exactly the controls a click actuates anyway —
+/// `<button>`, `<summary>`, the actionable `<input>` types (a bare `type`
+/// is `text`, which stays an I-beam via blitz), `[onclick]`, and ARIA roles
+/// that read as buttons/links. The plain-textish inputs are deliberately
+/// absent: blitz already reports `Text` for the caret controls.
+fn is_clickable_element(el: &ElementData) -> bool {
+    let name = &el.name.local;
+    if *name == blitz_dom::local_name!("button") || *name == blitz_dom::local_name!("summary") {
+        return true;
+    }
+    if *name == blitz_dom::local_name!("input") {
+        return matches!(
+            el.attr(blitz_dom::local_name!("type"))
+                .map(|t| t.trim().to_ascii_lowercase())
+                .as_deref(),
+            Some(
+                "button" | "checkbox" | "color" | "file" | "image" | "radio" | "range" | "reset"
+                | "submit"
+            )
+        );
+    }
+    if el.attr(blitz_dom::local_name!("onclick")).is_some() {
+        return true;
+    }
+    matches!(
+        el.attr(blitz_dom::local_name!("role"))
+            .map(|r| r.trim().to_ascii_lowercase())
+            .as_deref(),
+        Some(
+            "button" | "link" | "tab" | "menuitem" | "option" | "checkbox" | "radio" | "switch"
+                | "slider"
         )
     )
 }

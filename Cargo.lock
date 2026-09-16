@@ -3359,6 +3359,7 @@ dependencies = [
  "blitz-traits",
  "boa_engine",
  "cssparser",
+ "cursor-icon",
  "euclid",
  "ironsurf-common",
  "ironsurf-sandbox",

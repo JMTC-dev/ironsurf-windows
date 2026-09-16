@@ -7,8 +7,8 @@
 use std::io::BufReader;
 
 use ironsurf_common::{
-    read_frame, write_frame, ContextAction, ContextTarget, ContainerId, DialogKind, FromTab,
-    MouseButton, PointerKind, TabId, ToTab,
+    read_frame, write_frame, ContextAction, ContextTarget, ContainerId, CursorIcon, DialogKind,
+    FromTab, MouseButton, PointerKind, TabId, ToTab,
 };
 
 fn main() {
@@ -20,6 +20,7 @@ fn main() {
     let mut crash = false;
     let mut devtools_feed = false;
     let mut dialog_feed = false;
+    let mut cursor = false;
 
     let mut it = args.iter().skip(1);
     while let Some(arg) = it.next() {
@@ -49,6 +50,11 @@ fn main() {
             // alert at startup, then one prompt after every Reload — each
             // echoed back on the status line when the shell answers it.
             "--dialog" => dialog_feed = true,
+            // Scripted hover cursor (task: cursor icon): the fake page is a
+            // "link" at x ≥ 100 — hover reports the pointing hand there and
+            // the plain arrow elsewhere (reported only on change, as the
+            // real tab does).
+            "--cursor" => cursor = true,
             _ => {} // tolerate the real tab's flags
         }
     }
@@ -94,6 +100,9 @@ fn main() {
         eprintln!("stack backtrace:\n   0: fake_backtrace_frame_0\n   1: fake_backtrace_frame_1");
         std::process::exit(101);
     }
+
+    // Last scripted cursor (`--cursor`); `None` = nothing reported yet.
+    let mut last_cursor: Option<CursorIcon> = None;
 
     let stdin = std::io::stdin();
     let mut reader = BufReader::new(stdin.lock());
@@ -161,6 +170,20 @@ fn main() {
                             editable: true,
                         },
                     });
+                }
+                if cursor
+                    && p.button == MouseButton::Left
+                    && matches!(p.kind, PointerKind::Move | PointerKind::Out)
+                {
+                    let icon = if p.kind != PointerKind::Out && p.x >= 100.0 {
+                        CursorIcon::Pointer
+                    } else {
+                        CursorIcon::Default
+                    };
+                    if Some(icon) != last_cursor {
+                        last_cursor = Some(icon);
+                        emit(FromTab::CursorChanged { cursor: icon });
+                    }
                 }
             }
             ToTab::Key(_) | ToTab::Scroll(_) | ToTab::SetVisible { .. } => {}

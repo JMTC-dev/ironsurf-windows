@@ -105,6 +105,12 @@ pub enum FromTab {
     // thread** (pumping stdin, deferring every other ToTab message) until
     // the shell answers with the matching `ToTab::DialogResponse`.
     DialogRequest    { dialog_id: u32, kind: DialogKind, message: String, default: Option<String> },
+    // the pointer shape over the page viewport: CSS `cursor:` on the hovered
+    // element (blitz-resolved) first, then the engine's clickability
+    // heuristics (link/button/clickable control → Pointer; a video's seek bar
+    // → EwResize); `Default` is the plain arrow. Emitted **only on change**,
+    // like StatusText; `Pointer` is the pointing hand over an `<a>`.
+    CursorChanged    { cursor: CursorIcon },
     Closed,
     Error            { message: String },
 }

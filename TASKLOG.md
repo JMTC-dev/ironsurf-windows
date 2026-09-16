@@ -1,4 +1,12 @@
 # Task log
+## #36 Hover cursor completed (hand over <a>): the Slint half was broken — `Rectangle.absolute-x/-y` do not exist (Slint 1.17 exposes only
+  `absolute-position`), and Rust has no `slint::MouseCursor` root export (it is `slint::private_unstable_api::re_exports::MouseCursor`, the very
+  type the generated `set_page_cursor` takes). Page-point now maps through `page-frame.absolute-position`, the pump re-dispatches a synthetic
+  PointerMoved (LogicalPosition) so a shape arriving while the mouse sits still still paints, and tab switches re-arm the per-tab shape.
+  Tests: common 30-variant CursorChanged round-trip, shell state/map units + tests/cursor.rs (fake_tab --cursor: transitions only, in order,
+  unchanged shapes silent), tab tests/hover_cursor.rs (REAL blitz engine over localhost: hand on `<a>`, `cursor: crosshair` overrides CSS-quiet
+  heuristics, Out ⇒ arrow, no duplicate emits); live :2.0 xdotool hover over link/text/blank — alive, no panic, no dispatch loop. Workspace +
+  release green (tab 177u+8 suites, shell 47u+12, common 24); ARCH FromTab snippet synced.
 ## #35 window.alert/confirm/prompt as real synchronous modals: common +FromTab::DialogRequest{dialog_id,kind,message,default}
   +ToTab::DialogResponse{dialog_id,confirmed,text} (DialogKind, MAX_DIALOG_MESSAGE 64 KiB, round-trip tests). Tab: DialogHost
   (runtime.rs) blocks the calling script in place — poll+read+decode stdin, every other ToTab deferred FIFO (take_deferred) and

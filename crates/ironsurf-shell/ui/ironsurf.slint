@@ -186,6 +186,17 @@ export component AppWindow inherits Window {
     // page area size, read by Rust to send ToTab::Resize
     out property <length> page-width: page.width;
     out property <length> page-height: page.height;
+    // hover cursor (task: cursor icon): the shape a tab wants over its page
+    // (`FromTab::CursorChanged`), pushed by Rust onto the page TouchArea.
+    in property <MouseCursor> page-cursor;
+    // whether the pointer is over the page, and its last position in WINDOW
+    // coordinates: when a new shape arrives Rust re-dispatches a pointer
+    // move there — Slint only re-reads a TouchArea's `mouse-cursor` while
+    // processing a pointer event, and the mouse may have stopped the instant
+    // the tab answered.
+    out property <bool> page-pointer-inside: ta.has-hover;
+    out property <length> pointer-x-in-window: page-frame.absolute-position.x + ta.mouse-x;
+    out property <length> pointer-y-in-window: page-frame.absolute-position.y + ta.mouse-y;
     // right-click context menu (task: context menu): opened by Rust when a
     // tab reports `FromTab::ContextMenu`; (menu-x, menu-y) is in page-area
     // coordinates, items are labels only — Rust maps the picked index onto
@@ -409,7 +420,7 @@ export component AppWindow inherits Window {
                 root.page-key(pressed, txt, ctrl, shift, alt, meta, repeat);
             }
 
-            Rectangle {
+            page-frame := Rectangle {
                 x: 0; y: 0;
                 width: parent.width; height: parent.height;
                 background: #ffffff;
@@ -422,6 +433,8 @@ export component AppWindow inherits Window {
                 }
 
                 ta := TouchArea {
+                    // the page's pointer shape (task: cursor icon)
+                    mouse-cursor: root.page-cursor;
                     // clicking the page returns keyboard focus to it
                     changed pressed => { if (ta.pressed) { root.focus-page-token += 1; } }
                     pointer-event(ev) => {

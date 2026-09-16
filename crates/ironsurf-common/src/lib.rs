@@ -118,6 +118,15 @@ pub enum FromTab {
         /// `prompt` default value; `None` for alert/confirm.
         default: Option<String>,
     },
+    /// The pointer shape for what the mouse is over **in the page viewport**
+    /// (task: hover cursor). Emitted whenever the shape *changes* (the tab
+    /// change-detects, like `StatusText`): CSS `cursor` on the hovered
+    /// element first (blitz resolves it), then the engine's clickability
+    /// heuristics — links, buttons, clickable form controls, a video's
+    /// play/pause area. `CursorIcon::Default` means the plain arrow.
+    CursorChanged {
+        cursor: CursorIcon,
+    },
     Closed,
     Error {
         message: String,
@@ -280,6 +289,50 @@ pub enum MouseButton {
     Left,
     Right,
     Middle,
+}
+
+/// A cursor (pointer) shape, as reported by the tab for what is under the
+/// mouse ([`FromTab::CursorChanged`]). Mirrors the subset every layer of the
+/// stack agrees on: the CSS `cursor` keywords blitz resolves, the
+/// `cursor-icon` crate's vocabulary it reports them in, and the shapes
+/// Slint's `MouseCursor` can actually draw (the names follow CSS).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum CursorIcon {
+    /// The platform's plain arrow.
+    #[default]
+    Default,
+    /// `cursor: none` — the pointer is hidden.
+    Hidden,
+    Help,
+    /// The pointing hand: the thing under the cursor is clickable.
+    Pointer,
+    Progress,
+    Wait,
+    Crosshair,
+    /// The I-beam: text (or a text control) is under the cursor.
+    Text,
+    VerticalText,
+    Alias,
+    Copy,
+    Move,
+    NoDrop,
+    NotAllowed,
+    Grab,
+    Grabbing,
+    ColResize,
+    RowResize,
+    NResize,
+    EResize,
+    SResize,
+    WResize,
+    NeResize,
+    NwResize,
+    SeResize,
+    SwResize,
+    EwResize,
+    NsResize,
+    NeswResize,
+    NwseResize,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -542,6 +595,8 @@ mod tests {
                 error: None,
             },
         });
+        frame_round_trip(FromTab::CursorChanged { cursor: CursorIcon::Default });
+        frame_round_trip(FromTab::CursorChanged { cursor: CursorIcon::Pointer });
         frame_round_trip(FromTab::Closed);
         frame_round_trip(FromTab::Error { message: "boom".into() });
         frame_round_trip(FromTab::ContextMenu {
@@ -735,6 +790,49 @@ mod tests {
             Modifiers::NONE.with_ctrl().with_alt()
         );
         assert!(Modifiers::default().empty());
+    }
+
+    #[test]
+    fn every_cursor_icon_round_trips() {
+        // The full vocabulary the tab may report — the shell must be able to
+        // decode any of it (task: hover cursor).
+        let all = [
+            CursorIcon::Default,
+            CursorIcon::Hidden,
+            CursorIcon::Help,
+            CursorIcon::Pointer,
+            CursorIcon::Progress,
+            CursorIcon::Wait,
+            CursorIcon::Crosshair,
+            CursorIcon::Text,
+            CursorIcon::VerticalText,
+            CursorIcon::Alias,
+            CursorIcon::Copy,
+            CursorIcon::Move,
+            CursorIcon::NoDrop,
+            CursorIcon::NotAllowed,
+            CursorIcon::Grab,
+            CursorIcon::Grabbing,
+            CursorIcon::ColResize,
+            CursorIcon::RowResize,
+            CursorIcon::NResize,
+            CursorIcon::EResize,
+            CursorIcon::SResize,
+            CursorIcon::WResize,
+            CursorIcon::NeResize,
+            CursorIcon::NwResize,
+            CursorIcon::SeResize,
+            CursorIcon::SwResize,
+            CursorIcon::EwResize,
+            CursorIcon::NsResize,
+            CursorIcon::NeswResize,
+            CursorIcon::NwseResize,
+        ];
+        assert_eq!(all.len(), 30, "every CursorIcon variant is covered");
+        for cursor in all {
+            frame_round_trip(FromTab::CursorChanged { cursor });
+        }
+        assert_eq!(CursorIcon::default(), CursorIcon::Default);
     }
 
     #[test]

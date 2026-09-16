@@ -5,7 +5,7 @@
 //! `Frame` messages never touch the state — they are handed to the frame
 //! compositor directly (coalesced to the newest per tab).
 
-use ironsurf_common::{FromTab, NetEvent};
+use ironsurf_common::{CursorIcon, FromTab, NetEvent};
 
 /// Cap on retained DevTools console entries per tab: the oldest are dropped
 /// once the ring is full, so a chatty page cannot grow shell memory forever.
@@ -39,6 +39,10 @@ pub struct TabState {
     pub ready: bool,
     pub closed: bool,
     pub error: Option<String>,
+    /// Pointer shape the tab last asked for over its page (task: hover
+    /// cursor). Kept per tab so switching tabs re-arms the right shape;
+    /// the change itself is applied to the window by the pump at once.
+    pub cursor: CursorIcon,
     /// DevTools console feed (bounded by [`MAX_CONSOLE_ENTRIES`]).
     pub console: Vec<ConsoleEntry>,
     /// DevTools network feed (bounded by [`MAX_NETWORK_ENTRIES`]).
@@ -126,6 +130,12 @@ impl TabState {
             FromTab::ContextMenu { .. } => false,
             FromTab::ClipboardText { .. } => false,
             FromTab::DialogRequest { .. } => false,
+            // Hover cursor: no frame to repaint (the pump pushes it onto the
+            // window immediately); the record here only serves tab switches.
+            FromTab::CursorChanged { cursor } => {
+                self.cursor = *cursor;
+                false
+            }
             FromTab::Frame { .. } => false,
             FromTab::Closed => {
                 if self.closed {
@@ -565,6 +575,21 @@ mod tests {
         assert_eq!(format_duration(Some(0)), "0 ms");
         assert_eq!(format_duration(Some(999)), "999 ms");
         assert_eq!(format_duration(Some(1000)), "1.00 s");
+    }
+
+    #[test]
+    fn cursor_changes_are_carried_without_a_repaint() {
+        // Task: hover cursor. The shape lives on the record (tab switches
+        // re-arm it from here) but never dirties a frame — the pump applies
+        // it to the window directly.
+        let mut s = TabState::default();
+        assert_eq!(s.cursor, CursorIcon::Default, "a fresh tab starts with the arrow");
+        assert!(!s.reduce(&FromTab::CursorChanged { cursor: CursorIcon::Pointer }));
+        assert_eq!(s.cursor, CursorIcon::Pointer);
+        assert!(!s.reduce(&FromTab::CursorChanged { cursor: CursorIcon::Pointer }));
+        assert_eq!(s.cursor, CursorIcon::Pointer, "the same shape again changes nothing");
+        assert!(!s.reduce(&FromTab::CursorChanged { cursor: CursorIcon::Text }));
+        assert_eq!(s.cursor, CursorIcon::Text);
     }
 
     #[test]
