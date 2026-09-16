@@ -198,6 +198,10 @@ fn main() {
                 text: Some("video-toggled".into()),
             }),
             ToTab::SetZoom { .. } => {} // no real layout to rescale
+            // Userscripts (task: userscript execution): only the REAL tab runs
+            // them; this fake has no JS engine, so the set is accepted and
+            // dropped. The point is that the message never breaks the pump.
+            ToTab::SetUserscripts { .. } => {}
             ToTab::Destroy => break,
         }
     }

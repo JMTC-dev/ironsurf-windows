@@ -61,12 +61,20 @@ use ironsurf_common::{error, info, trace, warn, DialogKind};
 
 /// Emit one `console.*` line to stderr at the level the page chose.
 /// The same line also reaches the shell (status text) via the host capture.
-fn log_console(level: ConsoleLevel, url: &str, text: &str) {
+///
+/// `userscript` is the name of the userscript the line came from (task:
+/// userscripts) — `None` for the page's own scripts — so `grep`ing a tab log
+/// always says which program talked.
+fn log_console(level: ConsoleLevel, url: &str, text: &str, userscript: Option<&str>) {
+    let origin = match userscript {
+        Some(name) => format!("userscript {name}"),
+        None => "page".to_string(),
+    };
     match level {
-        ConsoleLevel::Error => error!("page console [{level}] {url}: {text}"),
-        ConsoleLevel::Warn => warn!("page console [{level}] {url}: {text}"),
+        ConsoleLevel::Error => error!("{origin} console [{level}] {url}: {text}"),
+        ConsoleLevel::Warn => warn!("{origin} console [{level}] {url}: {text}"),
         ConsoleLevel::Info | ConsoleLevel::Log => {
-            info!("page console [{level}] {url}: {text}")
+            info!("{origin} console [{level}] {url}: {text}")
         }
     }
 }
@@ -254,6 +262,32 @@ impl std::fmt::Display for ConsoleLevel {
     }
 }
 
+/// One captured `console.*` line: the level the caller chose, the already
+/// stringified message, and — task: userscripts — **which userscript** produced
+/// it (`None` = the page's own scripts). The name rides on the line itself (not
+/// on a shared "who is running now" lookup at drain time) because a userscript
+/// turn and a page turn are drained separately and each entry must be
+/// attributable to its author after the fact.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ConsoleLine {
+    pub level: ConsoleLevel,
+    pub text: String,
+    /// Name of the userscript that made the call (`None` for page scripts).
+    pub userscript: Option<String>,
+}
+
+impl ConsoleLine {
+    /// Message as the DevTools console shows it: userscript lines lead with
+    /// `"{name}: "` so the culprit is obvious without looking at the source
+    /// column; page lines are verbatim.
+    pub fn display_message(&self) -> String {
+        match &self.userscript {
+            Some(name) => format!("{name}: {}", self.text),
+            None => self.text.clone(),
+        }
+    }
+}
+
 /// Per-navigation host state shared between the tab runtime and the JS
 /// bindings. Everything the engine gives back is data (title text, console
 /// lines, notes) — never DOM mutations.
@@ -265,8 +299,16 @@ pub struct HostState {
     /// `Some` once a script assigned `document.title`. The runtime turns this
     /// into `FromTab::TitleChanged` and a repaint request.
     pub title_assigned: Option<String>,
-    /// Captured `console.*` output (level + already stringified message).
-    pub console: Vec<(ConsoleLevel, String)>,
+    /// Captured `console.*` output (level + already stringified message +
+    /// originating userscript name, `None` for page scripts).
+    pub console: Vec<ConsoleLine>,
+    /// Name of the **userscript currently being evaluated** (task: userscripts),
+    /// set by [`JsRuntime::run_userscript`] for the duration of one script and
+    /// `None` the moment it returns — so `console.*` calls (and the tab's
+    /// diagnostics) know their author while the script runs, and page scripts,
+    /// timer callbacks and `javascript:` URLs never inherit it. Single-threaded
+    /// by construction: one field, one script at a time, no global race.
+    pub userscript: Option<String>,
     /// Messages of JS exceptions thrown **by the native DOM bindings**
     /// (`__ironsurfDom*`) while these scripts ran — recorded by the
     /// `native!` registration macro on every native `Err`. The runtime uses
@@ -3185,12 +3227,20 @@ pub fn build_context(host: &HostRef, _timers: &Rc<RefCell<TimerQueue>>) -> Conte
                 .to_string(_context)?
                 .to_std_string_escaped();
             let level = ConsoleLevel::parse(&level);
-            let url = with_host(|host| {
-                host.console.push((level, text.clone()));
-                host.url.clone()
+            let (url, userscript) = with_host(|host| {
+                // Tag the line with the userscript that is running (if any):
+                // the tab turns `Some(name)` into a `source: "userscript"`
+                // console entry prefixed with the same name.
+                let userscript = host.userscript.clone();
+                host.console.push(ConsoleLine {
+                    level,
+                    text: text.clone(),
+                    userscript: userscript.clone(),
+                });
+                (host.url.clone(), userscript)
             })
             .unwrap_or_default();
-            log_console(level, &url, &text);
+            log_console(level, &url, &text, userscript.as_deref());
             Ok(JsValue::undefined())
         }),
     ) {
@@ -3614,6 +3664,58 @@ impl JsRuntime {
         errors
     }
 
+    /// Run **one userscript** (task: userscripts) in this document's realm —
+    /// the same `Context`, the same host cell, the same live document (docId 0)
+    /// the page's own scripts ran in, so a userscript can read and mutate the
+    /// real DOM, change `document.title`, call `console.*`, and open dialogs
+    /// exactly like page code.
+    ///
+    /// Identity is the point: `name` is published on [`HostState::userscript`]
+    /// for the duration of this one evaluation, which is what makes every
+    /// `console.*` line the script produces attributable (and every diagnostic
+    /// line name its author). Nothing else on the host changes, so a timer
+    /// callback a userscript scheduled later runs unattributed — like a page
+    /// script turn — rather than pretending to be the userscript.
+    ///
+    /// Returns `Some(ScriptError)` when the script threw (parse errors
+    /// included): `origin` = the script name, `message` prefixed with
+    /// `"{name}: "`, `source` = `"userscript"` — the wire shape the DevTools
+    /// console wants (`[userscript] Boom script: Error: ...`). A throw can only
+    /// ever kill **this** script: the evaluation is caught, the identity field
+    /// is cleared, and the tab keeps running.
+    pub fn run_userscript(
+        &mut self,
+        name: &str,
+        code: &str,
+        doc: Option<&mut HtmlDocument>,
+    ) -> Option<ScriptError> {
+        let _active = self.activate();
+        let _live_doc = doc.map(register_live_doc);
+        // Publish the author for this evaluation only (single-threaded: no race,
+        // and the guard below clears it on every path out of here).
+        self.host.borrow_mut().userscript = Some(name.to_string());
+        let dom_before = self.host.borrow().dom_throws.len();
+        let outcome = self.context.eval(Source::from_bytes(code));
+        self.host.borrow_mut().userscript = None;
+        match outcome {
+            Ok(_) => None,
+            Err(err) => {
+                let message = first_line(&err);
+                // Native DOM throws during a userscript run are reported as the
+                // userscript's own error (the script is the author a user can
+                // act on); the throw log is rolled back so a stale entry can
+                // never mis-classify a later page-script error as `"dom"`.
+                self.host.borrow_mut().dom_throws.truncate(dom_before);
+                error!("javascript error in userscript {name}: {message}");
+                Some(ScriptError {
+                    origin: name.to_string(),
+                    message: format!("{name}: {message}"),
+                    source: "userscript",
+                })
+            }
+        }
+    }
+
     /// Evaluate one snippet with this runtime's scope active (the same world
     /// page scripts see; used by the binding tests).
     #[cfg(test)]
@@ -4019,7 +4121,7 @@ mod tests {
             .borrow()
             .console
             .iter()
-            .map(|(level, text)| (level.as_str().to_string(), text.clone()))
+            .map(|line| (line.level.as_str().to_string(), line.text.clone()))
             .collect();
         assert_eq!(
             captured,
@@ -4187,6 +4289,110 @@ mod tests {
             "{status}"
         );
         assert!(status_text_for_errors(&[]).is_none());
+    }
+
+    // -- userscripts (task: userscript execution with per-script error attribution)
+
+    /// A userscript runs in the page's own realm: it can assign
+    /// `document.title` exactly like a page script (the assignment lands in the
+    /// host cell the tab turns into `FromTab::TitleChanged`), and its
+    /// `console.*` output is tagged with the **script name** — while the script
+    /// is the only thing that was ever "the current userscript" for that long.
+    #[test]
+    fn userscript_runs_in_the_page_realm_and_tags_its_output() {
+        let host = sample_host();
+        let mut runtime = JsRuntime::new(Rc::clone(&host));
+        assert_eq!(host.borrow().userscript, None, "no script runs yet");
+        let err = runtime.run_userscript(
+            "Title fixer",
+            "document.title = 'fixed by userscript'; console.log('patched');",
+            None,
+        );
+        assert!(err.is_none(), "a good userscript must not report an error");
+        assert_eq!(
+            host.borrow().title_assigned.as_deref(),
+            Some("fixed by userscript"),
+            "a userscript mutates the page like any script"
+        );
+        let lines = host.borrow().console.clone();
+        assert_eq!(lines.len(), 1, "one console line was captured");
+        assert_eq!(lines[0].level, ConsoleLevel::Log);
+        assert_eq!(
+            lines[0].userscript.as_deref(),
+            Some("Title fixer"),
+            "the line knows which userscript made it"
+        );
+        assert_eq!(
+            lines[0].display_message(),
+            "Title fixer: patched",
+            "the wire message leads with the script name"
+        );
+        assert_eq!(
+            runtime.eval("1 + 1").expect("eval").as_i32(),
+            Some(2),
+            "the shared realm is intact afterwards"
+        );
+    }
+
+    /// Identity is scoped to one script: page scripts (and every later JS turn,
+    /// timer callbacks included) keep their unattributed lines, and a name never
+    /// leaks out of `run_userscript`.
+    #[test]
+    fn page_script_console_stays_unattributed() {
+        let host = sample_host();
+        let mut runtime = JsRuntime::new(Rc::clone(&host));
+        let scripts = [ScriptSource {
+            code: "console.log('from the page');".to_string(),
+            origin: "inline".to_string(),
+        }];
+        assert!(runtime.run_scripts(&scripts, None).is_empty());
+        assert!(runtime
+            .run_userscript("Namer", "console.log('from the script');", None)
+            .is_none());
+        runtime.eval("console.log('after the script')").expect("eval");
+        let lines = host.borrow().console.clone();
+        assert_eq!(lines.len(), 3, "{lines:?}");
+        assert_eq!(lines[0].userscript, None, "page script line stays plain");
+        assert_eq!(lines[0].display_message(), "from the page");
+        assert_eq!(lines[1].userscript.as_deref(), Some("Namer"));
+        assert_eq!(lines[2].userscript, None, "the name never leaked");
+        assert_eq!(host.borrow().userscript, None);
+    }
+
+    /// A userscript that throws (or cannot even compile) is reported **by
+    /// name** with `source: "userscript"`, and only that script dies: the next
+    /// one still runs and the realm stays usable. This is the message shape the
+    /// shell shows as `[userscript] Boom script: Error: kaput`.
+    #[test]
+    fn throwing_userscript_is_named_and_never_fatal() {
+        let host = sample_host();
+        let mut runtime = JsRuntime::new(Rc::clone(&host));
+        let err = runtime
+            .run_userscript("Boom script", "throw new Error('kaput');", None)
+            .expect("the throw is reported");
+        assert_eq!(err.origin, "Boom script");
+        assert_eq!(err.source, "userscript");
+        assert!(
+            err.message.starts_with("Boom script: "),
+            "the script name must lead the message, got {:?}",
+            err.message
+        );
+        assert!(err.message.contains("kaput"), "{:?}", err.message);
+
+        // A parse error is the same story (nothing ran, still attributed).
+        let syntax = runtime
+            .run_userscript("Broken script", "function broken( {", None)
+            .expect("a compile error is reported");
+        assert_eq!(syntax.source, "userscript");
+        assert!(syntax.message.starts_with("Broken script: ")); 
+
+        assert_eq!(host.borrow().userscript, None, "identity cleared on the error path");
+        // The tab's world is intact: the next script of the same document runs.
+        assert!(runtime
+            .run_userscript("Next", "document.title = 'after boom';", None)
+            .is_none());
+        assert_eq!(host.borrow().title_assigned.as_deref(), Some("after boom"));
+        assert_eq!(runtime.eval("2 * 21").expect("eval").as_i32(), Some(42));
     }
 
     #[test]

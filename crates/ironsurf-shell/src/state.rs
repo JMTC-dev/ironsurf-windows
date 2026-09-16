@@ -19,7 +19,8 @@ pub const MAX_NETWORK_ENTRIES: usize = 500;
 /// on [`TabState::console`] in arrival order; the (future) panel reads it.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ConsoleEntry {
-    /// Origin subsystem: `"js"` | `"css"` | `"dom"` | `"page"`.
+    /// Origin subsystem: `"js"` | `"css"` | `"dom"` | `"page"` | `"userscript"`
+    /// (a userscript entry leads with its script name — the panel shows both).
     pub source: String,
     /// Severity label as the engine emitted it (`"log"`, `"warn"`, …).
     pub level: String,

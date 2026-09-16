@@ -90,10 +90,13 @@ pub enum FromTab {
     },
     /// DevTools console entry. `source` names the subsystem the entry came
     /// from: `"js"` (script `console.*` / engine JS diagnostics), `"css"`
-    /// (stylesheet parse/style problems), `"dom"` (markup/DOM diagnostics)
-    /// or `"page"` (anything else about the document itself).
+    /// (stylesheet parse/style problems), `"dom"` (markup/DOM diagnostics),
+    /// `"page"` (anything else about the document itself) or `"userscript"`
+    /// (a user script ran: its `console.*` output or its uncaught error).
+    /// A `"userscript"` entry always **leads with the script's name** —
+    /// `"{name}: {message}"` — so the culprit is readable in the panel.
     ConsoleLog {
-        /// `"js"` | `"css"` | `"dom"` | `"page"`.
+        /// `"js"` | `"css"` | `"dom"` | `"page"` | `"userscript"`.
         source: String,
         level: String,
         message: String,

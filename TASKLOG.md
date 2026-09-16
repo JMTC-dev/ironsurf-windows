@@ -1,4 +1,9 @@
 # Task log
+## #39 Userscripts execute in the tab (step 3/5): Tab stores ToTab::SetUserscripts (replace-wholesale; empty clears) and run_scripts ends with run_userscripts(url) —
+  once per document (incl. JS-redirect targets), userscripts_for_url filtered at run time, shell store order, same Boa realm via JsRuntime::run_userscript(name, code,
+  doc) with HostState::userscript naming the running script for that evaluation only: its console.* ships as ConsoleLog source "userscript" "{name}: {text}" (page keeps
+  "js" verbatim; ConsoleLine carries the author), a throw as "userscript"/error "{name}: {err}" + StatusText "Userscript error in {name}", caught per script so the tab
+  lives. 3 js.rs units + tests/userscripts.rs 3 localhost wire tests (patcher title, 'Boom script' named, unmatched silent, page-first order, empty clears, redirect re-runs, confirm() answered + attributed, alive+frame); tab 180u + every suite green, workspace check clean (fake_tab gained the missing SetUserscripts arm); ARCH/common docs name the source.
 ## #38 Userscripts persisted in storage (step 2/5, storage only): global (not per-container) Vec<Userscript> at
   <root>/userscripts.json, sibling of containers.json — same pattern: load-if-exists (missing = empty, never
   seeded), write_atomic temp+rename, loaded at Store::open and kept in memory. API on Store: userscripts(),
@@ -89,10 +94,3 @@ HttpOnly persisted+sent normally, scripts have zero cookie access; per-container
 (containers_have_separate_jars test + sandbox probe). localhost HTTP wire tests (redirect chain, path/domain scope,
 cross-host, Passthrough nav), runtime ptr_eq shared-jar test; ARCH cookie rules+net layer updated; workspace green,
 live example.com real_tab ok.
-
-## video wired — media engine live in the tab. runtime.rs: attach_video_widgets (blitz set_custom_widget + width/height attrs → VideoWidget::with_size_hint, 640×360 fallback, per-tick re-scan for late <video>), fetch worker threads (SelfPipe + results queue, container cookies/policy, 2xx + MAX_VIDEO_BYTES only), pump_media after run_due_timers with MEDIA_TICK=40ms capping the poll sleep, PlayerEvent→DOM events via __ironsurfFire, catch_unwind media_guard on every step; --no-media master switch. js.rs: __ironsurfMediaGet/MediaCmd natives + NodeProto HTMLMediaElement glue (currentTime/duration/paused/ended/playbackRate/muted/videoWidth/videoHeight/mediaError, play/pause/canPlayType, instanceof HTMLMediaElement), page writes queue MediaCommands the loop applies (MediaHost cell in HostState). Spec APIs adapted to shipped blitz 0.3 (set_custom_widget not Node::Widget; SelfPipe not to_main; std::thread not tokio); /tmp/vid/flower.mp4 is 960×540 (tests assert the demuxer's own reading). cargo test -p ironsurf-tab 190 green; cargo check --workspace clean (ironsurf-net/-session/-ironsurf are not packages in this tree).
-## Ctrl-L/F6 now highlight the whole URL-bar address: UrlBar's focus-token handler pairs edit.focus() with
-  edit.select-all() (Slint 1.17 LineEdit), so one character typed after the chord replaces the address (placeholder
-  text now says "Ctrl-L or F6"); keymap adds bare F6 (U+F709, unmodified — alt/meta/ctrl combos untouched) →
-  Shortcut::FocusUrl with unit tests; new tests/url_bar.rs drives the testing backend (window-activated, page click,
-  invoke_page_key chords, synthetic keypress) asserting typing replaces the URL after Ctrl-L and F6; shell suite green.

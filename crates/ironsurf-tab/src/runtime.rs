@@ -75,9 +75,9 @@ use blitz_traits::events::{
 use blitz_traits::navigation::{NavigationOptions, NavigationProvider};
 use blitz_traits::shell::{ClipboardError, ColorScheme, ShellProvider, Viewport};
 use ironsurf_common::{
-    read_frame, write_frame, ContextAction, ContextTarget, ContainerId, CursorIcon,
-    DialogKind, FromTab, KeyEvent, Modifiers, NetEvent, PointerEvent, PointerKind, ScrollEvent,
-    TabId, ToTab, MAX_CONTEXT_TEXT, MAX_DIALOG_MESSAGE,
+    read_frame, write_frame, userscripts_for_url, ContextAction, ContextTarget, ContainerId,
+    CursorIcon, DialogKind, FromTab, KeyEvent, Modifiers, NetEvent, PointerEvent, PointerKind,
+    ScrollEvent, TabId, ToTab, Userscript, MAX_CONTEXT_TEXT, MAX_DIALOG_MESSAGE,
 };
 use keyboard_types::{Code, Key, Location, Modifiers as KMods};
 use kurbo::{Affine, Rect, Size};
@@ -583,6 +583,13 @@ pub struct Tab {
     /// Per-document bookkeeping for the CSS re-parse seam (content hashes of
     /// already-reported `<style>` bodies / `style="…"` attributes).
     css_scan: CssScanState,
+    /// Userscripts installed by the shell (`ToTab::SetUserscripts`, task:
+    /// userscripts): **replace-wholesale**, in the shell's store order, every
+    /// entry enabled (the shell never sends disabled ones). Matching against a
+    /// document URL happens at run time via [`userscripts_for_url`], so a
+    /// script still applies after JS-driven redirects and an empty set costs
+    /// exactly nothing.
+    userscripts: Vec<Userscript>,
     /// Master switch mirroring `TabArgs::media_enabled`.
     media_enabled: bool,
     /// When the media steps must next run even with no events at all; `None`
@@ -871,6 +878,7 @@ impl Tab {
             net_events,
             console_events,
             css_scan: CssScanState::new(),
+            userscripts: Vec::new(),
         }
     }
 
@@ -1324,6 +1332,57 @@ impl Tab {
         self.settle();
         self.consume_js_status(extraction.notes.first().cloned(), &errors);
         self.take_js_title();
+        // Userscripts (task: userscripts) run **after** the page's own scripts,
+        // once per document, so they see the DOM the page built.
+        self.run_userscripts(url);
+    }
+
+    /// Run the userscripts that apply to this document (task: userscripts).
+    ///
+    /// Called at the end of every `run_scripts`, i.e. once per loaded document
+    /// — including documents reached through a JS-driven redirect, because the
+    /// filter runs against the **current document URL at run time**, which is
+    /// exactly what [`userscripts_for_url`] is for. Matching scripts run in the
+    /// shell's store order, in the page's own Boa realm
+    /// ([`js::JsRuntime::run_userscript`]), each caught individually: one bad
+    /// script never stops the others and never kills the tab.
+    ///
+    /// Zero cost when no scripts are installed (the common case): the function
+    /// returns before touching the runtime.
+    fn run_userscripts(&mut self, url: &Url) {
+        if self.userscripts.is_empty() || self.js.is_none() {
+            return;
+        }
+        let matching: Vec<(String, String)> = userscripts_for_url(&self.userscripts, url.as_str())
+            .into_iter()
+            .map(|script| (script.name.clone(), script.code.clone()))
+            .collect();
+        if matching.is_empty() {
+            return;
+        }
+        info!(
+            "running {} userscript(s) for {url} (of {} installed)",
+            matching.len(),
+            self.userscripts.len()
+        );
+        // The runtime leaves `self` for the duration so the live document can
+        // be borrowed mutably alongside it (the same dance `run_scripts` does
+        // by building the runtime locally); it goes straight back, timers and
+        // any queued navigation included.
+        let mut runtime = self.js.take().expect("js runtime presence checked above");
+        let mut errors = Vec::new();
+        for (name, code) in &matching {
+            if let Some(err) = runtime.run_userscript(name, code, self.doc.as_mut()) {
+                errors.push(err);
+            }
+        }
+        self.js = Some(runtime);
+        // Scripts may have restyled/extended the DOM: restyle + relayout before
+        // the pending paint, and fold their side effects into the IPC feed.
+        self.settle();
+        self.needs_paint = true;
+        self.consume_userscript_status(&errors);
+        self.take_js_title();
     }
 
     /// Run a `javascript:` URL's program (task: JS-driven navigation): the
@@ -1480,11 +1539,19 @@ impl Tab {
         }
         // 1. Every `console.*` line of this JS turn, in order, as a DevTools
         // console entry (the old behaviour only ever showed the newest one).
-        for (level, text) in &console_entries {
+        // Page scripts stay `source: "js"` with verbatim text; a line tagged
+        // with a userscript name (which only happens inside a userscript turn —
+        // see `consume_userscript_status`) is attributed the same way there.
+        for line in &console_entries {
+            let source = if line.userscript.is_some() {
+                "userscript"
+            } else {
+                "js"
+            };
             self.emit(FromTab::ConsoleLog {
-                source: "js".to_string(),
-                level: level.as_str().to_string(),
-                message: text.clone(),
+                source: source.to_string(),
+                level: line.level.as_str().to_string(),
+                message: line.display_message(),
             });
         }
         // 2. Uncaught exceptions (compile errors included): `"dom"` for
@@ -1503,12 +1570,71 @@ impl Tab {
         // outranks the "skipped script" extraction notes.
         let console_last = console_entries
             .last()
-            .map(|(level, text)| format!("js console {level}: {text}"));
+            .map(|line| format!("js console {}: {}", line.level.as_str(), line.display_message()));
         let status = js::status_text_for_errors(errors)
             .or(console_last)
             .or(note);
         if status.is_some() {
             self.js_status = status;
+        }
+    }
+
+    /// Fold a **userscript** turn into the IPC feed (task: userscripts).
+    ///
+    /// Same shape as [`Tab::consume_js_status`], one difference per entry: a
+    /// `console.*` line authored by a userscript ships as
+    /// `FromTab::ConsoleLog { source: "userscript", … }` with the message
+    /// prefixed `"{name}: "`, and a script that threw ships as
+    /// `{ source: "userscript", level: "error", message: "{name}: {err}" }`
+    /// (the name is baked in by [`js::JsRuntime::run_userscript`]), so the
+    /// DevTools console reads `[userscript] Boom script: Error: …` and the
+    /// culprit is obvious at a glance. The status bar gets the one-line
+    /// `Userscript error in {name}` (matching the existing script-error
+    /// behaviour of one line, newest error wins).
+    fn consume_userscript_status(&mut self, errors: &[js::ScriptError]) {
+        let mut lines = Vec::new();
+        if let Some(runtime) = self.js.as_ref() {
+            let mut host = runtime.host().borrow_mut();
+            lines = std::mem::take(&mut host.console);
+            host.notes.clear();
+            // Anything a native threw during the userscript turn has already
+            // been rolled back by `run_userscript`; clear the slate so no stale
+            // entry can classify a later page-script error as `"dom"`.
+            host.dom_throws.clear();
+            if host.repaint {
+                self.needs_paint = true;
+                host.repaint = false;
+            }
+        }
+        for line in &lines {
+            // A page-script line in this drain (a timer callback that fired
+            // inside the turn, say) keeps its honest `"js"` source.
+            let source = if line.userscript.is_some() {
+                "userscript"
+            } else {
+                "js"
+            };
+            self.emit(FromTab::ConsoleLog {
+                source: source.to_string(),
+                level: line.level.as_str().to_string(),
+                message: line.display_message(),
+            });
+        }
+        for err in errors {
+            self.emit(FromTab::ConsoleLog {
+                source: err.source.to_string(),
+                level: "error".to_string(),
+                message: err.message.clone(),
+            });
+        }
+        if let Some(err) = errors.last() {
+            self.js_status = Some(format!("Userscript error in {}", err.origin));
+        } else if let Some(line) = lines.last() {
+            self.js_status = Some(format!(
+                "userscript console {}: {}",
+                line.level.as_str(),
+                line.display_message()
+            ));
         }
     }
 
@@ -1833,6 +1959,22 @@ impl Tab {
                 *self.shell.clipboard.lock().expect("clipboard mutex") = text;
             }
             ToTab::ContextAction(action) => self.handle_context_action(action),
+            ToTab::SetUserscripts { scripts } => {
+                // Replace-wholesale per the contract: the shell sends every
+                // ENABLED script (patterns included) and an empty vec clears
+                // the tab-side set. Scripts apply to the next document that
+                // loads — the per-URL filter runs at script time, never here.
+                info!(
+                    "userscripts: {} script(s) installed{}",
+                    scripts.len(),
+                    if scripts.is_empty() {
+                        " (set cleared)"
+                    } else {
+                        ""
+                    }
+                );
+                self.userscripts = scripts;
+            }
             ToTab::DialogResponse { dialog_id, .. } => {
                 // A reply with no modal open: it either raced the tab-side
                 // cancel (shell quit mid-dialog) or is stale — nothing to

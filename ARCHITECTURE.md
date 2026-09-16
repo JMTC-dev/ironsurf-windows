@@ -97,7 +97,9 @@ pub enum FromTab {
     HistoryChanged   { can_go_back: bool, can_go_forward: bool },
     StatusText       { text: Option<String> },
     OpenLinkInNewTab { url: String },      // middle-click a link → shell opens url in a new tab (same container)
-    // source: "js" | "css" | "dom" | "page" — which DevTools panel the entry belongs to
+    // source: "js" | "css" | "dom" | "page" | "userscript" — which DevTools panel the entry
+    // belongs to. A "userscript" entry always names its author first: message is
+    // `"{script name}: {text}"` (console line) or `"{script name}: {Error: …}"` (throw).
     ConsoleLog       { source: String, level: String, message: String },
     // one finished (or failed) page request → DevTools network panel
     NetworkEvent     { event: NetEvent },
@@ -473,6 +475,24 @@ are a deliberately tiny surface (no engine-internal DOM mutation yet):
   uncaught exception is also a `ConsoleLog { source: "js", level: "error" }` — or `source:
   "dom"` when a native `__ironsurfDom*` binding threw (the registration macro records native
   `Err`s; reported **exactly once**, never duplicated on the generic script-error path).
+- **Userscripts (`ToTab::SetUserscripts`) run in the page's own realm.** The tab keeps the
+  enabled set the shell installed (replace-wholesale; empty clears) and, **once per document**
+  (including documents reached by a JS-driven redirect, since the filter uses the current
+  document URL at run time), runs every script `userscripts_for_url` selects — in shell store
+  order, after that document's own `<script>`s, through the same `boa_engine::Context` via
+  `JsRuntime::run_userscript(name, code, doc)`: same live DOM (`document.title = …`, DOM writes,
+  `location.href = …` push history, dialogs block exactly like page dialogs) and the same
+  per-script `catch`.
+  **Identity is the contract**: `HostState::userscript` carries the running script's name for the
+  duration of that one evaluation (a field on the host cell, set/cleared around the run —
+  single-threaded, never a global race, never inherited by later timer callbacks), so
+  * `console.*` made by a userscript → `ConsoleLog { source: "userscript", level, message:
+    "{name}: {text}" }` (page scripts keep `source: "js"` with verbatim text),
+    * a script that throws → `ConsoleLog { source: "userscript", level: "error", message:
+      "{name}: {err}" }` plus a one-line `StatusText` of `Userscript error in {name}`; the throw
+      kills only its own script — the next script runs, the tab stays alive and painting.
+  With no scripts installed the whole path returns before touching the runtime (zero behaviour
+  change).
 - **JS-driven navigation is implemented**: `location.href=`/`assign`/`replace`/`reload` queue a
   real navigation (`HostState::pending_nav`) that the tab's poll loop follows through its single
   navigation entry point after each JS turn — `assign`/`href=` push history, `replace`/`reload`
