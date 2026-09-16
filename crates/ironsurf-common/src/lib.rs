@@ -173,6 +173,14 @@ pub enum ToTab {
     /// The user picked an entry in a context menu that the *engine* services
     /// (paste, video play/pause); shell-side entries never reach the tab.
     ContextAction(ContextAction),
+    /// Replace the tab-side userscript set. The shell sends **all enabled**
+    /// scripts (patterns included); the **tab** filters them against the
+    /// document URL on every navigation (see [`userscripts_for_url`]), so a
+    /// script still applies after JS-driven redirects. Disabled scripts are
+    /// never sent; an empty vec clears the tab-side set entirely.
+    SetUserscripts {
+        scripts: Vec<Userscript>,
+    },
     /// Answer a [`FromTab::DialogRequest`] (matched by `dialog_id`):
     /// `confirmed` is the button the user pressed (alert: always true once
     /// dismissed; confirm: the answer JS returns; prompt: OK vs Cancel).
@@ -241,6 +249,27 @@ pub enum ContextAction {
 /// Cap for text carried in context-menu messages (`ContextTarget::selection`)
 /// — the selection is a convenience copy path, not an exfil channel.
 pub const MAX_CONTEXT_TEXT: usize = 256 * 1024;
+
+/// A user-defined JavaScript program that runs on matching pages
+/// (Tampermonkey/Greasemonkey-style). The shell owns the script set and
+/// ships it wholesale via [`ToTab::SetUserscripts`]; the tab decides, per
+/// navigation, which scripts apply to the current document URL
+/// (see [`userscripts_for_url`]).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Userscript {
+    /// Stable id chosen by the shell (manager-UI bookkeeping / dedup).
+    pub id: u64,
+    /// Human-readable name shown in the manager UI (may be unicode).
+    pub name: String,
+    /// URL patterns this script runs on — exact or wildcard, matched by
+    /// [`userscript_matches`]. An empty pattern list matches **nothing**.
+    pub patterns: Vec<String>,
+    /// The JavaScript source, verbatim.
+    pub code: String,
+    /// Disabled scripts are never sent to the tab
+    /// (see [`ToTab::SetUserscripts`]).
+    pub enabled: bool,
+}
 
 /// One network request observed by the tab, reported to the shell as
 /// [`FromTab::NetworkEvent`] (DevTools network panel).
@@ -456,6 +485,122 @@ pub const WELCOME_URL: &str = "ironsurf://welcome";
 /// Default start page URL (the built-in `ironsurf://welcome` page).
 pub fn default_url() -> String {
     WELCOME_URL.to_string()
+}
+
+/// Split a lowercased URL into `(scheme, host)`. The host is `None` when the
+/// URL carries no `://` authority (`data:…`, `about:…`, plain `ironsurf://`
+/// with an empty authority, or anything without a scheme). Credentials and
+/// `:port` are stripped; IPv6 literal hosts are not special-cased (contract-
+/// level matching only).
+fn scheme_and_host(url: &str) -> (Option<&str>, Option<&str>) {
+    let idx = match url.find("://") {
+        Some(i) if i > 0 => i,
+        _ => return (None, None),
+    };
+    let scheme = &url[..idx];
+    let rest = &url[idx + 3..];
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    let host = authority.rsplit_once('@').map(|(_, h)| h).unwrap_or(authority);
+    let host = host.split(':').next().unwrap_or("");
+    (Some(scheme), if host.is_empty() { None } else { Some(host) })
+}
+
+/// Whether the URL speaks `http:` or `https:` (the only schemes a wildcard
+/// domain pattern may ever match).
+fn is_http_like(scheme: Option<&str>) -> bool {
+    matches!(scheme, Some("http") | Some("https"))
+}
+
+/// Match one userscript URL pattern against a document URL.
+///
+/// Comparison is fully case-insensitive: **both** strings are lowercased
+/// first, so paths compare case-insensitively too (documented simplification).
+///
+/// * A blank (empty/whitespace) pattern matches nothing; skip blanks.
+/// * The bare pattern `"*"` matches every URL (any scheme).
+/// * A pattern **not** starting with `*` is compared to the **full URL
+///   string** exactly (after lowercasing) — this is how non-http(s) URLs
+///   like `ironsurf://settings/plugins` can still be targeted literally.
+///   Additionally, a pattern with no `*` and no `://` (e.g.
+///   `example.com/docs`) is `*://example.com/docs*` **sugar**: it matches
+///   http(s) URLs whose host *equals* the pattern's host part and whose
+///   path starts with the pattern's path (a pattern with no path — just a
+///   bare host — matches any path on that exact host).
+/// * A pattern starting with `*` (but not the bare `"*"`) strips the leading
+///   `*` into remainder `R`, split at the first `/` into a **domain part**
+///   and a **path part**. The URL must be http(s). Host boundary rule: the
+///   URL's host matches iff it equals the domain (after stripping an
+///   optional leading `*.` / `.`) or *ends with* `.{domain}` — a lookalike
+///   like `notexample.com` NEVER matches `example.com`. An empty domain part
+///   (`*/api`) means any host. If R has a path part, the lowercased URL must
+///   `ends_with` that path string verbatim (no percent-decoding).
+///
+/// So `*example.com` matches `https://example.com/` and
+/// `http://x.example.com/page` but NOT `https://notexample.com/`, and
+/// `*example.com/api` matches URLs on that host boundary whose URL ends in
+/// `/api`. Non-http(s) schemes (`data:`, `ironsurf:`, `about:`) never match
+/// wildcard domain patterns; exact patterns can still match them literally.
+pub fn userscript_matches(pattern: &str, url: &str) -> bool {
+    let pattern = pattern.trim().to_ascii_lowercase();
+    let url = url.trim().to_ascii_lowercase();
+    if pattern.is_empty() {
+        return false;
+    }
+    if pattern == "*" {
+        return true;
+    }
+    if let Some(domain) = pattern.strip_prefix('*') {
+        let (domain, path) = match domain.split_once('/') {
+            Some((d, p)) => (d, Some(p)),
+            None => (domain, None),
+        };
+        let domain = domain.strip_prefix("*.").or_else(|| domain.strip_prefix('.')).unwrap_or(domain);
+        let (scheme, host) = scheme_and_host(&url);
+        if !is_http_like(scheme) {
+            return false;
+        }
+        let host = match host {
+            Some(h) => h,
+            None => return false,
+        };
+        let host_ok =
+            domain.is_empty() || host == domain || host.ends_with(&format!(".{domain}"));
+        host_ok && path.map(|p| url.ends_with(p)).unwrap_or(true)
+    } else {
+        if url == pattern {
+            return true;
+        }
+        // `example.com/docs` sugar = `*://example.com/docs*` (host+prefix).
+        if !pattern.contains("://") {
+            let (pat_host, pat_path) = match pattern.split_once('/') {
+                Some((h, p)) => (h, p),
+                None => (pattern.as_str(), ""),
+            };
+            let (scheme, host) = scheme_and_host(&url);
+            if is_http_like(scheme) && host == Some(pat_host) {
+                let url_path = url
+                    .split_once("://")
+                    .map(|(_, r)| {
+                        let after_auth =
+                            r.split_once('/').map(|(_, p)| p).unwrap_or("");
+                        after_auth.split(['?', '#']).next().unwrap_or("")
+                    })
+                    .unwrap_or("");
+                return url_path.starts_with(pat_path);
+            }
+        }
+        false
+    }
+}
+
+/// The scripts that apply to `url`: enabled scripts whose **any** pattern
+/// matches (see [`userscript_matches`]). Scripts with an empty/whitespace
+/// pattern list match nothing and are never returned.
+pub fn userscripts_for_url<'a>(scripts: &'a [Userscript], url: &str) -> Vec<&'a Userscript> {
+    scripts
+        .iter()
+        .filter(|s| s.enabled && s.patterns.iter().any(|p| userscript_matches(p, url)))
+        .collect()
 }
 
 fn invalid_data<E: std::fmt::Display>(e: E) -> std::io::Error {
@@ -766,6 +911,186 @@ mod tests {
             text: Some(String::new()),
         });
         frame_round_trip(ToTab::Destroy);
+    }
+
+    /// The userscript contract rides the wire intact: empty set (clear),
+    /// one script with several patterns, and a unicode name.
+    #[test]
+    fn set_userscripts_round_trips() {
+        frame_round_trip(ToTab::SetUserscripts { scripts: vec![] });
+        frame_round_trip(ToTab::SetUserscripts {
+            scripts: vec![Userscript {
+                id: 1,
+                name: "Darkify".into(),
+                patterns: vec!["*example.com".into(), "example.org/*".into()],
+                code: "console.log('hi')".into(),
+                enabled: true,
+            }],
+        });
+        let msg = frame_round_trip(ToTab::SetUserscripts {
+            scripts: vec![
+                Userscript {
+                    id: 7,
+                    name: "🔧 Т工具 — ünïcode Ñame 日".into(),
+                    patterns: vec![],
+                    code: "".into(),
+                    enabled: false,
+                },
+                Userscript {
+                    id: 8,
+                    name: "second".into(),
+                    patterns: vec!["*".into()],
+                    code: "var x = 1;".into(),
+                    enabled: true,
+                },
+            ],
+        });
+        match msg {
+            ToTab::SetUserscripts { scripts } => {
+                assert_eq!(scripts.len(), 2);
+                assert_eq!(scripts[0].name, "🔧 Т工具 — ünïcode Ñame 日");
+                assert!(!scripts[0].enabled);
+                assert_eq!(scripts[1].patterns, vec!["*".to_string()]);
+            }
+            other => panic!("unexpected message: {other:?}"),
+        }
+    }
+
+    /// Table-driven coverage of the documented URL-pattern semantics: exact
+    /// match ±case, wildcard host boundary (never a lookalike), wildcard +
+    /// path, bare `*`, no-scheme sugar, blank patterns, internal schemes.
+    #[test]
+    fn userscript_url_matching() {
+        type Case = (&'static str, &'static str, bool);
+        let cases: &[Case] = &[
+            // Exact patterns: full-URL string equality, case-insensitive.
+            ("https://example.com/x", "https://example.com/x", true),
+            ("https://example.com/x", "https://example.com/y", false),
+            ("HTTPS://Example.COM/X", "https://example.com/x", true),
+            ("https://example.com/x", "https://example.com/x?q=1", false),
+            // Bare `*` matches every URL (any scheme).
+            ("*", "https://example.com/", true),
+            ("*", "data:text/html,hi", true),
+            ("*", "ironsurf://welcome", true),
+            // Wildcard domain boundary: exact host and subdomains match.
+            ("*example.com", "https://example.com/", true),
+            ("*example.com", "http://x.example.com/page", true),
+            ("*example.com", "https://a.b.example.com/deep/path?q=1", true),
+            ("*example.com", "https://EXAMPLE.COM/Upper/Path", true),
+            // …a lookalike suffix NEVER matches (host boundary rule).
+            ("*example.com", "https://notexample.com/", false),
+            ("*example.com", "https://evil.com/?u=example.com", false),
+            ("*example.com", "https://xexample.com/", false),
+            // Leading `*.` / `.` on the domain behave like `*example.com`.
+            ("*.example.com", "https://example.com/", true),
+            ("*.example.com", "https://sub.example.com/a", true),
+            ("*.example.com", "https://notexample.com/", false),
+            ("*sub.example.com", "https://example.com/", false),
+            // Wildcard + path: the lowercased URL must end with the path part.
+            ("*example.com/api", "https://example.com/api", true),
+            ("*example.com/api", "http://sub.example.com/v1/api", true),
+            ("*example.com/api", "https://example.com/api/extra", false),
+            ("*example.com/api", "https://notexample.com/api", false),
+            ("*example.com/", "https://example.com/anything", true),
+            // No-scheme sugar: `host` = that exact host, any path; `host/path`
+            // = path prefix.
+            ("example.com", "https://example.com/", true),
+            ("example.com", "https://example.com/deep/path?x=1", true),
+            ("example.com", "https://x.example.com/", false),
+            ("example.com", "https://notexample.com/", false),
+            ("example.com/docs", "https://example.com/docs", true),
+            ("example.com/docs", "https://example.com/docs/intro", true),
+            ("example.com/docs", "https://example.com/other", false),
+            ("example.com/docs", "http://example.com/docs", true),
+            ("example.com/docs", "https://notexample.com/docs", false),
+            // Non-http(s) schemes never match sugar or wildcard domains…
+            ("example.com", "ironsurf://example.com/docs", false),
+            ("*example.com", "ironsurf://example.com/", false),
+            ("*example.com", "data:text/html,example.com", false),
+            // …but exact patterns match internal schemes literally.
+            ("ironsurf://welcome", "ironsurf://welcome", true),
+            ("ironsurf://welcome", "ironsurf://settings", false),
+            ("ironsurf://settings/plugins", "ironsurf://settings/plugins", true),
+            // Blank patterns match nothing.
+            ("", "https://example.com/", false),
+            ("   ", "https://example.com/", false),
+        ];
+        for (pattern, url, want) in cases {
+            assert_eq!(
+                userscript_matches(pattern, url),
+                *want,
+                "pattern {pattern:?} vs url {url:?} (expected {want})"
+            );
+        }
+    }
+
+    /// `userscripts_for_url` returns enabled scripts with a matching pattern
+    /// only — disabled scripts, non-matching patterns, and empty/whitespace
+    /// pattern lists are all excluded.
+    #[test]
+    fn userscripts_for_url_filters_enabled_and_patterns() {
+        let scripts = vec![
+            Userscript {
+                id: 1,
+                name: "on-example".into(),
+                patterns: vec!["*example.com".into()],
+                code: "1".into(),
+                enabled: true,
+            },
+            Userscript {
+                id: 2,
+                name: "disabled".into(),
+                patterns: vec!["*".into()],
+                code: "2".into(),
+                enabled: false,
+            },
+            Userscript {
+                id: 3,
+                name: "no-patterns".into(),
+                patterns: vec![],
+                code: "3".into(),
+                enabled: true,
+            },
+            Userscript {
+                id: 4,
+                name: "blank-patterns".into(),
+                patterns: vec!["".into(), "  ".into()],
+                code: "4".into(),
+                enabled: true,
+            },
+            Userscript {
+                id: 5,
+                name: "other-host".into(),
+                patterns: vec!["example.org".into()],
+                code: "5".into(),
+                enabled: true,
+            },
+            Userscript {
+                id: 6,
+                name: "multi-pattern".into(),
+                patterns: vec!["example.org".into(), "  ".into(), "*docs.example.net/guide".into()],
+                code: "6".into(),
+                enabled: true,
+            },
+        ];
+
+        let on_example = userscripts_for_url(&scripts, "https://example.com/page");
+        let ids: Vec<u64> = on_example.iter().map(|s| s.id).collect();
+        assert_eq!(ids, vec![1], "only the enabled matching script");
+
+        let on_docs = userscripts_for_url(&scripts, "https://docs.example.net/guide");
+        assert_eq!(
+            on_docs.iter().map(|s| s.id).collect::<Vec<_>>(),
+            vec![6],
+            "a later pattern in the list matches"
+        );
+
+        assert!(userscripts_for_url(&scripts, "https://ironsurf.internal/x").is_empty());
+        assert!(userscripts_for_url(&scripts, "data:text/html,x").is_empty());
+        assert!(userscripts_for_url(&[], "https://example.com/").is_empty());
+
+        // The returned references point at the original scripts.
+        assert_eq!(on_example[0].code, "1");
     }
 
     #[test]

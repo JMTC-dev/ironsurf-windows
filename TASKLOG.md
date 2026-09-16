@@ -1,4 +1,11 @@
 # Task log
+## #37 Userscripts IPC contract (step 1/5, common only): Userscript{id,name,patterns,code,enabled} +
+  ToTab::SetUserscripts{scripts} (shell sends all ENABLED scripts; tab filters per document URL every
+  navigation; empty vec clears), userscript_matches + userscripts_for_url (case-insensitive; bare `*`;
+  exact full-URL; `host/path` no-scheme sugar; `*domain[/path]` host-boundary wildcard — subdomains yes,
+  notexample.com never; non-http(s) schemes exact-only). ARCH snippet synced; common 27 green (round-trip
+  empty/one/unicode + table-driven matching + enabled filtering); tab/shell untouched (expected to gain
+  the match arm in later steps).
 ## #36 Hover cursor completed (hand over <a>): the Slint half was broken — `Rectangle.absolute-x/-y` do not exist (Slint 1.17 exposes only
   `absolute-position`), and Rust has no `slint::MouseCursor` root export (it is `slint::private_unstable_api::re_exports::MouseCursor`, the very
   type the generated `set_page_cursor` takes). Page-point now maps through `page-frame.absolute-position`, the pump re-dispatches a synthetic

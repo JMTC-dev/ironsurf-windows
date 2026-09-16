@@ -141,7 +141,23 @@ pub enum ToTab {
     // `text` is `Some` exactly when a Prompt was accepted. Responses for
     // unknown dialog ids are ignored (the request may have been cleared).
     DialogResponse { dialog_id: u32, confirmed: bool, text: Option<String> },
+    // userscripts: the shell sends **all enabled** scripts (patterns included);
+    // the tab filters them per document URL on every navigation (scripts still
+    // apply after JS-driven redirects). Disabled scripts are never sent; an
+    // empty vec clears the tab-side set.
+    SetUserscripts { scripts: Vec<Userscript> },
     Destroy,
+}
+
+/// A user-defined JS program run on matching pages (Tampermonkey-style).
+/// Empty pattern list matches nothing; patterns see `userscript_matches`.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Userscript {
+    pub id: u64,
+    pub name: String,
+    pub patterns: Vec<String>,
+    pub code: String,
+    pub enabled: bool,           // disabled scripts are never sent to the tab
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
@@ -172,6 +188,20 @@ pub struct NetEvent {
     pub duration_ms: Option<u64>,
     pub error: Option<String>,
 }
+
+/// One userscript URL pattern vs one document URL (both lowercased — paths
+/// compare case-insensitively too). Blank patterns match nothing; bare `"*"`
+/// matches every URL; non-`*` patterns match the full URL exactly, with
+/// `example.com/docs` sugar = `*://example.com/docs*` (exact host, path
+/// prefix); `*`-leading patterns apply their domain (leading `*.`/`.`
+/// stripped) as a host **boundary** — host == domain or ends with
+/// `.{domain}`, never a lookalike like `notexample.com` — plus verbatim
+/// `ends_with` on the URL for an optional path part. Non-http(s) schemes
+/// (data:, ironsurf:, about:) never match wildcard domain patterns; exact
+/// patterns can still match them literally.
+pub fn userscript_matches(pattern: &str, url: &str) -> bool;
+/// Enabled scripts with at least one matching pattern, in input order.
+pub fn userscripts_for_url<'a>(scripts: &'a [Userscript], url: &str) -> Vec<&'a Userscript>;
 
 /// Framing: u32 LE length prefix + bincode payload, over stdin/stdout pipes.
 pub fn write_frame<W: std::io::Write, T: serde::Serialize>(w: &mut W, msg: &T) -> std::io::Result<()>;
