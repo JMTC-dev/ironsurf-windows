@@ -1,11 +1,13 @@
-//! IronSurf disk layer: container registry, per-container profile stores,
-//! an RFC6265-subset cookie jar, a bounded LRU network cache, and history.
+//! IronSurf disk layer: container registry, global userscripts, per-container
+//! profile stores, an RFC6265-subset cookie jar, a bounded LRU network cache,
+//! and history.
 //!
 //! No engine dependency — pure files under a data root:
 //!
 //! ```text
 //! $IRONSURF_DATA_DIR (or ~/.local/share/ironsurf)
 //!   containers.json                       # registry, written atomically
+//!   userscripts.json                      # global userscript list, atomic
 //!   profiles/<name-slug>-<id>/            # one dir per container (Servo data path)
 //!     cookies.json
 //!     net-cache/
@@ -23,7 +25,7 @@ mod registry;
 
 pub use cache::{CachedEntry, NetCache, DEFAULT_MAX_ENTRIES, DEFAULT_MAX_TOTAL_BYTES};
 pub use cookies::{Cookie, CookieJar};
-pub use registry::{Store, StoreError};
+pub use registry::{Store, StoreError, MAX_USERSCRIPT_CODE_BYTES, MAX_USERSCRIPT_NAME_CHARS};
 
 use ironsurf_common::ContainerId;
 use std::path::{Path, PathBuf};

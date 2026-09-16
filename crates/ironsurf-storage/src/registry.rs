@@ -1,6 +1,7 @@
-//! Container registry (`containers.json`) and the top-level [`Store`].
+//! Container registry (`containers.json`), the global userscript list
+//! (`userscripts.json`), and the top-level [`Store`].
 
-use ironsurf_common::{Container, ContainerId};
+use ironsurf_common::{Container, ContainerId, Userscript};
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -25,7 +26,25 @@ pub enum StoreError {
     CannotDeleteDefault,
     #[error("container name must not be empty")]
     EmptyName,
+    #[error("no such userscript: {0}")]
+    NoSuchUserscript(u64),
+    #[error("userscript name must not be empty")]
+    EmptyUserscriptName,
+    #[error("userscript name too long: {length} chars (max {max})")]
+    UserscriptNameTooLong { length: usize, max: usize },
+    #[error("userscript must have at least one URL pattern")]
+    EmptyUserscriptPatterns,
+    #[error("userscript code must not be empty")]
+    EmptyUserscriptCode,
+    #[error("userscript code too large: {size} bytes (max {max})")]
+    UserscriptCodeTooLarge { size: usize, max: usize },
 }
+
+/// Upper bound on a userscript's JavaScript source (1 MiB).
+pub const MAX_USERSCRIPT_CODE_BYTES: usize = 1024 * 1024;
+
+/// Upper bound on a userscript's display name (in unicode chars).
+pub const MAX_USERSCRIPT_NAME_CHARS: usize = 200;
 
 impl StoreError {
     pub(crate) fn io(path: impl AsRef<Path>, source: io::Error) -> Self {
@@ -46,6 +65,8 @@ impl StoreError {
 pub struct Store {
     root: PathBuf,
     containers: Vec<Container>,
+    /// Global userscript list (not per-container), from `userscripts.json`.
+    userscripts: Vec<Userscript>,
     next_id: u32,
     default_id: ContainerId,
 }
@@ -75,9 +96,20 @@ impl Store {
             .find(|c| c.is_default)
             .map(|c| c.id)
             .unwrap_or(ContainerId(1));
+        // Missing userscripts.json = empty list (never seeded, unlike the
+        // registry); a corrupt file is a Json error, same as containers.
+        let userscript_path = root.join("userscripts.json");
+        let mut userscripts: Vec<Userscript> = Vec::new();
+        if userscript_path.exists() {
+            let text = fs::read_to_string(&userscript_path)
+                .map_err(|e| StoreError::io(&userscript_path, e))?;
+            userscripts =
+                serde_json::from_str(&text).map_err(|e| StoreError::json(&userscript_path, e))?;
+        }
         let mut store = Store {
             root,
             containers,
+            userscripts,
             next_id: 0,
             default_id,
         };
@@ -234,6 +266,89 @@ impl Store {
     /// Atomically rewrite `containers.json` (temp file + rename).
     fn save(&self) -> Result<(), StoreError> {
         write_atomic(&self.root.join("containers.json"), &self.containers)
+    }
+
+    // ---- Userscripts (global, `userscripts.json`) ----
+
+    /// Atomically rewrite `userscripts.json` (temp file + rename).
+    fn save_userscripts(&self) -> Result<(), StoreError> {
+        write_atomic(&self.root.join("userscripts.json"), &self.userscripts)
+    }
+
+    /// All stored userscripts, in storage order (loaded at `open`).
+    pub fn userscripts(&self) -> Vec<Userscript> {
+        self.userscripts.clone()
+    }
+
+    /// The id to hand out for a new userscript: max existing id + 1
+    /// (`1` when the list is empty). Ids are caller-supplied, so this only
+    /// needs to keep climbing across reloads.
+    pub fn next_userscript_id(&self) -> u64 {
+        self.userscripts
+            .iter()
+            .map(|s| s.id)
+            .max()
+            .map(|max| max + 1)
+            .unwrap_or(1)
+    }
+
+    /// Insert `script` (by caller-supplied id) or replace the stored script
+    /// with the same id. Validates name/patterns/code (see [`StoreError`]
+    /// userscript variants); the name is stored trimmed.
+    pub fn upsert_userscript(&mut self, script: Userscript) -> Result<(), StoreError> {
+        let name = script.name.trim().to_string();
+        if name.is_empty() {
+            return Err(StoreError::EmptyUserscriptName);
+        }
+        let name_chars = name.chars().count();
+        if name_chars > MAX_USERSCRIPT_NAME_CHARS {
+            return Err(StoreError::UserscriptNameTooLong {
+                length: name_chars,
+                max: MAX_USERSCRIPT_NAME_CHARS,
+            });
+        }
+        if script.patterns.is_empty() {
+            return Err(StoreError::EmptyUserscriptPatterns);
+        }
+        if script.code.is_empty() {
+            return Err(StoreError::EmptyUserscriptCode);
+        }
+        if script.code.len() > MAX_USERSCRIPT_CODE_BYTES {
+            return Err(StoreError::UserscriptCodeTooLarge {
+                size: script.code.len(),
+                max: MAX_USERSCRIPT_CODE_BYTES,
+            });
+        }
+        let script = Userscript { name, ..script };
+        match self.userscripts.iter_mut().find(|s| s.id == script.id) {
+            Some(existing) => *existing = script,
+            None => self.userscripts.push(script),
+        }
+        self.save_userscripts()
+    }
+
+    /// Enable/disable the userscript with `id`. Unknown ids are
+    /// [`StoreError::NoSuchUserscript`] (mirrors `NoSuchContainer`).
+    pub fn set_userscript_enabled(&mut self, id: u64, enabled: bool) -> Result<(), StoreError> {
+        let script = self
+            .userscripts
+            .iter_mut()
+            .find(|s| s.id == id)
+            .ok_or(StoreError::NoSuchUserscript(id))?;
+        script.enabled = enabled;
+        self.save_userscripts()
+    }
+
+    /// Remove the userscript with `id`; unknown ids are
+    /// [`StoreError::NoSuchUserscript`].
+    pub fn delete_userscript(&mut self, id: u64) -> Result<(), StoreError> {
+        let pos = self
+            .userscripts
+            .iter()
+            .position(|s| s.id == id)
+            .ok_or(StoreError::NoSuchUserscript(id))?;
+        self.userscripts.remove(pos);
+        self.save_userscripts()
     }
 }
 

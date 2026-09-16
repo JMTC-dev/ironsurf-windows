@@ -1,4 +1,9 @@
 # Task log
+## #38 Userscripts persisted in storage (step 2/5, storage only): global (not per-container) Vec<Userscript> at
+  <root>/userscripts.json, sibling of containers.json — same pattern: load-if-exists (missing = empty, never
+  seeded), write_atomic temp+rename, loaded at Store::open and kept in memory. API on Store: userscripts(),
+  next_userscript_id() (max+1, 1 empty), upsert_userscript (insert/replace by caller-supplied id; name stored
+  trimmed), set_userscript_enabled + delete_userscript (unknown id ⇒ NoSuchUserscript, tested). Validation: EmptyUserscriptName/EmptyUserscriptPatterns/EmptyUserscriptCode + UserscriptNameTooLong (200 chars) / UserscriptCodeTooLarge (1 MiB); rejected upserts leave list + file untouched. lib.rs layout comment synced; tests/userscripts.rs 8 green (+34 pre-existing), common 27 green. tab/shell untouched (steps 3–5).
 ## #37 Userscripts IPC contract (step 1/5, common only): Userscript{id,name,patterns,code,enabled} +
   ToTab::SetUserscripts{scripts} (shell sends all ENABLED scripts; tab filters per document URL every
   navigation; empty vec clears), userscript_matches + userscripts_for_url (case-insensitive; bare `*`;
@@ -42,10 +47,6 @@ request — method, URL, status, bytes, duration_ms; docs report every redirect 
 NetProvider subresources + <script src> push into net_events drained per poll tick; failures error Some/status
 None (upgrade block names the requested URL); revalidated cache hits report the entry's status/size, data:/
 unsupported silent (no-spam); localhost wire test tests/network_events.rs + tab 172u + e2e 14 + suite green.
-## #30 Shell-side DevTools state reduction: TabState now carries a bounded console log (Vec<ConsoleEntry{source,level,
-message}>, cap MAX_CONSOLE_ENTRIES=500) and a running network log (Vec<NetEvent>, cap MAX_NETWORK_ENTRIES=500, never
-cleared on nav), both appended oldest-dropped-first via push_bounded and never dirtying the frame (reduce returns false).
-5 state.rs unit tests cover append order, ring caps, success+failure net events; ironsurf-shell --lib 37 + full suite green.
 ## #29 DevTools IPC contract: FromTab::ConsoleLog gained `source` ("js"|"css"|"dom"|"page") and there is a new
 FromTab::NetworkEvent { event: NetEvent } — NetEvent{method,url,status,response_bytes,duration_ms,error}
 (error is Some exactly when the request failed, status then None). Shell console log carries the source, both
