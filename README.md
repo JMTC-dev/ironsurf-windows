@@ -58,5 +58,23 @@ stderr (`--log trace`), not in the panel.
 
 `scripts/demo.sh` reproduces both screenshots on a headless X display with a localhost fixture.
 
+## Userscripts
+
+The `</>` button in the top bar opens the userscript menu:
+
+![Userscript menu](docs/screenshots/userscripts.png)
+
+- Each entry runs its JavaScript on matching pages (URL patterns with `*` wildcards, e.g.
+  `*://*.example.com/*`, `example.org/docs`), in the page's own realm — real DOM, dialogs,
+  navigation — after the page's own `<script>`s, in menu order.
+- The enable checkbox flips a script off everywhere at once (disabled scripts are never
+  even sent to a tab); ✕ deletes it; clicking the row edits it in place (same id, same
+  `enabled` flag). A throwing script only kills itself: its name and error land in the
+  DevTools console tagged `[userscript]`, the tab keeps running.
+- Scripts live in `~/.local/share/ironsurf/userscripts.json` (next to the container
+  registry), so they survive restarts; edits reach every open tab immediately.
+
+## Feedback
+
 Feel free to help out, fork, spend some tokens on it. The initial Proof of Concept build (this repo) is built entirely from locally-hosted Qwen 3.8 Flash Next.
 

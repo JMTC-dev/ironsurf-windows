@@ -240,11 +240,16 @@ export component AppWindow inherits Window {
     // Userscript menu (task: userscript menu): toggled by the "</>" toolbar
     // button. Rust owns the open flag, re-pushes `us-scripts` from the Store
     // after every mutation, and keeps `(us-editing, us-name, us-patterns,
-    // us-code)` as the inline "+ New script" editor. A failed Save leaves the
+    // us-code)` as the inline editor — opened by "+ New script" **or** by
+    // clicking a row (`us-edit(idx)` prefills that script; `us-editing-existing`
+    // tells the heading which mode is up). A failed Save leaves the
     // editor up with `us-error` set and the script NOT added.
     in property <bool> us-menu-open: false;
     in property <[UserscriptRow]> us-scripts;
     in property <bool> us-editing: false;
+    // true while the editor holds a *pre-filled existing* script (upsert,
+    // same id), false for a fresh "+ New script" draft.
+    in property <bool> us-editing-existing: false;
     in property <string> us-error: "";
     in-out property <string> us-name: "";
     in-out property <string> us-patterns: "";
@@ -294,6 +299,8 @@ export component AppWindow inherits Window {
     callback close-us-menu();
     callback us-toggle(idx: int);
     callback us-delete(idx: int);
+    // row clicked (anywhere but the CheckBox / ✕): edit that script.
+    callback us-edit(idx: int);
     callback us-new();
     callback us-save();
     callback us-cancel();
@@ -906,7 +913,12 @@ export component AppWindow inherits Window {
                     // receive their clicks — a TouchArea declared last swallowed all
                     // of them, so toggling and deleting did nothing (same trap the
                     // container-manager rows above already fell into).
-                    usa := TouchArea { }
+                    // Clicking anywhere else on the row edits the script: the
+                    // text/layout items above are click-transparent, so their
+                    // clicks land here and round-trip to `us-edit(idx)`.
+                    usa := TouchArea {
+                        clicked => { root.us-edit(i); }
+                    }
                     HorizontalLayout {
                         x: 6px; y: 3px;
                         width: parent.width - 12px;
@@ -956,7 +968,11 @@ export component AppWindow inherits Window {
                 }
                 if root.us-editing: VerticalLayout {
                     spacing: 6px;
-                    Text { text: "New userscript"; color: #f0f0f0; font-weight: 600; }
+                    Text {
+                        text: root.us-editing-existing ? "Edit userscript" : "New userscript";
+                        color: #f0f0f0;
+                        font-weight: 600;
+                    }
                     LineEdit {
                         height: 26px;
                         text <=> root.us-name;

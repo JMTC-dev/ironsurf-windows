@@ -4,8 +4,10 @@
 //! `ToTab::SetUserscripts` on its status line with the ids it carries, so the
 //! whole menu flow is assertable over the real pipe: the toolbar "</>" button
 //! toggles the overlay, Save goes through the Store (a rejected script is not
-//! added and shows a one-line error), every mutation — toggle / save / delete
-//! — rebroadcasts the **enabled-only** set to every live tab, a freshly
+//! added and shows a one-line error), a row click edits that script in place
+//! (prefilled editor, same id/position/enabled flag), every mutation —
+//! toggle / save / edit / delete — rebroadcasts the **enabled-only** set to
+//! every live tab, a freshly
 //! opened tab is seeded with the current set, the container manager and the
 //! menu never stack, and the toggled flag lands on disk (the storage round
 //! trip itself is covered by `src/userscripts.rs` and ironsurf-storage).
@@ -142,10 +144,61 @@ fn userscript_menu_persists_and_broadcasts_the_enabled_set() {
     });
 
     // ── Delete: row removed, wire follows ────────────────────────────────────
+    // ── Row click → inline edit: prefilled, and Save writes **in place** ────
+    let (dark_id, quiet_id) = (scripts()[0].id, scripts()[1].id);
+    ui.invoke_us_edit(0);
+    assert!(ui.get_us_editing(), "a row click opens the editor");
+    assert!(ui.get_us_editing_existing(), "…as an edit of the clicked script");
+    assert_eq!(ui.get_us_name().to_string(), "Darkify");
+    assert_eq!(
+        ui.get_us_patterns().to_string(),
+        "*example.com, example.org/docs",
+        "patterns prefill exactly as the row joins them"
+    );
+    assert_eq!(ui.get_us_code().to_string(), "document.title = 'dark';");
+
+    ui.set_us_name("   ".into());
+    ui.invoke_us_save();
+    assert!(ui.get_us_editing(), "a rejected edit keeps the editor up");
+    assert_eq!(scripts()[0].name, "Darkify", "and writes nothing to the Store");
+
+    ui.set_us_name("Darkify v2".into());
+    ui.set_us_code("document.title = 'darker';".into());
+    ui.invoke_us_save();
+    assert!(!ui.get_us_editing(), "an accepted edit closes the editor");
+    assert!(!ui.get_us_editing_existing());
+    let s = scripts();
+    assert_eq!(s.len(), 2, "the edit replaced the script, it did not add one");
+    assert_eq!(s[0].id, dark_id, "an edit keeps its id");
+    assert_eq!(s[1].id, quiet_id, "…and the list order");
+    assert_eq!(
+        (s[0].name.as_str(), s[0].code.as_str()),
+        ("Darkify v2", "document.title = 'darker';")
+    );
+    assert_eq!(rows(&ui)[0].1, "Darkify v2", "the row mirrors the edit");
+
+    // Cancel from an edit discards it; and editing a *disabled* script must
+    // not flip its flag back on (the CheckBox owns `enabled`, not the editor).
+    ui.invoke_us_toggle(1);
+    ui.invoke_us_edit(1);
+    ui.set_us_code("nope".into());
+    ui.invoke_us_cancel();
+    assert_eq!(scripts()[1].code, "console.log(2);", "Cancel discards the edit");
+    ui.invoke_us_edit(1);
+    ui.set_us_name("Quiet-ish".into());
+    ui.invoke_us_save();
+    assert_eq!(scripts()[1].name, "Quiet-ish");
+    assert!(!scripts()[1].enabled, "the edit kept the checkbox's flag");
+    wait_for("the wire still carries only the enabled script", || {
+        pump();
+        status(&ui) == format!("userscripts:[{dark_id}]")
+    });
+
+    // ── Delete: row removed, wire follows ────────────────────────────────
     ui.invoke_us_delete(1);
     let s = scripts();
     assert_eq!(s.len(), 1);
-    assert_eq!(s[0].name, "Darkify");
+    assert_eq!(s[0].name, "Darkify v2");
     assert_eq!(rows(&ui).len(), 1);
     wait_for("the delete rebroadcasts the rest", || {
         pump();

@@ -578,11 +578,15 @@ UI (`crates/ironsurf-shell/ui/ironsurf.slint`):
   (LinuxKMS has no popups) — and the two never stack: opening one closes the other. List
   rows from the Store: enable CheckBox (persisted through `Store::set_userscript_enabled`
   the instant it flips), bold name, URL patterns joined by `", "` in dim, ✕ deletes
-  (`Store::delete_userscript`). Footer "+ New script" reveals an inline editor (name and
-  patterns `LineEdit` — patterns comma/space-separated — plus a multi-line `TextInput`
-  for the code); Save upserts via `Store::upsert_userscript` with an id from
-  `next_userscript_id`, and a rejected script is **not** added — the `StoreError` text
-  shows as a one-line error while the draft stays. Broadcast policy: after every mutation
+  (`Store::delete_userscript`). Clicking a row **anywhere but its CheckBox/✕** (a
+  bottom-z `TouchArea` — the layouts above it are click-transparent) edits that script:
+  the same inline editor, prefilled (patterns rejoined as displayed), headed "Edit
+  userscript". Footer "+ New script" reveals it empty, headed "New userscript". Either
+  way Save upserts via `Store::upsert_userscript` — a **new** draft takes the id from
+  `next_userscript_id` (read per Save; two Saves never collide), an **edit** keeps the
+  row's id, its list position, and its stored `enabled` flag (the CheckBox owns that,
+  the editor never flips it) — and a rejected script is **not** written: the `StoreError`
+  text shows as a one-line error while the draft stays; Cancel drops the draft/edit. Broadcast policy: after every mutation
   (and at tab spawn/respawn) the shell sends `ToTab::SetUserscripts` with **all enabled**
   scripts to every live tab, best effort — crashed/closed tabs are skipped, send failures
   ignored (the crash reporting owns those); disabled scripts are never sent.

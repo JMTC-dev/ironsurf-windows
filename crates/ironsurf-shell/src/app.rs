@@ -37,7 +37,7 @@ use crate::{AppWindow, ContainerInfo, MenuItem, TabInfo};
 // view-models of the same name are converted into these).
 use crate::{ConsoleRow, NetRow};
 // The pure userscript-menu helpers (src/userscripts.rs).
-use crate::userscripts::{build_new_userscript, enabled_userscripts, userscript_rows};
+use crate::userscripts::{build_new_userscript, enabled_userscripts, parse_patterns, userscript_rows};
 
 /// Fixed palette — **keep in sync** with `palette-color()` in ui/ironsurf.slint.
 pub const PALETTE: [&str; 7] = [
@@ -176,6 +176,11 @@ pub struct Core {
     /// the overlay mutates by row index, the Store (and the wire) speak ids.
     /// Refreshed from the Store whenever the menu list is re-pushed.
     us_ids: RefCell<Vec<u64>>,
+    /// The script the inline editor is **editing** (row clicked): Some(id)
+    /// upserts in place on Save (same id, same list position, `enabled`
+    /// carried through); `None` is a fresh "+ New script" draft that takes
+    /// the next id. Cleared on Save, Cancel, and every menu (re)open.
+    us_edit_id: RefCell<Option<u64>>,
 }
 
 /// The assembled application: core + the timers that drive it (owned so
@@ -221,6 +226,7 @@ impl App {
             dt_console: Rc::new(VecModel::default()),
             dt_net: Rc::new(VecModel::default()),
             us_ids: RefCell::new(Vec::new()),
+            us_edit_id: RefCell::new(None),
         });
 
         core.attach_callbacks(ui);
@@ -1220,10 +1226,13 @@ impl Core {
     /// [`Core::manager_open`]).
     fn userscript_menu(&self, open: bool) {
         let Some(ui) = self.ui() else { return };
+        debug!("userscript menu {}", if open { "opened" } else { "closed" });
         if open {
             ui.set_manager_open(false);
             ui.set_us_editing(false);
+            ui.set_us_editing_existing(false);
             ui.set_us_error(SharedString::default());
+            *self.us_edit_id.borrow_mut() = None;
             self.us_refresh();
         }
         ui.set_us_menu_open(open);
@@ -1267,17 +1276,42 @@ impl Core {
     /// "+ New script": reveal the inline editor with empty fields.
     fn us_new(&self) {
         let Some(ui) = self.ui() else { return };
+        *self.us_edit_id.borrow_mut() = None;
         ui.set_us_name(SharedString::default());
         ui.set_us_patterns(SharedString::default());
         ui.set_us_code(SharedString::default());
         ui.set_us_error(SharedString::default());
+        ui.set_us_editing_existing(false);
         ui.set_us_editing(true);
     }
 
-    /// Save the editor. Validation is the Store's (`upsert_userscript`): a
-    /// rejected script is **not** added, the editor stays up, and the
-    /// `StoreError` text becomes the menu's one-line error. An accepted one
-    /// (id from `next_userscript_id`) rebroadcasts the new enabled set.
+    /// A row was clicked (anywhere but its CheckBox / ✕): prefill the editor
+    /// with that script and mark the session as an **edit** — Save upserts
+    /// the same id instead of minting a new one. Clicking another row while
+    /// the editor is up simply retargets it (the unsaved draft is dropped).
+    fn us_edit(&self, idx: usize) {
+        let Some(ui) = self.ui() else { return };
+        // Row indices resolve through the row-id mirror, exactly like toggle
+        // and delete; the script itself comes from the Store (the source of
+        // truth, and the only place holding the full code).
+        let Some(id) = self.us_ids.borrow().get(idx).copied() else { return };
+        let Some(script) = self.store.borrow().userscripts().into_iter().find(|s| s.id == id)
+        else { return }; // vanished between refresh and click — nothing to edit
+        *self.us_edit_id.borrow_mut() = Some(id);
+        ui.set_us_name(script.name.as_str().into());
+        ui.set_us_patterns(script.patterns.join(crate::userscripts::PATTERN_SEPARATOR).into());
+        ui.set_us_code(script.code.as_str().into());
+        ui.set_us_error(SharedString::default());
+        ui.set_us_editing_existing(true);
+        ui.set_us_editing(true);
+    }
+
+    /// Save the editor — as a **new** script (next id) or **in place** (the
+    /// id of the row that opened the editor; `enabled` and list position are
+    /// the stored script's, everything else the editor's). Validation is the
+    /// Store's (`upsert_userscript`): a rejected script is **not** added,
+    /// the editor stays up, and the `StoreError` text becomes the menu's
+    /// one-line error. An accepted Save rebroadcasts the new enabled set.
     fn us_save(&self) {
         let Some(ui) = self.ui() else { return };
         let (name, patterns, code) = (
@@ -1285,20 +1319,41 @@ impl Core {
             ui.get_us_patterns().to_string(),
             ui.get_us_code().to_string(),
         );
-        // One id per Save, read from the Store at this instant — the shell is
-        // the only writer and Save is sequential, so `next_userscript_id` is
-        // fresh here; two Saves always produce two distinct scripts. (An
-        // allocator that reads `next` up-front and upserts later hands the
-        // same id out twice — the silent overwrite the userscripts e2e hit.)
-        let id = self.store.borrow().next_userscript_id();
-        let script = build_new_userscript(id, &name, &patterns, &code);
+        let editing = *self.us_edit_id.borrow();
+        let script = match editing {
+            // Edit: keep the id and the enabled flag (the CheckBox owns that);
+            // if the row was deleted out from under the editor, the upsert
+            // simply re-inserts under the still-unused id.
+            Some(id) => Userscript {
+                id,
+                name: name.trim().to_string(),
+                patterns: parse_patterns(&patterns),
+                code,
+                enabled: self
+                    .store
+                    .borrow()
+                    .userscripts()
+                    .iter()
+                    .find(|s| s.id == id)
+                    .is_some_and(|s| s.enabled),
+            },
+            // New: one id per Save, read from the Store at this instant — the
+            // shell is the only writer and Save is sequential, so
+            // `next_userscript_id` is fresh here; two Saves always produce two
+            // distinct scripts. (An allocator that reads `next` up-front and
+            // upserts later hands the same id out twice — the silent overwrite
+            // the userscripts e2e hit.)
+            None => build_new_userscript(self.store.borrow().next_userscript_id(), &name, &patterns, &code),
+        };
         if let Err(err) = self.store.borrow_mut().upsert_userscript(script) {
             warn!("userscript {name:?} rejected: {err}");
             ui.set_us_error(err.to_string().into());
-            return; // script not added; the editor keeps the draft
+            return; // script not added/changed; the editor keeps the draft
         }
+        *self.us_edit_id.borrow_mut() = None;
         ui.set_us_error(SharedString::default());
         ui.set_us_editing(false);
+        ui.set_us_editing_existing(false);
         ui.set_us_name(SharedString::default());
         ui.set_us_patterns(SharedString::default());
         ui.set_us_code(SharedString::default());
@@ -1306,10 +1361,12 @@ impl Core {
         self.us_refresh();
     }
 
-    /// "Cancel": drop the draft, keep the list.
+    /// "Cancel": drop the draft (or the edit), keep the list.
     fn us_cancel(&self) {
         let Some(ui) = self.ui() else { return };
+        *self.us_edit_id.borrow_mut() = None;
         ui.set_us_editing(false);
+        ui.set_us_editing_existing(false);
         ui.set_us_error(SharedString::default());
     }
 
@@ -1824,6 +1881,14 @@ impl Core {
             ui.on_us_delete(move |idx| {
                 if idx >= 0 {
                     c.us_delete(idx as usize);
+                }
+            });
+        }
+        {
+            let c = self.clone();
+            ui.on_us_edit(move |idx| {
+                if idx >= 0 {
+                    c.us_edit(idx as usize);
                 }
             });
         }
