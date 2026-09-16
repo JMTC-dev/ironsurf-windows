@@ -58,6 +58,15 @@ export struct UserscriptRow {
     enabled: bool,
 }
 
+/// One User-Agent-menu row, reduced from the active tab's container value by
+/// `user_agents::ua_menu_rows` (`ua` is the wire string — empty on the
+/// "Default (IronSurf)" row; `active` marks the row matching the container).
+export struct UaRow {
+    label: string,
+    ua: string,
+    active: bool,
+}
+
 /// A tiny borderless toolbar button (cheaper than styled Buttons in rows).
 component MiniButton inherits Rectangle {
     in property <string> label: "";
@@ -255,6 +264,20 @@ export component AppWindow inherits Window {
     in-out property <string> us-patterns: "";
     in-out property <string> us-code: "";
 
+    // User-Agent switcher (task: per-container UA): toggled by the "UA"
+    // toolbar button and scoped to the *active tab's container*. Rust owns
+    // the open flag, re-pushes `ua-rows`/`ua-current` from the Store after
+    // every mutation and after every tab switch, and shows a rejected custom
+    // string as the one-line `ua-error` (the draft in the LineEdit survives).
+    in property <bool> ua-menu-open: false;
+    in property <[UaRow]> ua-rows;
+    in property <string> ua-current: "";
+    in property <string> ua-error: "";
+    // the custom-UA LineEdit (mirrored so the Apply button, a sibling, can
+    // hand its text back — ids are only visible to descendants — and so a
+    // rejected Apply keeps the draft while `ua-error` says why)
+    in-out property <string> ua-custom: "";
+
     // ------------------------------------------------------------------
     // intents surfaced to Rust
     // ------------------------------------------------------------------
@@ -304,6 +327,18 @@ export component AppWindow inherits Window {
     callback us-new();
     callback us-save();
     callback us-cancel();
+
+    // User-Agent-menu intents (indices are rows of `ua-rows`; Rust maps them
+    // back onto preset strings). Every accepted choice persists through the
+    // Store at once and rebroadcasts ToTab::SetUserAgent to the live tabs of
+    // the *container the menu belongs to* only.
+    callback toggle-ua-menu();
+    callback close-ua-menu();
+    callback ua-select(idx: int);
+    callback ua-copy();
+    callback ua-restore-default();
+    // the custom-UA LineEdit → Apply (its current text, blank = default).
+    callback ua-apply-custom(text: string);
 
     // Console severity: icon + colour (error red, warn yellow, info/log grey).
     function devtools-level-icon(level: string) -> string {
@@ -362,6 +397,10 @@ export component AppWindow inherits Window {
 
                 // userscript menu (task: userscript menu)
                 MiniButton { label: "</>"; clicked => { root.toggle-us-menu(); } }
+
+                // User-Agent switcher (task: per-container UA) — same house
+                // pattern as the "</>" button directly to its left.
+                MiniButton { label: "UA"; clicked => { root.toggle-ua-menu(); } }
 
                 // container dropdown: shows the active tab's container,
                 // opens the manager on click
@@ -1012,6 +1051,113 @@ export component AppWindow inherits Window {
                         MiniButton { label: "Cancel"; clicked => { root.us-cancel(); } }
                         Rectangle { horizontal-stretch: 1; }
                     }
+                }
+            }
+        }
+    }
+
+    // ------------------------------------------------------------------------
+    // User-Agent switcher overlay (task: per-container UA)
+    //
+    // Exactly like the userscript menu above and the container manager before
+    // it — a right-docked Rectangle (never a PopupWindow: LinuxKMS has none),
+    // its scrim a TouchArea that closes the menu. Declared last ⇒ on top of
+    // both; Rust closes those when this opens (and vice versa), so no two of
+    // the three ever stack. The menu targets the *active tab's container*.
+    // ------------------------------------------------------------------------
+    Rectangle {
+        x: 0; y: 0;
+        width: root.width; height: root.height;
+        visible: root.ua-menu-open;
+        background: #00000099;
+        ua-scrim := TouchArea { clicked => { root.close-ua-menu(); } }
+
+        ua-panel := Rectangle {
+            TouchArea {} // swallow clicks over the panel
+            x: root.width - self.width;
+            width: Math.min(420px, root.width);
+            height: root.height;
+            background: #1e1e1e;
+
+            VerticalLayout {
+                padding: 12px;
+                spacing: 6px;
+
+                HorizontalLayout {
+                    spacing: 8px;
+                    height: 26px;
+                    Text { text: "User-Agent"; color: #f0f0f0; font-weight: 600; vertical-alignment: center; }
+                    Rectangle { horizontal-stretch: 1; }
+                    MiniButton { label: "✕"; clicked => { root.close-ua-menu(); } }
+                }
+
+                // the container's live value ("Default (IronSurf)" / a preset
+                // name / "Custom"), re-pushed after every mutation
+                Text {
+                    text: "Current: " + root.ua-current;
+                    color: #a8b8c8;
+                    wrap: word-wrap;
+                }
+
+                // one-line validation feedback (a rejected Apply keeps the draft)
+                Text {
+                    visible: root.ua-error != "";
+                    text: root.ua-error;
+                    color: #ef5350;
+                    wrap: word-wrap;
+                }
+
+                for ua[i] in root.ua-rows: Rectangle {
+                    height: 26px;
+                    width: parent.width;
+                    // the active row is highlighted; declared before the text
+                    // ⇒ bottom z-order, so its TouchArea still receives the
+                    // click the layout above lets through (the trap the
+                    // container-manager and userscript rows already fell into).
+                    uabg := Rectangle {
+                        background: ua.active ? #3a3a3a : uata.has-hover ? #2c2c2c : #262626;
+                        border-radius: 4px;
+                    }
+                    uata := TouchArea {
+                        clicked => { root.ua-select(i); }
+                    }
+                    Text {
+                        x: 10px;
+                        max-width: parent.width - 32px;
+                        height: parent.height;
+                        text: ua.label + (ua.active ? "  ✓" : "");
+                        color: ua.active ? #f0f0f0 : #c8c8c8;
+                        font-weight: ua.active ? 600 : 400;
+                        vertical-alignment: center;
+                        overflow: elide;
+                    }
+                }
+
+                Rectangle { vertical-stretch: 1; }
+
+                // ---- footer: copy / restore / custom editor ---------------
+                HorizontalLayout {
+                    height: 28px;
+                    spacing: 6px;
+                    MiniButton { label: "Copy"; clicked => { root.ua-copy(); } }
+                    MiniButton { label: "Restore default"; clicked => { root.ua-restore-default(); } }
+                    Rectangle { horizontal-stretch: 1; }
+                }
+                HorizontalLayout {
+                    height: 28px;
+                    spacing: 6px;
+                    LineEdit {
+                        horizontal-stretch: 1;
+                        text <=> root.ua-custom;
+                        placeholder-text: "custom User-Agent string";
+                        accepted(t) => { root.ua-apply-custom(t); }
+                    }
+                    MiniButton { label: "Apply"; clicked => { root.ua-apply-custom(root.ua-custom); } }
+                }
+                Text {
+                    text: "The choice is persisted for this container and sent to its live tabs; tabs in other containers keep their own User-Agent. New tabs of this container start with it.";
+                    color: #888888;
+                    wrap: word-wrap;
                 }
             }
         }

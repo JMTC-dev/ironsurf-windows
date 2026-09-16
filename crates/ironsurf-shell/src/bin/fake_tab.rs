@@ -22,6 +22,13 @@ fn main() {
     let mut dialog_feed = false;
     let mut cursor = false;
     let mut expect_userscripts = false;
+    // User-Agent-switcher harness (task: per-container UA): the launch
+    // `--user-agent` is this fake tab's *initial* current value (exactly how
+    // the real tab seeds its UA cell), and with `--expect-user-agent` every
+    // current value — the launch one and each inbound ToTab::SetUserAgent —
+    // echoes on the status line as `ua:<value>` (`ua:default` for `None`).
+    let mut expect_user_agent = false;
+    let mut current_ua: Option<String> = None;
 
     let mut it = args.iter().skip(1);
     while let Some(arg) = it.next() {
@@ -61,6 +68,16 @@ fn main() {
             // it carries (comma-joined), so the tests can assert the shell
             // seeded this tab and rebroadcast every mutation.
             "--expect-userscripts" => expect_userscripts = true,
+            "--expect-user-agent" => expect_user_agent = true,
+            // the shell spawns a UA container's tabs with the container's UA;
+            // mirror the real tab: blank/absent ⇒ the built-in default.
+            "--user-agent" => {
+                let v = value("user-agent");
+                let v = v.trim().to_string();
+                if !v.is_empty() {
+                    current_ua = Some(v);
+                }
+            }
             _ => {} // tolerate the real tab's flags
         }
     }
@@ -74,6 +91,18 @@ fn main() {
     emit(FromTab::Ready { tab_id });
     announce(&mut emit, &url, false);
     emit(frame(size)); // like the real tab: a first frame without any Resize
+
+    // The launch UA (from `--user-agent`, when the shell passed one) is the
+    // current value from the very first page load: echo it so a test can see
+    // the spawn path delivered it.
+    if expect_user_agent {
+        emit(FromTab::StatusText {
+            text: Some(format!(
+                "ua:{}",
+                current_ua.clone().unwrap_or_else(|| "default".into())
+            )),
+        });
+    }
 
     if devtools_feed {
         emit_feed(&mut emit, 1);
@@ -192,8 +221,23 @@ fn main() {
                     }
                 }
             }
-            // implemented in a later step (the shell owns the UA switcher)
-            ToTab::SetUserAgent { .. } => {}
+            // The UA switcher's wire (task: per-container UA): replace the
+            // current value and — with `--expect-user-agent` — echo it on the
+            // status line, `ua:default` for `None` (the built-in default).
+            // The real tab never reloads for this; neither does the fake.
+            ToTab::SetUserAgent { user_agent } => {
+                current_ua = user_agent
+                    .map(|v| v.trim().to_string())
+                    .filter(|v| !v.is_empty());
+                if expect_user_agent {
+                    emit(FromTab::StatusText {
+                        text: Some(format!(
+                            "ua:{}",
+                            current_ua.clone().unwrap_or_else(|| "default".into())
+                        )),
+                    });
+                }
+            }
             ToTab::Key(_) | ToTab::Scroll(_) | ToTab::SetVisible { .. } => {}
 
             ToTab::Clipboard { .. } => {} // cache push: nothing to edit here

@@ -16,6 +16,7 @@ pub mod classify;
 pub mod keymap;
 pub mod state;
 pub mod tabs;
+pub mod user_agents;
 pub mod userscripts;
 
 pub mod app;

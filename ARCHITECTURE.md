@@ -625,6 +625,20 @@ UI (`crates/ironsurf-shell/ui/ironsurf.slint`):
   (and at tab spawn/respawn) the shell sends `ToTab::SetUserscripts` with **all enabled**
   scripts to every live tab, best effort — crashed/closed tabs are skipped, send failures
   ignored (the crash reporting owns those); disabled scripts are never sent.
+- User-Agent switcher (top-bar "UA" button, right of "</>", toggles it): the same
+  right-docked overlay Rectangle (never a `PopupWindow`), and no two of the three
+  full-window overlays (manager / userscripts / UA) ever stack — each open closes the
+  others. The menu targets the **active tab's container**: rows are "Default
+  (IronSurf)" first, then the five `BUILTIN_USER_AGENTS` presets, the row matching the
+  stored value highlighted (pure `user_agents::ua_menu_rows`/`ua_display`); Copy puts the
+  *effective* UA on the session clipboard (the tab default when there is no override),
+  "Restore default" clears it, and a custom LineEdit + Apply normalises (trim; blank =
+  default) before `Store::set_container_user_agent` — a rejected string shows its
+  `StoreError` on the one line with the draft kept and nothing written. Every accepted
+  change broadcasts `ToTab::SetUserAgent` to that container's **live tabs only** (tabs
+  of other containers never receive it), and spawn/respawn of a UA container's tab
+  appends `--user-agent <ua>` to that spawn alone (per-spawn args; the first page load
+  already sends it).
 - Menu (native or in-toolbar): New Window(v1: new tab), Close Tab (Ctrl-W), Tab Next/Prev
   (Ctrl-Tab), Open Container Manager, Clear Container Data.
 

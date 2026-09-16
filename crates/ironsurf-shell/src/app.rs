@@ -38,6 +38,24 @@ use crate::{AppWindow, ContainerInfo, MenuItem, TabInfo};
 use crate::{ConsoleRow, NetRow};
 // The pure userscript-menu helpers (src/userscripts.rs).
 use crate::userscripts::{build_new_userscript, enabled_userscripts, parse_patterns, userscript_rows};
+// The pure User-Agent-switcher helpers (src/user_agents.rs).
+use crate::user_agents::{normalize_custom_ua, ua_display, ua_menu_rows};
+
+/// The tab's built-in User-Agent — what a container **without** an override
+/// sends, and what the UA menu's Copy button copies in that case. Duplicate
+/// of `ironsurf-tab`'s `netmod::USER_AGENT` (the tab binary is not a library
+/// dependency); keep the two strings in sync.
+pub const DEFAULT_USER_AGENT: &str = "Mozilla/5.0 (X11; Linux x86_64; IronSurf/0.1)";
+
+/// The stored UA override of `container` (trimmed; blank stored values are
+/// treated as "no override", matching what `Store::set_container_user_agent`
+/// writes). `None` = the container uses the tab's built-in default.
+fn container_user_agent(store: &ironsurf_storage::Store, container: ContainerId) -> Option<String> {
+    store
+        .container(container)
+        .and_then(|c| c.user_agent.clone())
+        .filter(|ua| !ua.trim().is_empty())
+}
 
 /// Fixed palette — **keep in sync** with `palette-color()` in ui/ironsurf.slint.
 pub const PALETTE: [&str; 7] = [
@@ -387,9 +405,18 @@ impl Core {
     }
 
     fn open_tab(&self, container: ContainerId, url: Option<&str>) {
+        // Per-spawn argument list: the shared `extra_tab_args` plus this
+        // container's UA override (task: per-container UA), so the very first
+        // page load of a fresh tab already sends the stored string. Built
+        // per spawn — `self.extra_tab_args` is never mutated.
         let (profile_dir, tab_bin, extra) = {
             let store = self.store.borrow();
-            (store.profile_dir(container), self.tab_bin.clone(), self.extra_tab_args.clone())
+            let mut extra = self.extra_tab_args.clone();
+            if let Some(ua) = container_user_agent(&store, container) {
+                extra.push("--user-agent".to_string());
+                extra.push(ua);
+            }
+            (store.profile_dir(container), self.tab_bin.clone(), extra)
         };
         let id = {
             let id = TabId(self.next_tab_id.get());
@@ -429,6 +456,8 @@ impl Core {
         }
         self.set_visible_except();
         self.sync_ui();
+        // A new tab activates: an open UA menu re-points to its container.
+        self.ua_refresh_if_open();
     }
 
     fn close_tab(&self, idx: usize) {
@@ -633,6 +662,9 @@ impl Core {
             }
         }
         self.sync_ui();
+        // The UA menu (if open) follows the activation: the new tab's
+        // container's value, rows, and error line replace the previous one's.
+        self.ua_refresh_if_open();
     }
 
     fn cycle_tab(&self) {
@@ -1045,8 +1077,10 @@ impl Core {
         let Some(ui) = self.ui() else { return };
         if open {
             // Two full-window overlays never stack: opening the manager shuts
-            // the userscript menu (and vice versa — see `userscript_menu`).
+            // the userscript menu and the UA switcher (and vice versa — see
+            // `userscript_menu` and `ua_menu`).
             ui.set_us_menu_open(false);
+            ui.set_ua_menu_open(false);
             let active_container = self
                 .active_proc_index()
                 .map(|i| self.procs.borrow()[i].tab.container)
@@ -1083,13 +1117,23 @@ impl Core {
         let profile_dir = self.store.borrow().profile_dir(cid);
         let (w, h) = self.page_size();
         info!("moving tab {id} to container {}: respawning the process", cid.0);
+        // The respawn rides the destination container's UA exactly like
+        // `open_tab` does — a per-spawn list, `extra_tab_args` untouched.
+        let extra = {
+            let mut extra = self.extra_tab_args.clone();
+            if let Some(ua) = container_user_agent(&self.store.borrow(), cid) {
+                extra.push("--user-agent".to_string());
+                extra.push(ua);
+            }
+            extra
+        };
         let replacement = TabProc::spawn(
             &self.tab_bin,
             id,
             cid,
             &profile_dir,
             url.as_deref(),
-            &self.extra_tab_args.iter().map(String::as_str).collect::<Vec<&str>>(),
+            &extra.iter().map(String::as_str).collect::<Vec<&str>>(),
             &self.sink,
         );
         if let Ok(tab) = replacement {
@@ -1228,7 +1272,10 @@ impl Core {
         let Some(ui) = self.ui() else { return };
         debug!("userscript menu {}", if open { "opened" } else { "closed" });
         if open {
+            // Never stack: the manager and the UA switcher both step aside —
+            // and close this menu the same way from their own open legs.
             ui.set_manager_open(false);
+            ui.set_ua_menu_open(false);
             ui.set_us_editing(false);
             ui.set_us_editing_existing(false);
             ui.set_us_error(SharedString::default());
@@ -1400,6 +1447,144 @@ impl Core {
     fn seed_userscripts(&self, tid: TabId) {
         let scripts = self.us_payload();
         let _ = self.send_to(tid, ToTab::SetUserscripts { scripts });
+    }
+
+    // ---- User-Agent switcher (task: per-container UA) -------------------------
+
+    /// The container of the active tab — the one the UA menu reads and
+    /// mutates (and the container manager selects on open).
+    fn active_container(&self) -> ContainerId {
+        self.active_proc_index()
+            .map(|i| self.procs.borrow()[i].tab.container)
+            .unwrap_or_else(|| self.store.borrow().default_container_id())
+    }
+
+    /// Push the menu's live state for the active tab's container: the
+    /// `ua-current` display label and the `ua-rows` list (default row first,
+    /// then the five presets, the container's value highlighted). Called on
+    /// every (re)open, after every mutation, and on every tab switch.
+    fn ua_state(&self, ui: &AppWindow) {
+        let current = container_user_agent(&self.store.borrow(), self.active_container());
+        ui.set_ua_current(ua_display(current.as_deref()).as_str().into());
+        ui.set_ua_rows(ModelRc::from(Rc::new(VecModel::from(ua_menu_rows(
+            current.as_deref(),
+        )))));
+    }
+
+    /// A tab switch moved the menu to another container: re-point rows and
+    /// current label (and drop the previous container's stale error line).
+    fn ua_refresh_if_open(&self) {
+        if let Some(ui) = self.ui() {
+            if ui.get_ua_menu_open() {
+                self.ua_state(&ui);
+                ui.set_ua_error(SharedString::default());
+            }
+        }
+    }
+
+    /// Open/close the UA overlay. Opening re-reads the Store for the active
+    /// tab's container, prefills the custom draft with the container's raw
+    /// value, and closes the userscript menu **and** the container manager —
+    /// two full-window overlays never stack, and both close this one the same
+    /// way (see [`Core::manager_open`] / [`Core::userscript_menu`]).
+    fn ua_menu(&self, open: bool) {
+        let Some(ui) = self.ui() else { return };
+        debug!("user-agent menu {}", if open { "opened" } else { "closed" });
+        if open {
+            ui.set_manager_open(false);
+            ui.set_us_menu_open(false);
+            ui.set_ua_error(SharedString::default());
+            let current = container_user_agent(&self.store.borrow(), self.active_container());
+            // Prefill the draft with exactly what the container holds (a
+            // custom string shows itself; a preset or the default starts
+            // blank — like the userscript editor prefilling its row).
+            let draft = current
+                .filter(|ua| ironsurf_common::builtin_user_agent_label(ua).is_none())
+                .unwrap_or_default();
+            ui.set_ua_custom(draft.as_str().into());
+            self.ua_state(&ui);
+        }
+        ui.set_ua_menu_open(open);
+    }
+
+    /// The toolbar's "UA" button: flip the overlay.
+    fn toggle_ua_menu(&self) {
+        let open = self.ui().is_some_and(|ui| ui.get_ua_menu_open());
+        self.ua_menu(!open);
+    }
+
+    /// Persist `ua` for the container the menu currently targets and push it
+    /// onto that container's live tabs. A Store rejection (bad characters,
+    /// too long) rides the one-line `ua-error` and changes nothing at all —
+    /// rows, stored value, and the wire stay as they were, exactly like the
+    /// userscripts Save leg.
+    fn apply_ua(&self, ui: &AppWindow, ua: Option<&str>) {
+        let cid = self.active_container();
+        if let Err(err) = self.store.borrow_mut().set_container_user_agent(cid, ua) {
+            warn!("container {} rejected a user agent: {err}", cid.0);
+            ui.set_ua_error(err.to_string().into());
+            return;
+        }
+        ui.set_ua_error(SharedString::default());
+        self.ua_broadcast(cid, ua);
+        self.ua_state(ui);
+    }
+
+    /// A row was clicked: select that UA for the container. Row indices
+    /// resolve through the pushed `ua-rows` model — row 0 (empty `ua`) is
+    /// "Default (IronSurf)", the others carry their preset string verbatim.
+    fn ua_select(&self, idx: usize) {
+        let Some(ui) = self.ui() else { return };
+        let Some(row) = ui.get_ua_rows().row_data(idx) else { return };
+        let ua = if row.ua.is_empty() { None } else { Some(row.ua.as_str()) };
+        self.apply_ua(&ui, ua);
+    }
+
+    /// "Restore default": the container drops its override.
+    fn ua_restore_default(&self) {
+        if let Some(ui) = self.ui() {
+            self.apply_ua(&ui, None);
+        }
+    }
+
+    /// The custom-UA LineEdit → Apply: [`normalize_custom_ua`] first (trim;
+    /// all-blank = restore the default), then the same Store leg as a row
+    /// pick. A rejected string shows on the one line **with the draft kept**;
+    /// an accepted one clears the draft and updates rows and label.
+    fn ua_apply_custom(&self, input: &str) {
+        let Some(ui) = self.ui() else { return };
+        let normalized = normalize_custom_ua(input);
+        self.apply_ua(&ui, normalized.as_deref());
+        if container_user_agent(&self.store.borrow(), self.active_container()) == normalized {
+            // only after success — on rejection the draft must survive as typed
+            ui.set_ua_custom(SharedString::default());
+        }
+    }
+
+    /// "Copy": the *effective* UA of the menu's container on the session
+    /// clipboard — the override if there is one, the tab default otherwise.
+    fn ua_copy(&self) {
+        let effective = container_user_agent(&self.store.borrow(), self.active_container())
+            .unwrap_or_else(|| DEFAULT_USER_AGENT.to_string());
+        self.clipboard_set(&effective);
+    }
+
+    /// After any accepted mutation: push the new value to every **live** tab
+    /// of that container only — tabs in other containers must not receive it
+    /// (each tab applies its own container's value). Crashed and closed tabs
+    /// are skipped and send failures ignored, exactly like
+    /// [`Core::us_broadcast`] — the crash reporter owns those tabs.
+    fn ua_broadcast(&self, container: ContainerId, ua: Option<&str>) {
+        let mut procs = self.procs.borrow_mut();
+        for p in procs.iter_mut() {
+            if p.tab.container != container || p.crashed || p.state.closed {
+                continue;
+            }
+            let msg = ToTab::SetUserAgent { user_agent: ua.map(str::to_string) };
+            if let Err(err) = p.tab.send(msg) {
+                debug!("user agent not delivered to tab {}: {err}", p.tab.id);
+            }
+        }
     }
 
     // ---- persistence -------------------------------------------------------------
@@ -1891,6 +2076,27 @@ impl Core {
                     c.us_edit(idx as usize);
                 }
             });
+        }
+
+        // User-Agent switcher (task: per-container UA): the toolbar toggle,
+        // the scrim/✕ close, and the row/footer intents — every accepted
+        // mutation lands in the Store at once and rebroadcasts
+        // ToTab::SetUserAgent to the live tabs of that container only.
+        bind0!(on_toggle_ua_menu, |c: &Rc<Core>| c.toggle_ua_menu());
+        bind0!(on_close_ua_menu, |c: &Rc<Core>| c.ua_menu(false));
+        bind0!(on_ua_copy, |c: &Rc<Core>| c.ua_copy());
+        bind0!(on_ua_restore_default, |c: &Rc<Core>| c.ua_restore_default());
+        {
+            let c = self.clone();
+            ui.on_ua_select(move |idx| {
+                if idx >= 0 {
+                    c.ua_select(idx as usize);
+                }
+            });
+        }
+        {
+            let c = self.clone();
+            ui.on_ua_apply_custom(move |text| c.ua_apply_custom(text.as_str()));
         }
     }
 }

@@ -1,4 +1,9 @@
 # Task log
+## #45 Per-container UA switcher in the shell (step 4/5): "UA" MiniButton right of "</>" → right-docked overlay (house pattern; manager/US/UA
+  never stack). Default row + 5 BUILTIN_USER_AGENTS presets, container value highlighted (pure src/user_agents.rs, 4 units). Mutations via
+  Store::set_container_user_agent for the ACTIVE tab's container, broadcast SetUserAgent to THAT container's live tabs only; Copy ⇒ effective
+  UA (tab-default const when None), custom Apply keeps the draft on StoreError; spawn/respawn appends --user-agent per-spawn (extra_tab_args
+  never mutated). fake_tab --expect-user-agent (launch --user-agent = current), tests/user_agent.rs e2e green; shell 57u + all suites, ws clean.
 ## #44 Per-container UA applied in the tab (step 3/5): effective UA cell (netmod::SharedUserAgent=Arc<Mutex<String>>) seeded by new
   --user-agent (absent/blank⇒USER_AGENT), replaced in place by SetUserAgent (Some(v)⇒v.trim(); empty/None⇒default; no reload). One cell
   feeds every request — documents (fetch_document* report forms take it; wrappers default), form POSTs, redirect hops, subresources
