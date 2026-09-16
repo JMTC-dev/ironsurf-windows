@@ -120,10 +120,12 @@ impl TabState {
                 false
             }
             // Actions for the pump (spawn a new tab, open the context menu,
-            // file the copy into the session clipboard), not per-tab state.
+            // file the copy into the session clipboard, show the modal
+            // dialog overlay), not per-tab state.
             FromTab::OpenLinkInNewTab { .. } => false,
             FromTab::ContextMenu { .. } => false,
             FromTab::ClipboardText { .. } => false,
+            FromTab::DialogRequest { .. } => false,
             FromTab::Frame { .. } => false,
             FromTab::Closed => {
                 if self.closed {

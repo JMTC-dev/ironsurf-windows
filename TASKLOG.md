@@ -1,4 +1,15 @@
 # Task log
+## #35 window.alert/confirm/prompt as real synchronous modals: common +FromTab::DialogRequest{dialog_id,kind,message,default}
+  +ToTab::DialogResponse{dialog_id,confirmed,text} (DialogKind, MAX_DIALOG_MESSAGE 64 KiB, round-trip tests). Tab: DialogHost
+  (runtime.rs) blocks the calling script in place — poll+read+decode stdin, every other ToTab deferred FIFO (take_deferred) and
+  replayed by drain_stdin after the answer; js.rs __ironsurfDialog native + prelude trio (alert undefined, confirm bool, prompt
+  string|null; default prefills only the box). EOF/broken stdout/no host ⇒ cancelled, never a hang. Shell: FIFO dialog queue
+  (several tabs may each block), centred Slint overlay (scrim dead TouchArea, prompt LineEdit, OK/Cancel, prompt-Enter), requesting
+  tab activated; answer/rollback on close/crash/reap (state.rs DialogRequest ⇒ false). fake_tab --dialog (+--crash order); tests:
+  tab tests/dialogs.rs (3 real-engine localhost: trio return shapes, deferred Navigate in order, cancel false/null, EOF-cancel + exit
+  0), shell tests/dialogs.rs (queue/activation/prompt text/cancel) + tests/dialog_crash.rs (crash closes the overlay); tab 178u,
+  shell 60, common 23 all green; live :2.0 run (xdotool --window hover-then-XTEST click): alert OK, confirm Cancel, prompt default
+  "Marty" edited → Enter, page title reads the answers. CLI: -u/--url start URL (usage error without value) and -h/--help usage.
 ## #34 DevTools verified end to end + docs/screenshots: new crates/ironsurf-shell/tests/devtools_e2e.rs spawns the REAL ironsurf-tab
   through the shell TabProc pump on a std::net localhost fixture — asserts the full console feed (js log/error, broken script + tab
   alive, dom + css source entries) and NetworkEvents (document + <img> valid-PNG, exact bytes, method/status/duration sane, status⊕error)
@@ -63,33 +74,6 @@ HttpOnly persisted+sent normally, scripts have zero cookie access; per-container
 cross-host, Passthrough nav), runtime ptr_eq shared-jar test; ARCH cookie rules+net layer updated; workspace green,
 live example.com real_tab ok.
 
-## #19 FIX container manager "New" dead — row's selta TouchArea was declared AFTER the row content:
-last-declared TouchArea wins hit-testing (proven with scratch slint/test-backend repro), so it swallowed
-New/Move tab/Delete/Ren clicks (only ever fired mgr-select). selta moved first in the row (bottom z) ⇒
-buttons clickable, row still selects. Same latent bug fixed in tab strip: tabta after xt killed the ✕ —
-tabta first, ✕ in a glyph-sized Rectangle (bare TouchArea would fill the tab). Verified live on :2.0
-via xdotool: New spawns tab 2, row-click selects, ＋ works, ✕ closes; shell suite green.
-## #20 HTML <form> end to end — new src/forms.rs: spec entry list (tree order, form=/ancestor
-owner, disabled/nameless/datalist out, checkbox/radio checkedness, live editor text, select
-selectedness), GET query / POST bodies per enctype (urlencoded, text/plain, multipart), triggers
-= armed submit press finalised on release (JS click preventDefault cancels; our entry list
-replaces blitz's select-less one) + implicit Enter (not fed to blitz); selects clickable
-(selected attr+highlight, value attr synced), prepare_document seeds textarea editors; POST rides
-netmod::fetch_document_post/MainDocPost (real POST, never cached); GET works for file:/ironsurf:
-(blitz drops), POST to local schemes = honest status; JS events replay via __ironsurfFire
-(mousedown/up/click, keydown/up) + .value/.checked bindings (live editor); welcome page is a
-working form demo echoing its query. 88u + all integration suites green; ARCH §HTML forms.
-## #21 page zoom — common: +ToTab::SetZoom{zoom} (+round-trips, ARCH §5); tab: zoom state feeds
-Viewport::zoom (blitz hidpi×zoom), SetZoom → set_viewport restyle + forced frame, logical→CSS px
-for pointer coords + pixel wheel deltas (÷zoom), zoom survives navigation (fresh docs inherit) and
-NaN/negative rejected; shell keymap: Ctrl-=/+/−/0 chords, ×÷1.1 whole-percent steps clamped 30–500%,
-per-tab factor + "Zoom N%" status. Live xdotool 100→133% repaints (98.9k px differ); workspace green.
-## #22 FIX inverted mouse wheel — ironsurf.slint negated Slint's wheel deltas before IPC, but Slint hands
-over winit's deltas untouched and blitz beta.2 speaks that very convention (positive delta_y = scroll UP:
-handle_wheel → scroll_chain_by feeds ScrollAmount::By{-x,-y}), so that extra flip reversed the wheel. Handler
-now passes delta-x/delta-y verbatim; convention pinned in common::ScrollEvent docs + ARCH ToTab section and
-by the new tab test wheel_down_scrolls_the_document_down_and_wheel_up_back_up (pixel deltas, 20px notch, clamp
-at the top); workspace green.
 ## video wired — media engine live in the tab. runtime.rs: attach_video_widgets (blitz set_custom_widget + width/height attrs → VideoWidget::with_size_hint, 640×360 fallback, per-tick re-scan for late <video>), fetch worker threads (SelfPipe + results queue, container cookies/policy, 2xx + MAX_VIDEO_BYTES only), pump_media after run_due_timers with MEDIA_TICK=40ms capping the poll sleep, PlayerEvent→DOM events via __ironsurfFire, catch_unwind media_guard on every step; --no-media master switch. js.rs: __ironsurfMediaGet/MediaCmd natives + NodeProto HTMLMediaElement glue (currentTime/duration/paused/ended/playbackRate/muted/videoWidth/videoHeight/mediaError, play/pause/canPlayType, instanceof HTMLMediaElement), page writes queue MediaCommands the loop applies (MediaHost cell in HostState). Spec APIs adapted to shipped blitz 0.3 (set_custom_widget not Node::Widget; SelfPipe not to_main; std::thread not tokio); /tmp/vid/flower.mp4 is 960×540 (tests assert the demuxer's own reading). cargo test -p ironsurf-tab 190 green; cargo check --workspace clean (ironsurf-net/-session/-ironsurf are not packages in this tree).
 ## Ctrl-L/F6 now highlight the whole URL-bar address: UrlBar's focus-token handler pairs edit.focus() with
   edit.select-all() (Slint 1.17 LineEdit), so one character typed after the chord replaces the address (placeholder

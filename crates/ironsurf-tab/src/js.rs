@@ -46,6 +46,7 @@
 
 use std::cell::RefCell;
 use std::rc::Rc;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use boa_engine::property::Attribute;
@@ -56,7 +57,7 @@ use url::Url;
 
 // Page-side diagnostics: `console.*` and script errors go to stderr at the
 // level the page itself asked for (see [`log_console`]).
-use ironsurf_common::{error, info, trace, warn};
+use ironsurf_common::{error, info, trace, warn, DialogKind};
 
 /// Emit one `console.*` line to stderr at the level the page chose.
 /// The same line also reaches the shell (status text) via the host capture.
@@ -301,6 +302,11 @@ pub struct HostState {
     /// queue commands the poll loop applies to the real players. The type
     /// lives in `runtime` — the tab owns both ends of this cell.
     pub media: crate::runtime::MediaHost,
+    /// `window.alert`/`confirm`/`prompt` host (task: JS dialogs): `Some` in a
+    /// live IPC tab (the native blocks there until the shell answers — see
+    /// [`crate::runtime::DialogHost`]); `None` (bare JS tests, the headless
+    /// harness) makes `confirm` read `false` and `prompt` read `null`.
+    pub dialog: Option<Arc<crate::runtime::DialogHost>>,
 }
 
 impl HostState {
@@ -1955,6 +1961,14 @@ fn with_timers<R>(f: impl FnOnce(&mut TimerQueue) -> R) -> Option<R> {
     Some(outcome)
 }
 
+/// The active host's dialog cell (task: JS dialogs). The `Arc` is cloned out
+/// before `ask` blocks — no host borrow is ever held across the modal wait.
+fn active_dialog() -> Option<Arc<crate::runtime::DialogHost>> {
+    ACTIVE_HOSTS
+        .with(|stack| stack.borrow().last().cloned())
+        .and_then(|scope| scope.host.borrow().dialog.clone())
+}
+
 // ---------------------------------------------------------------------------
 // Bindings
 
@@ -1974,6 +1988,7 @@ mod native {
     pub(super) const TIMER_CLEAR: &str = "__ironsurfClearTimer";
     pub(super) const MEDIA_GET: &str = "__ironsurfMediaGet";
     pub(super) const MEDIA_CMD: &str = "__ironsurfMediaCmd";
+    pub(super) const DIALOG: &str = "__ironsurfDialog";
 }
 
 /// One-shot delay used for `requestAnimationFrame` (~60 Hz; the tab has no
@@ -3059,6 +3074,28 @@ const PRELUDE: &str = r##"
     assert: function () {},
   };
 
+  // ---------------------------------------------------------------------
+  // window.alert / confirm / prompt (task: JS dialogs). The native blocks
+  // the calling script right where it stands — real modal semantics — until
+  // the shell's dialog is dismissed, then answers: alert `undefined`,
+  // confirm the button, prompt the text or `null` (cancelled). With no
+  // dialog host (headless, bare tests) the native answers cancelled at once.
+  // ---------------------------------------------------------------------
+  function dialogMessage(value) {
+    return value === undefined ? "" : String(value);
+  }
+  host.alert = function (message) {
+    host.__ironsurfDialog("alert", dialogMessage(message), null);
+  };
+  host.confirm = function (message) {
+    return host.__ironsurfDialog("confirm", dialogMessage(message), null) === true;
+  };
+  host.prompt = function (message, def) {
+    // Spec: `prompt(msg)` prefills the empty string.
+    var fallback = def === undefined || def === null ? "" : String(def);
+    return host.__ironsurfDialog("prompt", dialogMessage(message), fallback);
+  };
+
   // `document`/`console` as globals (and thus as `window.document`/etc, since
   // window IS the global object).
   host.document = document;
@@ -3184,6 +3221,62 @@ pub fn build_context(host: &HostRef, _timers: &Rc<RefCell<TimerQueue>>) -> Conte
         }),
     ) {
         error!("js binding `location` failed to install: {err}");
+    }
+    // window.alert/confirm/prompt (task: JS dialogs): every argument is
+    // coerced first (a page's own `valueOf`/`toString` could re-enter JS),
+    // then — with a dialog host attached — the call BLOCKS the script until
+    // the shell dismisses its dialog. The return shape is the native's call
+    // per kind: alert `undefined`, confirm a boolean, prompt a string or
+    // `null`; without a host the cancelled readings come back immediately.
+    if let Err(err) = context.register_global_builtin_callable(
+        JsString::from(native::DIALOG),
+        3,
+        NativeFunction::from_copy_closure(|_this, args, context| {
+            let kind_raw = args
+                .first()
+                .cloned()
+                .unwrap_or(JsValue::undefined())
+                .to_string(context)?
+                .to_std_string_escaped();
+            let message = args
+                .get(1)
+                .cloned()
+                .unwrap_or(JsValue::undefined())
+                .to_string(context)?
+                .to_std_string_escaped();
+            let default = match args.get(2) {
+                Some(value) if !value.is_undefined() && !value.is_null() => Some(
+                    value
+                        .to_string(context)?
+                        .to_std_string_escaped(),
+                ),
+                _ => None,
+            };
+            let kind = match kind_raw.as_str() {
+                "confirm" => DialogKind::Confirm,
+                "prompt" => DialogKind::Prompt,
+                _ => DialogKind::Alert,
+            };
+            let reply = match active_dialog() {
+                Some(host) => host.ask(kind, &message, default.as_deref()),
+                // No IPC shell behind this context (tests, headless): the
+                // cancelled answer, no wait.
+                None => crate::runtime::DialogReply::default(),
+            };
+            Ok(match kind {
+                DialogKind::Alert => JsValue::undefined(),
+                DialogKind::Confirm => JsValue::from(reply.confirmed),
+                DialogKind::Prompt => {
+                    if reply.confirmed {
+                        JsValue::from(JsString::from(reply.text.unwrap_or_default()))
+                    } else {
+                        JsValue::null()
+                    }
+                }
+            })
+        }),
+    ) {
+        error!("js binding `dialog` failed to install: {err}");
     }
     // Timers: real queue entries the tab's poll loop executes. A non-callable
     // callback schedules nothing and reads as id 0 (what browsers do).
@@ -3684,6 +3777,47 @@ mod tests {
             Some("Parsed Title"),
             Some(" body text ".to_string()),
         )))
+    }
+
+    /// With no dialog host attached (bare tests; the headless harness), the
+    /// three window dialogs exist on `window` and answer their cancelled
+    /// readings at once — `confirm` false, `prompt` null, `alert` undefined —
+    /// and never throw.
+    #[test]
+    fn dialogs_answer_cancelled_without_a_host() {
+        let host = sample_host();
+        assert!(
+            host.borrow().dialog.is_none(),
+            "a bare test host has no shell to answer dialogs"
+        );
+        assert_eq!(
+            eval_snippet("typeof alert === 'function' && typeof window.alert === 'function'", &host)
+                .as_boolean(),
+            Some(true),
+            "alert must exist as a window function"
+        );
+        assert_eq!(
+            eval_snippet("typeof confirm === 'function' && typeof prompt === 'function'", &host)
+                .as_boolean(),
+            Some(true),
+            "confirm/prompt must exist as window functions"
+        );
+        assert!(eval_snippet("window.alert('hi'); 'done'", &host)
+            .as_string()
+            .is_some());
+        assert!(eval_snippet("alert(undefined); 'ok'", &host).as_string().is_some());
+        assert_eq!(eval_snippet("confirm('Delete?')", &host).as_boolean(), Some(false));
+        assert!(
+            eval_snippet("prompt('Name?', 'Ada')", &host).is_null(),
+            "a cancelled prompt reads null, never the default"
+        );
+        assert!(eval_snippet("window.prompt('Name?')", &host).is_null());
+        // `window` IS the global object, so the trio is identity-stable.
+        assert_eq!(
+            eval_snippet("window.alert === alert && window.confirm === confirm", &host)
+                .as_boolean(),
+            Some(true)
+        );
     }
 
     #[test]

@@ -7,8 +7,8 @@
 use std::io::BufReader;
 
 use ironsurf_common::{
-    read_frame, write_frame, ContextAction, ContextTarget, ContainerId, FromTab, MouseButton,
-    PointerKind, TabId, ToTab,
+    read_frame, write_frame, ContextAction, ContextTarget, ContainerId, DialogKind, FromTab,
+    MouseButton, PointerKind, TabId, ToTab,
 };
 
 fn main() {
@@ -19,6 +19,7 @@ fn main() {
     let mut size = (400u32, 300u32);
     let mut crash = false;
     let mut devtools_feed = false;
+    let mut dialog_feed = false;
 
     let mut it = args.iter().skip(1);
     while let Some(arg) = it.next() {
@@ -44,6 +45,10 @@ fn main() {
             // testable without an engine: one batch at startup, one more after
             // every Reload.
             "--devtools-feed" => devtools_feed = true,
+            // Scripted JS dialogs (task: window.alert/confirm/prompt): one
+            // alert at startup, then one prompt after every Reload — each
+            // echoed back on the status line when the shell answers it.
+            "--dialog" => dialog_feed = true,
             _ => {} // tolerate the real tab's flags
         }
     }
@@ -62,7 +67,26 @@ fn main() {
         emit_feed(&mut emit, 1);
     }
 
+    // The scripted dialogs: `dialog_seq` is the next request id (the shell
+    // must answer it before this fake tab speaks again on the topic).
+    let mut dialog_seq: u32 = 0;
+    if dialog_feed {
+        dialog_seq += 1;
+        emit(FromTab::DialogRequest {
+            dialog_id: dialog_seq,
+            kind: DialogKind::Alert,
+            message: "Fake page greets you!".into(),
+            default: None,
+        });
+    }
+
     if crash {
+        // With `--dialog` too: the startup modal above is up *before* the
+        // fake panic — the shell must close that overlay when it notices
+        // the crash (test: dialogs).
+        if dialog_feed {
+            std::thread::sleep(std::time::Duration::from_millis(300));
+        }
         // Stand in for a panicking `ironsurf-tab`: the panic line + backtrace
         // go to stderr (which the shell captures), then a crash exit code.
         eprintln!("thread 'main' panicked at src/bin/fake_tab.rs:99:10:\ncrash requested");
@@ -88,6 +112,30 @@ fn main() {
                 if devtools_feed {
                     emit_feed(&mut emit, 2);
                 }
+                if dialog_feed {
+                    dialog_seq += 1;
+                    emit(FromTab::DialogRequest {
+                        dialog_id: dialog_seq,
+                        kind: DialogKind::Prompt,
+                        message: "Give it a name:".into(),
+                        default: Some("ada".into()),
+                    });
+                }
+            }
+            // The shell's answer to a scripted dialog: echo it on the status
+            // line so the tests can see the full round trip.
+            ToTab::DialogResponse {
+                dialog_id,
+                confirmed,
+                text,
+            } => {
+                emit(FromTab::StatusText {
+                    text: Some(format!(
+                        "dialog{dialog_id}:{}:{}",
+                        confirmed as u8,
+                        text.unwrap_or_default()
+                    )),
+                });
             }
             ToTab::Resize { width, height, .. } => {
                 size = (width.clamp(16, 4096), height.clamp(16, 4096));
@@ -116,6 +164,7 @@ fn main() {
                 }
             }
             ToTab::Key(_) | ToTab::Scroll(_) | ToTab::SetVisible { .. } => {}
+
             ToTab::Clipboard { .. } => {} // cache push: nothing to edit here
             ToTab::ContextAction(ContextAction::Paste { text }) => {
                 emit(FromTab::StatusText {

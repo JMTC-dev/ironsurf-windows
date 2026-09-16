@@ -194,6 +194,16 @@ export component AppWindow inherits Window {
     in property <length> menu-x: 0px;
     in property <length> menu-y: 0px;
     in property <[MenuItem]> menu-items;
+    // JS dialog (task: window.alert/confirm/prompt): opened by Rust when a
+    // tab reports `FromTab::DialogRequest`; the requesting tab is activated
+    // first, so the modal always belongs to the page on screen. Rust keeps
+    // the (tab, dialog id) pair and answers over the wire when the user
+    // presses a button. kind: 0 alert, 1 confirm, 2 prompt.
+    in property <bool> dialog-open: false;
+    in property <int> dialog-kind: 0;
+    in property <string> dialog-message: "";
+    in property <string> dialog-title: "";
+    in-out property <string> dialog-input: "";
 
     // DevTools panel (task: DevTools UI): bottom-docked over the page area of
     // the *active* tab. Rust owns the open/closed flag (per tab) and the view
@@ -237,6 +247,11 @@ export component AppWindow inherits Window {
     // DevTools intents: pick a pane (0 console / 1 network) or close the panel.
     callback devtools-select-view(view: int);
     callback devtools-close();
+    // JS-dialog intents: `OK` (accepted, `dialog-input` carries the prompt
+    // text) or `Cancel`/Esc (dismissed). The scrim deliberately does nothing
+    // — a modal is dismissed by an answer, never by clicking past it.
+    callback dialog-accept();
+    callback dialog-cancel();
 
     // Console severity: icon + colour (error red, warn yellow, info/log grey).
     function devtools-level-icon(level: string) -> string {
@@ -612,6 +627,68 @@ export component AppWindow inherits Window {
                     vertical-alignment: center;
                     max-width: Math.max(0px, root.width - 220px);
                     overflow: elide;
+                }
+            }
+        }
+    }
+
+    // ------------------------------------------------------------------------
+    // JS dialog overlay (window.alert / confirm / prompt)
+    //
+    // An in-window overlay like the manager and the context menu (LinuxKMS
+    // has no popups), declared after the page ⇒ above every page overlay
+    // including the DevTools panel: while a dialog is open its scrim
+    // swallows every click on the page, matching a real modal — and the tab
+    // process is blocked on the answer anyway, so the page cannot act.
+    // ------------------------------------------------------------------------
+    Rectangle {
+        x: 0; y: 0;
+        width: root.width; height: root.height;
+        visible: root.dialog-open;
+        background: #00000066;
+        dialog-scrim := TouchArea { }
+
+        dialog-panel := Rectangle {
+            x: (root.width - self.width) / 2;
+            y: Math.max(24px, (root.height - self.height) / 2);
+            width: Math.min(440px, root.width - 48px);
+            height: dialog-body.preferred-height + 36px;
+            background: #242424;
+            border-radius: 8px;
+            border-width: 1px;
+            border-color: #565656;
+            // clicks on the panel itself must not fall through to the scrim
+            panel-ta := TouchArea { }
+
+            dialog-body := VerticalLayout {
+                padding: 16px;
+                spacing: 10px;
+
+                Text {
+                    text: root.dialog-title;
+                    color: #a8b8c8;
+                    font-size: 12px;
+                }
+                Text {
+                    text: root.dialog-message;
+                    color: #ececec;
+                    wrap: word-wrap;
+                    horizontal-alignment: left;
+                }
+                if root.dialog-kind == 2: LineEdit {
+                    text <=> root.dialog-input;
+                    placeholder-text: "Enter text";
+                    accepted => { root.dialog-accept(); }
+                }
+                Rectangle {
+                    height: 28px;
+                    HorizontalLayout {
+                        x: 0; width: parent.width; height: parent.height;
+                        spacing: 8px;
+                        alignment: end;
+                        MiniButton { label: "Cancel"; visible: root.dialog-kind != 0; clicked => { root.dialog-cancel(); } }
+                        MiniButton { label: "OK"; clicked => { root.dialog-accept(); } }
+                    }
                 }
             }
         }

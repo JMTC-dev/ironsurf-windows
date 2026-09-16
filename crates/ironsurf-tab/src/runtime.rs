@@ -49,8 +49,8 @@
 //! parsed as HTML — while a page's own `<script src="data:text/javascript;base64,…">`
 //! still fetches and runs (`docs/ENGINE_INTEGRATION.md` §G).
 
-use std::cell::RefCell;
-use std::collections::{HashMap, HashSet};
+use std::cell::{Cell, RefCell};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::error::Error;
 use std::io::{self, BufWriter, Read, StdoutLock, Write};
 use std::os::fd::AsRawFd;
@@ -74,8 +74,9 @@ use blitz_traits::events::{
 use blitz_traits::navigation::{NavigationOptions, NavigationProvider};
 use blitz_traits::shell::{ClipboardError, ColorScheme, ShellProvider, Viewport};
 use ironsurf_common::{
-    read_frame, write_frame, ContextAction, ContextTarget, ContainerId, FromTab, KeyEvent,
-    Modifiers, NetEvent, PointerEvent, PointerKind, ScrollEvent, TabId, ToTab, MAX_CONTEXT_TEXT,
+    read_frame, write_frame, ContextAction, ContextTarget, ContainerId, DialogKind, FromTab,
+    KeyEvent, Modifiers, NetEvent, PointerEvent, PointerKind, ScrollEvent, TabId, ToTab,
+    MAX_CONTEXT_TEXT, MAX_DIALOG_MESSAGE,
 };
 use keyboard_types::{Code, Key, Location, Modifiers as KMods};
 use kurbo::{Affine, Rect, Size};
@@ -490,7 +491,6 @@ pub fn render_document(fetch: &netmod::DocFetch) -> String {
 // Runtime
 
 pub struct Tab {
-    out: TabOut,
     /// Latest size/scale from the shell (physical px + device scale).
     width: u32,
     height: u32,
@@ -583,6 +583,164 @@ pub struct Tab {
     /// When the media steps must next run even with no events at all; `None`
     /// = no live players, and the loop may idle (`media_poll_tick`).
     media_next_pump: Option<Instant>,
+    /// stdout side of the IPC, shared with [`Tab::dialog`] (a modal pumps
+    /// stdin while the loop is inside a JS turn, and must still be able to
+    /// emit). All writes go through the `RefCell` — never borrowed across a
+    /// re-entrant call.
+    out: Rc<RefCell<TabOut>>,
+    /// `window.alert`/`confirm`/`prompt` host (task: JS dialogs): attached to
+    /// every document's [`js::HostState`]; the JS native blocks here until
+    /// the shell answers.
+    dialog: Arc<DialogHost>,
+    /// The raw stdin buffer the poll loop pumps through — shared with
+    /// [`DialogHost`], so bytes read during a modal (which may contain the
+    /// reply *and* the shell's next commands) are never lost when the modal
+    /// returns mid-buffer.
+    stdin_pending: Rc<RefCell<Vec<u8>>>,
+}
+
+/// The answer one modal dialog got back from the shell. `confirmed` is the
+/// button pressed; `text` is the edited value of an accepted prompt.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct DialogReply {
+    pub confirmed: bool,
+    pub text: Option<String>,
+}
+
+/// The synchronous-dialog host living inside [`js::HostState`] (task: JS
+/// dialogs). `window.alert`/`confirm`/`prompt` block the tab's thread right
+/// where the script called them — exactly like a real browser's modal — by
+/// emitting [`FromTab::DialogRequest`] and pumping the shell's stdin until
+/// the matching [`ToTab::DialogResponse`] lands.
+///
+/// While the modal is up, every *other* `ToTab` message is queued in order
+/// (`take_deferred`) and replayed to `handle_to_tab` on the loop's next
+/// stdin drain, so a Resize/Key that raced the dialog is applied after it, never dropped.
+/// EOF (shell gone) answers the dialog as cancelled instead of hanging; the
+/// main loop's own stdin read then sees the same EOF and shuts down.
+pub struct DialogHost {
+    out: Rc<RefCell<TabOut>>,
+    pipe: Arc<SelfPipe>,
+    /// The main loop's very own stdin byte buffer (see [`Tab::stdin_pending`]).
+    pending: Rc<RefCell<Vec<u8>>>,
+    /// Messages swallowed while a modal is open, oldest first.
+    deferred: RefCell<VecDeque<ToTab>>,
+    next_dialog_id: Cell<u32>,
+    /// `--headless` (and any sink-less harness): `ask` answers cancelled
+    /// immediately instead of waiting for a reply nobody can send.
+    disabled: Cell<bool>,
+}
+
+/// Cap the modal poll at a quarter second — stdin wakes the modal instantly
+/// via `poll()`; the tick only bounds how long a wedged shell can keep a
+/// dead wake pipe spinning the modal.
+const DIALOG_POLL_TICK: Duration = Duration::from_millis(250);
+
+impl DialogHost {
+    fn new(out: Rc<RefCell<TabOut>>, pipe: Arc<SelfPipe>, pending: Rc<RefCell<Vec<u8>>>) -> Self {
+        DialogHost {
+            out,
+            pipe,
+            pending,
+            deferred: RefCell::new(VecDeque::new()),
+            next_dialog_id: Cell::new(1),
+            disabled: Cell::new(false),
+        }
+    }
+
+    /// Never block on a shell that cannot answer (headless harness).
+    fn disable(&self) {
+        self.disabled.set(true);
+    }
+
+    /// Take every message deferred while a modal was open (oldest first),
+    /// ready to prepend to the next stdin batch.
+    fn take_deferred(&self) -> VecDeque<ToTab> {
+        std::mem::take(&mut *self.deferred.borrow_mut())
+    }
+
+    /// Show one modal dialog and block until the shell answers it. The
+    /// defaults (no shell, shell died mid-dialog) are the cancelled answer:
+    /// `confirm` reads `false`, `prompt` reads `null` — and the tab stays alive.
+    pub(crate) fn ask(&self, kind: DialogKind, message: &str, default: Option<&str>) -> DialogReply {
+        if self.disabled.get() {
+            debug!("dialog {kind:?} with no live shell: answered cancelled");
+            return DialogReply::default();
+        }
+        // `nth` hands back the byte offset of the first dropped char, which
+        // is a char boundary by construction.
+        let message = match message.char_indices().nth(MAX_DIALOG_MESSAGE) {
+            Some((at, _)) => &message[..at],
+            None => message,
+        };
+        let id = self.next_dialog_id.get();
+        self.next_dialog_id.set(id.wrapping_add(1));
+        info!("page opened a {kind:?} dialog (#{id}): {}", message.trim());
+        self.out.borrow_mut().send(FromTab::DialogRequest {
+            dialog_id: id,
+            kind,
+            message: message.to_owned(),
+            default: default.map(str::to_owned),
+        });
+        let stdin_fd = io::stdin().as_raw_fd();
+        loop {
+            if self.out.borrow().broken {
+                warn!("stdout broke while dialog #{id} was open — answering it cancelled");
+                return DialogReply::default();
+            }
+            // Sleep until the shell speaks (stdin), something wakes the loop,
+            // or the tick passes — no repainting meanwhile: the shell owns
+            // the screen while its modal dialog is up.
+            poll_inputs(stdin_fd, self.pipe.read_fd(), DIALOG_POLL_TICK);
+            self.pipe.drain();
+            let frames = {
+                let mut pending = self.pending.borrow_mut();
+                match read_stdin_bytes(stdin_fd, &mut pending) {
+                    Ok(true) => {
+                        // The shell closed the pipe (window quit, crash): a
+                        // cancelled dialog beats a hung tab.
+                        debug!("stdin EOF while dialog #{id} was open — answering it cancelled");
+                        return DialogReply::default();
+                    }
+                    Ok(false) => decode_stdin_frames(&mut pending),
+                    Err(err) => {
+                        error!("stdin broke while dialog #{id} was open: {err}");
+                        return DialogReply::default();
+                    }
+                }
+            };
+            match frames {
+                Ok(frames) => {
+                    for msg in frames {
+                        match msg {
+                            ToTab::DialogResponse { dialog_id, confirmed, text }
+                                if dialog_id == id =>
+                            {
+                                debug!(
+                                    "dialog #{id} answered: confirmed={confirmed} text={text:?}"
+                                );
+                                return DialogReply { confirmed, text };
+                            }
+                            other => self.deferred.borrow_mut().push_back(other),
+                        }
+                    }
+                }
+                Err(err) => {
+                    error!("stdin protocol error during dialog #{id}: {err}");
+                    return DialogReply::default();
+                }
+            }
+        }
+    }
+}
+
+impl std::fmt::Debug for DialogHost {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DialogHost")
+            .field("next_dialog_id", &self.next_dialog_id.get())
+            .field("disabled", &self.disabled.get())
+            .finish_non_exhaustive()
+    }
 }
 
 /// stdout side of the IPC: one persistent BufWriter, flushed per frame.
@@ -619,6 +777,10 @@ impl TabOut {
             self.broken = true;
         }
     }
+
+    fn flush(&mut self) {
+        let _ = self.writer.flush();
+    }
 }
 
 impl Tab {
@@ -629,7 +791,10 @@ impl Tab {
     /// [`crate::headless`]).
     pub(crate) fn new_headless(args: &TabArgs, pipe: Arc<SelfPipe>) -> Self {
         let mut tab = Tab::new(args, pipe);
-        tab.out = TabOut::null();
+        tab.out = Rc::new(RefCell::new(TabOut::null()));
+        // No shell to answer a modal: dialogs resolve to their cancelled
+        // reading instead of blocking the harness.
+        tab.dialog.disable();
         tab
     }
 
@@ -646,8 +811,17 @@ impl Tab {
         let net_events = provider.net_events();
         // …and the fetch-side console queue with it (css content-type seam).
         let console_events = provider.console_events();
+        let out = Rc::new(RefCell::new(TabOut::new()));
+        let stdin_pending = Rc::new(RefCell::new(Vec::new()));
+        let dialog = Arc::new(DialogHost::new(
+            Rc::clone(&out),
+            Arc::clone(&pipe),
+            Rc::clone(&stdin_pending),
+        ));
         Tab {
-            out: TabOut::new(),
+            out: Rc::clone(&out),
+            dialog,
+            stdin_pending,
             width: DEFAULT_SIZE.0,
             height: DEFAULT_SIZE.1,
             scale: 1.0,
@@ -735,7 +909,7 @@ impl Tab {
             }
             other => debug!("to shell: {other:?}"),
         }
-        self.out.send(msg);
+        self.out.borrow_mut().send(msg);
     }
 
     fn viewport(&self) -> Viewport {
@@ -1113,6 +1287,9 @@ impl Tab {
             parsed_title.as_deref(),
             body_text,
         )));
+        // window.alert/confirm/prompt block on the shell through this cell
+        // (task: JS dialogs); headless already disabled it.
+        host.borrow_mut().dialog = Some(Arc::clone(&self.dialog));
         debug!(
             "running {} script(s) for {url}; skipped: {:?}",
             extraction.scripts.len(),
@@ -1647,6 +1824,12 @@ impl Tab {
                 *self.shell.clipboard.lock().expect("clipboard mutex") = text;
             }
             ToTab::ContextAction(action) => self.handle_context_action(action),
+            ToTab::DialogResponse { dialog_id, .. } => {
+                // A reply with no modal open: it either raced the tab-side
+                // cancel (shell quit mid-dialog) or is stale — nothing to
+                // apply, and never a protocol error.
+                warn!("dialog response #{dialog_id} arrived with no dialog open — ignored");
+            }
             ToTab::Destroy => {
                 self.persist();
                 return Some(0);
@@ -2313,7 +2496,7 @@ impl Tab {
     }
 
     fn flush_stdout(&mut self) {
-        let _ = self.out.writer.flush();
+        self.out.borrow_mut().flush();
     }
 
     /// One harness pump: drain a pending navigation request, else run any
@@ -3168,40 +3351,43 @@ impl Read for CursorReader<'_> {
     }
 }
 
-/// Pull everything currently available on stdin into `pending` and handle
-/// every complete `ToTab` frame. `Ok(Some(code))` requests shutdown.
-fn drain_stdin(tab: &mut Tab, pending: &mut Vec<u8>) -> io::Result<Option<i32>> {
-    let fd = io::stdin().as_raw_fd();
+/// Pull everything currently available on non-blocking stdin into `pending`.
+/// `Ok(true)` = EOF (the shell closed the pipe). Shared by the poll loop
+/// ([`drain_stdin`]) and the modal dialog pump ([`DialogHost::ask`]).
+fn read_stdin_bytes(fd: RawFd, pending: &mut Vec<u8>) -> io::Result<bool> {
     let mut chunk = [0u8; 64 * 1024];
-    let mut eof = false;
     loop {
         // SAFETY: read into a valid buffer from stdin.
         let n = unsafe { libc::read(fd, chunk.as_mut_ptr() as *mut libc::c_void, chunk.len()) };
         if n > 0 {
             pending.extend_from_slice(&chunk[..n as usize]);
             if (n as usize) < chunk.len() {
-                break;
+                return Ok(false);
             }
             continue;
         }
         if n == 0 {
-            eof = true; // Shell closed the pipe: same as Destroy.
-            break;
+            return Ok(true); // Shell closed the pipe: same as Destroy.
         }
         let err = io::Error::last_os_error();
         if err.raw_os_error() == Some(libc::EAGAIN) || err.raw_os_error() == Some(libc::EWOULDBLOCK)
         {
-            break;
+            return Ok(false);
         }
         return Err(err);
     }
+}
 
-    // Decode every complete frame that is available right now, then dispatch
-    // the batch with superseded hover moves dropped (see [`coalesce_moves`]).
+/// Decode every complete `ToTab` frame currently sitting in `pending`
+/// (length-prefixed bincode via common), consuming exactly those bytes; a
+/// partial frame at the tail waits for the rest. Shared by the poll loop and
+/// the modal dialog pump — the buffer lives outside both so bytes read across
+/// a re-entrant modal can never be lost.
+fn decode_stdin_frames(pending: &mut Vec<u8>) -> io::Result<Vec<ToTab>> {
     let mut batch: Vec<ToTab> = Vec::new();
     loop {
         if pending.len() < 4 {
-            break;
+            return Ok(batch);
         }
         let len = u32::from_le_bytes([pending[0], pending[1], pending[2], pending[3]]) as usize;
         if len > ironsurf_common::MAX_FRAME_BYTES {
@@ -3211,7 +3397,7 @@ fn drain_stdin(tab: &mut Tab, pending: &mut Vec<u8>) -> io::Result<Option<i32>> 
             ));
         }
         if pending.len() < 4 + len {
-            break; // wait for the rest
+            return Ok(batch); // wait for the rest
         }
         // Deserialize exactly one frame (length-prefixed bincode via common).
         let mut reader = CursorReader {
@@ -3222,6 +3408,23 @@ fn drain_stdin(tab: &mut Tab, pending: &mut Vec<u8>) -> io::Result<Option<i32>> 
         pending.drain(..4 + len);
         batch.push(msg);
     }
+}
+
+/// Read stdin (into the shared `pending` buffer) and handle every complete
+/// `ToTab` frame. `Ok(Some(code))` requests shutdown.
+///
+/// Frames deferred by a modal dialog ([`DialogHost`]) go first — they were
+/// read off the pipe before anything this tick pulled in — and the batch is
+/// then dispatched with superseded hover moves dropped (see [`coalesce_moves`]).
+fn drain_stdin(tab: &mut Tab, pending: &RefCell<Vec<u8>>) -> io::Result<Option<i32>> {
+    let fd = io::stdin().as_raw_fd();
+    let eof = {
+        let mut pending = pending.borrow_mut();
+        read_stdin_bytes(fd, &mut pending)?
+    };
+    let mut batch: Vec<ToTab> = Vec::new();
+    batch.extend(tab.dialog.take_deferred());
+    batch.extend(decode_stdin_frames(&mut pending.borrow_mut())?);
 
     for msg in coalesce_moves(batch) {
         if let Some(code) = tab.handle_to_tab(msg) {
@@ -3403,7 +3606,9 @@ pub fn run(args: TabArgs) -> i32 {
 
     let stdin_fd = io::stdin().as_raw_fd();
     let wake_fd = pipe.read_fd();
-    let mut pending: Vec<u8> = Vec::new();
+    // The stdin byte buffer lives on the tab (the modal dialog pump reads
+    // through the very same one).
+    let pending = Rc::clone(&tab.stdin_pending);
     let mut exit_code = 0;
 
     loop {
@@ -3421,7 +3626,7 @@ pub fn run(args: TabArgs) -> i32 {
         let mut stdin_frames = false;
 
         // 1. Shell messages.
-        match drain_stdin(&mut tab, &mut pending) {
+        match drain_stdin(&mut tab, &pending) {
             Ok(Some(code)) => {
                 exit_code = code;
                 break;
@@ -3436,7 +3641,7 @@ pub fn run(args: TabArgs) -> i32 {
                 break;
             }
         }
-        if !pending.is_empty() {
+        if !pending.borrow().is_empty() {
             stdin_frames = true;
         }
 
@@ -3479,7 +3684,7 @@ pub fn run(args: TabArgs) -> i32 {
             tab.resolve_and_maybe_paint();
         }
 
-        if tab.out.broken {
+        if tab.out.borrow().broken {
             // Shell vanished: persist what we can, then die quietly.
             debug!("stdout write failed: shell is gone, shutting down");
             break;

@@ -6,6 +6,7 @@
 //! drain tick; the model is pushed once per tick when anything changed.
 
 use std::cell::{Cell, RefCell};
+use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
@@ -13,7 +14,7 @@ use std::sync::mpsc::{channel, Receiver, Sender};
 
 use ironsurf_common::{debug, error, info, trace, warn};
 use ironsurf_common::{
-    default_url, ContextAction, ContextTarget, ContainerId, FromTab, TabId, ToTab,
+    default_url, ContextAction, ContextTarget, ContainerId, DialogKind, FromTab, TabId, ToTab,
 };
 use ironsurf_storage::default_data_root;
 use slint::{
@@ -54,6 +55,27 @@ struct Proc {
     devtools_open: bool,
     /// Which pane the panel shows for this tab (Console / Network).
     devtools_view: DevToolsView,
+}
+
+/// The shell-side half of a JS dialog being shown (task: window.alert /
+/// confirm / prompt): which tab is blocked on the pipe, under which request
+/// id, waiting for the user's button. Exactly one can exist at a time — the
+/// requesting tab does not answer its stdin while it waits.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PendingDialog {
+    tab: TabId,
+    dialog_id: u32,
+    kind: DialogKind,
+    message: String,
+    default: Option<String>,
+}
+
+impl PendingDialog {
+    /// Only a prompt carries text back (the contract: `text` is `Some`
+    /// exactly when a prompt was accepted).
+    fn prompt(&self) -> bool {
+        self.kind == DialogKind::Prompt
+    }
 }
 
 /// Which DevTools pane the panel shows. Kept as an index (`view_index`) for
@@ -128,6 +150,16 @@ pub struct Core {
     /// The actions behind the currently-open context menu, index-aligned
     /// with the Slint `menu-items` model.
     menu_items: RefCell<Vec<MenuAction>>,
+    /// The JS dialogs awaiting an answer (task: window.alert/confirm/prompt),
+    /// FIFO. Every requesting tab is **blocked** on its pipe, so several
+    /// tabs can queue at once; the overlay shows the front one (its tab
+    /// activated), and the `dialog_shown` marker says whether that front is
+    /// already on screen. Ids tie each answer to its request
+    /// (`ToTab::DialogResponse`).
+    pending_dialogs: RefCell<VecDeque<PendingDialog>>,
+    /// `(tab, dialog id)` of the dialog currently on screen (`None` = the
+    /// overlay is closed, and the front of the queue is waiting for it).
+    dialog_shown: RefCell<Option<(TabId, u32)>>,
     /// The DevTools console table. Shared with the window (`console-rows`), so
     /// it is patched in place instead of rebuilt per drain tick.
     dt_console: Rc<VecModel<ConsoleRow>>,
@@ -173,6 +205,8 @@ impl App {
             pending_move: Cell::new(None),
             clipboard: RefCell::new(String::new()),
             menu_items: RefCell::new(Vec::new()),
+            pending_dialogs: RefCell::new(VecDeque::new()),
+            dialog_shown: RefCell::new(None),
             dt_console: Rc::new(VecModel::default()),
             dt_net: Rc::new(VecModel::default()),
         });
@@ -223,6 +257,16 @@ impl Core {
     /// Snapshot of the per-tab states (integration tests / debugging).
     pub fn tab_snapshot(&self) -> Vec<TabState> {
         self.procs.borrow().iter().map(|p| p.state.clone()).collect()
+    }
+
+    /// The JS dialogs awaiting the user (task: window.alert/confirm/prompt):
+    /// `(tab, dialog id)` in FIFO order (integration tests peek here).
+    pub fn pending_dialogs(&self) -> Vec<(TabId, u32)> {
+        self.pending_dialogs
+            .borrow()
+            .iter()
+            .map(|p| (p.tab, p.dialog_id))
+            .collect()
     }
 
     /// The DevTools panel as the tabs have it: `(open, pane)` per tab, in strip
@@ -367,6 +411,12 @@ impl Core {
     }
 
     fn close_tab(&self, idx: usize) {
+        // A tab whose modal is still open must not be left waiting on an
+        // answer the overlay will never produce again (task: JS dialogs):
+        // close it cancelled first (which also unblocks the tab process).
+        if let Some(tid) = self.procs.borrow().get(idx).map(|p| p.tab.id) {
+            self.clear_dialog_for(tid, true);
+        }
         let mut procs = self.procs.borrow_mut();
         if idx >= procs.len() {
             return;
@@ -386,6 +436,159 @@ impl Core {
             self.set_visible_except();
         }
         self.sync_ui();
+    }
+
+    // ---- JS dialogs (window.alert/confirm/prompt) --------------------------
+
+    /// A tab reported `FromTab::DialogRequest`: that tab is now blocked on
+    /// its pipe (task: window.alert/confirm/prompt). The request joins the
+    /// FIFO queue; a request from a tab that is gone or crashed is answered
+    /// cancelled right away, so a dying tab never waits on a dialog nobody
+    /// can show.
+    fn open_dialog(&self, tid: TabId, dialog_id: u32, kind: DialogKind, message: &str, default: Option<&str>) {
+        let alive = self
+            .procs
+            .borrow()
+            .iter()
+            .find(|p| p.tab.id == tid)
+            .is_some_and(|p| !p.crashed && !p.state.closed);
+        if !alive {
+            warn!("tab {tid} asked for a dialog but is gone or crashed — answering cancelled");
+            let _ = self.send_to(tid, ToTab::DialogResponse { dialog_id, confirmed: false, text: None });
+            return;
+        }
+        self.pending_dialogs.borrow_mut().push_back(PendingDialog {
+            tab: tid,
+            dialog_id,
+            kind,
+            message: message.to_string(),
+            default: default.map(str::to_string),
+        });
+        self.show_next_dialog();
+    }
+
+    /// Put the front of the queue on screen — unless a dialog is already
+    /// showing. The requesting tab is activated: a background tab's modal
+    /// must not sit unseen while its process waits. A queued tab that
+    /// vanished since is dropped (its pump answers cancelled at EOF).
+    fn show_next_dialog(&self) {
+        if self.dialog_shown.borrow().is_some() {
+            return; // one modal at a time; the next waits its turn
+        }
+        let Some(next) = self.pending_dialogs.borrow().front().cloned() else { return };
+        let at = self.procs.borrow().iter().position(|p| p.tab.id == next.tab);
+        let Some(at) = at else {
+            self.pending_dialogs.borrow_mut().retain(|p| p != &next);
+            return self.show_next_dialog();
+        };
+        let title = format!("Tab {} — {}", next.tab.0, self.procs.borrow()[at].state.title);
+        let Some(ui) = self.ui() else { return };
+        if self.active.get() != at {
+            info!("tab {} has a dialog — switching to its tab", next.tab.0);
+            self.activate_tab(at);
+        }
+        *self.dialog_shown.borrow_mut() = Some((next.tab, next.dialog_id));
+        ui.set_dialog_kind(match next.kind {
+            DialogKind::Alert => 0,
+            DialogKind::Confirm => 1,
+            DialogKind::Prompt => 2,
+        });
+        ui.set_dialog_message(next.message.as_str().into());
+        ui.set_dialog_title(title.into());
+        // The prompt box starts at the page's default; the other kinds
+        // clear it so a stale answer can never leak into the next dialog.
+        ui.set_dialog_input(next.default.as_deref().unwrap_or_default().into());
+        ui.set_dialog_open(true);
+    }
+
+    /// The user dismissed the open dialog: OK (accepted) or Cancel/Esc
+    /// (cancelled). The answer rides back as `ToTab::DialogResponse`; the
+    /// blocked tab's JS call returns from there, and the next queued dialog
+    /// (from any tab) takes the overlay.
+    fn answer_dialog(&self, confirmed: bool) {
+        let Some(shown) = self.dialog_shown.borrow_mut().take() else {
+            debug!("dialog answer with no dialog on screen — ignored");
+            return;
+        };
+        let pending = {
+            let mut queue = self.pending_dialogs.borrow_mut();
+            let at = queue.iter().position(|p| (p.tab, p.dialog_id) == shown);
+            match at.map(|i| queue.remove(i).expect("position came from this queue")) {
+                Some(p) => p,
+                None => {
+                    // The request was already cleared (its tab went away);
+                    // the tab we answered is the same request — drop it.
+                    debug!("dialog answer for an already-cleared request — ignored");
+                    if let Some(ui) = self.ui() {
+                        ui.set_dialog_open(false);
+                    }
+                    return;
+                }
+            }
+        };
+        let ui = self.ui();
+        let text = ui
+            .as_ref()
+            .filter(|_| confirmed && pending.prompt())
+            .map(|ui| ui.get_dialog_input().to_string());
+        if let Some(ui) = ui {
+            ui.set_dialog_open(false);
+        }
+        info!(
+            "dialog #{} ({:?}) on tab {} answered {}",
+            pending.dialog_id,
+            pending.kind,
+            pending.tab.0,
+            if confirmed { "OK" } else { "cancel" }
+        );
+        self.send_to(pending.tab, ToTab::DialogResponse { dialog_id: pending.dialog_id, confirmed, text });
+        self.show_next_dialog();
+    }
+
+    /// Drop every request queued or shown for *that* tab — it is going away
+    /// (closed, reaped, or crashed) and its blocked calls can no longer be
+    /// answered from the overlay. The tab is woken with cancelled answers
+    /// while it can still receive them (`notify_tab`); the overlay closes
+    /// (or rolls to the next queued dialog).
+    fn clear_dialog_for(&self, tid: TabId, notify_tab: bool) {
+        let dropped: Vec<PendingDialog> = {
+            let queue = self.pending_dialogs.borrow();
+            let dropped = queue.iter().filter(|p| p.tab == tid).cloned().collect::<Vec<_>>();
+            if dropped.is_empty() {
+                return;
+            }
+            dropped
+        };
+        self.pending_dialogs.borrow_mut().retain(|p| p.tab != tid);
+        let shown_was_ours =
+            self.dialog_shown.borrow().as_ref().is_some_and(|(t, _)| *t == tid);
+        if shown_was_ours {
+            *self.dialog_shown.borrow_mut() = None;
+            if let Some(ui) = self.ui() {
+                ui.set_dialog_open(false);
+            }
+        }
+        if notify_tab {
+            for p in &dropped {
+                let _ = self.send_to(
+                    tid,
+                    ToTab::DialogResponse { dialog_id: p.dialog_id, confirmed: false, text: None },
+                );
+            }
+        }
+        if shown_was_ours {
+            self.show_next_dialog();
+        }
+    }
+
+    /// Send one command to a tab by id (the pending dialog's tab is not
+    /// necessarily the active one at the moments this is called).
+    fn send_to(&self, tid: TabId, msg: ToTab) -> std::io::Result<()> {
+        let mut procs = self.procs.borrow_mut();
+        match procs.iter_mut().find(|p| p.tab.id == tid) {
+            Some(p) => p.tab.send(msg),
+            None => Err(std::io::Error::other("tab is gone")),
+        }
     }
 
     fn activate_tab(&self, idx: usize) {
@@ -1013,6 +1216,9 @@ impl Core {
                 FromTab::ContextMenu { x, y, target } => {
                     info!("tab {tid} right-click at ({x:.0},{y:.0}): {target:?}")
                 }
+                FromTab::DialogRequest { dialog_id, kind, message, .. } => {
+                    info!("tab {tid} opened a {kind:?} dialog #{dialog_id}: {message:?}")
+                }
                 FromTab::ClipboardText { text } => {
                     // Page copy (Ctrl+C/X, editor cut): the shell owns the
                     // session clipboard (task: context menu).
@@ -1076,6 +1282,12 @@ impl Core {
             if let FromTab::ContextMenu { x, y, target } = &msg {
                 self.open_context_menu(*x, *y, target);
             }
+            // `alert`/`confirm`/`prompt` → the tab is now blocked on the
+            // pipe; the overlay opens (on the requesting tab, brought to
+            // the front) and the answer goes back via OK/Cancel.
+            if let FromTab::DialogRequest { dialog_id, kind, message, default } = &msg {
+                self.open_dialog(tid, *dialog_id, *kind, message, default.as_deref());
+            }
         }
 
         // Reap closed tabs (dropping a TabProc closes stdin and reaps it).
@@ -1092,6 +1304,22 @@ impl Core {
             }
             (before, after)
         };
+        if before != after {
+            // A tab that said `Closed` while its modal was queued or shown
+            // takes the overlay with it (the request ids die with the
+            // process); the queue rolls to the next live dialog.
+            let queued = self
+                .pending_dialogs
+                .borrow()
+                .iter()
+                .map(|p| p.tab)
+                .collect::<Vec<_>>();
+            for tab in queued {
+                if !self.procs.borrow().iter().any(|p| p.tab.id == tab) {
+                    self.clear_dialog_for(tab, false);
+                }
+            }
+        }
         if before != after {
             info!("reaped {} closed tab(s); {} remain", before - after, after);
             dirty = true;
@@ -1120,6 +1348,7 @@ impl Core {
     /// is the last thing the user asked for); ✕ still closes them.
     fn check_crashes(&self) {
         let mut crashed = false;
+        let mut victims = Vec::new();
         {
             let mut procs = self.procs.borrow_mut();
             for p in procs.iter_mut() {
@@ -1128,9 +1357,16 @@ impl Core {
                 }
                 if let Some(status) = p.tab.try_wait_status() {
                     note_tab_crash(p, format_args!("the process exited ({status}) without closing cleanly"));
+                    victims.push(p.tab.id);
                     crashed = true;
                 }
             }
+        }
+        // A crashed tab that was blocked on a modal dialog takes the overlay
+        // down with it — the answer cannot reach a dead process (task: JS
+        // dialogs).
+        for tid in victims {
+            self.clear_dialog_for(tid, false);
         }
         if crashed {
             self.sync_ui();
@@ -1343,6 +1579,11 @@ impl Core {
             });
         }
         bind0!(on_menu_close, |c: &Rc<Core>| c.close_context_menu());
+
+        // JS dialogs (task: window.alert/confirm/prompt): the two buttons of
+        // the overlay — and the prompt box's Enter — answer the blocked tab.
+        bind0!(on_dialog_accept, |c: &Rc<Core>| c.answer_dialog(true));
+        bind0!(on_dialog_cancel, |c: &Rc<Core>| c.answer_dialog(false));
 
         // DevTools panel: the models are installed once and patched in place
         // (see `write_devtools`), the two intents come back to the core.

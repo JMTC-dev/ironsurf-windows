@@ -101,9 +101,21 @@ pub enum FromTab {
     ConsoleLog       { source: String, level: String, message: String },
     // one finished (or failed) page request → DevTools network panel
     NetworkEvent     { event: NetEvent },
+    // window.alert/confirm/prompt: the tab emits this and **blocks its JS
+    // thread** (pumping stdin, deferring every other ToTab message) until
+    // the shell answers with the matching `ToTab::DialogResponse`.
+    DialogRequest    { dialog_id: u32, kind: DialogKind, message: String, default: Option<String> },
     Closed,
     Error            { message: String },
 }
+
+/// Which modal the shell shows: `Alert` (OK), `Confirm` (OK/Cancel → bool),
+/// `Prompt` (LineEdit + OK/Cancel → string|null). `message` is capped at
+/// `MAX_DIALOG_MESSAGE` (64 KiB) chars; `default` is only meaningful for
+/// `Prompt`. A cancelled answer (Cancel/Esc, shell quit, broken pipe) reads
+/// `confirm` → `false` and `prompt` → `null`; `alert` always returns undefined.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DialogKind { Alert, Confirm, Prompt }
 
 /// One shell-to-tab message.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -119,6 +131,10 @@ pub enum ToTab {
     Pointer      (PointerEvent),
     Key          (KeyEvent),
     Scroll       (ScrollEvent),
+    // answer to `FromTab::DialogRequest`: `confirmed` = OK (vs Cancel/Esc);
+    // `text` is `Some` exactly when a Prompt was accepted. Responses for
+    // unknown dialog ids are ignored (the request may have been cleared).
+    DialogResponse { dialog_id: u32, confirmed: bool, text: Option<String> },
     Destroy,
 }
 
@@ -404,6 +420,19 @@ are a deliberately tiny surface (no engine-internal DOM mutation yet):
   and repaint), `document.body.textContent` read-only snapshot,
   `console.log/info/warn/error` → tab stderr + `FromTab::StatusText` **and** a
   `FromTab::ConsoleLog { source: "js", level, message }` per line (all four levels, page order).
+- **`window.alert`/`confirm`/`prompt` are implemented as real synchronous modals**: the native
+  emits `FromTab::DialogRequest` and **blocks the calling script in place** — pumping stdin
+  (poll + read + frame-decode) without repainting — until the shell's `ToTab::DialogResponse`
+  with the request's id arrives. Every *other* `ToTab` message received mid-dialog is deferred
+  (FIFO) and replayed through the normal stdin pipeline right after the dialog resolves. The
+  shell queues requests FIFO (several tabs may each be blocked on their own dialog), shows the
+  front one in a centred modal overlay (scrim swallows page clicks; prompt prefills `default`),
+  activating the requesting tab, and answers OK/Cancel/prompt-Enter over the wire. Every
+  degenerate path answers **cancelled** rather than hanging a tab: Cancel/Esc, a tab that
+  crashes or closes mid-dialog (the shell drops its overlay), a broken stdout, and stdin EOF
+  (shell quit). With no dialog host at all (headless harness, bare tests) the calls answer
+  cancelled immediately. Returns: `alert` → `undefined`, `confirm` → `true`/`false`,
+  `prompt` → the text or `null` (never the default — the default only prefills the box).
 - Script exceptions must never kill the tab: catch, report via StatusText, continue. Every
   uncaught exception is also a `ConsoleLog { source: "js", level: "error" }` — or `source:
   "dom"` when a native `__ironsurfDom*` binding threw (the registration macro records native
@@ -481,6 +510,13 @@ UI (`crates/ironsurf-shell/ui/ironsurf.slint`):
   Network table (Method | URL | Status | Size | Time; unknown values `—`; a failed request
   shows its error text in red instead of the status). Fed by the per-tab bounded logs
   (`TabState::console` / `network`), re-pushed on every drain tick while open.
+- JS dialog overlay (`window.alert`/`confirm`/`prompt`): a centred modal Rectangle (title =
+  the requesting tab, message, prompt LineEdit prefilled with the page's default, Cancel —
+  hidden for alerts — + OK), declared after the page so it outranks every page overlay; the
+  scrim is a dead TouchArea (a modal is dismissed by an answer, never by clicking past it).
+  Fed by the shell's FIFO dialog queue (`FromTab::DialogRequest`, the requesting tab
+  activated); OK/Cancel/prompt-Enter send `ToTab::DialogResponse` and unblock that tab.
+  Closing or crashing a tab drops its queued/shown dialogs (cancelled).
 - Menu (native or in-toolbar): New Window(v1: new tab), Close Tab (Ctrl-W), Tab Next/Prev
   (Ctrl-Tab), Open Container Manager, Clear Container Data.
 

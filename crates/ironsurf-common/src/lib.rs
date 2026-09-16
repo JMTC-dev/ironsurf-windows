@@ -104,6 +104,20 @@ pub enum FromTab {
     NetworkEvent {
         event: NetEvent,
     },
+    /// Page JavaScript opened a modal dialog (`alert` / `confirm` / `prompt`).
+    /// The tab **blocks** on the poll loop until the shell answers with
+    /// [`ToTab::DialogResponse`] carrying the same `dialog_id` (sync JS
+    /// dialogs, like every real browser); every other `ToTab` message that
+    /// arrives meanwhile is deferred, in order, until the dialog settles.
+    /// `default` is the `prompt` prefill (always `None` for alert/confirm).
+    DialogRequest {
+        dialog_id: u32,
+        kind: DialogKind,
+        /// Dialog body text (bounded by [`MAX_DIALOG_MESSAGE`]).
+        message: String,
+        /// `prompt` default value; `None` for alert/confirm.
+        default: Option<String>,
+    },
     Closed,
     Error {
         message: String,
@@ -150,8 +164,34 @@ pub enum ToTab {
     /// The user picked an entry in a context menu that the *engine* services
     /// (paste, video play/pause); shell-side entries never reach the tab.
     ContextAction(ContextAction),
+    /// Answer a [`FromTab::DialogRequest`] (matched by `dialog_id`):
+    /// `confirmed` is the button the user pressed (alert: always true once
+    /// dismissed; confirm: the answer JS returns; prompt: OK vs Cancel).
+    /// `text` is the edited prompt value — `Some` exactly when a **prompt**
+    /// was accepted (an empty box is `Some("")`).
+    DialogResponse {
+        dialog_id: u32,
+        confirmed: bool,
+        text: Option<String>,
+    },
     Destroy,
 }
+
+/// Which of the three synchronous window dialogs the page asked for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum DialogKind {
+    /// `window.alert(msg)` — one OK, returns `undefined`.
+    Alert,
+    /// `window.confirm(msg)` — OK/Cancel, returns the boolean.
+    Confirm,
+    /// `window.prompt(msg, def)` — text box + OK/Cancel, returns the text or
+    /// `null`.
+    Prompt,
+}
+
+/// Cap for the text carried in a dialog message (the page hands over
+/// whatever string it likes; the dialog is UI, not an exfil channel).
+pub const MAX_DIALOG_MESSAGE: usize = 64 * 1024;
 
 /// What the cursor was over when the user right-clicked. Every field is
 /// "under the cursor at right-click time"; the shell decides from these
@@ -522,6 +562,45 @@ mod tests {
             target: ContextTarget::default(),
         });
         frame_round_trip(FromTab::ClipboardText { text: "copied".into() });
+        frame_round_trip(FromTab::DialogRequest {
+            dialog_id: 1,
+            kind: DialogKind::Alert,
+            message: "Page says hi".into(),
+            default: None,
+        });
+    }
+
+    /// Every dialog kind survives the codec with its id/message/default
+    /// intact (the prompt default travels as `Some`, alert/confirm as `None`).
+    #[test]
+    fn dialog_requests_round_trip() {
+        frame_round_trip(FromTab::DialogRequest {
+            dialog_id: 0,
+            kind: DialogKind::Alert,
+            message: "".into(),
+            default: None,
+        });
+        frame_round_trip(FromTab::DialogRequest {
+            dialog_id: 7,
+            kind: DialogKind::Confirm,
+            message: "Leave?".into(),
+            default: None,
+        });
+        let msg = frame_round_trip(FromTab::DialogRequest {
+            dialog_id: 42,
+            kind: DialogKind::Prompt,
+            message: "Your name:".into(),
+            default: Some("Ada".into()),
+        });
+        match msg {
+            FromTab::DialogRequest { dialog_id, kind, message, default } => {
+                assert_eq!(dialog_id, 42);
+                assert_eq!(kind, DialogKind::Prompt);
+                assert_eq!(message, "Your name:");
+                assert_eq!(default.as_deref(), Some("Ada"));
+            }
+            other => panic!("unexpected message: {other:?}"),
+        }
     }
 
     /// `source` is one of the four documented DevTools origins; every one of
@@ -614,6 +693,23 @@ mod tests {
         frame_round_trip(ToTab::Clipboard { text: "clip".into() });
         frame_round_trip(ToTab::ContextAction(ContextAction::Paste { text: "hi".into() }));
         frame_round_trip(ToTab::ContextAction(ContextAction::ToggleVideo));
+        frame_round_trip(ToTab::DialogResponse { dialog_id: 1, confirmed: true, text: None });
+        frame_round_trip(ToTab::DialogResponse {
+            dialog_id: 2,
+            confirmed: false,
+            text: None,
+        });
+        frame_round_trip(ToTab::DialogResponse {
+            dialog_id: 3,
+            confirmed: true,
+            text: Some("Ada Lovelace".into()),
+        });
+        // An accepted empty prompt box is Some(""), not None.
+        frame_round_trip(ToTab::DialogResponse {
+            dialog_id: 4,
+            confirmed: true,
+            text: Some(String::new()),
+        });
         frame_round_trip(ToTab::Destroy);
     }
 

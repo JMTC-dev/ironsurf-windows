@@ -1,9 +1,14 @@
 //! ironsurf-shell — Slint GUI for IronSurf.
 //!
 //! Usage:
-//!   ironsurf-shell [--smoke] [--managed-net] [--no-sandbox]
-//!                 [--fake-tab] [--tab-bin PATH] [--software] [--linuxkms]
+//!   ironsurf-shell [-h|--help] [-u|--url URL] [--smoke] [--managed-net]
+//!                 [--no-sandbox] [--fake-tab] [--tab-bin PATH]
+//!                 [--software] [--linuxkms]
 //!                 [--log LEVEL|--verbose|-v] [--tab-stderr|--no-tab-stderr]
+//!
+//! `-h`/`--help` prints [`USAGE`] and exits 0; `-u`/`--url` picks the start
+//! address instead of the default start page (`ironsurf://welcome`), with
+//! `--smoke` still winning to keep the smoke contract on `about:blank`.
 //!
 //! Logging: every line the shell (and, when inherited, every tab) writes goes
 //! to **stderr** — stdout stays untouched. `--log off|error|warn|info|debug|
@@ -30,6 +35,43 @@ use ironsurf_shell::AppWindow;
 use ironsurf_common::{error, info, warn};
 use slint::ComponentHandle;
 
+/// The full CLI help, printed verbatim for `-h`/`--help`.
+pub(crate) const USAGE: &str = "\
+ironsurf-shell — the IronSurf browser shell (Slint GUI, one tab process per tab)
+
+USAGE:
+    ironsurf-shell [OPTIONS]
+
+OPTIONS:
+    -u, --url URL         open URL at startup instead of the default start page
+                          (ironsurf://welcome); --smoke overrides it
+    -h, --help            print this help and exit
+        --smoke           smoke-test boot: load about:blank, exit 0 after ~3 s
+        --managed-net     tabs fetch through the shell-managed network module
+        --no-sandbox      start tabs without the sandbox (dev/debug escape hatch)
+        --fake-tab        drive the scripted fake tab instead of the real engine
+                          (dev harness; the IPC contract exercised unchanged)
+        --tab-bin PATH    use PATH as the tab host binary (default: sibling
+                          ironsurf-tab, else PATH lookup)
+        --software        pin Slint's software renderer (no GPU required)
+        --linuxkms        pin the DRM/KMS backend (bare virtual console)
+        --log LEVEL       logging level: off|error|warn|info|debug|trace
+                          (default info; also IRONSURF_LOG/RUST_LOG)
+        --verbose, -v     shortcut for --log debug
+        --tab-stderr      let tab stderr lines reach this terminal
+        --no-tab-stderr   suppress them (default when a level is set)
+
+ENVIRONMENT:
+    IRONSURF_DATA_DIR     profile/container data root (default ~/.local/share/ironsurf)
+    SLINT_BACKEND         explicit Slint backend/renderer, wins over the flags
+                          (e.g. linuxkms/femtovg, winit/software)
+";
+
+/// `-h`/`--help` anywhere in the arguments (first match, like every flag here).
+pub(crate) fn wants_help(args: &[String]) -> bool {
+    args.iter().any(|a| a == "-h" || a == "--help")
+}
+
 fn main() -> ExitCode {
     match run() {
         Ok(()) => ExitCode::SUCCESS,
@@ -44,8 +86,16 @@ fn main() -> ExitCode {
 
 fn run() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().collect();
+    // Help is pure output: no logging init, no window, no tab.
+    if wants_help(&args) {
+        print!("{USAGE}");
+        return Ok(());
+    }
     let flag = |f: &str| args.iter().any(|a| a == f);
     let smoke = flag("--smoke");
+    // `-u`/`--url` picks the start page; validated up front so a bare
+    // `ironsurf-shell -u` is a usage error, not a silently opened welcome.
+    let url = start_url_from(&args)?;
 
     // Level from --log/-v, then IRONSURF_LOG/RUST_LOG, then `info`.
     let level = logging::level_from_args(&args)
@@ -58,8 +108,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         .unwrap_or(logging::DEFAULT_LEVEL);
     logging::init("shell", Some(level));
     info!(
-        "ironsurf-shell starting: smoke={} managed-net={} no-sandbox={} fake-tab={} log {}",
+        "ironsurf-shell starting: smoke={} url={:?} managed-net={} no-sandbox={} fake-tab={} log {}",
         smoke,
+        url.as_deref(),
         flag("--managed-net"),
         flag("--no-sandbox"),
         flag("--fake-tab"),
@@ -132,7 +183,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let ui = AppWindow::new()?;
     let app = App::new(&ui, tab_bin, extra_tab_args)?;
 
-    app.start(if smoke { Some("about:blank") } else { None });
+    // The smoke contract is an about:blank boot no matter what URL was given.
+    app.start(if smoke { Some("about:blank") } else { url.as_deref() });
 
     ui.window().set_size(slint::LogicalSize::new(1024.0, 768.0));
     ui.window().show()?;
@@ -150,6 +202,23 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     slint::run_event_loop()?;
     app.shutdown();
     Ok(())
+}
+
+/// The start URL from `-u URL` / `--url URL` (first match wins).
+/// `Ok(None)` = no flag, open the default start page; `Err` = the flag came
+/// without a value (or with what is clearly the *next* flag), a usage error.
+fn start_url_from(args: &[String]) -> Result<Option<String>, &'static str> {
+    for (i, arg) in args.iter().enumerate() {
+        if arg == "-u" || arg == "--url" {
+            return match args.get(i + 1) {
+                Some(value) if !value.is_empty() && !value.starts_with('-') => {
+                    Ok(Some(value.clone()))
+                }
+                _ => Err("-u/--url requires a URL"),
+            };
+        }
+    }
+    Ok(None)
 }
 
 /// A pinned backend/renderer combination for [`BackendSelector`]; `None` in a
@@ -232,6 +301,64 @@ mod tests {
         let both = backend_choice(true, true).unwrap();
         assert_eq!(both.backend, Some("linuxkms"));
         assert_eq!(both.renderer, Some("software"));
+    }
+
+    #[test]
+    fn help_is_answered_for_both_spellings() {
+        let argv = |argv: &[&str]| -> Vec<String> {
+            argv.iter().map(|a| a.to_string()).collect()
+        };
+        assert!(wants_help(&argv(&["ironsurf-shell", "-h"])));
+        assert!(wants_help(&argv(&["ironsurf-shell", "--help"])));
+        assert!(wants_help(&argv(&["ironsurf-shell", "--smoke", "-h"])));
+        assert!(!wants_help(&argv(&["ironsurf-shell", "-u", "https://example.com"])));
+        // The usage text stays in sync with the flags this binary accepts —
+        // every long flag named in it must exist as a string above too.
+        assert!(USAGE.contains("-u, --url URL"));
+        assert!(USAGE.contains("-h, --help"));
+        for flag in [
+            "--smoke",
+            "--managed-net",
+            "--no-sandbox",
+            "--fake-tab",
+            "--tab-bin",
+            "--software",
+            "--linuxkms",
+            "--log",
+            "--tab-stderr",
+        ] {
+            assert!(USAGE.contains(flag), "help must document {flag}");
+        }
+    }
+
+    #[test]
+    fn start_url_reads_u_and_long_url_flags() {
+        let parse = |argv: &[&str]| {
+            let args: Vec<String> = argv.iter().map(|a| a.to_string()).collect();
+            start_url_from(&args).map(|url| url.as_deref().map(str::to_owned))
+        };
+        // No flag → the default start page.
+        assert_eq!(parse(&["ironsurf-shell", "--software"]), Ok(None));
+        // Both spellings, and the value is taken verbatim (any scheme the
+        // shell's URL contract accepts: https, about, file, data…).
+        assert_eq!(
+            parse(&["ironsurf-shell", "--url", "https://example.com/x"]),
+            Ok(Some("https://example.com/x".to_string()))
+        );
+        assert_eq!(
+            parse(&["ironsurf-shell", "-u", "about:blank"]),
+            Ok(Some("about:blank".to_string()))
+        );
+        // The first occurrence wins over later ones.
+        assert_eq!(
+            parse(&["ironsurf-shell", "-u", "https://a.test", "--url", "https://b.test"]),
+            Ok(Some("https://a.test".to_string()))
+        );
+        // A flag without a value — missing or followed by another flag — is a
+        // usage error, never a silently ignored welcome page.
+        assert!(parse(&["ironsurf-shell", "-u"]).is_err());
+        assert!(parse(&["ironsurf-shell", "--url", "--smoke"]).is_err());
+        assert!(parse(&["ironsurf-shell", "--url", ""]).is_err());
     }
 
     #[test]
