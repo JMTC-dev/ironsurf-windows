@@ -1285,10 +1285,13 @@ impl Core {
             ui.get_us_patterns().to_string(),
             ui.get_us_code().to_string(),
         );
-        let script = {
-            let id = self.store.borrow().next_userscript_id();
-            build_new_userscript(id, &name, &patterns, &code)
-        };
+        // One id per Save, read from the Store at this instant — the shell is
+        // the only writer and Save is sequential, so `next_userscript_id` is
+        // fresh here; two Saves always produce two distinct scripts. (An
+        // allocator that reads `next` up-front and upserts later hands the
+        // same id out twice — the silent overwrite the userscripts e2e hit.)
+        let id = self.store.borrow().next_userscript_id();
+        let script = build_new_userscript(id, &name, &patterns, &code);
         if let Err(err) = self.store.borrow_mut().upsert_userscript(script) {
             warn!("userscript {name:?} rejected: {err}");
             ui.set_us_error(err.to_string().into());

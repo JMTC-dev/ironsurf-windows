@@ -57,7 +57,7 @@ use url::Url;
 
 // Page-side diagnostics: `console.*` and script errors go to stderr at the
 // level the page itself asked for (see [`log_console`]).
-use ironsurf_common::{error, info, trace, warn, DialogKind};
+use ironsurf_common::{debug, error, info, trace, warn, DialogKind};
 
 /// Emit one `console.*` line to stderr at the level the page chose.
 /// The same line also reaches the shell (status text) via the host capture.
@@ -3698,7 +3698,14 @@ impl JsRuntime {
         let outcome = self.context.eval(Source::from_bytes(code));
         self.host.borrow_mut().userscript = None;
         match outcome {
-            Ok(_) => None,
+            // Success is silent on the console feed (attribution is for errors),
+            // but never in the log: a script that runs without logging or
+            // throwing must still be visible when debugging why a page was
+            // (or was not) touched — the run is logged here at debug level.
+            Ok(_) => {
+                debug!("userscript {name:?} ran clean ({} bytes)", code.len());
+                None
+            }
             Err(err) => {
                 let message = first_line(&err);
                 // Native DOM throws during a userscript run are reported as the
