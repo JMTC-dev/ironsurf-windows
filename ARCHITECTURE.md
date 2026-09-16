@@ -84,6 +84,8 @@ pub struct Container {
     pub name: String,
     pub color: String,        // "#rrggbb" hex, used for the tab stripe
     pub is_default: bool,
+    #[serde(default)]
+    pub user_agent: Option<String>,  // per-container UA override; None = engine default
 }
 
 /// One tab-to-shell message.
@@ -148,6 +150,10 @@ pub enum ToTab {
     // apply after JS-driven redirects). Disabled scripts are never sent; an
     // empty vec clears the tab-side set.
     SetUserscripts { scripts: Vec<Userscript> },
+    // per-container User-Agent override: Some(v) = send exactly v as the HTTP
+    // User-Agent on every subsequent request; None = the tab's built-in
+    // default. The shell re-sends it on every tab spawn and on every switch.
+    SetUserAgent { user_agent: Option<String> },
     Destroy,
 }
 
@@ -204,6 +210,16 @@ pub struct NetEvent {
 pub fn userscript_matches(pattern: &str, url: &str) -> bool;
 /// Enabled scripts with at least one matching pattern, in input order.
 pub fn userscripts_for_url<'a>(scripts: &'a [Userscript], url: &str) -> Vec<&'a Userscript>;
+
+/// Built-in User-Agent presets `(label, UA)` in switcher menu order; a user
+/// may still type any other string (these are conveniences, not a whitelist).
+pub const BUILTIN_USER_AGENTS: &[(&str, &str)];
+/// Label of `ua` iff it is one of `BUILTIN_USER_AGENTS` (exact match);
+/// `None` = a custom UA string.
+pub fn builtin_user_agent_label(ua: &str) -> Option<&'static str>;
+pub fn is_builtin_user_agent(ua: &str) -> bool;
+/// Cap on a user-edited User-Agent string, in chars.
+pub const MAX_USER_AGENT_CHARS: usize = 512;
 
 /// Framing: u32 LE length prefix + bincode payload, over stdin/stdout pipes.
 pub fn write_frame<W: std::io::Write, T: serde::Serialize>(w: &mut W, msg: &T) -> std::io::Result<()>;

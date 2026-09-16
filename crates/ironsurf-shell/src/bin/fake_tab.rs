@@ -192,6 +192,8 @@ fn main() {
                     }
                 }
             }
+            // implemented in a later step (the shell owns the UA switcher)
+            ToTab::SetUserAgent { .. } => {}
             ToTab::Key(_) | ToTab::Scroll(_) | ToTab::SetVisible { .. } => {}
 
             ToTab::Clipboard { .. } => {} // cache push: nothing to edit here

@@ -1975,6 +1975,9 @@ impl Tab {
                 );
                 self.userscripts = scripts;
             }
+            // Per-container User-Agent override (`None` = engine default).
+            // implemented in a later step
+            ToTab::SetUserAgent { .. } => {}
             ToTab::DialogResponse { dialog_id, .. } => {
                 // A reply with no modal open: it either raced the tab-side
                 // cancel (shell quit mid-dialog) or is stale — nothing to

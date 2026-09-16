@@ -36,6 +36,12 @@ pub struct Container {
     /// `"#rrggbb"` hex, used for the tab stripe.
     pub color: String,
     pub is_default: bool,
+    /// Per-container **User-Agent** override, pushed to every tab of this
+    /// container as [`ToTab::SetUserAgent`]. `None` = the engine's built-in
+    /// default UA. `serde(default)` keeps legacy `containers.json` files
+    /// (written before this field existed) loading as `None`.
+    #[serde(default)]
+    pub user_agent: Option<String>,
 }
 
 /// One tab-to-shell message.
@@ -183,6 +189,17 @@ pub enum ToTab {
     /// never sent; an empty vec clears the tab-side set entirely.
     SetUserscripts {
         scripts: Vec<Userscript>,
+    },
+    /// Per-container **User-Agent** override (the shell owns the choice and
+    /// re-sends it on every tab spawn and whenever the user switches presets
+    /// or edits the string — see [`BUILTIN_USER_AGENTS`]).
+    ///
+    /// `Some(v)` = send **exactly** `v` as the HTTP `User-Agent` header on
+    /// every subsequent request this tab makes (the shell trims/caps it at
+    /// [`MAX_USER_AGENT_CHARS`]); `None` = reset to the tab's built-in
+    /// default UA. It applies for the tab's lifetime (across navigations).
+    SetUserAgent {
+        user_agent: Option<String>,
     },
     /// Answer a [`FromTab::DialogRequest`] (matched by `dialog_id`):
     /// `confirmed` is the button the user pressed (alert: always true once
@@ -606,6 +623,36 @@ pub fn userscripts_for_url<'a>(scripts: &'a [Userscript], url: &str) -> Vec<&'a 
         .collect()
 }
 
+/// Built-in **User-Agent** presets the shell's switcher offers, as
+/// `(label, UA string)` in menu order. The labels are display-only; the UA
+/// strings are what actually goes on the wire (stored verbatim in
+/// [`Container::user_agent`], shipped in [`ToTab::SetUserAgent`]). A user may
+/// still supply any other string — these are conveniences, not a whitelist.
+pub const BUILTIN_USER_AGENTS: &[(&str, &str)] = &[
+    ("Firefox", "Mozilla/5.0 (X11; Linux x86_64; rv:128.0) Gecko/20100101 Firefox/128.0"),
+    ("Chrome", "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"),
+    ("Bingbot", "Mozilla/5.0 AppleWebKit/537.36 (KHTML, like Gecko; compatible; Bingbot/2.0; +http://www.bing.com/bingbot.htm) Chrome/116.0.1950.0 Safari/537.36"),
+    ("Googlebot", "Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)"),
+    ("Android Chrome", "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.6478.122 Mobile Safari/537.36"),
+];
+
+/// Label of `ua` when it is one of [`BUILTIN_USER_AGENTS`] — an **exact**
+/// string match (no case folding, no trimming). `None` means `ua` is a
+/// custom (non-preset) UA string.
+pub fn builtin_user_agent_label(ua: &str) -> Option<&'static str> {
+    BUILTIN_USER_AGENTS.iter().find(|(_, v)| *v == ua).map(|(label, _)| *label)
+}
+
+/// Whether `ua` is one of the [`BUILTIN_USER_AGENTS`] presets (exact match);
+/// shorthand for [`builtin_user_agent_label`].is_some().
+pub fn is_builtin_user_agent(ua: &str) -> bool {
+    builtin_user_agent_label(ua).is_some()
+}
+
+/// Cap on a user-edited **User-Agent** string (in `char`s): the field is a
+/// header value, not a place to paste a novel. Presets are all well under it.
+pub const MAX_USER_AGENT_CHARS: usize = 512;
+
 fn invalid_data<E: std::fmt::Display>(e: E) -> std::io::Error {
     std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string())
 }
@@ -702,9 +749,91 @@ mod tests {
             name: "personal".into(),
             color: "#ff5500".into(),
             is_default: true,
+            user_agent: None,
         });
         assert_eq!(ContainerId(1), ContainerId(1));
         assert_ne!(ContainerId(1), ContainerId(2));
+    }
+
+    /// `ToTab::SetUserAgent` covers both halves of the contract: `Some(v)`
+    /// (a preset or a hand-typed string, unicode included) ships verbatim,
+    /// `None` resets to the tab's default.
+    #[test]
+    fn set_user_agent_round_trips() {
+        frame_round_trip(ToTab::SetUserAgent { user_agent: None });
+        frame_round_trip(ToTab::SetUserAgent {
+            user_agent: Some("Mozilla/5.0 (custom UA // IronSurf-测试)".into()),
+        });
+        let preset = builtin_user_agent_label("Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)");
+        assert_eq!(preset, Some("Googlebot"));
+        let msg = frame_round_trip(ToTab::SetUserAgent {
+            user_agent: Some(BUILTIN_USER_AGENTS[0].1.to_string()),
+        });
+        match msg {
+            ToTab::SetUserAgent { user_agent } => {
+                assert_eq!(user_agent.as_deref(), Some(BUILTIN_USER_AGENTS[0].1));
+            }
+            other => panic!("unexpected message: {other:?}"),
+        }
+    }
+
+    /// The preset table is menu-ordered, every entry is labelable, and only
+    /// an **exact** string counts as a preset (lookalikes are custom).
+    #[test]
+    fn builtin_user_agent_presets() {
+        let labels: Vec<&str> = BUILTIN_USER_AGENTS.iter().map(|(l, _)| *l).collect();
+        assert_eq!(
+            labels,
+            vec!["Firefox", "Chrome", "Bingbot", "Googlebot", "Android Chrome"]
+        );
+        for (label, ua) in BUILTIN_USER_AGENTS {
+            assert_eq!(builtin_user_agent_label(ua), Some(*label));
+            assert!(is_builtin_user_agent(ua));
+            assert!(ua.chars().count() < MAX_USER_AGENT_CHARS);
+        }
+        // Exact match only: case, whitespace and near-misses are custom UAs.
+        assert_eq!(builtin_user_agent_label("firefox"), None);
+        assert!(!is_builtin_user_agent("firefox"));
+        assert_eq!(builtin_user_agent_label(""), None);
+        assert!(!is_builtin_user_agent(""));
+        assert_eq!(builtin_user_agent_label("Mozilla/5.0 (X11; Linux x86_64; rv:999.0) Gecko/20100101 Firefox/999.0"), None);
+        let firefox = BUILTIN_USER_AGENTS[0].1;
+        assert_eq!(builtin_user_agent_label(&format!(" {firefox}")), None);
+    }
+
+    /// A UA override survives both codecs, and a legacy `containers.json`
+    /// written **without** the `user_agent` key still loads (as `None`).
+    #[test]
+    fn container_user_agent_field_round_trips_and_defaults() {
+        for ua in [
+            None,
+            Some(BUILTIN_USER_AGENTS[4].1.to_string()),
+            Some("MyCustomAgent/1.0 ✨".to_string()),
+        ] {
+            let container = Container {
+                id: ContainerId(3),
+                name: "work".into(),
+                color: "#00ff88".into(),
+                is_default: false,
+                user_agent: ua.clone(),
+            };
+            frame_round_trip(container.clone());
+            let json = serde_json::to_string(&container).expect("to json");
+            let back: Container = serde_json::from_str(&json).expect("from json");
+            assert_eq!(back, container);
+        }
+
+        // Legacy `containers.json` (a raw array of containers, see
+        // ironsurf-storage) written before this field existed: no
+        // `user_agent` key at all.
+        let legacy = r##"[{"id":1,"name":"personal","color":"#ff5500","is_default":true}]"##;
+        let back: Vec<Container> = serde_json::from_str(legacy).expect("legacy json");
+        assert_eq!(back.len(), 1);
+        assert_eq!(back[0].user_agent, None);
+        // An explicit null also reads as None.
+        let nul = r##"[{"id":1,"name":"personal","color":"#ff5500","is_default":true,"user_agent":null}]"##;
+        let back: Vec<Container> = serde_json::from_str(nul).expect("null json");
+        assert_eq!(back[0].user_agent, None);
     }
 
     #[test]

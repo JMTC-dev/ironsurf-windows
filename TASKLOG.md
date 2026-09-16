@@ -1,4 +1,9 @@
 # Task log
+## #42 Per-container User-Agent contract (step 1/5, common only): ToTab::SetUserAgent{user_agent} — Some(v) = send
+  exactly v as the HTTP User-Agent on every later request, None = the tab's built-in default; Container gains
+  #[serde(default)] user_agent: Option<String> (legacy containers.json written without the key still loads, as None);
+  presets BUILTIN_USER_AGENTS + builtin_user_agent_label/is_builtin_user_agent/MAX_USER_AGENT_CHARS=512. Fallout only:
+  inert SetUserAgent arms (tab runtime, fake_tab), user_agent: None (storage literals), ARCH synced; common 30 green, ws clean.
 ## #41 JS DOM changes now land in the live document, always: every JS turn that can mutate the tree — page-script
   batch, each userscript run, timer batches, javascript: programs — settles (restyle + relayout + repaint),
   and the three silent gaps behind the report are closed in js.rs: document.write/writeln really parse (fragment
@@ -75,23 +80,3 @@ context_menu_items matrix (Back/Forward/Reload, open link/image in new tab, Copy
 address, Play/Pause video, Paste only editable+non-empty clipboard). Sandbox-safe clipboard: ShellProvider
 copy→FromTab::ClipboardText→shell store, Ctrl+V preceded by ToTab::Clipboard push; Paste/ToggleVideo ride
 ToTab::ContextAction. common round-trips + shell unit matrix + context_menu e2e green; workspace suites green.
-## #27 Crashed tabs are loud: dead child (try_wait poll in every drain tick) or broken-pipe send now pins
-"Tab N has crashed" on the status line (tab kept in strip, last frame; further commands dropped, ✕ closes),
-tab stderr is captured (bounded 16K tail, was /dev/null) + RUST_BACKTRACE=full for children + tab panic hook
-force-prints backtrace, so the log carries exit status + panic + backtrace; fake_tab --crash; pump + gui-level
-crash tests; shell suite green (26u + pump 2 + gui + real_tab + tab_crash).
-## #26 FIX video play button dead — widget drew the play/pause glyph INSIDE the control strip (x=12, bottom 22px)
-but click_action mapped the whole strip to Seek: the visible button only sought ~4% (nothing visible). Strip left zone
-(PLAY_ZONE_WIDTH=30) now toggles, bar maps onto its drawn track (BAR_X/BAR_RIGHT_MARGIN shared with paint); strip test
-updated + new unit test; tests/video_play_button.rs spawns the real tab on file:///tmp/vid/flower.mp4 (fixture MP4 is
-actually 960×540) and proves strip-click pause/resume from the pixel stream; tab 169u+14e2e+4+3+1+1, workspace green.
-## #25 JS-driven navigation implemented (was: refused) — location.href=/assign/replace/reload queue
-js::PendingNav on HostState via __ironsurfNavigate (glue location also gained real protocol/host/
-hostname/pathname/search/hash getters); Tab::drain_nav_hook follows it after every JS turn (relative
-resolve vs doc URL; replace→Session(idx) history); javascript: URLs execute in the live page realm
-(run_javascript_url, pre-parse raw check + percent-decode) with string completion value → new
-about:blank doc replacing the entry (spec); netmod still never *fetches* javascript:; 4 e2e green
-(in-page exec, string→doc, href-push+Back, replace-hides-referrer) + js unit tests; ARCH/docs synced.
-## #24 search engine → https://html.duckduckgo.com/html/?q= (was duckduckgo.com/?q=) — classify::search_url +
-all test expectations + gui.rs + ARCH §URL-bar updated; ironsurf-shell suite green (26u + gui/e2e).
-

@@ -121,6 +121,7 @@ impl Store {
                 name: DEFAULT_NAME.to_string(),
                 color: DEFAULT_COLOR.to_string(),
                 is_default: true,
+                user_agent: None,
             });
             store.default_id = id;
             store.save()?;
@@ -168,6 +169,7 @@ impl Store {
             name,
             color,
             is_default: false,
+            user_agent: None,
         });
         self.save()?;
         Ok(id)
