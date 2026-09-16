@@ -901,6 +901,12 @@ export component AppWindow inherits Window {
                     height: 44px;
                     width: parent.width;
                     usbg := Rectangle { background: usa.has-hover ? #2c2c2c : #262626; border-radius: 4px; }
+                    // declared before the content ⇒ bottom z-order: the row still
+                    // highlights on hover, but the CheckBox and ✕ (declared on top)
+                    // receive their clicks — a TouchArea declared last swallowed all
+                    // of them, so toggling and deleting did nothing (same trap the
+                    // container-manager rows above already fell into).
+                    usa := TouchArea { }
                     HorizontalLayout {
                         x: 6px; y: 3px;
                         width: parent.width - 12px;
@@ -932,7 +938,6 @@ export component AppWindow inherits Window {
                         }
                         MiniButton { label: "✕"; clicked => { root.us-delete(i); } }
                     }
-                    usa := TouchArea { }
                 }
 
                 if root.us-scripts.length == 0 && !root.us-editing: Text {
