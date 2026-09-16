@@ -12,6 +12,7 @@
 // Generated Slint component (`AppWindow`) + exported structs at crate root.
 slint::include_modules!();
 
+pub mod archive;
 pub mod classify;
 pub mod keymap;
 pub mod state;
@@ -30,6 +31,14 @@ pub mod uisettings {
     pub struct UiSettings {
         /// Container id new tabs open in ("remember last chosen").
         pub new_tab_container: Option<u32>,
+        /// Archive mode (the 💾 toolbar toggle): off by default, persisted
+        /// so a session that left it running picks it back up.
+        #[serde(default)]
+        pub archive_enabled: bool,
+        /// Archive root folder; `None` = [`crate::archive::default_archive_root`]
+        /// (`$HOME/Downloads/ironsurf-tabs`).
+        #[serde(default)]
+        pub archive_dir: Option<String>,
     }
 
     impl UiSettings {

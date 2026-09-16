@@ -29,6 +29,12 @@ fn main() {
     // echoes on the status line as `ua:<value>` (`ua:default` for `None`).
     let mut expect_user_agent = false;
     let mut current_ua: Option<String> = None;
+    // Archive-mode harness (task: archive mode): `--archive-mode` is the
+    // spawn-time switch (exactly how the real tab seeds its archive sink),
+    // and with `--expect-archive-mode` every current value — the launch one
+    // and each inbound ToTab::SetArchiveMode — echoes as `archive:on|off`.
+    let mut expect_archive_mode = false;
+    let mut current_archive = false;
 
     let mut it = args.iter().skip(1);
     while let Some(arg) = it.next() {
@@ -69,6 +75,8 @@ fn main() {
             // seeded this tab and rebroadcast every mutation.
             "--expect-userscripts" => expect_userscripts = true,
             "--expect-user-agent" => expect_user_agent = true,
+            "--archive-mode" => current_archive = true,
+            "--expect-archive-mode" => expect_archive_mode = true,
             // the shell spawns a UA container's tabs with the container's UA;
             // mirror the real tab: blank/absent ⇒ the built-in default.
             "--user-agent" => {
@@ -102,6 +110,35 @@ fn main() {
                 current_ua.clone().unwrap_or_else(|| "default".into())
             )),
         });
+    }
+
+    // The spawn-time archive switch echoes too, so a test can see the
+    // shell passed `--archive-mode` to a tab born while the mode was on.
+    if expect_archive_mode {
+        emit(FromTab::StatusText {
+            text: Some(format!("archive:{}", if current_archive { "on" } else { "off" })),
+        });
+        // A tab *born with the mode on* ships archived fetches from its very
+        // first load — the fake emits them right away: a document, a
+        // query-stringed subresource (the query must not reach disk), and a
+        // `file:` asset the shell must drop (a local file is no website).
+        if current_archive {
+            emit(FromTab::ArchivedFetch {
+                url: "http://example.com/".into(),
+                is_document: true,
+                bytes: b"ARCHIVE-PAGE".to_vec(),
+            });
+            emit(FromTab::ArchivedFetch {
+                url: "http://example.com/js/app.js?v=2".into(),
+                is_document: false,
+                bytes: b"ARCHIVE-APP".to_vec(),
+            });
+            emit(FromTab::ArchivedFetch {
+                url: "file:///etc/passwd".into(),
+                is_document: false,
+                bytes: b"MUST-NOT-LAND".to_vec(),
+            });
+        }
     }
 
     if devtools_feed {
@@ -235,6 +272,18 @@ fn main() {
                             "ua:{}",
                             current_ua.clone().unwrap_or_else(|| "default".into())
                         )),
+                    });
+                }
+            }
+            // The archive-mode wire (task: archive mode): replace the current
+            // value and — with `--expect-archive-mode` — echo it. The real
+            // tab ships future fetches to the shell; this fake just tracks
+            // that the toggle arrived, in order.
+            ToTab::SetArchiveMode { enabled } => {
+                current_archive = enabled;
+                if expect_archive_mode {
+                    emit(FromTab::StatusText {
+                        text: Some(format!("archive:{}", if current_archive { "on" } else { "off" })),
                     });
                 }
             }

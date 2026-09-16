@@ -88,6 +88,27 @@ The `UA` button in the top bar (right of `</>`) switches the `User-Agent` **per 
 - It is stored with the container in `~/.local/share/ironsurf/containers.json`, so newly
   opened (or respawned) tabs in that container launch with it already applied.
 
+## Archive mode
+
+The 💾 button in the top bar (right of `UA`) opens the **Archive mode** menu — off by default:
+
+- With the mode **on**, every website a tab visits and every file it loads from that site —
+  documents, scripts, stylesheets, images, media — is saved to the archive folder as it
+  arrives. Nothing is written inside the tab process; the tab ships the bytes and the
+  shell writes them.
+- The tree is `<folder>/<timestamp>/<host[:port]>/…`, e.g.
+  `ironsurf-tabs/2026-09-17T07:20:48+10:00/example.com/index.html` and
+  `…/example.com/js/app.js`. Visited pages become the host's `index.html`; subresources
+  keep their URL path (query strings stripped). The timestamp is the **tab process's
+  spawn instant** (ISO 8601, local time with UTC offset), taken once per tab — so a
+  later browsing session lands in its own folder and never overwrites an earlier one.
+  Tabs that were already open when the mode switches on start a fresh timestamp folder
+  from that moment.
+- The folder is configurable in the same menu (default `$HOME/Downloads/ironsurf-tabs`;
+  `~` expands, absolute paths only, created on demand) and both the folder and the
+  switch persist across restarts (`~/.local/share/ironsurf/ui.json`). Tabs spawned
+  while the mode is on archive from their very first fetch.
+
 ## Feedback
 
 Feel free to help out, fork, spend some tokens on it. The initial Proof of Concept build (this repo) is built entirely from locally-hosted Qwen 3.8 Flash Next.

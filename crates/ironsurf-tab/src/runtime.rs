@@ -133,6 +133,10 @@ pub struct TabArgs {
     /// `None` (flag absent, or blank after trim) = the built-in default
     /// [`netmod::USER_AGENT`].
     pub user_agent: Option<String>,
+    /// Archive mode master switch at spawn (`--archive-mode`, present = on):
+    /// the shell passes it when its 💾 toggle is on, so a fresh tab archives
+    /// from its first fetch; `ToTab::SetArchiveMode` moves it afterwards.
+    pub archive_mode: bool,
 }
 
 impl TabArgs {
@@ -146,6 +150,7 @@ impl TabArgs {
         let mut no_sandbox = false;
         let mut no_media = false;
         let mut user_agent = None;
+        let mut archive_mode = false;
 
         let mut it = args.iter().skip(1);
         while let Some(arg) = it.next() {
@@ -166,6 +171,7 @@ impl TabArgs {
                 "--no-sandbox" => no_sandbox = true,
                 "--no-media" => no_media = true,
                 "--user-agent" => user_agent = Some(value("user-agent")?),
+                "--archive-mode" => archive_mode = true,
                 // Verbosity flags: the level itself is read from argv by
                 // `logging::level_from_args` in `run`; they are accepted here so
                 // passing them is not a fatal "unexpected argument".
@@ -200,6 +206,7 @@ impl TabArgs {
             no_sandbox,
             media_enabled: !no_media,
             user_agent,
+            archive_mode,
         })
     }
 }
@@ -584,6 +591,11 @@ pub struct Tab {
     /// media, redirect hops) plus `navigator.userAgent` reads this one cell.
     /// Changing it never forces a reload.
     user_agent: netmod::SharedUserAgent,
+    /// Archive-mode sink (the shell's 💾 toggle): seeded by `--archive-mode`,
+    /// moved by `ToTab::SetArchiveMode`, shared with the net provider, the
+    /// script-src fetcher, and the media worker; the poll loop drains it into
+    /// `FromTab::ArchivedFetch` messages exactly like `net_events`.
+    archive: Arc<crate::archive::ArchiveState>,
     /// DevTools network queue (the provider's own): subresource fetch threads
     /// push one [`NetEvent`] per settled request here, and the poll loop
     /// drains it into `FromTab::NetworkEvent` messages (a NetWaker wake makes
@@ -832,10 +844,12 @@ impl Tab {
         // The effective UA first: the provider (subresources) and the tab
         // (documents, media, JS) share this one cell from birth.
         let user_agent = netmod::new_user_agent(args.user_agent.as_deref());
+        let archive = crate::archive::ArchiveState::shared(args.archive_mode);
         let provider = Arc::new(
             BlitzNetProvider::new(args.net_policy, store.cookie_jar(), store.cache())
                 .with_waker(Arc::new(PipeWaker(Arc::clone(&pipe))))
-                .with_user_agent(user_agent.clone()),
+                .with_user_agent(user_agent.clone())
+                .with_archive(archive.clone()),
         );
         // Grab the DevTools network queue before `provider` moves into the tab.
         let net_events = provider.net_events();
@@ -898,6 +912,7 @@ impl Tab {
             css_scan: CssScanState::new(),
             userscripts: Vec::new(),
             user_agent,
+            archive,
         }
     }
 
@@ -1081,6 +1096,13 @@ impl Tab {
                     doc_fetch.body.len(),
                     started.elapsed().as_millis()
                 );
+                // Archive mode: the served document rides to the shell as
+                // `FromTab::ArchivedFetch` (documents become the host's
+                // `index.html`); error statuses are not "visited pages".
+                if doc_fetch.status < 400 {
+                    self.archive
+                        .store(&doc_fetch.url, true, &doc_fetch.body);
+                }
                 let html = render_document(&doc_fetch);
                 self.load_html(&doc_fetch.url, &html, history);
                 info!(
@@ -1095,6 +1117,7 @@ impl Tab {
                 // External `<script src>` fetches settled during load_html;
                 // ship their network events with the navigation, not a tick late.
                 self.drain_net_events();
+                self.drain_archive_events();
                 self.drain_console_events();
                 true
             }
@@ -1300,7 +1323,13 @@ impl Tab {
                     &self.user_agent,
                     Some(&|event| events.lock().expect("net events mutex").push(event)),
                 )
-                .map(|script| script.body_text())
+                .map(|script| {
+                    // Archive mode: an external script payload is a
+                    // subresource, whatever its scheme ended up being.
+                    self.archive
+                        .store(&script.url, false, &script.body);
+                    script.body_text()
+                })
                 .map_err(|err| err.to_string())
             };
             extraction = js::extract_scripts(doc, url, &mut fetch);
@@ -2013,6 +2042,14 @@ impl Tab {
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner()) = effective;
             }
+            ToTab::SetArchiveMode { enabled } => {
+                // The 💾 toggle: from here on (or off), every successful
+                // http(s) response — documents, subresources, scripts, media
+                // — is queued for `FromTab::ArchivedFetch` and written by
+                // the shell. Nothing is written inside the tab.
+                info!("archive mode → {}", if enabled { "on" } else { "off" });
+                self.archive.set_enabled(enabled);
+            }
             ToTab::DialogResponse { dialog_id, .. } => {
                 // A reply with no modal open: it either raced the tab-side
                 // cancel (shell quit mid-dialog) or is stale — nothing to
@@ -2240,6 +2277,21 @@ impl Tab {
         let events = std::mem::take(&mut *self.net_events.lock().expect("net events mutex"));
         for event in events {
             self.emit(FromTab::NetworkEvent { event });
+        }
+    }
+
+    /// Ship every response archived since the last poll as one
+    /// `FromTab::ArchivedFetch` each (the shell's 💾 archive mode): the fetch
+    /// threads, the script-src fetcher, and the media worker push into the
+    /// shared sink, and this loop drains it — documents drained inline with
+    /// the navigation just like their network events.
+    fn drain_archive_events(&mut self) {
+        for fetch in self.archive.take_pending() {
+            self.emit(FromTab::ArchivedFetch {
+                url: fetch.url,
+                is_document: fetch.is_document,
+                bytes: fetch.bytes,
+            });
         }
     }
 
@@ -3149,6 +3201,7 @@ impl Tab {
         let jar = Arc::clone(&self.jar);
         let policy = self_provider_policy(&self.provider);
         let user_agent = self.user_agent.clone();
+        let archive = Arc::clone(&self.archive);
         let worker_href = href.clone();
         let spawn = std::thread::Builder::new()
             .name("ironsurf-media-fetch".to_string())
@@ -3158,6 +3211,9 @@ impl Tab {
                 match outcome {
                     Ok(bytes) => {
                         debug!("media: {href} fetched ({} B)", bytes.len());
+                        // Archive mode: media bodies ride the same pipe as
+                        // any other file loaded from the site.
+                        archive.store(&url, false, &bytes);
                         slot.lock()
                             .unwrap_or_else(|poisoned| poisoned.into_inner())
                             .push(MediaLoaded {
@@ -4093,6 +4149,9 @@ pub fn run(args: TabArgs) -> i32 {
         // 2a′. Network: every request that settled since the last poll
         // becomes one FromTab::NetworkEvent (DevTools network panel).
         tab.drain_net_events();
+        // 2a‴. Archive mode: every archived response settled since the last
+        // poll ships to the shell, which owns the archive folder.
+        tab.drain_archive_events();
 
         // 2a″. Console: fetch-side CSS diagnostics (wrong `Content-Type` on a
         // `.css` response) join the DevTools console here (src/logging.rs).
@@ -4361,6 +4420,7 @@ mod tests {
             no_sandbox: true,
             media_enabled: true,
             user_agent: None,
+            archive_mode: false,
         };
         let pipe = Arc::new(SelfPipe::new().expect("pipe"));
         let tab = Tab::new_headless(&args, pipe);
@@ -4395,6 +4455,7 @@ mod tests {
             no_sandbox: true,
             media_enabled: true,
             user_agent: None,
+            archive_mode: false,
         };
         let pipe = Arc::new(SelfPipe::new().expect("pipe"));
         Tab::new_headless(&args, pipe)
@@ -4710,6 +4771,7 @@ mod tests {
             no_sandbox: true,
             media_enabled: true,
             user_agent: None,
+            archive_mode: false,
         };
         let pipe = Arc::new(SelfPipe::new().expect("pipe"));
         let mut tab = Tab::new_headless(&args, pipe);
@@ -4939,6 +5001,7 @@ mod tests {
             no_sandbox: true,
             media_enabled: false,
             user_agent: None,
+            archive_mode: false,
         };
         let pipe = Arc::new(SelfPipe::new().expect("pipe"));
         let mut tab = Tab::new_headless(&args, pipe);

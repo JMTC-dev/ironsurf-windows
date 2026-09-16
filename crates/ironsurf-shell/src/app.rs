@@ -27,6 +27,7 @@ use slint::{
 // exported for Rust code next to the generated accessors themselves.
 use slint::private_unstable_api::re_exports::MouseCursor;
 
+use crate::archive;
 use crate::classify::classify_input;
 use crate::keymap::{self, Shortcut};
 use crate::state::TabState;
@@ -67,6 +68,12 @@ const SPINNER_FRAMES: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '�
 struct Proc {
     tab: TabProc,
     state: TabState,
+    /// Archive-mode timestamp folder for this tab process (task: archive
+    /// mode): taken at spawn — or re-taken the moment archive mode is
+    /// switched on for an already-live tab — and used for every
+    /// `FromTab::ArchivedFetch` the process ships, so one tab generation
+    /// lands in one `<root>/<ISO8601>/…` folder.
+    visit_dir: String,
     /// Page zoom factor (Ctrl-`+`/`-`/`0`, shell-owned policy; see
     /// `keymap::zoom_in`/`zoom_out`). Sent to the tab as `ToTab::SetZoom`.
     zoom: f32,
@@ -199,6 +206,13 @@ pub struct Core {
     /// carried through); `None` is a fresh "+ New script" draft that takes
     /// the next id. Cleared on Save, Cancel, and every menu (re)open.
     us_edit_id: RefCell<Option<u64>>,
+    /// Archive-mode root folder in force (the 💾 menu's folder LineEdit →
+    /// Apply re-points it): the effective value of the persisted setting,
+    /// defaulting to [`archive::default_archive_root`].
+    archive_dir: RefCell<PathBuf>,
+    /// Files written by archive mode this shell session (the one-line
+    /// overlay status; the counter is not persisted — the files are).
+    archive_saved: Cell<usize>,
 }
 
 /// The assembled application: core + the timers that drive it (owned so
@@ -219,6 +233,15 @@ impl App {
         let store = ironsurf_storage::Store::open(default_data_root())?;
         let ui_path = store.root().join("ui.json");
         let settings = UiSettings::load(&ui_path);
+        // Effective archive root before `settings` moves into the core:
+        // the persisted folder, or the built-in ~/Downloads/ironsurf-tabs.
+        let archive_root = settings
+            .archive_dir
+            .as_deref()
+            .map(str::trim)
+            .filter(|d| !d.is_empty())
+            .map(PathBuf::from)
+            .unwrap_or_else(archive::default_archive_root);
         let (sink, rx) = channel();
         let core = Rc::new(Core {
             store: RefCell::new(store),
@@ -245,6 +268,8 @@ impl App {
             dt_net: Rc::new(VecModel::default()),
             us_ids: RefCell::new(Vec::new()),
             us_edit_id: RefCell::new(None),
+            archive_dir: RefCell::new(archive_root),
+            archive_saved: Cell::new(0),
         });
 
         core.attach_callbacks(ui);
@@ -416,6 +441,11 @@ impl Core {
                 extra.push("--user-agent".to_string());
                 extra.push(ua);
             }
+            // A fresh tab starts archiving from its very first fetch when
+            // the 💾 mode is on (task: archive mode).
+            if self.settings.borrow().archive_enabled {
+                extra.push("--archive-mode".to_string());
+            }
             (store.profile_dir(container), self.tab_bin.clone(), extra)
         };
         let id = {
@@ -432,6 +462,7 @@ impl Core {
                 {
                     let mut procs = self.procs.borrow_mut();
                     procs.push(Proc {
+                        visit_dir: archive::visit_dir_name(),
                         tab,
                         state: TabState::default(),
                         zoom: 1.0,
@@ -1077,10 +1108,12 @@ impl Core {
         let Some(ui) = self.ui() else { return };
         if open {
             // Two full-window overlays never stack: opening the manager shuts
-            // the userscript menu and the UA switcher (and vice versa — see
-            // `userscript_menu` and `ua_menu`).
+            // the userscript menu, the UA switcher, and the archive menu
+            // (and vice versa — see `userscript_menu`, `ua_menu`,
+            // `archive_menu`).
             ui.set_us_menu_open(false);
             ui.set_ua_menu_open(false);
+            ui.set_archive_menu_open(false);
             let active_container = self
                 .active_proc_index()
                 .map(|i| self.procs.borrow()[i].tab.container)
@@ -1125,6 +1158,9 @@ impl Core {
                 extra.push("--user-agent".to_string());
                 extra.push(ua);
             }
+            if self.settings.borrow().archive_enabled {
+                extra.push("--archive-mode".to_string());
+            }
             extra
         };
         let replacement = TabProc::spawn(
@@ -1145,6 +1181,7 @@ impl Core {
                 std::mem::replace(
                     &mut procs[at],
                     Proc {
+                        visit_dir: archive::visit_dir_name(),
                         tab,
                         state: TabState::default(),
                         zoom,
@@ -1272,10 +1309,12 @@ impl Core {
         let Some(ui) = self.ui() else { return };
         debug!("userscript menu {}", if open { "opened" } else { "closed" });
         if open {
-            // Never stack: the manager and the UA switcher both step aside —
-            // and close this menu the same way from their own open legs.
+            // Never stack: the manager, the UA switcher, and the archive
+            // menu all step aside — and close this menu the same way from
+            // their own open legs.
             ui.set_manager_open(false);
             ui.set_ua_menu_open(false);
+            ui.set_archive_menu_open(false);
             ui.set_us_editing(false);
             ui.set_us_editing_existing(false);
             ui.set_us_error(SharedString::default());
@@ -1493,6 +1532,7 @@ impl Core {
         if open {
             ui.set_manager_open(false);
             ui.set_us_menu_open(false);
+            ui.set_archive_menu_open(false);
             ui.set_ua_error(SharedString::default());
             let current = container_user_agent(&self.store.borrow(), self.active_container());
             // Prefill the draft with exactly what the container holds (a
@@ -1587,6 +1627,173 @@ impl Core {
         }
     }
 
+    // ---- archive mode (task: archive mode) ---------------------------------
+
+    /// The effective archive root as display text.
+    fn archive_root_text(&self) -> String {
+        self.archive_dir.borrow().display().to_string()
+    }
+
+    /// The overlay's one-line status: state, effective root, and how many
+    /// files this shell session has written so far.
+    fn archive_status(&self) -> String {
+        if self.settings.borrow().archive_enabled {
+            format!(
+                "On \u{2014} saving to {} ({} file(s) saved this session)",
+                self.archive_root_text(),
+                self.archive_saved.get()
+            )
+        } else {
+            format!(
+                "Off \u{2014} pages and files would be saved under {}",
+                self.archive_root_text()
+            )
+        }
+    }
+
+    /// Re-push the menu's live values (CheckBox + status line).
+    fn archive_state(&self, ui: &AppWindow) {
+        ui.set_archive_enabled(self.settings.borrow().archive_enabled);
+        ui.set_archive_status(self.archive_status().as_str().into());
+    }
+
+    /// Refresh the status line while the menu is open (a file just landed).
+    fn archive_refresh_if_open(&self) {
+        if let Some(ui) = self.ui() {
+            if ui.get_archive_menu_open() {
+                self.archive_state(&ui);
+            }
+        }
+    }
+
+    /// Open/close the archive overlay. Opening closes the manager, the
+    /// userscript menu, and the UA switcher (two full-window overlays never
+    /// stack; the other three menus close this one the same way from their
+    /// own open legs) and prefills the folder draft with the effective root.
+    fn archive_menu(&self, open: bool) {
+        let Some(ui) = self.ui() else { return };
+        debug!("archive menu {}", if open { "opened" } else { "closed" });
+        if open {
+            ui.set_manager_open(false);
+            ui.set_us_menu_open(false);
+            ui.set_ua_menu_open(false);
+            ui.set_archive_error(SharedString::default());
+            ui.set_archive_dir_text(self.archive_root_text().as_str().into());
+        }
+        ui.set_archive_menu_open(open);
+        if open {
+            self.archive_state(&ui);
+        }
+    }
+
+    /// The toolbar's 💾 button: flip the overlay.
+    fn toggle_archive_menu(&self) {
+        let open = self.ui().is_some_and(|ui| ui.get_archive_menu_open());
+        self.archive_menu(!open);
+    }
+
+    /// The CheckBox: persist **at once**, rebroadcast to every live tab, and
+    /// (switching on) stamp a fresh ISO8601 folder onto every live tab
+    /// process — turning the mode off and on again starts a new archive run
+    /// instead of appending to the old one. Tabs spawned later ride the
+    /// setting through `--archive-mode` and take their own spawn-time folder.
+    fn archive_set_enabled(&self, on: bool) {
+        let Some(ui) = self.ui() else { return };
+        self.settings.borrow_mut().archive_enabled = on;
+        self.save_settings();
+        if on {
+            let now = archive::visit_dir_name();
+            for p in self.procs.borrow_mut().iter_mut() {
+                p.visit_dir = now.clone();
+            }
+        }
+        self.archive_broadcast(on);
+        info!(
+            "archive mode \u{2192} {} (root {})",
+            if on { "on" } else { "off" },
+            self.archive_root_text()
+        );
+        self.archive_state(&ui);
+    }
+
+    /// Push the switch to every live, un-crashed tab (global — containers
+    /// are irrelevant here). Send failures are ignored: the crash reporter
+    /// owns those tabs, exactly like [`Core::us_broadcast`].
+    fn archive_broadcast(&self, enabled: bool) {
+        let mut procs = self.procs.borrow_mut();
+        for p in procs.iter_mut() {
+            if p.crashed || p.state.closed {
+                continue;
+            }
+            if let Err(err) = p.tab.send(ToTab::SetArchiveMode { enabled }) {
+                debug!("archive mode not delivered to tab {}: {err}", p.tab.id);
+            }
+        }
+    }
+
+    /// The folder LineEdit → Apply: trim, expand a leading `~`, insist on an
+    /// absolute path, and require that the tree can actually be created — a
+    /// rejected folder rides the one-line `archive-error` **with the draft
+    /// kept** and changes nothing (the UA-menu Save leg, same rule).
+    fn archive_apply_dir(&self, input: &str) {
+        let Some(ui) = self.ui() else { return };
+        let text = expand_tilde(input.trim());
+        if text.is_empty() {
+            ui.set_archive_error("archive folder must not be empty".into());
+            return;
+        }
+        let path = PathBuf::from(&text);
+        if !path.is_absolute() {
+            ui.set_archive_error(
+                format!("archive folder must be an absolute path: {text}").as_str().into(),
+            );
+            return;
+        }
+        if let Err(err) = std::fs::create_dir_all(&path) {
+            ui.set_archive_error(format!("cannot create {text}: {err}").as_str().into());
+            return;
+        }
+        ui.set_archive_error(SharedString::default());
+        *self.archive_dir.borrow_mut() = path;
+        self.settings.borrow_mut().archive_dir = Some(text);
+        self.save_settings();
+        info!("archive root \u{2192} {}", self.archive_root_text());
+        self.archive_state(&ui);
+    }
+
+    /// Write one archived body under the tab's timestamp folder (task:
+    /// archive mode). The tab ships bytes only while the mode is on, but the
+    /// setting is re-checked here too: a message already in flight when the
+    /// user switched the mode off is dropped, never written to a stale run.
+    fn archive_write(&self, tid: TabId, is_document: bool, url: &str, bytes: &[u8]) {
+        if !self.settings.borrow().archive_enabled {
+            return;
+        }
+        let Some(rel) = archive::archive_relative_path(url, is_document) else {
+            debug!("archive: {url} has no archive path (not a web url?) — dropped");
+            return;
+        };
+        let visit = {
+            let procs = self.procs.borrow();
+            procs.iter().find(|p| p.tab.id == tid).map(|p| p.visit_dir.clone())
+        };
+        let Some(visit) = visit else { return }; // the tab died mid-flight
+        let root = self.archive_dir.borrow().clone();
+        match archive::write_archived(&root, &visit, &rel, bytes) {
+            Ok(()) => {
+                let n = self.archive_saved.get() + 1;
+                self.archive_saved.set(n);
+                debug!("archive: wrote {} ({n} file(s) this session)", rel.display());
+                self.archive_refresh_if_open();
+            }
+            Err(err) => warn!(
+                "archive: cannot write {} under {}: {err}",
+                rel.display(),
+                root.display()
+            ),
+        }
+    }
+
     // ---- persistence -------------------------------------------------------------
 
     fn save_settings(&self) {
@@ -1636,6 +1843,13 @@ impl Core {
                 // DevTools network panel: the row data is the reduced per-tab
                 // log (`TabState::network`); nothing to log per message.
                 FromTab::NetworkEvent { .. } => devtools_feed = true,
+                // Archive mode: the bytes themselves go to disk below — the
+                // log line stays tiny (never format a multi-MB body).
+                FromTab::ArchivedFetch { url, is_document, bytes } => debug!(
+                    "tab {tid} archived {}{url} ({} B)",
+                    if *is_document { "document " } else { "subresource " },
+                    bytes.len()
+                ),
                 FromTab::UrlChanged { url } => {
                     info!("tab {tid} url → {}", url.as_deref().unwrap_or("<none>"))
                 }
@@ -1733,6 +1947,12 @@ impl Core {
                 if Some(tid) == active {
                     self.apply_page_cursor(*cursor);
                 }
+            }
+            // Archive mode: the tab's shipped body lands under the tab's
+            // timestamp folder (task: archive mode). Writing happens in the
+            // pump — the tab process stays inside its sandbox.
+            if let FromTab::ArchivedFetch { url, is_document, bytes } = &msg {
+                self.archive_write(tid, *is_document, url, bytes);
             }
         }
 
@@ -2098,7 +2318,40 @@ impl Core {
             let c = self.clone();
             ui.on_ua_apply_custom(move |text| c.ua_apply_custom(text.as_str()));
         }
+
+        // Archive mode (task: archive mode): the 💾 toolbar toggle, the
+        // scrim/✕ close, the CheckBox switch (persist + broadcast to every
+        // live tab), and the root-folder Apply (validated, rejected drafts
+        // survive on the one-line error) — all pure Core state.
+        bind0!(on_toggle_archive_menu, |c: &Rc<Core>| c.toggle_archive_menu());
+        bind0!(on_close_archive_menu, |c: &Rc<Core>| c.archive_menu(false));
+        {
+            let c = self.clone();
+            ui.on_archive_set_enabled(move |on| c.archive_set_enabled(on));
+        }
+        {
+            let c = self.clone();
+            ui.on_archive_apply_dir(move |text| c.archive_apply_dir(text.as_str()));
+        }
     }
+}
+
+/// Expand a leading `~` / `~/…` to `$HOME/…` (the archive-folder LineEdit
+/// accepts the shell spelling; anything else passes through untouched).
+fn expand_tilde(raw: &str) -> String {
+    if raw == "~" {
+        return std::env::var_os("HOME")
+            .map(|home| PathBuf::from(home).display().to_string())
+            .unwrap_or_else(|| raw.to_owned());
+    }
+    if let Some(rest) = raw.strip_prefix("~/") {
+        if let Some(home) = std::env::var_os("HOME") {
+            let mut path = PathBuf::from(home);
+            path.push(rest);
+            return path.display().to_string();
+        }
+    }
+    raw.to_owned()
 }
 
 /// Grow, shrink and patch a shared Slint model in place. Appending only the

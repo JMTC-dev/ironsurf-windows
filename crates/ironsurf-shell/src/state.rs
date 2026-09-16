@@ -138,6 +138,9 @@ impl TabState {
                 false
             }
             FromTab::Frame { .. } => false,
+            // Archive mode: the pump writes the body to disk; there is no
+            // per-tab state to show and never a frame to repaint.
+            FromTab::ArchivedFetch { .. } => false,
             FromTab::Closed => {
                 if self.closed {
                     false

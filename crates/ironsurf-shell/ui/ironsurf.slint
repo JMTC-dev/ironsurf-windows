@@ -278,6 +278,18 @@ export component AppWindow inherits Window {
     // rejected Apply keeps the draft while `ua-error` says why)
     in-out property <string> ua-custom: "";
 
+    // Archive mode (the 💾 toggle): Rust owns every value — `archive-enabled`
+    // mirrors the live setting (off by default, persisted), `archive-dir-text`
+    // is the root folder (prefilled with the effective one, the built-in
+    // default being $HOME/Downloads/ironsurf-tabs), `archive-status` is the
+    // one-line summary under the CheckBox, and `archive-error` the one-line
+    // rejection of a bad folder (the draft survives, UA-menu style).
+    in property <bool> archive-menu-open: false;
+    in-out property <bool> archive-enabled: false;
+    in-out property <string> archive-dir-text: "";
+    in property <string> archive-status: "";
+    in property <string> archive-error: "";
+
     // ------------------------------------------------------------------
     // intents surfaced to Rust
     // ------------------------------------------------------------------
@@ -340,6 +352,14 @@ export component AppWindow inherits Window {
     // the custom-UA LineEdit → Apply (its current text, blank = default).
     callback ua-apply-custom(text: string);
 
+    // Archive-menu intents: the CheckBox flips the mode (broadcast to every
+    // live tab at once, global — not per-container), the LineEdit → Apply
+    // re-points the root folder (validated in Rust; rejected → `archive-error`).
+    callback toggle-archive-menu();
+    callback close-archive-menu();
+    callback archive-set-enabled(on: bool);
+    callback archive-apply-dir(text: string);
+
     // Console severity: icon + colour (error red, warn yellow, info/log grey).
     function devtools-level-icon(level: string) -> string {
         if (level == "error") { return "\u{2715}"; }
@@ -401,6 +421,11 @@ export component AppWindow inherits Window {
                 // User-Agent switcher (task: per-container UA) — same house
                 // pattern as the "</>" button directly to its left.
                 MiniButton { label: "UA"; clicked => { root.toggle-ua-menu(); } }
+
+                // archive mode (task: archive mode) — same house pattern
+                // again; the glyph doubles as the on/off state hint in the
+                // overlay, the button only ever toggles the menu.
+                MiniButton { label: "\u{1F4BE}"; clicked => { root.toggle-archive-menu(); } }
 
                 // container dropdown: shows the active tab's container,
                 // opens the manager on click
@@ -1156,6 +1181,86 @@ export component AppWindow inherits Window {
                 }
                 Text {
                     text: "The choice is persisted for this container and sent to its live tabs; tabs in other containers keep their own User-Agent. New tabs of this container start with it.";
+                    color: #888888;
+                    wrap: word-wrap;
+                }
+            }
+        }
+    }
+
+    // ------------------------------------------------------------------------
+    // Archive-mode overlay (task: archive mode)
+    //
+    // The same right-docked Rectangle as the other three menus (never a
+    // PopupWindow: LinuxKMS has none), opened by the 💾 toolbar button and
+    // never stacked — Rust closes it when any other menu opens, and closes
+    // the others when this one opens.
+    // ------------------------------------------------------------------------
+    Rectangle {
+        x: 0; y: 0;
+        width: root.width; height: root.height;
+        visible: root.archive-menu-open;
+        background: #00000099;
+        archive-scrim := TouchArea { clicked => { root.close-archive-menu(); } }
+
+        archive-panel := Rectangle {
+            TouchArea {} // swallow clicks over the panel
+            x: root.width - self.width;
+            width: Math.min(420px, root.width);
+            height: root.height;
+            background: #1e1e1e;
+
+            VerticalLayout {
+                padding: 12px;
+                spacing: 6px;
+
+                HorizontalLayout {
+                    spacing: 8px;
+                    height: 26px;
+                    Text { text: "\u{1F4BE} Archive mode"; color: #f0f0f0; font-weight: 600; vertical-alignment: center; }
+                    Rectangle { horizontal-stretch: 1; }
+                    MiniButton { label: "✕"; clicked => { root.close-archive-menu(); } }
+                }
+
+                CheckBox {
+                    text: "Save every visited site and every file it loads";
+                    checked <=> root.archive-enabled;
+                    // `toggled` fires after the checkbox flipped `checked`,
+                    // so the property already carries the wanted state.
+                    toggled => { root.archive-set-enabled(root.archive-enabled); }
+                }
+
+                // one-line live status (effective root + files saved so far)
+                Text {
+                    text: root.archive-status;
+                    color: #a8b8c8;
+                    wrap: word-wrap;
+                }
+
+                // one-line validation feedback (a rejected Apply keeps the draft)
+                Text {
+                    visible: root.archive-error != "";
+                    text: root.archive-error;
+                    color: #ef5350;
+                    wrap: word-wrap;
+                }
+
+                HorizontalLayout {
+                    height: 28px;
+                    spacing: 6px;
+                    LineEdit {
+                        horizontal-stretch: 1;
+                        text <=> root.archive-dir-text;
+                        placeholder-text: "archive folder (default: ~/Downloads/ironsurf-tabs)";
+                        accepted(t) => { root.archive-apply-dir(t); }
+                    }
+                    MiniButton { label: "Apply"; clicked => { root.archive-apply-dir(root.archive-dir-text); } }
+                }
+
+                Rectangle { vertical-stretch: 1; }
+
+                Text {
+                    text: "While on, every page (saved as <host>/index.html), script, style, image, and media file the tabs load is written under <folder>/<timestamp of the tab's start>/<host>/… . Each tab process gets its own timestamp folder, so nothing an earlier run saved is ever overwritten by a later one. Folders are created on demand; failures are logged, never fatal.";
                     color: #888888;
                     wrap: word-wrap;
                 }

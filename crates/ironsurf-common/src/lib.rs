@@ -136,6 +136,20 @@ pub enum FromTab {
     CursorChanged {
         cursor: CursorIcon,
     },
+    /// **Archive mode** (the 💾 toolbar toggle): one finished http(s) fetch
+    /// while the mode was on — the tab ships the response body verbatim and
+    /// the **shell** writes it under the configured archive root. `url` is
+    /// the final (post-redirect) request URL; `is_document` marks a
+    /// main-document navigation (saved as `<host>/index.html`), every other
+    /// entry is a subresource (media, script, style, image — saved under its
+    /// URL path). Emitted per successful (2xx/3xx-delivered) response, like
+    /// [`FromTab::NetworkEvent`] but with the bytes attached; failures are
+    /// never archived.
+    ArchivedFetch {
+        url: String,
+        is_document: bool,
+        bytes: Vec<u8>,
+    },
     Closed,
     Error {
         message: String,
@@ -200,6 +214,17 @@ pub enum ToTab {
     /// default UA. It applies for the tab's lifetime (across navigations).
     SetUserAgent {
         user_agent: Option<String>,
+    },
+    /// **Archive mode** master switch (the 💾 toolbar menu; global, not
+    /// per-container). While `enabled`, the tab emits [`FromTab::ArchivedFetch`]
+    /// for every successful http(s) response it fetches — documents,
+    /// subresources, and media — from that moment until switched off; the
+    /// **shell** owns the destination (root folder + per-tab timestamp
+    /// directory) and does the writing (tabs stay sandboxed). Newly spawned
+    /// tabs start with the current setting via the `--archive-mode` flag;
+    /// the shell rebroadcasts this message to every live tab on each toggle.
+    SetArchiveMode {
+        enabled: bool,
     },
     /// Answer a [`FromTab::DialogRequest`] (matched by `dialog_id`):
     /// `confirmed` is the button the user pressed (alert: always true once

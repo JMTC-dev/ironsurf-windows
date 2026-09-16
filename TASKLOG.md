@@ -1,4 +1,12 @@
 # Task log
+## #47 Archive mode (💾): common gains ToTab::SetArchiveMode{enabled} + FromTab::ArchivedFetch{url,is_document,bytes};
+  tab archives NOTHING itself — archive.rs sink (AtomicBool + queue; --archive-mode seeds, SetArchiveMode moves, off drops
+  the queue) fed by navigate Ok(<400, document), spawn_http (subresources), script-src, and media, drained like net_events;
+  shell owns disk: archive.rs (pure: $HOME/Downloads/ironsurf-tabs default, ISO8601 %Y-%m-%dT%H:%M:%S%:z **tab-process
+  SPAWN time** = visit_dir per Proc, host[:port]/index.html documents, sanitized subresource paths, traversal refused),
+  💾 button + fourth never-stacking overlay (CheckBox persisted in ui.json with the Apply-validated root, status counts saves),
+  pump writes in-flight-checked, spawn adds --archive-mode; fake_tab --expect-archive-mode + scripted fetches; tests:
+  archive.rs 9u + e2e + real_tab_archive.rs (localhost server, doc+css on disk, one folder), tab 3u, common+shell+ws green.
 ## #46 Docs-only: README gains §Per-container User-Agent (UA button, Default + 5 presets + Custom, applies to every later
   request of the active tab's container incl. navigator.userAgent live, persists in containers.json) before Feedback; welcome page
   (netmod::WELCOME_PAGE) gains §User agent after Containers and loses §Network policy + §Try a form (form, {query} echo, and the
@@ -71,18 +79,11 @@
   0), shell tests/dialogs.rs (queue/activation/prompt text/cancel) + tests/dialog_crash.rs (crash closes the overlay); tab 178u,
   shell 60, common 23 all green; live :2.0 run (xdotool --window hover-then-XTEST click): alert OK, confirm Cancel, prompt default
   "Marty" edited → Enter, page title reads the answers. CLI: -u/--url start URL (usage error without value) and -h/--help usage.
-## #34 DevTools verified end to end + docs/screenshots: new crates/ironsurf-shell/tests/devtools_e2e.rs spawns the REAL ironsurf-tab
-  through the shell TabProc pump on a std::net localhost fixture — asserts the full console feed (js log/error, broken script + tab
-  alive, dom + css source entries) and NetworkEvents (document + <img> valid-PNG, exact bytes, method/status/duration sane, status⊕error)
-  and clean Destroy. cargo test --workspace green (incl. the new test); release green (rustc needed RUST_MIN_STACK for vp9dec).
-  scripts/demo.sh reproduces docs/screenshots/devtools{,-network}.png on :2.0 (xdotool --window coords, URL bar, F12); README
-  §Developer tools + ARCH §Developer tools, §DevTools CSS seam and tab emission/NetworkEvent notes.
 ## #33 DevTools panel UI in the shell (Slint): bottom-docked overlay Rectangle over the page (no PopupWindow — LinuxKMS), F12 (U+F70F, U+F70B also) / Ctrl-I toggle it per tab
   (keymap `Shortcut::ToggleDevTools`, consumed, page-focus only); header [Console n | Network n | ✕], Console rows (icon+colour per level, `[source] message`) + Network table
   (Method|URL|Status|Size|Time, unknown `—`, failures show the error text in red). Pure view-models `TabState::console_rows/net_rows` + `format_size/duration`; app.rs keeps the
   open flag+pane on the tab record, pushes rows into shared VecModels from sync_ui and the drain tick (reduce says `false` for feed msgs, so nothing else would); fake_tab
   `--devtools-feed`; keymap/state/app units + tests/devtools.rs; shell 44u + all suites, common 22, workspace build green; :2.0 pixel-diff confirms the 1024x240 band paints on F12.
-## #32 DevTools console on the wire: ironsurf-tab now emits FromTab::ConsoleLog for every JS console.* line (all four levels, page order, source "js"), every uncaught script exception (source "js", or "dom" when a native __ironsurfDom* threw — the registration macro records native Errs into HostState::dom_throws and JsRuntime::classify_throw matches the eval-time message with boa's (native)/(at :l:c) Display suffix stripped; reported exactly once, StatusText unchanged), and a NEW src/logging.rs CSS seam: <style> bodies + inline style="" re-parsed through stylo's real ParseErrorReporter (blitz passes None upstream — gap documented in-code) plus wrong-Content-Type .css responses from BlitzNetProvider; tests/console_log.rs (5 localhost wire tests: levels+order, broken script + tab alive, dom-once, css seams, content-type ±control) + js/logging units; tab 176u + all suites green.
 ## #31 Network requests ride the IPC (DevTools Network panel): one FromTab::NetworkEvent per settled/failed
 request — method, URL, status, bytes, duration_ms; docs report every redirect hop (*_report fetch variants),
 NetProvider subresources + <script src> push into net_events drained per poll tick; failures error Some/status

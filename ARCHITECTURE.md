@@ -115,6 +115,13 @@ pub enum FromTab {
     // → EwResize); `Default` is the plain arrow. Emitted **only on change**,
     // like StatusText; `Pointer` is the pointing hand over an `<a>`.
     CursorChanged    { cursor: CursorIcon },
+    // archive mode (the shell's 💾 toggle): one finished http(s) fetch while
+    // the mode was on — the tab ships the body verbatim, the **shell** writes
+    // it under the configured root. `url` = final (post-redirect) URL;
+    // `is_document` = a main-document navigation (saved as the host's
+    // `index.html`), every other entry a subresource/media file (saved under
+    // its URL path). Failures are never archived; local schemes never ship.
+    ArchivedFetch    { url: String, is_document: bool, bytes: Vec<u8> },
     Closed,
     Error            { message: String },
 }
@@ -154,6 +161,13 @@ pub enum ToTab {
     // User-Agent on every subsequent request; None = the tab's built-in
     // default. The shell re-sends it on every tab spawn and on every switch.
     SetUserAgent { user_agent: Option<String> },
+    // archive mode master switch (the 💾 toolbar menu; **global**, not
+    // per-container): while enabled the tab emits `FromTab::ArchivedFetch`
+    // for every successful http(s) response (documents, subresources,
+    // media) from that moment on. The shell owns the destination (root +
+    // per-tab timestamp dir) and does all writing — tabs stay sandboxed.
+    // Fresh tabs inherit the setting via the `--archive-mode` spawn flag.
+    SetArchiveMode { enabled: bool },
     Destroy,
 }
 
@@ -639,6 +653,25 @@ UI (`crates/ironsurf-shell/ui/ironsurf.slint`):
   of other containers never receive it), and spawn/respawn of a UA container's tab
   appends `--user-agent <ua>` to that spawn alone (per-spawn args; the first page load
   already sends it).
+- Archive mode (top-bar 💾 button, right of "UA", toggles it): the same right-docked
+  overlay Rectangle, and no two of the four full-window overlays (manager /
+  userscripts / UA / archive) ever stack — each open closes the others. The CheckBox
+  flips the mode (**off by default**, persisted in `ui.json` alongside the root folder),
+  broadcasts `ToTab::SetArchiveMode` to every live tab at once (**global** — containers
+  are irrelevant), and a tab spawned while the mode is on launches with
+  `--archive-mode` and archives from its first fetch. The destination is
+  `<root>/<ISO8601 tab-process spawn timestamp>/<host[:port]>/…` (default root
+  `$HOME/Downloads/ironsurf-tabs`, editable in the overlay: `~` expanded, relative
+  paths rejected on the one line with the draft kept, the tree created on Apply).
+  The **spawn instant** names the folder (chrono `%Y-%m-%dT%H:%M:%S%:z` — e.g.
+  `2026-09-17T07:20:48+10:00/example.com/index.html`,
+  `…/127.0.0.1:8000/image.png`), re-taken from that moment for tabs that were already
+  live when the mode switched on — so a later run never overwrites an earlier one's
+  folder. Tabs never write: each successful fetch arrives as `FromTab::ArchivedFetch`
+  and the pump maps it to disk (document → `<host>/index.html`; subresource/media →
+  sanitized URL path, query/fragment stripped, `%XX` decoded, dot-segments neutralized
+  — pure `shell::archive`, traversal refused at write time too); the status line counts
+  the saves, failures are logged, never fatal.
 - Menu (native or in-toolbar): New Window(v1: new tab), Close Tab (Ctrl-W), Tab Next/Prev
   (Ctrl-Tab), Open Container Manager, Clear Container Data.
 

@@ -3323,6 +3323,7 @@ dependencies = [
 name = "ironsurf-shell"
 version = "0.1.0"
 dependencies = [
+ "chrono",
  "i-slint-backend-testing",
  "ironsurf-common",
  "ironsurf-storage",

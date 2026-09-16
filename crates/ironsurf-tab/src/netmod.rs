@@ -1225,6 +1225,10 @@ pub struct BlitzNetProvider {
     /// [`crate::logging::css_content_type_warning`]); drained by the tab loop
     /// exactly like `net_events` (same wake, same tick).
     console_events: crate::logging::ConsoleQueue,
+    /// Archive-mode sink (the shell's 💾 toggle): a delivered subresource
+    /// body is queued here (`store` is a no-op while the mode is off) and
+    /// shipped as `FromTab::ArchivedFetch` by the tab loop.
+    archive: Arc<crate::archive::ArchiveState>,
 }
 
 impl BlitzNetProvider {
@@ -1240,6 +1244,7 @@ impl BlitzNetProvider {
             user_agent: new_user_agent(None),
             net_events: Arc::new(Mutex::new(Vec::new())),
             console_events: crate::logging::console_queue(),
+            archive: crate::archive::ArchiveState::shared(false),
         }
     }
 
@@ -1302,6 +1307,15 @@ impl BlitzNetProvider {
         self
     }
 
+    /// Builder: share the tab's archive-mode sink with subresource fetches —
+    /// every delivered 2xx/3xx body is queued for `FromTab::ArchivedFetch`
+    /// while the mode is on.
+    #[must_use]
+    pub fn with_archive(mut self, archive: Arc<crate::archive::ArchiveState>) -> Self {
+        self.archive = archive;
+        self
+    }
+
     pub fn policy(&self) -> NetPolicy {
         self.policy
     }
@@ -1337,6 +1351,7 @@ impl BlitzNetProvider {
         let events = Arc::clone(&self.net_events);
         let console = Arc::clone(&self.console_events);
         let user_agent = Arc::clone(&self.user_agent);
+        let archive = Arc::clone(&self.archive);
         debug!(
             "subresource GET {url} (doc {doc_id}, {})",
             if managed { "managed" } else { "passthrough" }
@@ -1394,6 +1409,9 @@ impl BlitzNetProvider {
                     {
                         console.lock().expect("console events mutex").push(entry);
                     }
+                    // Archive mode: the delivered body is shipped to the shell
+                    // (no-op while off; never for local schemes).
+                    archive.store(&o.final_url, false, &o.body);
                     deliver(Some(handler), o.final_url.to_string(), o.body)
                 }
                 Ok(o) if aborted => {
