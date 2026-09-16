@@ -4,15 +4,15 @@
 //! characters for special keys, e.g. `Tab` is `"\t"`, arrows are the
 //! private-use code points from the Slint key table). We map those to the
 //! DOM `key`/`code` strings the tab hands to Servo, and we detect browser
-//! chords (Ctrl-L / Ctrl-W / Ctrl-R / Ctrl-T / Ctrl-Tab / Esc / Ctrl-+ / Ctrl--
-//! / Ctrl-0 / F12 / Ctrl-I) here so the logic stays pure and testable.
+//! chords (Ctrl-L / F6 / Ctrl-W / Ctrl-R / Ctrl-T / Ctrl-Tab / Esc / Ctrl-+ /
+//! Ctrl-- / Ctrl-0 / F12 / Ctrl-I) here so the logic stays pure and testable.
 
 use ironsurf_common::{KeyEvent, Modifiers};
 
 /// Browser-level shortcuts intercepted by the shell (never forwarded).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Shortcut {
-    /// Ctrl-L: focus the URL bar.
+    /// Ctrl-L / F6: focus the URL bar (and highlight its whole text).
     FocusUrl,
     /// Ctrl-W: close the active tab.
     CloseTab,
@@ -87,6 +87,11 @@ pub fn shortcut_for(text: &str, ctrl: bool, alt: bool, meta: bool) -> Option<Sho
     // the same chord: the only cost is F8, which no page we ship needs.
     if matches!(c, '\u{F70F}' | '\u{F70B}') && !alt && !meta {
         return Some(Shortcut::ToggleDevTools);
+    }
+    // F6 focuses the URL bar with no modifier (classic convention). F6 =
+    // U+F704 + 5 = U+F709 in the same private-use table as F12 above.
+    if c == '\u{F709}' && !ctrl && !alt && !meta {
+        return Some(Shortcut::FocusUrl);
     }
     if !ctrl || alt || meta {
         return None;
@@ -216,6 +221,22 @@ mod tests {
             shortcut_for("\u{1b}", false, false, false),
             Some(Shortcut::PageFocus)
         );
+    }
+
+    #[test]
+    fn f6_focuses_url_bar_like_ctrl_l() {
+        // F6 = U+F704 + 5 = U+F709, unmodified, focuses the URL bar.
+        assert_eq!(
+            shortcut_for("\u{F709}", false, false, false),
+            Some(Shortcut::FocusUrl)
+        );
+        // Modified F6 combos stay with the window manager / page.
+        assert_eq!(shortcut_for("\u{F709}", true, false, false), None);
+        assert_eq!(shortcut_for("\u{F709}", false, true, false), None);
+        assert_eq!(shortcut_for("\u{F709}", false, false, true), None);
+        // Neighbouring function keys are not URL focus.
+        assert_eq!(shortcut_for("\u{F708}", false, false, false), None); // F5
+        assert_eq!(shortcut_for("\u{F70A}", false, false, false), None); // F7
     }
 
     #[test]

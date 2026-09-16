@@ -74,7 +74,8 @@ component MiniButton inherits Rectangle {
     }
 }
 
-/// URL bar wrapper: bumps `focus-token` (from Rust / Ctrl-L) to grab focus.
+/// URL bar wrapper: bumps `focus-token` (from Rust / Ctrl-L / F6) to grab
+/// focus and highlight the whole address, so typing replaces it outright.
 component UrlBar inherits Rectangle {
     in property <int> focus-token: 0;
     in-out property<string> text <=> edit.text;
@@ -82,13 +83,16 @@ component UrlBar inherits Rectangle {
     edit := LineEdit {
         width: parent.width;
         height: parent.height;
-        placeholder-text: "Search or enter address — Ctrl-L to focus";
+        placeholder-text: "Search or enter address — Ctrl-L or F6 to focus";
         accepted(txt) => { root.submitted(txt); }
     }
     // armed on token bumps only (> 0), so clicking out of the bar does not
     // yank focus back
     changed focus-token => {
-        if (root.focus-token > 0) { edit.focus(); }
+        if (root.focus-token > 0) {
+            edit.focus();
+            edit.select-all();
+        }
     }
 }
 
