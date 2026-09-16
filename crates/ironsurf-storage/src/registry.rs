@@ -1,7 +1,8 @@
-//! Container registry (`containers.json`), the global userscript list
+//! Container registry (`containers.json`), including each container's
+//! optional per-container User-Agent, the global userscript list
 //! (`userscripts.json`), and the top-level [`Store`].
 
-use ironsurf_common::{Container, ContainerId, Userscript};
+use ironsurf_common::{Container, ContainerId, Userscript, MAX_USER_AGENT_CHARS};
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -26,6 +27,10 @@ pub enum StoreError {
     CannotDeleteDefault,
     #[error("container name must not be empty")]
     EmptyName,
+    #[error("user agent too long: {length} chars (max {max})")]
+    UserAgentTooLong { length: usize, max: usize },
+    #[error("user agent must not contain control characters")]
+    InvalidUserAgent,
     #[error("no such userscript: {0}")]
     NoSuchUserscript(u64),
     #[error("userscript name must not be empty")]
@@ -205,6 +210,52 @@ impl Store {
             .find(|c| c.id == id)
             .ok_or(StoreError::NoSuchContainer(id))?;
         container.color = color;
+        self.save()
+    }
+
+    /// Set the per-container User-Agent for `id` (persisted in
+    /// `containers.json`, like [`Store::set_container_color`]).
+    ///
+    /// `Some(v)` is stored trimmed; an all-blank `v` stores `None` (empty
+    /// input means the tab's built-in default). `None` stores `None`.
+    /// Validation happens before any mutation — a rejected call leaves the
+    /// in-memory container and `containers.json` untouched:
+    /// control characters are [`StoreError::InvalidUserAgent`], more than
+    /// [`MAX_USER_AGENT_CHARS`] chars is [`StoreError::UserAgentTooLong`].
+    pub fn set_container_user_agent(
+        &mut self,
+        id: ContainerId,
+        user_agent: Option<&str>,
+    ) -> Result<(), StoreError> {
+        // Validate first (mirrors `upsert_userscript`), then mutate + save.
+        let user_agent = match user_agent {
+            Some(v) => {
+                if v.chars().any(|c| c.is_control()) {
+                    return Err(StoreError::InvalidUserAgent);
+                }
+                let trimmed = v.trim();
+                // Blank input = the container has no override.
+                if trimmed.is_empty() {
+                    None
+                } else {
+                    let length = trimmed.chars().count();
+                    if length > MAX_USER_AGENT_CHARS {
+                        return Err(StoreError::UserAgentTooLong {
+                            length,
+                            max: MAX_USER_AGENT_CHARS,
+                        });
+                    }
+                    Some(trimmed.to_string())
+                }
+            }
+            None => None,
+        };
+        let container = self
+            .containers
+            .iter_mut()
+            .find(|c| c.id == id)
+            .ok_or(StoreError::NoSuchContainer(id))?;
+        container.user_agent = user_agent;
         self.save()
     }
 

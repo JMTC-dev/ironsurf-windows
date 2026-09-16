@@ -1,4 +1,5 @@
-//! IronSurf disk layer: container registry, global userscripts, per-container
+//! IronSurf disk layer: container registry (including each container's
+//! optional per-container User-Agent), global userscripts, per-container
 //! profile stores, an RFC6265-subset cookie jar, a bounded LRU network cache,
 //! and history.
 //!

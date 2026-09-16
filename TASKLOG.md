@@ -1,4 +1,9 @@
 # Task log
+## #43 Per-container User-Agent persisted (step 2/5, storage only): Store::set_container_user_agent(id, Option<&str>) writes Container::user_agent
+  into containers.json via the atomic save(), shaped like set_container_color; Some(v) stores v trimmed, all-blank Some("") and None both store
+  None (= the tab default); validation precedes mutation (upsert_userscript pattern) so rejects leave memory + the file byte-identical — control
+  chars ⇒ InvalidUserAgent, > MAX_USER_AGENT_CHARS ⇒ UserAgentTooLong{length,max}, unknown id ⇒ NoSuchContainer. Docs synced; tests/user_agent.rs
+  8 green (reopen, clear, A/B independence, trim, blank⇒None, cap boundary, control chars, bogus id) + 42 pre-existing, ws check clean.
 ## #42 Per-container User-Agent contract (step 1/5, common only): ToTab::SetUserAgent{user_agent} — Some(v) = send
   exactly v as the HTTP User-Agent on every later request, None = the tab's built-in default; Container gains
   #[serde(default)] user_agent: Option<String> (legacy containers.json written without the key still loads, as None);
