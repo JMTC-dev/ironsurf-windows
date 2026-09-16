@@ -15,6 +15,7 @@ use std::sync::mpsc::{channel, Receiver, Sender};
 use ironsurf_common::{debug, error, info, trace, warn};
 use ironsurf_common::{
     default_url, ContextAction, ContextTarget, ContainerId, DialogKind, FromTab, TabId, ToTab,
+    Userscript,
 };
 use ironsurf_storage::default_data_root;
 use slint::{
@@ -35,6 +36,8 @@ use crate::{AppWindow, ContainerInfo, MenuItem, TabInfo};
 // The Slint-side row structs the DevTools panel renders (`state`'s own
 // view-models of the same name are converted into these).
 use crate::{ConsoleRow, NetRow};
+// The pure userscript-menu helpers (src/userscripts.rs).
+use crate::userscripts::{build_new_userscript, enabled_userscripts, userscript_rows};
 
 /// Fixed palette — **keep in sync** with `palette-color()` in ui/ironsurf.slint.
 pub const PALETTE: [&str; 7] = [
@@ -169,6 +172,10 @@ pub struct Core {
     dt_console: Rc<VecModel<ConsoleRow>>,
     /// The DevTools network table (same reason).
     dt_net: Rc<VecModel<NetRow>>,
+    /// Script id of each userscript-menu row, in `us-scripts` model order:
+    /// the overlay mutates by row index, the Store (and the wire) speak ids.
+    /// Refreshed from the Store whenever the menu list is re-pushed.
+    us_ids: RefCell<Vec<u64>>,
 }
 
 /// The assembled application: core + the timers that drive it (owned so
@@ -213,6 +220,7 @@ impl App {
             dialog_shown: RefCell::new(None),
             dt_console: Rc::new(VecModel::default()),
             dt_net: Rc::new(VecModel::default()),
+            us_ids: RefCell::new(Vec::new()),
         });
 
         core.attach_callbacks(ui);
@@ -403,6 +411,9 @@ impl Core {
                 if w > 0.0 && h > 0.0 {
                     self.send_active(ToTab::Resize { width: w as u32, height: h as u32, scale: 1.0 });
                 }
+                // A tab process starts with an empty script set: seed it with
+                // the enabled userscripts at once (task: userscript menu).
+                self.seed_userscripts(id);
             }
             Err(err) => {
                 error!("spawn {} failed: {err}", tab_bin.display());
@@ -1027,6 +1038,9 @@ impl Core {
     fn manager_open(&self, open: bool) {
         let Some(ui) = self.ui() else { return };
         if open {
+            // Two full-window overlays never stack: opening the manager shuts
+            // the userscript menu (and vice versa — see `userscript_menu`).
+            ui.set_us_menu_open(false);
             let active_container = self
                 .active_proc_index()
                 .map(|i| self.procs.borrow()[i].tab.container)
@@ -1095,6 +1109,8 @@ impl Core {
             }
             let mut old = old;
             old.tab.destroy();
+            // The replacement process is new: seed its userscript set too.
+            self.seed_userscripts(id);
         }
         self.manager_open(false);
         self.sync_ui();
@@ -1173,6 +1189,157 @@ impl Core {
         if let Some(ui) = self.ui() {
             ui.set_selected_container(idx);
         }
+    }
+
+    // ---- userscript menu (task: userscript menu) -----------------------------
+
+    /// Every stored userscript, in storage order (integration tests).
+    pub fn userscripts(&self) -> Vec<Userscript> {
+        self.store.borrow().userscripts()
+    }
+
+    /// The id of each userscript-menu row, in `us-scripts` model order
+    /// (integration tests).
+    pub fn userscript_row_ids(&self) -> Vec<u64> {
+        self.us_ids.borrow().clone()
+    }
+
+    /// Re-read the list from the Store: refresh the row-id mirror and push the
+    /// rows (`name`, patterns joined by `", "`, enabled) onto the menu model.
+    fn us_refresh(&self) {
+        if let Some(ui) = self.ui() {
+            let scripts = self.store.borrow().userscripts();
+            *self.us_ids.borrow_mut() = scripts.iter().map(|s| s.id).collect();
+            ui.set_us_scripts(ModelRc::from(Rc::new(VecModel::from(userscript_rows(&scripts)))));
+        }
+    }
+
+    /// Open/close the menu overlay. Opening re-reads the Store, resets the
+    /// editor, and closes the container manager: two full-window overlays must
+    /// never stack — and the manager closes this one the same way (see
+    /// [`Core::manager_open`]).
+    fn userscript_menu(&self, open: bool) {
+        let Some(ui) = self.ui() else { return };
+        if open {
+            ui.set_manager_open(false);
+            ui.set_us_editing(false);
+            ui.set_us_error(SharedString::default());
+            self.us_refresh();
+        }
+        ui.set_us_menu_open(open);
+    }
+
+    /// The toolbar's "</>" button: flip the menu overlay.
+    fn toggle_userscript_menu(&self) {
+        let open = self.ui().is_some_and(|ui| ui.get_us_menu_open());
+        self.userscript_menu(!open);
+    }
+
+    /// A row's CheckBox was flipped: persist through the Store **at once** and
+    /// rebroadcast. `toggled` fires after the checkbox flipped its own
+    /// `checked`, so the wanted state is the negation of the stored one.
+    fn us_toggle(&self, idx: usize) {
+        let Some(id) = self.us_ids.borrow().get(idx).copied() else { return };
+        let now = !self
+            .store
+            .borrow()
+            .userscripts()
+            .iter()
+            .any(|s| s.id == id && s.enabled);
+        if let Err(err) = self.store.borrow_mut().set_userscript_enabled(id, now) {
+            warn!("userscript {id} could not be toggled: {err}");
+        }
+        self.us_broadcast();
+        self.us_refresh();
+    }
+
+    /// A row's ✕: remove the script (its data is the script itself — nothing
+    /// else to wipe) and rebroadcast the rest.
+    fn us_delete(&self, idx: usize) {
+        let Some(id) = self.us_ids.borrow().get(idx).copied() else { return };
+        if let Err(err) = self.store.borrow_mut().delete_userscript(id) {
+            warn!("userscript {id} could not be deleted: {err}");
+        }
+        self.us_broadcast();
+        self.us_refresh();
+    }
+
+    /// "+ New script": reveal the inline editor with empty fields.
+    fn us_new(&self) {
+        let Some(ui) = self.ui() else { return };
+        ui.set_us_name(SharedString::default());
+        ui.set_us_patterns(SharedString::default());
+        ui.set_us_code(SharedString::default());
+        ui.set_us_error(SharedString::default());
+        ui.set_us_editing(true);
+    }
+
+    /// Save the editor. Validation is the Store's (`upsert_userscript`): a
+    /// rejected script is **not** added, the editor stays up, and the
+    /// `StoreError` text becomes the menu's one-line error. An accepted one
+    /// (id from `next_userscript_id`) rebroadcasts the new enabled set.
+    fn us_save(&self) {
+        let Some(ui) = self.ui() else { return };
+        let (name, patterns, code) = (
+            ui.get_us_name().to_string(),
+            ui.get_us_patterns().to_string(),
+            ui.get_us_code().to_string(),
+        );
+        let script = {
+            let id = self.store.borrow().next_userscript_id();
+            build_new_userscript(id, &name, &patterns, &code)
+        };
+        if let Err(err) = self.store.borrow_mut().upsert_userscript(script) {
+            warn!("userscript {name:?} rejected: {err}");
+            ui.set_us_error(err.to_string().into());
+            return; // script not added; the editor keeps the draft
+        }
+        ui.set_us_error(SharedString::default());
+        ui.set_us_editing(false);
+        ui.set_us_name(SharedString::default());
+        ui.set_us_patterns(SharedString::default());
+        ui.set_us_code(SharedString::default());
+        self.us_broadcast();
+        self.us_refresh();
+    }
+
+    /// "Cancel": drop the draft, keep the list.
+    fn us_cancel(&self) {
+        let Some(ui) = self.ui() else { return };
+        ui.set_us_editing(false);
+        ui.set_us_error(SharedString::default());
+    }
+
+    /// The script set as it rides the wire: **all enabled** scripts (contract:
+    /// disabled ones are never sent; an empty set clears a tab).
+    fn us_payload(&self) -> Vec<Userscript> {
+        enabled_userscripts(&self.store.borrow().userscripts())
+    }
+
+    /// After any mutation (toggle / save / delete): push the new enabled set to
+    /// every **live** tab, best effort. Crashed and already-closed tabs are
+    /// skipped, and a send that fails on a tab the drain tick has not yet
+    /// noticed dying is ignored — `check_crashes` makes that noise, matching
+    /// the existing crash handling (see `set_visible_except`).
+    fn us_broadcast(&self) {
+        let scripts = self.us_payload();
+        let mut procs = self.procs.borrow_mut();
+        for p in procs.iter_mut() {
+            if p.crashed || p.state.closed {
+                continue;
+            }
+            if let Err(err) = p.tab.send(ToTab::SetUserscripts { scripts: scripts.clone() }) {
+                debug!("userscripts not delivered to tab {}: {err}", p.tab.id);
+            }
+        }
+    }
+
+    /// Hand the current enabled set to one freshly spawned tab process: a new
+    /// process starts empty, so the shell seeds it (the empty set is sent too
+    /// — it provably clears a respawned tab).
+    fn seed_userscripts(&self, tid: TabId) {
+        let scripts = self.us_payload();
+        let _ = self.send_to(tid, ToTab::SetUserscripts { scripts });
     }
 
     // ---- persistence -------------------------------------------------------------
@@ -1632,6 +1799,31 @@ impl Core {
             ui.on_devtools_select_view(move |view| c.set_devtools_view(DevToolsView::from_index(view)));
         }
         bind0!(on_devtools_close, |c: &Rc<Core>| c.close_devtools());
+
+        // Userscript menu (task: userscript menu): the toolbar toggle, the
+        // scrim/✕ close, and the row/footer intents — every mutation lands in
+        // the Store at once and rebroadcasts the enabled set to all live tabs.
+        bind0!(on_toggle_us_menu, |c: &Rc<Core>| c.toggle_userscript_menu());
+        bind0!(on_close_us_menu, |c: &Rc<Core>| c.userscript_menu(false));
+        bind0!(on_us_new, |c: &Rc<Core>| c.us_new());
+        bind0!(on_us_save, |c: &Rc<Core>| c.us_save());
+        bind0!(on_us_cancel, |c: &Rc<Core>| c.us_cancel());
+        {
+            let c = self.clone();
+            ui.on_us_toggle(move |idx| {
+                if idx >= 0 {
+                    c.us_toggle(idx as usize);
+                }
+            });
+        }
+        {
+            let c = self.clone();
+            ui.on_us_delete(move |idx| {
+                if idx >= 0 {
+                    c.us_delete(idx as usize);
+                }
+            });
+        }
     }
 }
 

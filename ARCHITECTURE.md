@@ -573,6 +573,19 @@ UI (`crates/ironsurf-shell/ui/ironsurf.slint`):
   Fed by the shell's FIFO dialog queue (`FromTab::DialogRequest`, the requesting tab
   activated); OK/Cancel/prompt-Enter send `ToTab::DialogResponse` and unblock that tab.
   Closing or crashing a tab drops its queued/shown dialogs (cancelled).
+- Userscript menu (top-bar "</>" button, right of ＋, toggles it): a right-docked overlay
+  Rectangle over the page — same pattern as the container manager, never a `PopupWindow`
+  (LinuxKMS has no popups) — and the two never stack: opening one closes the other. List
+  rows from the Store: enable CheckBox (persisted through `Store::set_userscript_enabled`
+  the instant it flips), bold name, URL patterns joined by `", "` in dim, ✕ deletes
+  (`Store::delete_userscript`). Footer "+ New script" reveals an inline editor (name and
+  patterns `LineEdit` — patterns comma/space-separated — plus a multi-line `TextInput`
+  for the code); Save upserts via `Store::upsert_userscript` with an id from
+  `next_userscript_id`, and a rejected script is **not** added — the `StoreError` text
+  shows as a one-line error while the draft stays. Broadcast policy: after every mutation
+  (and at tab spawn/respawn) the shell sends `ToTab::SetUserscripts` with **all enabled**
+  scripts to every live tab, best effort — crashed/closed tabs are skipped, send failures
+  ignored (the crash reporting owns those); disabled scripts are never sent.
 - Menu (native or in-toolbar): New Window(v1: new tab), Close Tab (Ctrl-W), Tab Next/Prev
   (Ctrl-Tab), Open Container Manager, Clear Container Data.
 

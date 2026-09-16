@@ -520,11 +520,22 @@ mod tests {
             level: "warn".into(),
             message: "bad selector".into(),
         });
+        // Userscript entries (task: userscript menu): the tab attributes them
+        // with the script's name in the message — the panel renders both.
+        s.reduce(&FromTab::ConsoleLog {
+            source: "userscript".into(),
+            level: "log".into(),
+            message: "Darkify: hello from the script".into(),
+        });
         assert_eq!(
             s.console_rows(),
             vec![
                 ConsoleRow { level: "error".into(), text: "[js] boom".into() },
                 ConsoleRow { level: "warn".into(), text: "[css] bad selector".into() },
+                ConsoleRow {
+                    level: "log".into(),
+                    text: "[userscript] Darkify: hello from the script".into(),
+                },
             ]
         );
     }

@@ -9,7 +9,7 @@
 // cannot declare custom properties — so the two focus() watchers live in
 // the small custom components `UrlBar` and `PageSurface` instead.
 
-import { LineEdit, ListView } from "std-widgets.slint";
+import { LineEdit, ListView, CheckBox } from "std-widgets.slint";
 
 export struct TabInfo {
     id: int,
@@ -46,6 +46,16 @@ export struct NetRow {
     size: string,
     time: string,
     failed: bool,
+}
+
+/// One userscript-menu row, reduced from a stored `Userscript` by
+/// `userscripts::userscript_rows` (`patterns` is the URL-pattern list joined
+/// by `", "`, painted dim under the name; `enabled` drives the CheckBox).
+export struct UserscriptRow {
+    id: int,
+    name: string,
+    patterns: string,
+    enabled: bool,
 }
 
 /// A tiny borderless toolbar button (cheaper than styled Buttons in rows).
@@ -227,6 +237,19 @@ export component AppWindow inherits Window {
     in property <[ConsoleRow]> console-rows;
     in property <[NetRow]> net-rows;
 
+    // Userscript menu (task: userscript menu): toggled by the "</>" toolbar
+    // button. Rust owns the open flag, re-pushes `us-scripts` from the Store
+    // after every mutation, and keeps `(us-editing, us-name, us-patterns,
+    // us-code)` as the inline "+ New script" editor. A failed Save leaves the
+    // editor up with `us-error` set and the script NOT added.
+    in property <bool> us-menu-open: false;
+    in property <[UserscriptRow]> us-scripts;
+    in property <bool> us-editing: false;
+    in property <string> us-error: "";
+    in-out property <string> us-name: "";
+    in-out property <string> us-patterns: "";
+    in-out property <string> us-code: "";
+
     // ------------------------------------------------------------------
     // intents surfaced to Rust
     // ------------------------------------------------------------------
@@ -263,6 +286,17 @@ export component AppWindow inherits Window {
     // — a modal is dismissed by an answer, never by clicking past it.
     callback dialog-accept();
     callback dialog-cancel();
+
+    // Userscript-menu intents (indices are rows of `us-scripts`; Rust maps
+    // them back onto script ids). Toggle/delete/save persist through the
+    // Store at once and rebroadcast the enabled set to every live tab.
+    callback toggle-us-menu();
+    callback close-us-menu();
+    callback us-toggle(idx: int);
+    callback us-delete(idx: int);
+    callback us-new();
+    callback us-save();
+    callback us-cancel();
 
     // Console severity: icon + colour (error red, warn yellow, info/log grey).
     function devtools-level-icon(level: string) -> string {
@@ -318,6 +352,9 @@ export component AppWindow inherits Window {
                 }
 
                 MiniButton { label: "＋"; clicked => { root.new-tab(); } }
+
+                // userscript menu (task: userscript menu)
+                MiniButton { label: "</>"; clicked => { root.toggle-us-menu(); } }
 
                 // container dropdown: shows the active tab's container,
                 // opens the manager on click
@@ -813,6 +850,147 @@ export component AppWindow inherits Window {
                     text: "Move tab re-spawns the active tab in the selected container (keeping its URL). Delete wipes that container's data. The palette recolors the selected container.";
                     color: #888888;
                     wrap: word-wrap;
+                }
+            }
+        }
+    }
+
+    // ------------------------------------------------------------------------
+    // userscript menu overlay (task: userscript menu)
+    //
+    // Exactly like the container manager above and never a PopupWindow (LinuxKMS
+    // has no popups): a right-docked Rectangle over everything, its scrim a
+    // TouchArea that closes the menu. Declared last ⇒ on top of the manager too
+    // — and Rust closes one when the other opens, so they never stack.
+    // ------------------------------------------------------------------------
+    Rectangle {
+        x: 0; y: 0;
+        width: root.width; height: root.height;
+        visible: root.us-menu-open;
+        background: #00000099;
+        us-scrim := TouchArea { clicked => { root.close-us-menu(); } }
+
+        us-panel := Rectangle {
+            TouchArea {} // swallow clicks over the panel
+            x: root.width - self.width;
+            width: Math.min(420px, root.width);
+            height: root.height;
+            background: #1e1e1e;
+
+            VerticalLayout {
+                padding: 12px;
+                spacing: 6px;
+
+                HorizontalLayout {
+                    spacing: 8px;
+                    height: 26px;
+                    Text { text: "Userscripts"; color: #f0f0f0; font-weight: 600; vertical-alignment: center; }
+                    Rectangle { horizontal-stretch: 1; }
+                    MiniButton { label: "✕"; clicked => { root.close-us-menu(); } }
+                }
+
+                // one-line validation feedback (a failed Save keeps the editor up)
+                Text {
+                    visible: root.us-error != "";
+                    text: root.us-error;
+                    color: #ef5350;
+                    wrap: word-wrap;
+                }
+
+                for us[i] in root.us-scripts: Rectangle {
+                    height: 44px;
+                    width: parent.width;
+                    usbg := Rectangle { background: usa.has-hover ? #2c2c2c : #262626; border-radius: 4px; }
+                    HorizontalLayout {
+                        x: 6px; y: 3px;
+                        width: parent.width - 12px;
+                        spacing: 8px;
+                        cross-axis-alignment: center;
+                        // the enable/disable toggle, bound to the stored flag;
+                        // Rust persists through the Store at once and re-broadcasts
+                        CheckBox {
+                            checked: us.enabled;
+                            toggled => { root.us-toggle(i); }
+                        }
+                        VerticalLayout {
+                            horizontal-stretch: 1;
+                            spacing: 0px;
+                            Text {
+                                text: us.name;
+                                color: #e8e8e8;
+                                font-weight: 600;
+                                horizontal-alignment: left;
+                                overflow: elide;
+                            }
+                            Text {
+                                text: us.patterns;
+                                color: #8a8a8a;
+                                font-size: 11px;
+                                horizontal-alignment: left;
+                                overflow: elide;
+                            }
+                        }
+                        MiniButton { label: "✕"; clicked => { root.us-delete(i); } }
+                    }
+                    usa := TouchArea { }
+                }
+
+                if root.us-scripts.length == 0 && !root.us-editing: Text {
+                    text: "No userscripts yet — add one below. Enabled scripts run on matching pages; disabled ones are never sent to a tab.";
+                    color: #888888;
+                    wrap: word-wrap;
+                }
+
+                Rectangle { vertical-stretch: 1; }
+
+                // ---- footer: "+ New script" and the inline editor ----------
+                if !root.us-editing: HorizontalLayout {
+                    height: 28px;
+                    spacing: 6px;
+                    MiniButton { label: "+ New script"; clicked => { root.us-new(); } }
+                }
+                if root.us-editing: VerticalLayout {
+                    spacing: 6px;
+                    Text { text: "New userscript"; color: #f0f0f0; font-weight: 600; }
+                    LineEdit {
+                        height: 26px;
+                        text <=> root.us-name;
+                        placeholder-text: "name";
+                    }
+                    LineEdit {
+                        height: 26px;
+                        text <=> root.us-patterns;
+                        placeholder-text: "URL patterns (comma or space separated, * wildcards ok)";
+                    }
+                    // multi-line code editor: the builtin TextInput with
+                    // single-line off (a LineEdit would flatten the script)
+                    Rectangle {
+                        height: Math.min(160px, Math.max(120px, parent.width * 0.35));
+                        background: #141414;
+                        border-radius: 4px;
+                        border-width: 1px;
+                        border-color: #3a3a3a;
+                        clip: true;
+                        us-code-focus := FocusScope {
+                            width: parent.width; height: parent.height;
+                            TextInput {
+                                width: parent.width;
+                                height: parent.height;
+                                single-line: false;
+                                wrap: word-wrap;
+                                font-size: 12px;
+                                color: #e8e8e8;
+                                text <=> root.us-code;
+                            }
+                        }
+                    }
+                    HorizontalLayout {
+                        height: 28px;
+                        spacing: 8px;
+                        MiniButton { label: "Save"; clicked => { root.us-save(); } }
+                        MiniButton { label: "Cancel"; clicked => { root.us-cancel(); } }
+                        Rectangle { horizontal-stretch: 1; }
+                    }
                 }
             }
         }

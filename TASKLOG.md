@@ -1,4 +1,5 @@
 # Task log
+## #40 Userscript MENU in the shell (step 4/5): glyph-free "US" toolbar button right of ＋ toggles a right-docked overlay (container-manager pattern, never PopupWindow; the two never stack — each closes the other). Rows: enable CheckBox persisted at once via Store::set_userscript_enabled, bold name, dim ", "-joined patterns, ✕ delete; "+ New script" inline editor (name/patterns LineEdits — patterns comma/space-split — multi-line TextInput for code); a rejected Save keeps the draft, shows the StoreError on one line, script NOT added. Broadcast: every mutation AND tab spawn/respawn sends ToTab::SetUserscripts with all ENABLED scripts to every live tab (crashed/closed skipped, send failures ignored — the crash reporter owns those); disabled never sent. Pure src/userscripts.rs (rows, enabled-only payload, parse_patterns, tempdir-Store reopen round-trips); fake_tab --expect-userscripts echoes "userscripts:[ids]" on its status line; tests/userscripts.rs drives save/validate/toggle/re-toggle/delete/seed/manager-exclusion over the real pipe; state.rs console_rows covers "[userscript] Name: msg"; shell 53u + all suites, common 27, storage green; ARCH §ironsurf-shell bullet added.
 ## #39 Userscripts execute in the tab (step 3/5): Tab stores ToTab::SetUserscripts (replace-wholesale; empty clears) and run_scripts ends with run_userscripts(url) —
   once per document (incl. JS-redirect targets), userscripts_for_url filtered at run time, shell store order, same Boa realm via JsRuntime::run_userscript(name, code,
   doc) with HostState::userscript naming the running script for that evaluation only: its console.* ships as ConsoleLog source "userscript" "{name}: {text}" (page keeps
@@ -82,15 +83,4 @@ about:blank doc replacing the entry (spec); netmod still never *fetches* javascr
 (in-page exec, string→doc, href-push+Back, replace-hides-referrer) + js unit tests; ARCH/docs synced.
 ## #24 search engine → https://html.duckduckgo.com/html/?q= (was duckduckgo.com/?q=) — classify::search_url +
 all test expectations + gui.rs + ARCH §URL-bar updated; ironsurf-shell suite green (26u + gui/e2e).
-## #23 cookies actually returned to sites — navigations are never cookie-less: plan_document (old plan dropped)
-routes every top-level http(s) load through managed_http_fetch EVEN under default Passthrough (Passthrough now skips
-only https-upgrade+cache); redirects followed hop-by-hop on a Policy::none() client (FetchWorker::managed_client):
-per-hop jar Cookie (cross-host redirect never replays blindly; localhost≠127.0.0.1 proven), per-hop Set-Cookie
-capture (chain cookies reach the final hop), POST→GET on 303/301/302, 307/308 keep body; Tab+provider share ONE
-Arc<Mutex<CookieJar>> (was two jars, last-save-won clobbered subresource cookies). cookies.rs RFC6265 hardening:
-§5.1.4 path-match exact (Path=/foo hits /foo+/foo/bar, /foo/ never /foo; no trailing-slash normalization), Domain= on
-IP host or invalid/single-label → reject, malformed Max-Age → delete, already-expired Expires deletes not stores;
-HttpOnly persisted+sent normally, scripts have zero cookie access; per-container jars = profile dirs
-(containers_have_separate_jars test + sandbox probe). localhost HTTP wire tests (redirect chain, path/domain scope,
-cross-host, Passthrough nav), runtime ptr_eq shared-jar test; ARCH cookie rules+net layer updated; workspace green,
-live example.com real_tab ok.
+

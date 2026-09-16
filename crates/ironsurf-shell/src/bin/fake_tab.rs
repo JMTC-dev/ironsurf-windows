@@ -21,6 +21,7 @@ fn main() {
     let mut devtools_feed = false;
     let mut dialog_feed = false;
     let mut cursor = false;
+    let mut expect_userscripts = false;
 
     let mut it = args.iter().skip(1);
     while let Some(arg) = it.next() {
@@ -55,6 +56,11 @@ fn main() {
             // the plain arrow elsewhere (reported only on change, as the
             // real tab does).
             "--cursor" => cursor = true,
+            // Userscript-menu harness (task: userscript menu): every inbound
+            // ToTab::SetUserscripts is echoed on the status line with the ids
+            // it carries (comma-joined), so the tests can assert the shell
+            // seeded this tab and rebroadcast every mutation.
+            "--expect-userscripts" => expect_userscripts = true,
             _ => {} // tolerate the real tab's flags
         }
     }
@@ -201,7 +207,20 @@ fn main() {
             // Userscripts (task: userscript execution): only the REAL tab runs
             // them; this fake has no JS engine, so the set is accepted and
             // dropped. The point is that the message never breaks the pump.
-            ToTab::SetUserscripts { .. } => {}
+            // With `--expect-userscripts` the ids echo on the status line so
+            // the shell-side menu test can see exactly what arrived, in order.
+            ToTab::SetUserscripts { scripts } => {
+                if expect_userscripts {
+                    let ids = scripts
+                        .iter()
+                        .map(|s| s.id.to_string())
+                        .collect::<Vec<_>>()
+                        .join(",");
+                    emit(FromTab::StatusText {
+                        text: Some(format!("userscripts:[{ids}]")),
+                    });
+                }
+            }
             ToTab::Destroy => break,
         }
     }
