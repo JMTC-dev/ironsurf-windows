@@ -635,6 +635,12 @@ pub struct Tab {
     /// When the media steps must next run even with no events at all; `None`
     /// = no live players, and the loop may idle (`media_poll_tick`).
     media_next_pump: Option<Instant>,
+    /// The `ironsurf://archive` page this tab is sitting on, when it is one:
+    /// the URL as asked for. The tab cannot serve the archive itself (it is
+    /// sandboxed and the archive tree belongs to the shell), so rendering the
+    /// page emits [`FromTab::ArchiveServerStart`] and the shell's
+    /// [`ToTab::ArchiveServerInfo`] is what the page shows.
+    archive_page: Option<String>,
     /// stdout side of the IPC, shared with [`Tab::dialog`] (a modal pumps
     /// stdin while the loop is inside a JS turn, and must still be able to
     /// emit). All writes go through the `RefCell` — never borrowed across a
@@ -921,6 +927,7 @@ impl Tab {
             media_results: Arc::new(Mutex::new(Vec::new())),
             media_enabled: args.media_enabled,
             media_next_pump: None,
+            archive_page: None,
             net_events,
             console_events,
             css_scan: CssScanState::new(),
@@ -1017,6 +1024,45 @@ impl Tab {
         self.navigate_post(raw, history, None)
     }
 
+    /// Render `ironsurf://archive`: ask the shell for its archive browsing
+    /// server, honouring the page's query (`?root=…`, `?host=…`, `?port=…`
+    /// override the shell's configured values; `?open=1` means "start it and
+    /// open the served folder in a **new tab**, leaving this page alone", and
+    /// without it this tab is sent to the server's own control page once the
+    /// address is known).
+    fn ask_archive_server(&mut self, url: &Url) {
+        let query = url.query().unwrap_or("").to_string();
+        let field = |name: &str| {
+            query
+                .split('&')
+                .rev()
+                .find_map(|pair| {
+                    let (key, value) = pair.split_once('=')?;
+                    (key == name && !value.trim().is_empty()).then(|| value.to_string())
+                })
+                // The query value arrives percent-encoded (a folder path has
+                // nothing else to be); decode once so the shell reads plain
+                // text. The shell's own path resolution is the safety net.
+                .map(|v| {
+                    String::from_utf8_lossy(&netmod::percent_decode(v.as_bytes()))
+                        .into_owned()
+                })
+        };
+        let port = field("port")
+            .as_deref()
+            .map(|text| text.trim().parse::<u16>().ok())
+            .flatten()
+            .filter(|p| *p != 0);
+        let open = field("open").is_some();
+        self.archive_page = Some(url.as_str().to_string());
+        self.emit(FromTab::ArchiveServerStart {
+            root: field("root"),
+            host: field("host"),
+            port,
+            open_in_new_tab: open,
+        });
+    }
+
     /// [`Self::navigate`] carrying an HTML form submission's POST body (task:
     /// `<form>`) — the main-document fetch sends a real POST with the
     /// enctype's `Content-Type` instead of a body-less GET.
@@ -1053,6 +1099,14 @@ impl Tab {
         };
         if history == NavHistory::Fresh {
             self.history.truncate(self.history_index + 1);
+        }
+
+        // `ironsurf://archive`: the page is rendered locally like every other
+        // internal page, but it describes a server the **shell** owns — tabs
+        // bind no sockets and read no archive tree — so ask for it now. The
+        // reply (`ToTab::ArchiveServerInfo`) is rendered by the next visit.
+        if netmod::is_archive_page(&url) {
+            self.ask_archive_server(&url);
         }
 
         self.emit(FromTab::LoadingChanged { loading: true });
@@ -2175,6 +2229,45 @@ impl Tab {
             }
             ev @ (ToTab::Pointer(_) | ToTab::Key(_) | ToTab::Scroll(_)) => {
                 self.handle_input(&ev);
+            }
+            ToTab::ArchiveServerInfo { ok, ref address, ref error, .. } => {
+                netmod::set_archive_server_status(Some(netmod::ArchiveServerStatus {
+                    ok,
+                    address: address.clone(),
+                    error: error.clone(),
+                }));
+                if ok {
+                    info!("archive server answered at {address}");
+                } else {
+                    warn!("archive server: {error:?}");
+                }
+                // This tab is still sitting on `ironsurf://archive`: without
+                // `?open=1` (which the shell answers with a *new* tab on the
+                // listing), the page's own job is done and it steps through to
+                // the server's control page, where the folder/host/port are
+                // editable. A tab that already navigated elsewhere (`None`)
+                // is never dragged along.
+                let asked_for_new_tab = self.archive_page.as_deref().is_some_and(|page| {
+                    page.split_once('?')
+                        .map(|(_, query)| {
+                            query.split('&').any(|pair| {
+                                let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
+                                key == "open" && !value.is_empty()
+                            })
+                        })
+                        .unwrap_or(false)
+                });
+                if ok && !asked_for_new_tab {
+                    if let Some(page) = self.archive_page.take() {
+                        let control = format!(
+                            "{}/{}",
+                            address.trim_end_matches('/'),
+                            netmod::ARCHIVE_CONTROL_PATH.trim_start_matches('/')
+                        );
+                        debug!("archive page {page} → the server's control page {control}");
+                        self.navigate(&control, NavHistory::Fresh);
+                    }
+                }
             }
             ToTab::Clipboard { text } => {
                 // The shell pushes the session clipboard just before it
@@ -4636,6 +4729,156 @@ mod tests {
         };
         let pipe = Arc::new(SelfPipe::new().expect("pipe"));
         Tab::new_headless(&args, pipe)
+    }
+
+    /// A tab whose tab→shell frames land in a buffer the test can decode
+    /// (`new_headless` sends them to a discarding sink).
+    fn capturing_tab(dir: &std::path::Path) -> (Tab, Arc<std::sync::Mutex<Vec<u8>>>) {
+        let mut tab = form_tab(dir);
+        let sink = Arc::new(std::sync::Mutex::new(Vec::new()));
+        tab.out = Rc::new(RefCell::new(TabOut {
+            writer: Box::new(Capture(Arc::clone(&sink))),
+            broken: false,
+        }));
+        (tab, sink)
+    }
+
+    /// [`std::io::Write`] into a shared buffer.
+    #[derive(Clone)]
+    struct Capture(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for Capture {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().expect("lock").extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// The URLs a (capturing) tab has fetched through the network stack.
+    fn fetched_urls(sink: &Arc<std::sync::Mutex<Vec<u8>>>) -> Vec<String> {
+        emitted(sink)
+            .into_iter()
+            .filter_map(|msg| match msg {
+                FromTab::NetworkEvent { event } => Some(event.url),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Every [`FromTab`] a (capturing) tab has emitted so far.
+    fn emitted(sink: &Arc<std::sync::Mutex<Vec<u8>>>) -> Vec<FromTab> {
+        let bytes = sink.lock().expect("lock").clone();
+        let mut cursor = std::io::Cursor::new(bytes);
+        let mut msgs = Vec::new();
+        while let Ok(msg) = ironsurf_common::read_frame(&mut cursor) {
+            msgs.push(msg);
+        }
+        msgs
+    }
+
+    /// `ironsurf://archive` renders the internal summary in this tab *and*
+    /// asks the shell for its browsing server, carrying the page's query
+    /// (`?root=` …) through as typed overrides.
+    #[test]
+    fn the_archive_page_renders_and_asks_the_shell() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (mut tab, sink) = capturing_tab(dir.path());
+        tab.handle_to_tab(ToTab::Resize { width: 800, height: 600, scale: 1.0 });
+        netmod::set_archive_server_status(None);
+        assert!(
+            tab.navigate(
+                "ironsurf://archive?root=%2Ftmp%2Fmy%20archive&port=8123",
+                NavHistory::Fresh
+            ),
+            "the archive page is a real page"
+        );
+
+        let asks: Vec<_> = emitted(&sink)
+            .into_iter()
+            .filter_map(|msg| match msg {
+                FromTab::ArchiveServerStart { root, host, port, open_in_new_tab } => {
+                    Some((root, host, port, open_in_new_tab))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            asks.len(),
+            1,
+            "one request per render of the page: {asks:?}"
+        );
+        assert_eq!(
+            asks[0],
+            (
+                Some("/tmp/my archive".into()),
+                None,
+                Some(8123),
+                false,
+            ),
+            "the query rides through, percent-decoded"
+        );
+        // The page stayed: no `open=1` means the shell answers this tab, and
+        // an address is not known yet.
+        let urls: Vec<String> = emitted(&sink)
+            .into_iter()
+            .filter_map(|msg| match msg {
+                FromTab::UrlChanged { url } => url,
+                _ => None,
+            })
+            .collect();
+        assert!(
+            urls.last()
+                .is_some_and(|url| url.starts_with("ironsurf://archive")),
+            "the summary is the current page: {urls:?}"
+        );
+    }
+
+    /// With the server up, the summary tab steps through to the server's own
+    /// control page; a tab that asked for `?open=1` (the shell opens the
+    /// listing in a *new* tab) is left where it is.
+    #[test]
+    fn the_answer_takes_the_summary_page_to_the_control_page() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (mut tab, sink) = capturing_tab(dir.path());
+        tab.handle_to_tab(ToTab::Resize { width: 800, height: 600, scale: 1.0 });
+        netmod::set_archive_server_status(None);
+        assert!(tab.navigate("ironsurf://archive", NavHistory::Fresh));
+        tab.handle_to_tab(ToTab::ArchiveServerInfo {
+            tab_id: TabId(1),
+            ok: true,
+            address: "http://127.0.0.1:1".into(), // deliberately dead: the *intent* is asserted
+            error: None,
+        });
+        // The tab asked the server's own page: a fetch of
+        // `<address>/ironsurf/serve` leaves this tab (the address itself is
+        // dead here on purpose — only the intent is under test).
+        let fetched: Vec<String> = fetched_urls(&sink);
+        assert!(
+            fetched
+                .iter()
+                .any(|url| url == "http://127.0.0.1:1/ironsurf/serve"),
+            "the summary hands the tab to the server: {fetched:?}"
+        );
+
+        // `?open=1`: the summary stays put (the listing belongs to a new tab).
+        let (mut opener, sink) = capturing_tab(dir.path());
+        opener.handle_to_tab(ToTab::Resize { width: 800, height: 600, scale: 1.0 });
+        assert!(opener.navigate("ironsurf://archive?open=1", NavHistory::Fresh));
+        opener.handle_to_tab(ToTab::ArchiveServerInfo {
+            tab_id: TabId(1),
+            ok: true,
+            address: "http://127.0.0.1:1".into(),
+            error: None,
+        });
+        let fetched: Vec<String> = fetched_urls(&sink);
+        assert!(
+            !fetched.iter().any(|url| url.starts_with("http://")),
+            "the ?open=1 summary stays put: {fetched:?}"
+        );
+        netmod::set_archive_server_status(None);
     }
 
     fn ptr(x: f32, y: f32, kind: PointerKind) -> ToTab {

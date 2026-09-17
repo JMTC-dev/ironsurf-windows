@@ -189,6 +189,10 @@ impl TabState {
             // Archive mode: the pump writes the body to disk; there is no
             // per-tab state to show and never a frame to repaint.
             FromTab::ArchivedFetch { .. } => false,
+            // The archive server is shell machinery, not page state: the pump
+            // acts on it (bind the server / mirror the settings), the tab's
+            // own line never changes.
+            FromTab::ArchiveServerStart { .. } | FromTab::ArchiveServerSettingsChanged { .. } => false,
             FromTab::Closed => {
                 if self.closed {
                     false

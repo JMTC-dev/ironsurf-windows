@@ -13,6 +13,7 @@
 slint::include_modules!();
 
 pub mod archive;
+pub mod archive_server;
 pub mod classify;
 pub mod keymap;
 pub mod state;
@@ -39,6 +40,27 @@ pub mod uisettings {
         /// (`$HOME/Downloads/ironsurf-tabs`).
         #[serde(default)]
         pub archive_dir: Option<String>,
+        /// The **archive browsing server** (`ironsurf://archive`): folder, host
+        /// and port, all applied from its own control page. `None`s mean "the
+        /// default": folder = the archive root, host `127.0.0.1`, port random.
+        #[serde(default)]
+        pub archive_server: ArchiveServerSettings,
+    }
+
+    /// What the archive server serves and from where (see
+    /// [`crate::archive_server`]). Kept in [`UiSettings`] so the choice
+    /// survives restarts.
+    #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+    pub struct ArchiveServerSettings {
+        /// Folder served (`None` = the effective archive root).
+        #[serde(default)]
+        pub root: Option<String>,
+        /// Host bound (`None` = `127.0.0.1`).
+        #[serde(default)]
+        pub host: Option<String>,
+        /// Port bound (`None`/`Some(0)` = a random free port).
+        #[serde(default)]
+        pub port: Option<u16>,
     }
 
     impl UiSettings {

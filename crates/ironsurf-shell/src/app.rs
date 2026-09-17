@@ -28,6 +28,7 @@ use slint::{
 use slint::private_unstable_api::re_exports::MouseCursor;
 
 use crate::archive;
+use crate::archive_server::{self, ServeEvent, ServeHandle, Spec};
 use crate::classify::classify_input;
 use crate::keymap::{self, Shortcut};
 use crate::state::TabState;
@@ -217,6 +218,19 @@ pub struct Core {
     /// Files written by archive mode this shell session (the one-line
     /// overlay status; the counter is not persisted — the files are).
     archive_saved: Cell<usize>,
+    /// The **archive browsing server** (`ironsurf://archive`): started on the
+    /// first request, serving the archive folder over `http://127.0.0.1:<random>`
+    /// from a pair of background threads. The handle talks to the control
+    /// socket; [`Self::archive_server_rx`] carries what the server reports back
+    /// (its address, applied folder/host/port, failures) into this pump.
+    archive_server: RefCell<Option<ServeHandle>>,
+    archive_server_rx: RefCell<Option<Receiver<ServeEvent>>>,
+    /// The server's end of the event queue, handed out once and kept (a fresh
+    /// `Sender` per start would fork the queue and lose the first reports).
+    archive_server_sink: RefCell<Option<Sender<ServeEvent>>>,
+    /// Address last announced to the tabs, so a drain tick that changes
+    /// nothing does not push a message nobody asked for.
+    archive_server_broadcast: RefCell<Option<Option<String>>>,
     /// The tab whose address the user is drafting in the URL bar (task: a new
     /// tab opens with the bar focused and its whole address highlighted, like
     /// F6). While it names the **active** tab, `sync_ui` stops pushing that
@@ -283,6 +297,10 @@ impl App {
             us_edit_id: RefCell::new(None),
             archive_dir: RefCell::new(archive_root),
             archive_saved: Cell::new(0),
+            archive_server: RefCell::new(None),
+            archive_server_rx: RefCell::new(None),
+            archive_server_sink: RefCell::new(None),
+            archive_server_broadcast: RefCell::new(None),
             url_draft: Cell::new(None),
         });
 
@@ -314,6 +332,11 @@ impl App {
     pub fn shutdown(&self) {
         let procs = std::mem::take(&mut *self.core.procs.borrow_mut());
         info!("shutting down: saving settings, closing {} tab(s)", procs.len());
+        // The archive browsing server is a pair of threads owned by the shell:
+        // without this the control socket would outlive the process's intent.
+        if let Some(handle) = self.core.archive_server.borrow_mut().take() {
+            handle.shutdown();
+        }
         self.core.save_settings();
         for mut p in procs {
             p.tab.destroy();
@@ -1934,6 +1957,17 @@ impl Core {
         self.settings.borrow_mut().archive_dir = Some(text);
         self.save_settings();
         info!("archive root \u{2192} {}", self.archive_root_text());
+        // A browsing server that was never aimed at a folder of its own keeps
+        // following the archive folder (its own control page, once used, makes
+        // the choice the server's).
+        if follows_archive_root(self.settings.borrow().archive_server.root.as_deref())
+            && self.archive_server.borrow().is_some()
+        {
+            let spec = self.archive_server_spec();
+            if let Err(err) = self.archive_server_apply(spec) {
+                warn!("archive server: the archive folder moved, the server did not: {err}");
+            }
+        }
         self.archive_state(&ui);
     }
 
@@ -1970,6 +2004,228 @@ impl Core {
         }
     }
 
+    // ---- archive browsing server (`ironsurf://archive`) --------------------------
+
+    /// What the server should serve, from the persisted settings: the folder
+    /// the archive server was pointed at, else the effective archive root; the
+    /// host it binds (default `127.0.0.1`); the port (default a random one).
+    fn archive_server_spec(&self) -> Spec {
+        let (saved_root, saved_host, saved_port) = {
+            let settings = self.settings.borrow();
+            (
+                settings.archive_server.root.clone(),
+                settings.archive_server.host.clone(),
+                settings.archive_server.port,
+            )
+        };
+        let fallback = self.archive_dir.borrow().clone();
+        archive_server::spec_from(saved_root.as_deref(), fallback, saved_host, saved_port)
+    }
+
+    /// Bring the archive server up (idempotent). A failed start is returned as
+    /// the reason, so `ironsurf://archive` can say it out loud instead of
+    /// showing a page that pretends to have a server.
+    fn ensure_archive_server(&self) -> Result<(), String> {
+        if self.archive_server.borrow().is_some() {
+            return Ok(());
+        }
+        if self.archive_server_rx.borrow().is_none() {
+            let (tx, rx) = channel();
+            *self.archive_server_rx.borrow_mut() = Some(rx);
+            // Keep the sender alive: it is the one event path the server has.
+            *self.archive_server_sink.borrow_mut() = Some(tx);
+        }
+        let sink = self
+            .archive_server_sink
+            .borrow()
+            .clone()
+            .ok_or_else(|| "the archive server event queue is gone".to_string())?;
+        let handle = ServeHandle::start(self.archive_server_spec(), sink)?;
+        *self.archive_server_broadcast.borrow_mut() = Some(handle.address.clone());
+        *self.archive_server.borrow_mut() = Some(handle);
+        Ok(())
+    }
+
+    /// Re-point the running server (used when the archive root changed, or
+    /// when a request carries an override). Never starts one: callers that
+    /// want that call [`Self::ensure_archive_server`] first.
+    fn archive_server_apply(&self, spec: Spec) -> Result<(), String> {
+        match self.archive_server.borrow().as_ref() {
+            Some(handle) => handle.set_spec(spec).map_err(|e| format!("archive server: {e}")),
+            None => Err("the archive server is not running".to_string()),
+        }
+    }
+
+    /// Serve the archive for one `ironsurf://archive` request: bring the
+    /// server up (honouring any override the URL carried), then answer the
+    /// requesting tab — and open the archive listing in a new tab when the
+    /// page asked for it (`ironsurf://archive?open=1`).
+    fn start_archive_server(
+        &self,
+        tid: TabId,
+        root: Option<&str>,
+        host: Option<&str>,
+        port: Option<u16>,
+        open_in_new_tab: bool,
+    ) {
+        // An override on the URL wins over the saved settings for this one
+        // request; the server keeps serving it afterwards, which is what the
+        // page's form says it does.
+        let overrides = root.is_some() || host.is_some() || port.is_some();
+        if let Err(err) = self.ensure_archive_server() {
+            warn!("archive server: {err}");
+            let _ = self.send_to(
+                tid,
+                ToTab::ArchiveServerInfo {
+                    tab_id: tid,
+                    ok: false,
+                    address: String::new(),
+                    error: Some(err),
+                },
+            );
+            return;
+        }
+        if overrides {
+            let base = self.archive_server_spec();
+            let spec = archive_server::spec_from(
+                root.or(base.root.to_str()),
+                base.root.clone(),
+                host.map(str::to_owned).or(Some(base.host.clone())),
+                port.or(Some(base.port)),
+            );
+            if let Err(err) = self.archive_server_apply(spec) {
+                warn!("archive server: {err}");
+            }
+        }
+        // The server announces itself on the event queue; until then the
+        // handle knows the address it bound, which is what the page shows.
+        let address = self
+            .archive_server
+            .borrow()
+            .as_ref()
+            .and_then(|h| h.address.clone());
+        match address {
+            Some(address) => {
+                if open_in_new_tab {
+                    let container = {
+                        let procs = self.procs.borrow();
+                        procs
+                            .iter()
+                            .find(|p| p.tab.id == tid)
+                            .map(|p| p.tab.container)
+                    };
+                    if let Some(container) = container {
+                        self.open_tab(container, Some(&address));
+                    }
+                }
+                let _ = self.send_to(
+                    tid,
+                    ToTab::ArchiveServerInfo {
+                        tab_id: tid,
+                        ok: true,
+                        address: address.clone(),
+                        error: None,
+                    },
+                );
+                info!("archive server: answering tab {tid} with {address}");
+            }
+            None => {
+                let err = "the archive folder is bound, but no address came back".to_string();
+                let _ = self.send_to(
+                    tid,
+                    ToTab::ArchiveServerInfo {
+                        tab_id: tid,
+                        ok: false,
+                        address: String::new(),
+                        error: Some(err.clone()),
+                    },
+                );
+                warn!("archive server: {err}");
+            }
+        }
+    }
+
+    /// Tell every live tab what the archive server is answering at (or that it
+    /// is not). Only pushes a change: the address is what the summary page
+    /// shows, and nobody wants a repaint they did not ask for.
+    fn archive_server_announce(&self, ok: bool, address: Option<&str>, error: Option<String>) {
+        let shown = address.map(str::to_owned);
+        let ids: Vec<TabId> = self.procs.borrow().iter().map(|p| p.tab.id).collect();
+        for tid in ids.clone() {
+            let _ = self.send_to(
+                tid,
+                ToTab::ArchiveServerInfo {
+                    tab_id: tid,
+                    ok,
+                    address: shown.clone().unwrap_or_default(),
+                    error: error.clone(),
+                },
+            );
+        }
+        debug!(
+            "archive server: announced {} of {} tab(s)",
+            match &shown {
+                Some(a) => format!("{a} to"),
+                None => "shutdown to".to_string(),
+            },
+            ids.len()
+        );
+    }
+
+    /// Drain what the archive server reported since the last tick: applied
+    /// folder/host/port go into the settings (and out to disk), address
+    /// changes go out to the tabs.
+    fn drain_archive_server(&self) {
+        let events: Vec<ServeEvent> = {
+            let mut slot = self.archive_server_rx.borrow_mut();
+            match slot.as_mut() {
+                Some(rx) => rx.try_iter().collect(),
+                None => return,
+            }
+        };
+        for event in events {
+            match event {
+                ServeEvent::Spec { spec } => {
+                    let mut settings = self.settings.borrow_mut();
+                    let saved = &mut settings.archive_server;
+                    saved.root = Some(spec.root.display().to_string());
+                    saved.host = Some(spec.host.clone());
+                    saved.port = Some(spec.port);
+                    drop(settings);
+                    self.save_settings();
+                    info!(
+                        "archive server: serving {} on {}:{}",
+                        spec.root.display(),
+                        spec.host,
+                        spec.port
+                    );
+                }
+                ServeEvent::Address { address } => {
+                    let mut last = self.archive_server_broadcast.borrow_mut();
+                    if last.as_ref() == Some(&address) {
+                        continue;
+                    }
+                    *last = Some(address.clone());
+                    drop(last);
+                    match &address {
+                        Some(addr) => self.archive_server_announce(true, Some(addr), None),
+                        None => self.archive_server_announce(
+                            false,
+                            None,
+                            Some("serving stopped from the control page".to_string()),
+                        ),
+                    }
+                }
+                ServeEvent::Failed { error } => warn!("archive server: {error}"),
+                ServeEvent::Gone => debug!("archive server: a retired listener has ended"),
+                ServeEvent::Closed => {
+                    info!("archive server: the control socket has closed");
+                    *self.archive_server.borrow_mut() = None;
+                }
+            }
+        }
+    }
+
     // ---- persistence -------------------------------------------------------------
 
     fn save_settings(&self) {
@@ -1982,6 +2238,10 @@ impl Core {
     /// Drain every queued `FromTab` message: reduce per-tab state, keep only
     /// the newest frame for the active tab, reap closed tabs, sync the UI.
     pub fn drain(&self) {
+        // The archive server is not a tab: its reports are drained here so the
+        // settings mirror and the summary pages stay honest even on a tick
+        // with no tab traffic at all.
+        self.drain_archive_server();
         // Superseded hover moves go out here, one per tick at the latest.
         self.flush_pending_move();
         // A child can die between messages (panic, kill): without a poll the
@@ -2046,6 +2306,17 @@ impl Core {
                 FromTab::DialogRequest { dialog_id, kind, message, .. } => {
                     info!("tab {tid} opened a {kind:?} dialog #{dialog_id}: {message:?}")
                 }
+                // Archive browsing server: the summary page asked for the
+                // server; the reply goes out below (the log line only says so).
+                FromTab::ArchiveServerStart { root, host, port, open_in_new_tab } => {
+                    info!(
+                        "tab {tid} asked for the archive server (root {root:?}, host {host:?}, \
+                         port {port:?}, new tab: {open_in_new_tab})"
+                    )
+                }
+                FromTab::ArchiveServerSettingsChanged { root, host, port } => {
+                    info!("tab {tid} reports the archive server moved to {host}:{port} ({root})")
+                }
                 FromTab::ClipboardText { text } => {
                     // Page copy (Ctrl+C/X, editor cut): the shell owns the
                     // session clipboard (task: context menu).
@@ -2103,6 +2374,25 @@ impl Core {
                 if let Some(container) = container {
                     self.open_tab(container, Some(url));
                 }
+            }
+            // `ironsurf://archive`: the tab cannot bind a socket or read the
+            // archive tree (it is sandboxed), so the server lives here. Start
+            // it on demand and answer the asking tab with its address; when
+            // the page asked for `?open=1`, the archive listing itself opens
+            // beside it in a new tab.
+            if let FromTab::ArchiveServerStart { root, host, port, open_in_new_tab } = &msg {
+                self.start_archive_server(tid, root.as_deref(), host.as_deref(), *port, *open_in_new_tab);
+            }
+            // The server's own control page applied a new folder/host/port:
+            // remember it (the server reports the change itself; this is the
+            // tab-relayed path, kept so a stale setting can never win).
+            if let FromTab::ArchiveServerSettingsChanged { root, host, port } = &msg {
+                let mut settings = self.settings.borrow_mut();
+                settings.archive_server.root = Some(root.clone());
+                settings.archive_server.host = Some(host.clone());
+                settings.archive_server.port = Some(*port);
+                drop(settings);
+                self.save_settings();
             }
             // Right-click → the context menu opens over the page at the
             // click point (task: context menu).
@@ -2758,6 +3048,13 @@ pub fn color_hex(hex: &str) -> Color {
     Color::from_rgb_u8(158, 158, 158)
 }
 
+/// Does the browsing server follow the archive folder? Until its own control
+/// page has been used to name a folder (`None` in the settings), the server
+/// serves whatever the archive writes into; after that the choice is its own.
+fn follows_archive_root(saved_root: Option<&str>) -> bool {
+    saved_root.map(str::trim).filter(|t| !t.is_empty()).is_none()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2793,6 +3090,18 @@ mod tests {
         let t0 = Instant::now();
         assert!(move_due(t0, None), "gate opens for the first move");
         assert!(!move_due(t0, Some(t0)), "gate closes again inside a frame");
+    }
+
+    // ---- archive browsing server: following the archive folder --------------
+
+    #[test]
+    fn the_browsing_server_follows_the_archive_folder_until_aimed_elsewhere() {
+        // Never configured (or configured then cleared): the archive root wins.
+        assert!(follows_archive_root(None));
+        assert!(follows_archive_root(Some("")), "a cleared field follows again");
+        assert!(follows_archive_root(Some("   ")), "blank is not a choice");
+        // A folder named once is the server's own and survives.
+        assert!(!follows_archive_root(Some("/home/you/other")));
     }
 
     // ---- context menu (task: right-click menu) ------------------------------

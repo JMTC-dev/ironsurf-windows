@@ -88,13 +88,14 @@
   0), shell tests/dialogs.rs (queue/activation/prompt text/cancel) + tests/dialog_crash.rs (crash closes the overlay); tab 178u,
   shell 60, common 23 all green; live :2.0 run (xdotool --window hover-then-XTEST click): alert OK, confirm Cancel, prompt default
   "Marty" edited → Enter, page title reads the answers. CLI: -u/--url start URL (usage error without value) and -h/--help usage.
-## #33 DevTools panel UI in the shell (Slint): bottom-docked overlay Rectangle over the page (no PopupWindow — LinuxKMS), F12 (U+F70F, U+F70B also) / Ctrl-I toggle it per tab
-  (keymap `Shortcut::ToggleDevTools`, consumed, page-focus only); header [Console n | Network n | ✕], Console rows (icon+colour per level, `[source] message`) + Network table
-  (Method|URL|Status|Size|Time, unknown `—`, failures show the error text in red). Pure view-models `TabState::console_rows/net_rows` + `format_size/duration`; app.rs keeps the
-  open flag+pane on the tab record, pushes rows into shared VecModels from sync_ui and the drain tick (reduce says `false` for feed msgs, so nothing else would); fake_tab
-  `--devtools-feed`; keymap/state/app units + tests/devtools.rs; shell 44u + all suites, common 22, workspace build green; :2.0 pixel-diff confirms the 1024x240 band paints on F12.
-## #31 Network requests ride the IPC (DevTools Network panel): one FromTab::NetworkEvent per settled/failed
-request — method, URL, status, bytes, duration_ms; docs report every redirect hop (*_report fetch variants),
-NetProvider subresources + <script src> push into net_events drained per poll tick; failures error Some/status
-None (upgrade block names the requested URL); revalidated cache hits report the entry's status/size, data:/
-unsupported silent (no-spam); localhost wire test tests/network_events.rs + tab 172u + e2e 14 + suite green (IPC contract: FromTab::NetworkEvent{method,url,status,response_bytes,duration_ms,error}, error Some exactly when failed; ConsoleLog `source`).
+## #49 Archive **browsing** server: `ironsurf://archive` brings up a shell-side localhost server over the archive
+  folder (default `$HOME/Downloads/ironsurf-tabs`) so saved visits browse in a tab. common: FromTab::ArchiveServerStart
+  {root,host,port,open_in_new_tab} + ArchiveServerSettingsChanged + ToTab::ArchiveServerInfo. shell src/archive_server.rs:
+  one control thread (page, /apply, /stop, command pipe) + a serve thread per *generation* (wake via loopback `libc::poll`
+  self-pipe; a stale thread can never kill its successor; a same-address apply re-points the live listener because rebinding
+  your own port is EADDRINUSE), traversal-proof resolve_in (`+` is never a space — ISO8601 folder names), extension sniff for
+  archived pages with no extension, 512 MiB read cap, listing + control page (GET or capped POST form; blank port keeps the
+  bound port; the serve socket's deferral carries the query). tab: internal `archive` page shows the shell's answer and steps
+  itself to `<addr>/ironsurf/serve`, `?open=1` opens the listing in a NEW tab; welcome documents it. 24 shell units + 2 e2e +
+  5 tab units, 48 suites green; :2.0 live — tab loads the listing, apply over the served address moves the folder, ui.json
+  persists root/host/bound port.

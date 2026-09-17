@@ -3327,6 +3327,7 @@ dependencies = [
  "i-slint-backend-testing",
  "ironsurf-common",
  "ironsurf-storage",
+ "libc",
  "serde",
  "serde_json",
  "slint",

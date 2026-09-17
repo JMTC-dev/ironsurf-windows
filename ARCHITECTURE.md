@@ -130,6 +130,17 @@ pub enum FromTab {
     // something and after a load re-ran a live query; `query` names the text the
     // numbers describe, so a stale reply the bar has typed past is recognisable.
     FindResult       { query: String, matches: usize, active: usize },
+    // **archive browsing server** (`ironsurf://archive`): the tab asks the shell to bring
+    // up the localhost server over the archive folder — tabs are sandboxed and the archive
+    // tree belongs to the shell, so only the shell binds a socket. Every override is
+    // optional (blank = the shell's configured value: folder `$HOME/Downloads/ironsurf-tabs`,
+    // host `127.0.0.1`, port random); `open_in_new_tab` (a link written
+    // `ironsurf://archive?open=1`) asks for the listing in a *new tab* instead of moving
+    // this tab to the server's control page. Answered with `ToTab::ArchiveServerInfo`.
+    ArchiveServerStart { root: Option<String>, host: Option<String>, port: Option<u16>, open_in_new_tab: bool },
+    // the server's own control page applied a new folder/host/port: the shell mirrors and
+    // persists it (`port` 0 = stopped).
+    ArchiveServerSettingsChanged { root: String, host: String, port: u16 },
     Closed,
     Error            { message: String },
 }
@@ -176,6 +187,11 @@ pub enum ToTab {
     // per-tab timestamp dir) and does all writing — tabs stay sandboxed.
     // Fresh tabs inherit the setting via the `--archive-mode` spawn flag.
     SetArchiveMode { enabled: bool },
+    // **archive browsing server** reply: `ok` = listening (or already was) with `address`
+    // = its `http://host:port` root; on failure `address` is empty and `error` says why
+    // (port busy, folder refused). The tab renders it on `ironsurf://archive`, and steps
+    // itself to `address + "/ironsurf/serve"` unless the request asked for a new tab.
+    ArchiveServerInfo { tab_id: TabId, ok: bool, address: String, error: Option<String> },
     // find in page (`Ctrl-F`): install/replace the live query and re-run it from
     // the top. The shell owns the bar; the **tab** matches over the text it laid
     // out (case-insensitive, document order, visible text only) and paints it —
@@ -472,7 +488,11 @@ in `ironsurf-tab/src/netmod.rs` and pass `Arc<OurProvider>` as `DocumentConfig.n
   answered locally by the tab and never touches the network, under either policy. The page is
   chosen by `internal_page_name` (host, with a `ironsurf` host or empty host falling through to
   the path, so `ironsurf://welcome` = `ironsurf:///welcome` = `ironsurf://ironsurf/welcome`);
-  `welcome` renders the start page (`WELCOME_URL` = `default_url()`), any other name renders an
+  `welcome` renders the start page (`WELCOME_URL` = `default_url()`, which documents and links
+  `ironsurf://archive`), `archive` renders the summary of the shell's
+  [archive browsing server](#archive-browsing-server-srcarchive_serversrc) — an address-less
+  page by itself: it asks the shell (see `FromTab::ArchiveServerStart`) and shows what comes
+  back, any other name renders an
   honest internal "no such page" that never left the process. All output escapes the requested
   URL — page names are user text, never markup.
 - Container isolation holds even in Passthrough: one process = one container; its on-disk
@@ -731,6 +751,58 @@ Process/tab management (`src/tabs.rs`):
   error 32) — pins “Tab N has crashed” on that tab's status line, keeps the tab in the strip on its last
   frame, and logs the exit status plus the captured stderr/panic backtrace; further commands to it are
   dropped with the crash message standing (✕ still closes it).
+
+### Archive browsing server (`src/archive_server.rs`)
+
+The other half of archive mode: the saved tree becomes a **browsable site** on localhost,
+served by the shell (never a tab — tabs are sandboxed and the archive folder is the shell's).
+`ironsurf://archive` in any tab asks for it; no Slint UI exists for it on purpose — folder,
+host and port are edited on the server's own HTML page.
+
+- **Request path**: tab renders `ironsurf://archive` → `FromTab::ArchiveServerStart`
+  (`?root=`, `?host=`, `?port=` override for this one request, percent-decoded by the tab,
+  `?open=1` = "also open the listing in a new tab") → the shell's pump starts the server
+  (lazily, once, reusing the running one) → `ToTab::ArchiveServerInfo`. Without `?open=1` the
+  summary tab then sends **itself** to `<address>/ironsurf/serve`; with it the shell opens
+  `address` (the archive listing) in a new tab of the same container and the summary stays put.
+- **Address**: `Spec { root, host, port }`, defaults `default_archive_root()`
+  (= `$HOME/Downloads/ironsurf-tabs`, the archive root's default), `127.0.0.1`, `0` = a random
+  free port. What gets bound is what gets reported and persisted — a request for port 0 is
+  answered with the port the OS picked. A server that cannot bind is refused **with the
+  reason** (port busy, folder refused); no half-dead handle is handed out, and a failed start
+  leaves any running server untouched.
+- **Threads**: one long-lived **control thread** (stable control page, `/apply`, `/stop`, the
+  internal command pipe, `ping`) plus a replaceable **serve thread** per *generation* — only
+  a **different address** retires the old listener; an apply that keeps the address (the usual
+  change of folder) re-points the live one, since the serving thread reads the folder per
+  request. That is also the only way an apply could work: rebinding a port the retired
+  listener still holds is `EADDRINUSE`. Retirement is generation-based (a stale thread can
+  never kill its successor), and the blocked `accept()` is woken through a loopback self-pipe
+  (`libc::poll`, no GL, no extra crate).
+- **Serving**: `GET`/`HEAD` only, one connection at a time, HTTP/1.1 with `Connection: close`.
+  Directory listings (directories first, then files, `/`-suffixed directory links), `index.html`
+  when a directory has one, percent-decoded path segments (**never** `+` → space: archive
+  folder names carry ISO8601 offsets like `2026-09-17T07:20:48+10:00`), and MIME from the
+  extension — falling back to a sniff of the first bytes (html/xml prologs) when the name says
+  nothing, which is the shape an archived query-less document arrives in
+  (`…/2026-…+10-00/example.com`). Files above 512 MiB are named in a `413`, never read whole.
+- **Traversal is refused, however written** — `..` segments, `%2e%2e`, `%2e`, over-encoded
+  forms and symlink escapes all resolve inside the root, and a hostile `..` can only ever mean
+  "the root itself" (`resolve_in` is pure and unit-tested; the serve root is canonicalized once).
+- **Pages**: `/` is the archive listing (with a link to the control page), `/ironsurf/serve`
+  is the control page — the live address, the folder/host/port `GET` form (apply re-points the
+  running server, and the form also answers a `POST` with a capped declared body), a stop
+  button, and the same folder tree browsable in place. A **blank or absent port field keeps the
+  port in use** (the field shows the bound number, so Apply never rolls a new address behind the
+  user; typing `0` asks for a fresh random one), and the serve socket's deferral of
+  `/apply`&nbsp;/&nbsp;`/stop` **carries the query** to the control socket — dropping it there
+  would silently re-apply what was already serving.
+  file names, errors, requested paths) is escaped; a browser that sends markup proves it.
+- **Lifecycle**: `ServeEvent::{Spec, Address, Failed, Gone, Closed}` on a `std::sync::mpsc`
+  channel the shell drains every tick — `Spec` persists the applied folder/host/port into
+  `ui.json` (`settings.archive_server`), `Address` broadcasts `ToTab::ArchiveServerInfo` to
+  every tab on a change (and announces a stop from the control page), `Closed` lets the shell
+  drop its handle. Quitting the shell shuts the server down, releasing the port.
 
 ### Developer tools (F12 / Ctrl-I)
 

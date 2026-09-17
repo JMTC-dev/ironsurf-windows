@@ -121,6 +121,10 @@ fn main() {
     };
 
     emit(FromTab::Ready { tab_id });
+    // `ironsurf://archive` at launch asks for the archive server exactly like
+    // the real runtime does while rendering that page (and like the fake does
+    // on a later Navigate to it).
+    ask_archive(&mut emit, &url);
     announce(&mut emit, &url, false);
     emit(frame(size)); // like the real tab: a first frame without any Resize
 
@@ -220,8 +224,33 @@ fn main() {
         };
         match msg {
             ToTab::Navigate { url: new } => {
+                // `ironsurf://archive` stands in for the real page: the tab
+                // cannot serve, so it asks the shell for the archive server
+                // (the same message the real runtime emits when it renders
+                // that page) and waits for the address back.
+                ask_archive(&mut emit, &new);
                 url = new;
                 announce(&mut emit, &url, true);
+            }
+            // The shell's answer: report it on the status line, which is what
+            // the tests read as the page's summary.
+            ToTab::ArchiveServerInfo { ok, address, error, .. } => {
+                emit(FromTab::StatusText {
+                    text: Some(format!(
+                        "archive-server:{}:{}",
+                        if ok { address.as_str() } else { "off" },
+                        error.as_deref().unwrap_or("")
+                    )),
+                });
+                emit(FromTab::ConsoleLog {
+                    source: "log".into(),
+                    level: if ok { "info".into() } else { "error".into() },
+                    message: if ok {
+                        format!("archive server at {address}")
+                    } else {
+                        format!("archive server failed: {}", error.as_deref().unwrap_or("unknown"))
+                    },
+                });
             }
             ToTab::Reload => {
                 announce(&mut emit, &url, true);
@@ -448,6 +477,70 @@ fn emit_feed(emit: &mut impl FnMut(FromTab), batch: u8) {
             },
         });
     }
+}
+
+/// Emit [`FromTab::ArchiveServerStart`] when a URL is the archive page (see
+/// [`archive_request_args`]); silence otherwise.
+fn ask_archive(emit: &mut impl FnMut(FromTab), url: &str) {
+    if !url.starts_with("ironsurf://archive") {
+        return;
+    }
+    let (root, host, port, open) = archive_request_args(url);
+    emit(FromTab::ArchiveServerStart {
+        root,
+        host,
+        port,
+        open_in_new_tab: open,
+    });
+}
+
+/// Read the `ironsurf://archive` page's query the way the real page does:
+/// `?root=…&host=…&port=…&open=1`. Blank fields are `None` ("use the shell's
+/// configured value"), an unparsable port is `None` too.
+fn archive_request_args(url: &str) -> (Option<String>, Option<String>, Option<u16>, bool) {
+    let query = url.split_once('?').map(|(_, q)| q).unwrap_or("");
+    let field = |name: &str| {
+        query
+            .split('&')
+            .find_map(|pair| pair.split_once('='))
+            .filter(|(k, _)| *k == name)
+            .map(|(_, v)| v.to_string())
+            .filter(|v| !v.is_empty())
+    };
+    // `find_map` above keeps only the first match; blank-or-missing is None.
+    let get = |name: &str| {
+        query.split('&').rev().find_map(|pair| {
+            let (k, v) = pair.split_once('=')?;
+            (k == name && !v.is_empty()).then(|| v.to_string())
+        })
+    };
+    let _ = field;
+    (
+        get("root").map(|v| percent_decode(&v)),
+        get("host").map(|v| percent_decode(&v)),
+        get("port").and_then(|p| p.parse().ok()),
+        get("open").is_some(),
+    )
+}
+
+/// Percent-decode a query value (`%2Ftmp%2Fx` → `/tmp/x`); invalid UTF-8 after
+/// decoding is left as the raw text, same as the real page's behaviour.
+fn percent_decode(input: &str) -> String {
+    let bytes = input.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let Ok(v) = u8::from_str_radix(&input[i + 1..i + 3], 16) {
+                out.push(v);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 fn announce(emit: &mut impl FnMut(FromTab), url: &str, with_nav_history: bool) {

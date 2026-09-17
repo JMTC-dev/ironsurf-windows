@@ -163,6 +163,37 @@ pub enum FromTab {
         matches: usize,
         active: usize,
     },
+    /// **Archive browsing server** (`ironsurf://archive`): the tab asks the
+    /// shell to bring up the localhost server that serves the archive folder
+    /// (or to talk to the one already running). Tabs cannot serve — they are
+    /// sandboxed and the archive tree belongs to the shell — so only the
+    /// shell binds the socket and reads the folder. The shell answers with
+    /// [`ToTab::ArchiveServerInfo`]. Every override is optional: `None`/blank
+    /// means "use the shell's configured value" (folder default
+    /// `$HOME/Downloads/ironsurf-tabs`, host `127.0.0.1`, port = random).
+    ArchiveServerStart {
+        /// Folder to serve (`None`/blank = the configured archive root).
+        root: Option<String>,
+        /// Host to bind (`None`/blank = `127.0.0.1`).
+        host: Option<String>,
+        /// Port to bind (`None` or `0` = a random free port).
+        port: Option<u16>,
+        /// `true` (a link written `ironsurf://archive?open=1`): serve the
+        /// archive **root** in a **new tab** of this container and leave this
+        /// tab on the summary page; `false`: send *this* tab to the server's
+        /// control page, where the folder, host and port are editable.
+        open_in_new_tab: bool,
+    },
+    /// Settings applied from the server's own control page: the shell mirrors
+    /// them into its configuration and persists them (best effort).
+    ArchiveServerSettingsChanged {
+        /// Absolute folder now being served.
+        root: String,
+        /// Host the server listens on now.
+        host: String,
+        /// Port the server listens on now (`0` = the server is stopped).
+        port: u16,
+    },
     Closed,
     Error {
         message: String,
@@ -238,6 +269,19 @@ pub enum ToTab {
     /// the shell rebroadcasts this message to every live tab on each toggle.
     SetArchiveMode {
         enabled: bool,
+    },
+    /// **Archive browsing server** reply to [`FromTab::ArchiveServerStart`] (the
+    /// `ironsurf://archive` page). `ok` = the server is listening (or already
+    /// was) and `address` is its `http://host:port` root; on failure `address`
+    /// is empty and `error` says why (port busy, folder refused, …). The tab
+    /// sends itself to `address + "/ironsurf/serve"` (the server's own control
+    /// page) when the request did not ask for a new tab, and the shell opens
+    /// `address` in a new tab when it did.
+    ArchiveServerInfo {
+        tab_id: TabId,
+        ok: bool,
+        address: String,
+        error: Option<String>,
     },
     /// Answer a [`FromTab::DialogRequest`] (matched by `dialog_id`):
     /// `confirmed` is the button the user pressed (alert: always true once

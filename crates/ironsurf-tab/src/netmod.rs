@@ -381,9 +381,46 @@ pub fn escape_html_text(s: &str) -> String {
     out
 }
 
+/// What the shell answered the last `ironsurf://archive` request with (see
+/// [`archive_server_status`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ArchiveServerStatus {
+    /// The server is listening.
+    pub ok: bool,
+    /// Its `http://host:port` root (empty when `ok` is false).
+    pub address: String,
+    /// Why it is not listening (`ok == false`).
+    pub error: Option<String>,
+}
+
+/// The archive server answer this process last heard, shared with the page
+/// renderer. `ironsurf://archive` is answered locally like every internal page,
+/// but its content depends on the **shell** (tabs cannot bind a socket nor read
+/// the archive tree), so the runtime asks over IPC and the reply is remembered
+/// here for the page to render. `None` = no answer yet.
+pub fn archive_server_status() -> Option<ArchiveServerStatus> {
+    ARCHIVE_STATUS
+        .get_or_init(Mutex::default)
+        .lock()
+        .expect("archive status mutex poisoned")
+        .clone()
+}
+
+/// Record the shell's answer (the runtime calls this when
+/// [`ironsurf_common::ToTab::ArchiveServerInfo`] lands).
+pub fn set_archive_server_status(status: Option<ArchiveServerStatus>) {
+    *ARCHIVE_STATUS
+        .get_or_init(Mutex::default)
+        .lock()
+        .expect("archive status mutex poisoned") = status;
+}
+
+static ARCHIVE_STATUS: OnceLock<Mutex<Option<ArchiveServerStatus>>> = OnceLock::new();
+
 /// Built-in bytes for the internal `ironsurf:` scheme: `ironsurf://welcome`
-/// (the start page); any other page name renders an honest "no such internal
-/// page" instead of a fetch error, so typos land on a real page.
+/// (the start page) and `ironsurf://archive` (the archive browsing server's
+/// summary); any other page name renders an honest "no such internal page"
+/// instead of a fetch error, so typos land on a real page.
 pub fn internal_page_bytes(url: &Url) -> Option<Vec<u8>> {
     if url.scheme() != INTERNAL_SCHEME {
         return None;
@@ -392,12 +429,57 @@ pub fn internal_page_bytes(url: &Url) -> Option<Vec<u8>> {
     let shown = escape_html_text(url.as_str());
     let html = if page == "welcome" || page.is_empty() {
         WELCOME_PAGE.replace("{url}", &shown)
+    } else if page == ARCHIVE_PAGE {
+        ARCHIVE_PAGE_HTML.replace("{status}", &archive_summary_html())
     } else {
         INTERNAL_NOT_FOUND
             .replace("{page}", &escape_html_text(&page))
             .replace("{url}", &shown)
     };
     Some(html.into_bytes())
+}
+
+/// The internal page that drives the shell's **archive browsing server**.
+pub const ARCHIVE_PAGE: &str = "archive";
+
+/// Where the shell's archive server keeps its own page (folder, host and port,
+/// editable). Duplicated from `ironsurf-shell`'s `archive_server::CONTROL_PATH`
+/// on purpose: the tab never links to the shell's code, only to its address.
+pub const ARCHIVE_CONTROL_PATH: &str = "/ironsurf/serve";
+
+/// Whether a URL is the `ironsurf://archive` page (any spelling the internal
+/// scheme accepts: `ironsurf://archive`, `ironsurf:///archive/`, …).
+pub fn is_archive_page(url: &Url) -> bool {
+    url.scheme() == INTERNAL_SCHEME && internal_page_name(url) == ARCHIVE_PAGE
+}
+
+/// The summary block on `ironsurf://archive`, from the shell's last answer.
+/// Every piece of shell text is escaped: the address and the error string are
+/// data, never markup.
+fn archive_summary_html() -> String {
+    match archive_server_status() {
+        None => String::from(
+            "<p class=\"wait\">Asking the browser to start the server&hellip; reload this page \n             if nothing appears.</p>",
+        ),
+        Some(status) if status.ok => {
+            let address = escape_html_text(&status.address);
+            format!(
+                "<p class=\"ok\">Serving at <a href=\"{address}\"><code>{address}</code></a>.</p>\n             <p><a href=\"{address}/{control}\"><code>{address}/{control}</code></a> &mdash; the server's own \n             page, where the folder, host and port are editable.</p>",
+                control = "ironsurf/serve",
+            )
+        }
+        Some(status) => {
+            let why = status
+                .error
+                .as_deref()
+                .filter(|t| !t.trim().is_empty())
+                .unwrap_or("the browser did not say why");
+            format!(
+                "<p class=\"bad\">The archive server is not running.<br>{} \n                 <a href=\"ironsurf://archive\">Ask again</a>.</p>",
+                escape_html_text(why)
+            )
+        }
+    }
 }
 
 /// The built-in start page (`ironsurf://welcome`). Self-contained by design:
@@ -451,8 +533,81 @@ const WELCOME_PAGE: &str = r#"<!doctype html>
      subresources, media, and <code>navigator.userAgent</code> &mdash; with no
      reload needed, and it persists with the container.</p>
 
+  <h2>Archive server</h2>
+  <p>Archive mode (the <kbd>&#128190;</kbd> button) saves visits to
+     <code>$HOME/Downloads/ironsurf-tabs</code>. <a
+     href="ironsurf://archive"><code>ironsurf://archive</code></a> starts a local
+     HTTP server over that folder &mdash; on <code>127.0.0.1</code> and a random
+     free port by default, both editable on the server's own page, along with the
+     folder &mdash; and answers with its address, so the archive can be browsed as
+     ordinary pages (<code>ironsurf://archive?open=1</code> opens the listing in a
+     new tab). It only ever reads, and only inside the chosen folder.</p>
+
   <p class="foot">You are looking at <code>{url}</code> &mdash; a page built into
      the tab process. It is the default start page.</p>
+</div>
+</body>
+</html>
+"#;
+
+/// The `ironsurf://archive` page: what the archive browsing server is, where it
+/// is answering, and how to point it at another folder. Like every internal
+/// page it is self-contained (inline styles, no scripts, no subresources) and
+/// it is served by the **shell**, not this process — a sandboxed tab cannot
+/// bind a socket or read the archive tree.
+const ARCHIVE_PAGE_HTML: &str = r#"<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>ironsurf: archive server</title>
+<style>
+  body { margin: 0; background: #14161a; color: #e6e6e6;
+         font-family: monospace; line-height: 1.5; }
+  .wrap { max-width: 46em; margin: 0 auto; padding: 3em 1.5em; }
+  h1 { color: #8fce8f; margin: 0 0 0.2em 0; }
+  h2 { color: #8fce8f; font-size: 1.1em; margin: 2em 0 0.5em 0; }
+  .sub { color: #9aa0a6; margin: 0 0 2em 0; }
+  a { color: #8fce8f; }
+  code { background: #1f2227; padding: 0.1em 0.4em; border-radius: 3px; }
+  ul { padding-left: 1.2em; }
+  .ok { color: #8fce8f; }
+  .bad { color: #e57373; }
+  .wait { color: #9aa0a6; }
+  .foot { margin-top: 3em; color: #6b7178; font-size: 0.9em; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>Archive server</h1>
+  <p class="sub">A local HTTP server over the folder of archived visits, so the
+     archive can be browsed with an ordinary page instead of a file manager.</p>
+
+  <h2>State</h2>
+  {status}
+
+  <h2>Folder, host and port</h2>
+  <p>The server's own page &mdash; <code>&lt;address&gt;/ironsurf/serve</code>
+  &mdash; holds the form: an absolute <em>folder</em> (default
+     <code>$HOME/Downloads/ironsurf-tabs</code>), a <em>host</em> (default
+     <code>127.0.0.1</code>, so nothing outside this machine can connect) and a
+     <em>port</em> (default a random free one). Applying re-binds the server and
+     the choice is remembered across restarts; nothing is ever written to the
+     archive over HTTP &mdash; the server only reads, and it refuses any path
+     that tries to climb out of the folder.</p>
+
+  <h2>Links</h2>
+  <ul>
+    <li><code>ironsurf://archive</code> &mdash; this page: start the server and
+        read its address</li>
+    <li><code>ironsurf://archive?open=1</code> &mdash; start it and open the
+        archive listing in a <strong>new tab</strong>, leaving this page where
+        it is</li>
+  </ul>
+
+  <p class="foot">Archived visits are the files archive mode (the &#128190; button)
+     writes: one folder per visit, timestamped, holding the page as it was
+     fetched. This page is built into the browser; the bytes it describes are
+     served by the browser process, not fetched from anywhere.</p>
 </div>
 </body>
 </html>
@@ -2241,6 +2396,70 @@ mod tests {
             .expect("not-found for hostile page name");
         let xss = String::from_utf8(xss).expect("utf8");
         assert!(!xss.contains("<script"));
+    }
+
+    #[test]
+    fn the_welcome_page_documents_the_archive_server() {
+        let text =
+            String::from_utf8(internal_page_bytes(&url("ironsurf://welcome")).expect("welcome"))
+                .expect("utf8");
+        assert!(text.contains("Archive server"), "the section is on the start page");
+        assert!(
+            text.contains("href=\"ironsurf://archive\""),
+            "a real link, not just prose"
+        );
+        assert!(text.contains("ironsurf://archive?open=1"));
+        assert!(text.contains("$HOME/Downloads/ironsurf-tabs"));
+        // Still self-contained: no new subresources, no scripts, no network.
+        assert!(!text.contains("<script"));
+        assert!(!text.contains("src="));
+        assert!(!text.contains("http://"));
+    }
+
+    #[test]
+    fn the_archive_page_names_the_shell_and_stays_static() {
+        assert!(is_archive_page(&url("ironsurf://archive")));
+        assert!(is_archive_page(&url("ironsurf:///archive")));
+        assert!(is_archive_page(&url("IRONSURF://Archive?open=1")));
+        assert!(!is_archive_page(&url("ironsurf://welcome")));
+
+        // With no answer from the shell yet, the page says so honestly instead
+        // of inventing an address.
+        set_archive_server_status(None);
+        let text =
+            String::from_utf8(internal_page_bytes(&url("ironsurf://archive")).expect("archive"))
+                .expect("utf8");
+        assert!(text.contains("Archive server"));
+        assert!(text.contains("Asking the browser"), "{}", &text[..400.min(text.len())]);
+        assert!(text.contains("$HOME/Downloads/ironsurf-tabs"));
+        assert!(text.contains(ARCHIVE_CONTROL_PATH.trim_start_matches('/')));
+        assert!(!text.contains("<script"));
+        assert!(!text.contains("src="));
+
+        // Listening: the address is shown and linked.
+        set_archive_server_status(Some(ArchiveServerStatus {
+            ok: true,
+            address: "http://127.0.0.1:41234".into(),
+            error: None,
+        }));
+        let text = String::from_utf8(internal_page_bytes(&url("ironsurf://archive")).expect("x"))
+            .expect("utf8");
+        assert!(text.contains("http://127.0.0.1:41234"));
+        assert!(text.contains("href=\"http://127.0.0.1:41234\""));
+        assert!(text.contains("http://127.0.0.1:41234/ironsurf/serve"));
+
+        // Failed: the reason is shown escaped — the shell's error text is data.
+        set_archive_server_status(Some(ArchiveServerStatus {
+            ok: false,
+            address: String::new(),
+            error: Some("cannot bind <b>127.0.0.1</b>".into()),
+        }));
+        let text = String::from_utf8(internal_page_bytes(&url("ironsurf://archive")).expect("x"))
+            .expect("utf8");
+        assert!(text.contains("not running"));
+        assert!(text.contains("cannot bind &lt;b&gt;127.0.0.1&lt;/b&gt;"));
+        assert!(!text.contains("<b>"));
+        set_archive_server_status(None);
     }
 
     #[test]
