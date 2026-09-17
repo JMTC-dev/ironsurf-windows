@@ -1,4 +1,13 @@
 # Task log
+## #48 A new tab opens in the address bar: every tab open (Ctrl-T, ＋, manager New tab, middle-click / OpenLinkInNewTab,
+  menu open-in-new-tab) fills url-text with the spawn URL and bumps the SAME focus-url-token Ctrl-L / F6 use — the UrlBar takes
+  focus with the **whole address highlighted**, so the first keystroke replaces it; a session's first tab still hands focus to
+  the page (open_first_tab's page token lands last). New Core::url_draft (Cell<Option<TabId>>): while it names the active tab,
+  sync_ui stops pushing that tab's URL, so its own load/redirect cannot clobber the half-typed address — ended by submit, Esc
+  (which re-syncs the bar), a page pointer Down, another tab becoming active, that tab dying. LineEdit.has-focus reads stale
+  till the next event, so the session is tracked in Rust, not slint. tests/new_tab_url_bar.rs (own binary — IRONSURF_DATA_DIR
+  is process-global): token bump, keystroke replaces, announce cannot clobber, Esc restores, page click drops the draft; shell
+  65u + every suite green; :2.0 real app — Ctrl-T then typing logs exactly `address bar: "example.com"`; ARCH §focus routing.
 ## #47 Archive mode (💾): common gains ToTab::SetArchiveMode{enabled} + FromTab::ArchivedFetch{url,is_document,bytes};
   tab archives NOTHING itself — archive.rs sink (AtomicBool + queue; --archive-mode seeds, SetArchiveMode moves, off drops
   the queue) fed by navigate Ok(<400, document), spawn_http (subresources), script-src, and media, drained like net_events;
@@ -89,9 +98,3 @@ request — method, URL, status, bytes, duration_ms; docs report every redirect 
 NetProvider subresources + <script src> push into net_events drained per poll tick; failures error Some/status
 None (upgrade block names the requested URL); revalidated cache hits report the entry's status/size, data:/
 unsupported silent (no-spam); localhost wire test tests/network_events.rs + tab 172u + e2e 14 + suite green (IPC contract: FromTab::NetworkEvent{method,url,status,response_bytes,duration_ms,error}, error Some exactly when failed; ConsoleLog `source`).
-## #28 Right-click context menu + session clipboard: tab hit-tests the cursor (link/image/video+playing/selection
-/caret → FromTab::ContextMenu{x,y,ContextTarget}); shell renders a Slint overlay menu whose rows are the pure
-context_menu_items matrix (Back/Forward/Reload, open link/image in new tab, Copy selection/link/image/video/page
-address, Play/Pause video, Paste only editable+non-empty clipboard). Sandbox-safe clipboard: ShellProvider
-copy→FromTab::ClipboardText→shell store, Ctrl+V preceded by ToTab::Clipboard push; Paste/ToggleVideo ride
-ToTab::ContextAction. common round-trips + shell unit matrix + context_menu e2e green; workspace suites green.

@@ -213,6 +213,15 @@ pub struct Core {
     /// Files written by archive mode this shell session (the one-line
     /// overlay status; the counter is not persisted — the files are).
     archive_saved: Cell<usize>,
+    /// The tab whose address the user is drafting in the URL bar (task: a new
+    /// tab opens with the bar focused and its whole address highlighted, like
+    /// F6). While it names the **active** tab, `sync_ui` stops pushing that
+    /// tab's URL, so a page that is still loading — or a redirect it follows —
+    /// can never overwrite what is being typed. Armed when a tab opens and by
+    /// Ctrl-L / F6; dropped by Submit (the draft became a navigation), by
+    /// Escape, by a click in the page (which hands keyboard focus back to it),
+    /// by a switch to another tab, and by that tab going away.
+    url_draft: Cell<Option<TabId>>,
 }
 
 /// The assembled application: core + the timers that drive it (owned so
@@ -270,6 +279,7 @@ impl App {
             us_edit_id: RefCell::new(None),
             archive_dir: RefCell::new(archive_root),
             archive_saved: Cell::new(0),
+            url_draft: Cell::new(None),
         });
 
         core.attach_callbacks(ui);
@@ -455,7 +465,7 @@ impl Core {
         };
         let extra_refs: Vec<&str> = extra.iter().map(String::as_str).collect();
         debug!("open tab {id} in container {}: url {:?}", container.0, url);
-        match TabProc::spawn(&tab_bin, id, container, &profile_dir, url, &extra_refs, &self.sink) {
+        let spawned = match TabProc::spawn(&tab_bin, id, container, &profile_dir, url, &extra_refs, &self.sink) {
             Ok(tab) => {
                 *self.spawn_error.borrow_mut() = None;
                 let (w, h) = self.page_size();
@@ -478,17 +488,44 @@ impl Core {
                 // A tab process starts with an empty script set: seed it with
                 // the enabled userscripts at once (task: userscript menu).
                 self.seed_userscripts(id);
+                true
             }
             Err(err) => {
                 error!("spawn {} failed: {err}", tab_bin.display());
                 *self.spawn_error.borrow_mut() =
                     Some(format!("spawn {} failed: {err}", tab_bin.display()));
+                false
             }
-        }
+        };
         self.set_visible_except();
         self.sync_ui();
         // A new tab activates: an open UA menu re-points to its container.
         self.ua_refresh_if_open();
+        // …and a new tab opens *in the address bar*: it takes focus with the
+        // whole address highlighted exactly like F6 would, so the first
+        // keystroke replaces it (task: new tabs focus the URL bar). The bar is
+        // filled from the spawn URL first (the tab has not reported one yet)
+        // and the token bumps after `sync_ui`, so nothing writes over the
+        // selection; the edit session then keeps the loading tab's own URL
+        // from clobbering what the user types.
+        if spawned {
+            if let (Some(ui), Some(url)) = (self.ui(), url) {
+                ui.set_url_text(url.into());
+            }
+            self.focus_url_bar();
+        }
+    }
+
+    /// Move keyboard focus to the URL bar with its whole address highlighted
+    /// (the F6 / Ctrl-L behaviour, reused for every newly opened tab): bump
+    /// the token the `UrlBar` watches and arm the edit session for whichever
+    /// tab is active now.
+    fn focus_url_bar(&self) {
+        if let Some(ui) = self.ui() {
+            let t = ui.get_focus_url_token() + 1;
+            ui.set_focus_url_token(t);
+        }
+        self.url_draft.set(self.active_tab_id());
     }
 
     fn close_tab(&self, idx: usize) {
@@ -722,6 +759,9 @@ impl Core {
         };
         info!("address bar: {text:?} → navigating to {url}");
         self.send_active(ToTab::Navigate { url: url.clone() });
+        // The draft became a navigation: from here the tab's own URL drives
+        // the bar again (see `sync_ui`).
+        self.url_draft.set(None);
         if let Some(ui) = self.ui() {
             ui.set_url_text(url.into());
             // After navigating from the URL bar, focus returns to the page.
@@ -751,10 +791,7 @@ impl Core {
         }
         match keymap::shortcut_for(text, ctrl, alt, meta) {
             Some(Shortcut::FocusUrl) => {
-                if let Some(ui) = self.ui() {
-                    let t = ui.get_focus_url_token() + 1;
-                    ui.set_focus_url_token(t);
-                }
+                self.focus_url_bar();
                 return;
             }
             Some(Shortcut::CloseTab) => {
@@ -796,12 +833,16 @@ impl Core {
                 return;
             }
             Some(Shortcut::PageFocus) => {
-                // Escape also dismisses an open context menu.
+                // Escape also dismisses an open context menu, and abandons an
+                // address being typed: focus goes back to the page and the bar
+                // shows the tab's real URL again.
                 self.close_context_menu();
+                self.url_draft.set(None);
                 if let Some(ui) = self.ui() {
                     let t = ui.get_focus_page_token() + 1;
                     ui.set_focus_page_token(t);
                 }
+                self.sync_ui();
                 return;
             }
             None => {}
@@ -942,6 +983,13 @@ impl Core {
             2 => MouseButton::Middle,
             _ => MouseButton::Left,
         };
+        if matches!(kind, PointerKind::Down) {
+            // A click in the page hands keyboard focus back to it (see the
+            // page `TouchArea`), so an address being typed in the bar is
+            // abandoned here — from now on the tab's own URL owns the bar
+            // again (`sync_ui`).
+            self.url_draft.set(None);
+        }
         // Hover moves are rate limited: a moving mouse produces far more of
         // them than the tab can hit-test, and every stale one delays the click
         // that follows. Presses, releases and buttons never wait.
@@ -2095,7 +2143,18 @@ impl Core {
         if let Some(p) = procs.get(active) {
             ui.set_can_back(p.state.can_back);
             ui.set_can_fwd(p.state.can_forward);
-            ui.set_url_text(p.state.url.clone().unwrap_or_default().into());
+            // An address being typed belongs to exactly one tab: switching
+            // tabs (or that tab going away) drops the draft, so the strip can
+            // never leave a stale address in the bar. While it is live the
+            // tab's own URL is *not* pushed — a page still loading, or a
+            // redirect it is following, must not overwrite the half-typed
+            // address the new tab just highlighted.
+            if self.url_draft.get().is_some_and(|t| t != p.tab.id) {
+                self.url_draft.set(None);
+            }
+            if self.url_draft.get() != Some(p.tab.id) {
+                ui.set_url_text(p.state.url.clone().unwrap_or_default().into());
+            }
             // The tab's hover cursor comes back with the tab (task: cursor
             // icon) — switching tabs must not leave the previous page's hand
             // (or I-beam) drawn over this one.

@@ -199,7 +199,8 @@ export component AppWindow inherits Window {
     in-out property <string> container-edit-text;
     in property <int> selected-container: 0;
     in property <int> active-index: 0;
-    // bumped by Rust to move focus programmatically (Ctrl-L / Esc / startup)
+    // bumped by Rust to move focus programmatically (Ctrl-L / Esc / startup,
+    // and every newly opened tab)
     in property <int> focus-url-token: 0;
     in-out property <int> focus-page-token: 0;
     // page area size, read by Rust to send ToTab::Resize

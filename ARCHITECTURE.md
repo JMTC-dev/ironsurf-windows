@@ -684,6 +684,16 @@ Process/tab management (`src/tabs.rs`):
 - Keyboard focus routing: Slint focus on page area → forward keys; Ctrl-L focuses URL bar;
   Esc unfocuses; F12 / Ctrl-I toggle the DevTools panel (consumed by the shell, never sent
   to the page; they act on the focused page, i.e. not while the URL bar holds focus).
+- **A new tab opens in the address bar**: every tab open (`Ctrl-T`, the ＋ button, the
+  container manager's New tab, a middle-click / `FromTab::OpenLinkInNewTab`, a context-menu
+  Open link in new tab) fills the bar with the tab's start URL, bumps the same
+  `focus-url-token` Ctrl-L / F6 use — so the bar takes keyboard focus with the **whole
+  address highlighted** and the first keystroke replaces it — and activates the tab. (The
+  first tab of a session is not a new tab: startup still hands focus to the page.)
+  While that address is being drafted the shell stops pushing the tab's own URL into the
+  bar, so the page that is loading in the background — or a redirect it follows — cannot
+  overwrite the half-typed text; the draft ends with Submit, Esc, a click in the page,
+  and a switch to (or the death of) its tab (`Core::url_draft`).
 - Default start page: `ironsurf://welcome` (the tab-rendered built-in welcome page —
   `default_url()`), then URL bar typing does search-or-navigate: contains dot
   → `https://host` (upgrading typed `host/path` to HTTPS), else → `https://html.duckduckgo.com/html/?q=`.
