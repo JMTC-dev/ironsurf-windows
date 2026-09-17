@@ -7,7 +7,13 @@
 //! ```text
 //! <root>/<ISO8601 tab-spawn timestamp>/<host[:port]>/index.html
 //! <root>/<ISO8601 tab-spawn timestamp>/<host[:port]>/js/app.js
+//! <root>/<ISO8601 tab-spawn timestamp>/<host[:port]>/html/?q=asdf
 //! ```
+//!
+//! The URL path names the folder chain and the **query rides on the last
+//! path segment as part of the file name** — `?q=asdf` is its own file next
+//! to `index.html`, so two different query URLs of the same page keep two
+//! archived bodies.
 //!
 //! The timestamp directory is taken once per tab process (its spawn
 //! instant, or the moment archive mode was switched on for a tab that was
@@ -91,10 +97,13 @@ fn sanitize_segment(raw: &str) -> Option<String> {
 
 /// Where one archived fetch lands, relative to the per-tab timestamp
 /// directory: `<host[:port]>/<sanitized URL path>` — a plain port rides in
-/// the host segment (`127.0.0.1:8000`), and a main document is always the
-/// host's `index.html` (the visit's front page). `None` = not archivable
-/// (non-http(s) scheme, or no host). Query and fragment never reach disk:
-/// the same URL minus `?a=b` is the same file.
+/// the host segment (`127.0.0.1:8000`). The URL **query** is kept: it
+/// appends `?<query>` to the last path segment, so `…/html/?q=asdf` is the
+/// file `?q=asdf` inside `…/html/`, and `…/search?q=a?q=b` (an empty last
+/// segment) is `search?q=a?q=b` — the same URL minus `?a=b` is a different
+/// file. A document whose URL carries no query is the host's `index.html`
+/// (the visit's front page). `None` = not archivable (non-http(s) scheme,
+/// or no host). The fragment never reaches disk.
 pub fn archive_relative_path(raw_url: &str, is_document: bool) -> Option<PathBuf> {
     let url = Url::parse(raw_url).ok()?;
     if !matches!(url.scheme(), "http" | "https") {
@@ -108,23 +117,64 @@ pub fn archive_relative_path(raw_url: &str, is_document: bool) -> Option<PathBuf
         None => host.to_owned(),
     };
     let mut rel = PathBuf::from(authority);
-    if is_document {
-        rel.push("index.html");
-        return Some(rel);
-    }
-    let mut segs: Vec<String> = url
-        .path_segments()?
-        .filter_map(sanitize_segment)
-        .collect();
-    if segs.is_empty() {
-        // A subresource fetched from the bare root (`/`) has no name of its
-        // own; the root document's file name is the honest one.
+    // `url.query()` is Some("") for a bare trailing `?`, which still names a
+    // file (`<name>?`) distinct from the same URL with no query at all.
+    let query = url.query().map(|q| sanitize_query(q));
+    // A query-less document is the visit's front page — the host's
+    // `index.html`, whatever path redirected into it. Once the URL carries a
+    // query the file is named by the full URL (path + `?query`), so
+    // `/html/?q=a` and `/html/?q=b` archive side by side.
+    let mut segs: Vec<String> = if is_document && query.is_none() {
+        Vec::new()
+    } else {
+        url.path_segments()?.filter_map(sanitize_segment).collect()
+    };
+    if query.is_some() && url.path().ends_with('/') {
+        // A URL that ends in `/` names a *directory*: with a query its own
+        // file name is empty, and the query becomes the whole name —
+        // `/html/?q=asdf` is `?q=asdf` inside `html/`, not `html?q=asdf`.
+        segs.push(String::new());
+    } else if segs.is_empty() {
+        // The bare root (`/`) has no name of its own; the root document's
+        // file name is the honest one.
         segs.push("index.html".into());
     }
+    let last = segs.len() - 1;
+    if let Some(q) = query {
+        segs[last].push('?');
+        segs[last].push_str(&q);
+    }
     for seg in segs {
-        rel.push(seg);
+        rel.push(clamp_name(&seg));
     }
     Some(rel)
+}
+
+/// Longest file-system component we ever emit (Linux `NAME_MAX`). A query
+/// can be arbitrarily long, and a name over the limit is a write that fails;
+/// cutting at a UTF-8 boundary keeps a readable (if last-writer-wins) file.
+const NAME_MAX: usize = 255;
+
+fn clamp_name(name: &str) -> String {
+    if name.len() <= NAME_MAX {
+        return name.to_owned();
+    }
+    let mut end = NAME_MAX;
+    while end > 0 && !name.is_char_boundary(end) {
+        end -= 1;
+    }
+    name[..end].to_owned()
+}
+
+/// The query as a file-name suffix: percent-decoded, control chars and
+/// separators stripped. Unlike a path segment it keeps leading/trailing `.`
+/// and `?` (`?q=..` means what it says on the wire); an all-noise query
+/// still leaves the `?` marker, so it is always Some.
+fn sanitize_query(raw: &str) -> String {
+    decode_percent(raw)
+        .chars()
+        .filter(|c| !c.is_control() && !matches!(c, '/' | '\\'))
+        .collect()
 }
 
 /// Write one archived body to `root/visit/rel`. The relative path is
@@ -159,10 +209,70 @@ mod tests {
     #[test]
     fn documents_land_on_the_host_index() {
         assert_eq!(rel("http://example.com/", true), Path::new("example.com/index.html"));
+        // No query keeps the old rule: a deep (or redirected) path is still
+        // the visit's front page.
+        assert_eq!(rel("https://example.com/deep/path#frag", true), Path::new("example.com/index.html"));
+    }
+
+    #[test]
+    fn the_query_rides_on_the_file_name() {
+        // The requested shape: the folder chain is the URL path, the query is
+        // part of the file name.
         assert_eq!(
-            rel("https://example.com/deep/path?a=1#frag", true),
-            Path::new("example.com/index.html")
+            rel("http://localhost/html/?q=asdf", true),
+            Path::new("localhost/html/?q=asdf")
         );
+        // Different queries of the same page are different files…
+        assert_eq!(
+            rel("http://localhost/html/?q=other", true),
+            Path::new("localhost/html/?q=other")
+        );
+        // …and so is the same page with no query at all.
+        assert_eq!(rel("http://localhost/html/", true), Path::new("localhost/index.html"));
+        // The fragment still never reaches disk; a bare `?` names its own file.
+        assert_eq!(
+            rel("http://localhost/html/?q=a%20b#frag", true),
+            Path::new("localhost/html/?q=a b")
+        );
+        assert_eq!(rel("http://localhost/html/?", true), Path::new("localhost/html/?"));
+        // A query on the bare root is a file of the host folder itself.
+        assert_eq!(rel("http://localhost/?q=1", true), Path::new("localhost/?q=1"));
+        assert_eq!(rel("http://localhost?q=1", true), Path::new("localhost/?q=1"));
+        // Without the trailing slash the query rides on the last name.
+        assert_eq!(
+            rel("http://localhost/html?q=asdf", true),
+            Path::new("localhost/html?q=asdf")
+        );
+        // Subresources keep their query too, attached to the file name.
+        assert_eq!(
+            rel("http://localhost/html/app.js?q=1", false),
+            Path::new("localhost/html/app.js?q=1")
+        );
+        // A `?` in the raw URL that is not a query separator (percent-encoded)
+        // stays an ordinary character of the name.
+        assert_eq!(
+            rel("http://localhost/a%3fb.js", false),
+            Path::new("localhost/a?b.js")
+        );
+    }
+
+    #[test]
+    fn query_names_stay_traversable_and_bounded() {
+        // Separators inside a query cannot climb out of the host folder.
+        assert_eq!(
+            rel("http://localhost/html/?q=..%2f..%2fetc%2fpasswd", true),
+            Path::new("localhost/html/?q=....etcpasswd")
+        );
+        assert_eq!(
+            rel("https://example.com/search?q=%2e%2e%2f%2e%2eshadow", false),
+            Path::new("example.com/search?q=....shadow")
+        );
+        // An over-long query is cut to one legal component, not a failed write.
+        let long = format!("http://localhost/html/?q={}", "x".repeat(400));
+        let path = rel(&long, true);
+        let file = path.file_name().unwrap().to_str().unwrap();
+        assert!(file.starts_with("?q="), "{file}");
+        assert!(file.len() <= 255, "{} bytes", file.len());
     }
 
     #[test]
@@ -188,9 +298,15 @@ mod tests {
             rel("https://example.com/js/app.min.js", false),
             Path::new("example.com/js/app.min.js")
         );
+        // The query is part of the name, so cache-busted versions never
+        // overwrite each other.
         assert_eq!(
             rel("https://example.com/assets/logo@2x.png?v=7", false),
-            Path::new("example.com/assets/logo@2x.png")
+            Path::new("example.com/assets/logo@2x.png?v=7")
+        );
+        assert_eq!(
+            rel("https://example.com/assets/logo@2x.png?v=8", false),
+            Path::new("example.com/assets/logo@2x.png?v=8")
         );
         // A bare-root subresource falls back to the index name.
         assert_eq!(rel("https://example.com", false), Path::new("example.com/index.html"));

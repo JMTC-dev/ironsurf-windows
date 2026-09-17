@@ -144,13 +144,19 @@ fn main() {
         });
         // A tab *born with the mode on* ships archived fetches from its very
         // first load — the fake emits them right away: a document, a
-        // query-stringed subresource (the query must not reach disk), and a
-        // `file:` asset the shell must drop (a local file is no website).
+        // query-stringed subresource and a query-stringed document (both
+        // queries ride on the file name), and a `file:` asset the shell must
+        // drop (a local file is no website).
         if current_archive {
             emit(FromTab::ArchivedFetch {
                 url: "http://example.com/".into(),
                 is_document: true,
                 bytes: b"ARCHIVE-PAGE".to_vec(),
+            });
+            emit(FromTab::ArchivedFetch {
+                url: "http://example.com/html/?q=asdf".into(),
+                is_document: true,
+                bytes: b"ARCHIVE-QUERY-PAGE".to_vec(),
             });
             emit(FromTab::ArchivedFetch {
                 url: "http://example.com/js/app.js?v=2".into(),

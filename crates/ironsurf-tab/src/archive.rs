@@ -22,9 +22,11 @@ use url::Url;
 pub struct ArchivedFetch {
     /// The final (post-redirect) request URL.
     pub url: String,
-    /// True for a main-document navigation (the shell saves it as
-    /// `<host>/index.html`); false for every other body (subresource,
-    /// script-src, media).
+    /// True for a main-document navigation; false for every other body
+    /// (subresource, script-src, media). The shell owns the layout: a
+    /// query-less document is the host's `<host>/index.html`, and a URL that
+    /// carries a query is stored under the full URL (the query names the
+    /// file, e.g. `<host>/html/?q=asdf`).
     pub is_document: bool,
     /// The response body, verbatim.
     pub bytes: Vec<u8>,

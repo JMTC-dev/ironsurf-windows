@@ -8,6 +8,8 @@
 //! ```text
 //! <root>/<ISO8601>/127.0.0.1:<port>/index.html      (the document)
 //! <root>/<ISO8601>/127.0.0.1:<port>/style.css       (a <link> subresource)
+//! <root>/<ISO8601>/127.0.0.1:<port>/html/?q=asdf    (a query URL: the query
+//!                                                   names the file)
 //! ```
 //!
 //! Skipped (like `tests/real_tab.rs`) when the tab binary is not built.
@@ -139,6 +141,26 @@ fn real_tab_archives_a_site_into_the_tree() {
         std::thread::sleep(Duration::from_millis(50));
     }
     assert_eq!(std::fs::read(&css).unwrap(), CSS.as_bytes());
+
+    // A query URL is stored in full: `/html/?q=asdf` lands as the file
+    // `?q=asdf` inside the `html/` folder of the same host segment (the task:
+    // not just `index.html` — the query belongs to the path too).
+    ui.invoke_navigate(format!("{site}html/?q=asdf").into());
+    let query_file = visit.join(format!("127.0.0.1:{port}/html/?q=asdf"));
+    let query_deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        core.drain();
+        if std::fs::read(&query_file).is_ok() {
+            break;
+        }
+        assert!(
+            Instant::now() < query_deadline,
+            "timed out waiting for the archived query URL at {}",
+            query_file.display()
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert_eq!(std::fs::read(&query_file).unwrap(), PAGE.as_bytes());
 
     // Switching off mid-session: the live tab acknowledges it; the archive
     // tree stops growing.

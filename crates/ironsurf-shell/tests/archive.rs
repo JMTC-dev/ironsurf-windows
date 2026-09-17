@@ -10,8 +10,9 @@
 //! A tab spawned **while the mode is on** launches with `--archive-mode`,
 //! echoes `archive:on` from its very first line, and ships its archived
 //! fetches — which the shell lays out as
-//! `<root>/<ISO8601>/<host>/index.html` and `<root>/<ISO8601>/<host>/js/app.js`
-//! (query stripped; the `file:` asset dropped entirely). Headless
+//! `<root>/<ISO8601>/<host>/index.html`, `<root>/<ISO8601>/<host>/js/app.js?v=2`
+//! and `<root>/<ISO8601>/<host>/html/?q=asdf` (the URL query rides on the
+//! file name; the `file:` asset dropped entirely). Headless
 //! (`i-slint-backend-testing`): no X, no engine.
 
 use std::path::{Path, PathBuf};
@@ -147,8 +148,14 @@ fn archive_mode_toggles_persists_and_writes_the_tree() {
     let name = landed.file_name().unwrap().to_string_lossy().to_string();
     assert!(name.contains('T') && name.len() >= 20, "visit folder {name}");
     assert_eq!(entries(&root), vec![name.clone()]);
-    // the subresource keeps its path (minus the query)…
-    assert_eq!(read(&landed.join("example.com/js/app.js")), b"ARCHIVE-APP");
+    // the subresource keeps its path, the query riding on the file name…
+    assert_eq!(read(&landed.join("example.com/js/app.js?v=2")), b"ARCHIVE-APP");
+    // …and so does a query document: `/html/?q=asdf` is the file `?q=asdf`
+    // inside `html/`, next to the front page rather than on top of it.
+    assert_eq!(
+        read(&landed.join("example.com/html/?q=asdf")),
+        b"ARCHIVE-QUERY-PAGE"
+    );
     // …and the local file never lands anywhere under the archive root.
     let walk = |root: &Path| -> Vec<String> {
         let mut out = Vec::new();
@@ -169,16 +176,17 @@ fn archive_mode_toggles_persists_and_writes_the_tree() {
     assert_eq!(
         walk(&root),
         vec![
+            format!("{name}/example.com/html/?q=asdf"),
             format!("{name}/example.com/index.html"),
-            format!("{name}/example.com/js/app.js"),
+            format!("{name}/example.com/js/app.js?v=2"),
         ],
-        "exactly the two web files, the file: asset dropped"
+        "exactly the three web files, the file: asset dropped"
     );
 
     // the status line counts the saves.
     wait_for("the overlay counts the archived files", || {
         pump();
-        ui.get_archive_status().contains("2 file(s) saved")
+        ui.get_archive_status().contains("3 file(s) saved")
     });
 
     // ── flip it off: broadcast, and nothing further is written ───────────────
@@ -188,7 +196,7 @@ fn archive_mode_toggles_persists_and_writes_the_tree() {
         status(&ui) == "archive:off"
     });
     assert!(!disk().archive_enabled);
-    assert_eq!(walk(&root).len(), 2, "off changes nothing on disk");
+    assert_eq!(walk(&root).len(), 3, "off changes nothing on disk");
     ui.invoke_close_archive_menu();
     assert!(!ui.get_archive_menu_open());
 }

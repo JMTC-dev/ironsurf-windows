@@ -119,8 +119,10 @@ pub enum FromTab {
     // the mode was on — the tab ships the body verbatim, the **shell** writes
     // it under the configured root. `url` = final (post-redirect) URL;
     // `is_document` = a main-document navigation (saved as the host's
-    // `index.html`), every other entry a subresource/media file (saved under
-    // its URL path). Failures are never archived; local schemes never ship.
+    // `index.html` when its URL carries **no query** — with a query the full
+    // URL names the file, see the shell's archive mapping), every other entry
+    // a subresource/media file (saved under its URL path + query).
+    // Failures are never archived; local schemes never ship.
     ArchivedFetch    { url: String, is_document: bool, bytes: Vec<u8> },
     // find in page: the tab counted `matches` hits for `query`; `active` is the
     // **1-based** index of the hit painted light blue (0 = none, which only
@@ -683,10 +685,13 @@ UI (`crates/ironsurf-shell/ui/ironsurf.slint`):
   `…/127.0.0.1:8000/image.png`), re-taken from that moment for tabs that were already
   live when the mode switched on — so a later run never overwrites an earlier one's
   folder. Tabs never write: each successful fetch arrives as `FromTab::ArchivedFetch`
-  and the pump maps it to disk (document → `<host>/index.html`; subresource/media →
-  sanitized URL path, query/fragment stripped, `%XX` decoded, dot-segments neutralized
-  — pure `shell::archive`, traversal refused at write time too); the status line counts
-  the saves, failures are logged, never fatal.
+  and the pump maps it to disk (a query-less document → `<host>/index.html`; anything
+  else → the sanitized URL path with the **query kept**, appended to the last segment
+  as part of the file name — `/html/?q=asdf` is the file `?q=asdf` *inside* `html/`,
+  `/search?q=a` is `search?q=a`, so two queries of one URL never overwrite each other;
+  the fragment is stripped, `%XX` decoded, dot-segments neutralized, each component
+  clamped to 255 bytes — pure `shell::archive`, traversal refused at write time too);
+  the status line counts the saves, failures are logged, never fatal.
 - Menu (native or in-toolbar): New Window(v1: new tab), Close Tab (Ctrl-W), Tab Next/Prev
   (Ctrl-Tab), Open Container Manager, Clear Container Data.
 
