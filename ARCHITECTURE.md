@@ -122,6 +122,12 @@ pub enum FromTab {
     // `index.html`), every other entry a subresource/media file (saved under
     // its URL path). Failures are never archived; local schemes never ship.
     ArchivedFetch    { url: String, is_document: bool, bytes: Vec<u8> },
+    // find in page: the tab counted `matches` hits for `query`; `active` is the
+    // **1-based** index of the hit painted light blue (0 = none, which only
+    // happens when `matches == 0`). Sent after every find command that changed
+    // something and after a load re-ran a live query; `query` names the text the
+    // numbers describe, so a stale reply the bar has typed past is recognisable.
+    FindResult       { query: String, matches: usize, active: usize },
     Closed,
     Error            { message: String },
 }
@@ -168,6 +174,15 @@ pub enum ToTab {
     // per-tab timestamp dir) and does all writing — tabs stay sandboxed.
     // Fresh tabs inherit the setting via the `--archive-mode` spawn flag.
     SetArchiveMode { enabled: bool },
+    // find in page (`Ctrl-F`): install/replace the live query and re-run it from
+    // the top. The shell owns the bar; the **tab** matches over the text it laid
+    // out (case-insensitive, document order, visible text only) and paints it —
+    // **every** hit yellow, the **active** hit light blue. First hit becomes
+    // active and scrolls into view; the empty query clears query, highlights and
+    // count. Answers `FromTab::FindResult`. The query survives navigations.
+    SetFind          { query: String },
+    FindNext,                             // next hit (wrapping), scrolls into view
+    FindPrevious,                          // previous hit (wrapping)
     Destroy,
 }
 

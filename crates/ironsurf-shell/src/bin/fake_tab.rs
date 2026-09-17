@@ -11,6 +11,30 @@ use ironsurf_common::{
     FromTab, MouseButton, PointerKind, TabId, ToTab,
 };
 
+/// The fake tab's "page": the text its find-in-page searches, standing in for
+/// the real engine's laid-out document (task: find bar). The word `page`
+/// appears three times, so `--find page` is a scripted three-hit search.
+const FAKE_PAGE: &str =
+    "Fake page. This fake page says page three times, and nothing else worth finding.";
+
+/// Case-insensitive, non-overlapping hits of `query` in [`FAKE_PAGE`] — the
+/// fake's stand-in for the engine's search, so the shell's counter, its wrap
+/// and its empty-query behaviour are all testable without a document.
+fn fake_find_matches(query: &str) -> usize {
+    if query.is_empty() {
+        return 0;
+    }
+    let hay = FAKE_PAGE.to_lowercase();
+    let needle = query.to_lowercase();
+    let mut from = 0usize;
+    let mut hits = 0usize;
+    while let Some(at) = hay[from..].find(&needle) {
+        hits += 1;
+        from += at + needle.len();
+    }
+    hits
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let mut tab_id = TabId(0);
@@ -173,6 +197,11 @@ fn main() {
         std::process::exit(101);
     }
 
+    // Find in page (task: find bar): the live query and the 1-based position of
+    // the active hit, exactly as the real tab keeps them.
+    let mut find_query = String::new();
+    let mut find_at: usize = 0;
+
     // Last scripted cursor (`--cursor`); `None` = nothing reported yet.
     let mut last_cursor: Option<CursorIcon> = None;
 
@@ -202,6 +231,44 @@ fn main() {
                         default: Some("ada".into()),
                     });
                 }
+            }
+            // Find in page (task: find bar): the fake searches its own canned
+            // page text — the shell cannot tell the difference from the real
+            // engine, which searches the document's laid-out text.
+            ToTab::SetFind { query } => {
+                find_query = query;
+                let matches = fake_find_matches(&find_query);
+                // Like the real tab: the first hit becomes active (1-based) and
+                // an empty query reports nothing at all.
+                find_at = if matches == 0 { 0 } else { 1 };
+                emit(FromTab::FindResult {
+                    query: find_query.clone(),
+                    matches,
+                    active: find_at,
+                });
+            }
+            ToTab::FindNext => {
+                let matches = fake_find_matches(&find_query);
+                if matches > 0 {
+                    // Wrapping at both ends, 1-based, like `Tab::find_jump`.
+                    find_at = if find_at >= matches { 1 } else { find_at + 1 };
+                }
+                emit(FromTab::FindResult {
+                    query: find_query.clone(),
+                    matches,
+                    active: find_at,
+                });
+            }
+            ToTab::FindPrevious => {
+                let matches = fake_find_matches(&find_query);
+                if matches > 0 {
+                    find_at = if find_at <= 1 { matches } else { find_at - 1 };
+                }
+                emit(FromTab::FindResult {
+                    query: find_query.clone(),
+                    matches,
+                    active: find_at,
+                });
             }
             // The shell's answer to a scripted dialog: echo it on the status
             // line so the tests can see the full round trip.

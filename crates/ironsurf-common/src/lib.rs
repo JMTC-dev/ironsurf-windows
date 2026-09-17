@@ -150,6 +150,19 @@ pub enum FromTab {
         is_document: bool,
         bytes: Vec<u8>,
     },
+    /// **Find in page** result (see [`ToTab::SetFind`]): the tab counted
+    /// `matches` hits for `query` and the **1-based** index of the hit drawn
+    /// in light blue is `active` (`0` = none, which only happens when
+    /// `matches == 0`). Emitted after every find message that changed
+    /// something, and after a load that re-ran a live query — `query` is the
+    /// text these numbers describe, so the shell can drop a stale result that
+    /// raced ahead of its own find bar. The tab never echoes for a query it
+    /// no longer holds.
+    FindResult {
+        query: String,
+        matches: usize,
+        active: usize,
+    },
     Closed,
     Error {
         message: String,
@@ -236,6 +249,25 @@ pub enum ToTab {
         confirmed: bool,
         text: Option<String>,
     },
+    /// **Find in page** (`Ctrl-F`): install/replace the live search query and
+    /// re-run it from the top of the document. The shell owns the find bar;
+    /// the **tab** owns the document, so it does the matching over the text it
+    /// laid out (case-insensitive, document order) and paints the result:
+    /// **every** hit gets a yellow background and the **active** hit a light
+    /// blue one. The first hit becomes active and is scrolled into view; the
+    /// empty query clears the query, the highlights and the count. Answers
+    /// with [`FromTab::FindResult`]. The query survives navigations: each new
+    /// document re-runs it once loaded.
+    SetFind {
+        query: String,
+    },
+    /// Jump to the next hit (wrapping at the end): it becomes the active
+    /// (light-blue) one and is scrolled into view. No-op while there are no
+    /// hits — the query stands, so a later [`ToTab::SetFind`] restarts.
+    FindNext,
+    /// Jump to the previous hit (wrapping at the start) — otherwise exactly
+    /// [`ToTab::FindNext`].
+    FindPrevious,
     Destroy,
 }
 

@@ -87,6 +87,10 @@ struct Proc {
     devtools_open: bool,
     /// Which pane the panel shows for this tab (Console / Network).
     devtools_view: DevToolsView,
+    /// Find-in-page bar open for *this* tab (Ctrl-`F`). Per tab like the panel:
+    /// switching tabs switches the bar to the other tab's search, and the
+    /// numbers beside it come from that tab (`state.find`).
+    find_open: bool,
 }
 
 /// The shell-side half of a JS dialog being shown (task: window.alert /
@@ -479,6 +483,7 @@ impl Core {
                         crashed: false,
                         devtools_open: false,
                         devtools_view: DevToolsView::default(),
+                        find_open: false,
                     });
                     self.active.set(procs.len() - 1);
                 }
@@ -720,6 +725,9 @@ impl Core {
         }
         self.active.set(idx);
         self.set_visible_except();
+        // The find bar follows the activation like the DevTools panel does: the
+        // new tab's own query (and its own open flag) replace the old one's.
+        self.show_find_query();
         if let Some(id) = self.active_tab_id() {
             let (w, h) = self.page_size();
             if w > 0.0 && h > 0.0 {
@@ -824,6 +832,10 @@ impl Core {
                 self.apply_zoom(1.0);
                 return;
             }
+            Some(Shortcut::Find) => {
+                self.open_find();
+                return;
+            }
             Some(Shortcut::ToggleDevTools) => {
                 // Page focus only: the chord arrives from the page's `FocusScope`.
                 // Catching it while the URL bar is focused would need a second
@@ -833,9 +845,14 @@ impl Core {
                 return;
             }
             Some(Shortcut::PageFocus) => {
-                // Escape also dismisses an open context menu, and abandons an
-                // address being typed: focus goes back to the page and the bar
-                // shows the tab's real URL again.
+                // Escape closes an open find bar first (that is what the reader
+                // is aiming at), then dismisses an open context menu, and
+                // abandons an address being typed: focus goes back to the page
+                // and the bar shows the tab's real URL again.
+                if self.find_open_active() {
+                    self.close_find();
+                    return;
+                }
                 self.close_context_menu();
                 self.url_draft.set(None);
                 if let Some(ui) = self.ui() {
@@ -934,6 +951,113 @@ impl Core {
             procs[i].devtools_view = view;
         }
         self.sync_ui();
+    }
+
+    // ---- find bar (Ctrl-F) ------------------------------------------------
+
+    /// Whether the active tab's find bar is open.
+    fn find_open_active(&self) -> bool {
+        let Some(i) = self.active_proc_index() else { return false };
+        self.procs.borrow()[i].find_open
+    }
+
+    /// Ctrl-`F`: open the active tab's bar, focus the entry, and re-assert the
+    /// query that tab was last searching (its own, per tab — the tab process
+    /// never dropped its highlights, so reopening the bar finds the page exactly
+    /// where the reader left it).
+    fn open_find(&self) {
+        let Some(i) = self.active_proc_index() else {
+            debug!("find bar dropped: no active tab");
+            return;
+        };
+        let query = self.procs.borrow()[i].state.find.query.clone();
+        {
+            let mut procs = self.procs.borrow_mut();
+            procs[i].find_open = true;
+        }
+        info!("find bar opened on tab {} (query {query:?})", self.active_tab_id().map(|id| id.0).unwrap_or(0));
+        // An empty query here is not a no-op: it tells the tab the bar is
+        // searching for nothing yet, which is also how its highlights get
+        // cleared after a previous bar was emptied rather than closed.
+        self.send_active(ToTab::SetFind { query });
+        self.show_find_query();
+        self.sync_ui();
+        if let Some(ui) = self.ui() {
+            let t = ui.get_find_focus_token() + 1;
+            ui.set_find_focus_token(t);
+        }
+    }
+
+    /// The bar's ✕ (and Escape, from inside the entry or from the page): stop
+    /// searching — the tab drops its highlights — and hand focus back to the
+    /// page. The query stays on the tab's record, so reopening resumes it.
+    fn close_find(&self) {
+        let Some(i) = self.active_proc_index() else { return };
+        if !self.procs.borrow()[i].find_open {
+            return;
+        }
+        self.procs.borrow_mut()[i].find_open = false;
+        self.send_active(ToTab::SetFind { query: String::new() });
+        self.sync_ui();
+        // The page gets the caret back, exactly as Escape left of a typed
+        // address does.
+        if let Some(ui) = self.ui() {
+            let t = ui.get_focus_page_token() + 1;
+            ui.set_focus_page_token(t);
+        }
+    }
+
+    /// Text typed into the entry: search live. The highlight colours are the
+    /// tab's business (every match yellow, the current one light blue); the
+    /// tab answers with the new counts, which `sync_ui` puts in the bar.
+    fn find_text_changed(&self, query: String) {
+        if !self.find_open_active() {
+            // A stray signal from a bar that was just closed (Slint fires the
+            // entry's `changed` on programmatic writes too).
+            return;
+        }
+        self.send_active(ToTab::SetFind { query });
+    }
+
+    /// ▲/▼, Enter/Shift-Enter: jump to the previous/next match, wrapping. The
+    /// tab scrolls it into view and repaints with the light-blue marker there.
+    fn find_jump(&self, forward: bool) {
+        if !self.find_open_active() {
+            return;
+        }
+        self.send_active(if forward {
+            ToTab::FindNext
+        } else {
+            ToTab::FindPrevious
+        });
+    }
+
+    /// Put the active tab's own query into the entry — the only place the query
+    /// is ever *written* into the bar, so a sync triggered by something else can
+    /// never overwrite half-typed text with the tab's last-confirmed query.
+    fn show_find_query(&self) {
+        let Some(i) = self.active_proc_index() else { return };
+        let query = self.procs.borrow()[i].state.find.query.clone();
+        if let Some(ui) = self.ui() {
+            if ui.get_find_text().as_str() != query.as_str() {
+                ui.set_find_text(query.into());
+            }
+        }
+    }
+
+    /// The find bar's view-model for the active tab: whether it is open, and the
+    /// counter the tab reported (`3 / 12`, `No results`). The entry's *text* is
+    /// written by [`Core::show_find_query`] only — never here — so a sync
+    /// triggered by an unrelated event cannot stomp half-typed text.
+    fn write_find(&self, ui: &AppWindow, procs: &[Proc]) {
+        let active = self.active.get().min(procs.len().saturating_sub(1));
+        let Some(p) = procs.get(active) else {
+            ui.set_find_open(false);
+            ui.set_find_count("".into());
+            return;
+        };
+        ui.set_find_open(p.find_open);
+        ui.set_find_count(p.state.find.label().into());
     }
 
     /// Write the panel's whole view-model (pane, counts, rows) for the active
@@ -1224,8 +1348,11 @@ impl Core {
             let old = {
                 let mut procs = self.procs.borrow_mut();
                 let zoom = procs[at].zoom;
-                let (devtools_open, devtools_view) =
-                    (procs[at].devtools_open, procs[at].devtools_view);
+                let (devtools_open, devtools_view, find_open) = (
+                    procs[at].devtools_open,
+                    procs[at].devtools_view,
+                    procs[at].find_open,
+                );
                 std::mem::replace(
                     &mut procs[at],
                     Proc {
@@ -1236,6 +1363,7 @@ impl Core {
                         crashed: false,
                         devtools_open,
                         devtools_view,
+                        find_open,
                     },
                 )
             };
@@ -2187,6 +2315,8 @@ impl Core {
         // The DevTools panel renders the active tab too (pane, counts, rows):
         // toggling, switching tabs and closing it all land here.
         self.write_devtools(&ui, &procs);
+        // …and so does the find bar (open flag + the tab's own counter).
+        self.write_find(&ui, &procs);
         // The spinner must react to LoadingChanged immediately, not on the next
         // tick of the spinner timer — a click on a link should start turning
         // the moment the tab says it is loading.
@@ -2209,6 +2339,13 @@ impl Core {
             let cid = c.new_tab_container();
             c.open_tab(cid, Some(&default_url()));
         });
+        bind0!(on_find_next, |c: &Rc<Core>| c.find_jump(true));
+        bind0!(on_find_previous, |c: &Rc<Core>| c.find_jump(false));
+        bind0!(on_find_close, |c: &Rc<Core>| c.close_find());
+        {
+            let c = self.clone();
+            ui.on_find_query_changed(move |q| c.find_text_changed(q.to_string()));
+        }
         bind0!(on_open_manager, |c: &Rc<Core>| c.manager_open(true));
         bind0!(on_close_manager, |c: &Rc<Core>| c.manager_open(false));
         bind0!(on_mgr_add, |c: &Rc<Core>| c.mgr_add());

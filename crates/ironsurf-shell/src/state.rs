@@ -28,6 +28,38 @@ pub struct ConsoleEntry {
     pub message: String,
 }
 
+/// Find-in-page results as the tab last reported them (task: the `Ctrl-F`
+/// find bar). The query travels *with* the counts: the bar shows its counter
+/// against exactly the text the search ran on, so a number belonging to a query
+/// the reader has already edited past never appears.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct FindState {
+    /// The query these counts belong to (`""` = not searching).
+    pub query: String,
+    /// Total hits on the page.
+    pub matches: usize,
+    /// 1-based position of the **active** (light-blue) hit; 0 = no active hit.
+    pub active: usize,
+}
+
+impl FindState {
+    /// The counter the bar shows: `3 / 12` while searching, an honest “No
+    /// results” when the query matches nothing, and blank when there is no
+    /// query (the bar is closed, or has been emptied).
+    pub fn label(&self) -> String {
+        if self.query.is_empty() {
+            String::new()
+        } else if self.matches == 0 {
+            "No results".to_owned()
+        } else if self.active == 0 {
+            // Search running / nothing jumped to yet: the total alone.
+            format!("{} matched", self.matches)
+        } else {
+            format!("{} / {}", self.active, self.matches)
+        }
+    }
+}
+
 /// Everything the shell renders about one tab, minus the frame itself.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct TabState {
@@ -48,6 +80,8 @@ pub struct TabState {
     pub console: Vec<ConsoleEntry>,
     /// DevTools network feed (bounded by [`MAX_NETWORK_ENTRIES`]).
     pub network: Vec<NetEvent>,
+    /// The find bar's numbers, straight from the tab (see [`FindState`]).
+    pub find: FindState,
 }
 
 impl TabState {
@@ -123,6 +157,20 @@ impl TabState {
             FromTab::NetworkEvent { event } => {
                 push_bounded(&mut self.network, event.clone(), MAX_NETWORK_ENTRIES);
                 false
+            }
+            // Find bar: the counts are shown, so a change dirties the UI.
+            FromTab::FindResult { query, matches, active } => {
+                let next = FindState {
+                    query: query.clone(),
+                    matches: *matches,
+                    active: *active,
+                };
+                if next == self.find {
+                    false
+                } else {
+                    self.find = next;
+                    true
+                }
             }
             // Actions for the pump (spawn a new tab, open the context menu,
             // file the copy into the session clipboard, show the modal
@@ -605,6 +653,46 @@ mod tests {
         assert_eq!(s.cursor, CursorIcon::Pointer, "the same shape again changes nothing");
         assert!(!s.reduce(&FromTab::CursorChanged { cursor: CursorIcon::Text }));
         assert_eq!(s.cursor, CursorIcon::Text);
+    }
+
+    #[test]
+    fn find_results_drive_the_bar_counter() {
+        let mut s = TabState::default();
+        assert_eq!(s.find.label(), "", "no query, no counter");
+        assert!(s.reduce(&FromTab::FindResult {
+            query: "the".into(),
+            matches: 12,
+            active: 1
+        }));
+        assert_eq!(s.find.label(), "1 / 12");
+        assert!(
+            !s.reduce(&FromTab::FindResult {
+                query: "the".into(),
+                matches: 12,
+                active: 1
+            }),
+            "the same numbers are not a change"
+        );
+        assert!(s.reduce(&FromTab::FindResult {
+            query: "the".into(),
+            matches: 12,
+            active: 7
+        }));
+        assert_eq!(s.find.label(), "7 / 12");
+        // A query that matches nothing says so plainly, and an emptied bar
+        // leaves no counter behind.
+        assert!(s.reduce(&FromTab::FindResult {
+            query: "zzz".into(),
+            matches: 0,
+            active: 0
+        }));
+        assert_eq!(s.find.label(), "No results");
+        assert!(s.reduce(&FromTab::FindResult {
+            query: String::new(),
+            matches: 0,
+            active: 0
+        }));
+        assert_eq!(s.find.label(), "");
     }
 
     #[test]

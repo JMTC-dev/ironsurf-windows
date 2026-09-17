@@ -5,7 +5,8 @@
 //! private-use code points from the Slint key table). We map those to the
 //! DOM `key`/`code` strings the tab hands to Servo, and we detect browser
 //! chords (Ctrl-L / F6 / Ctrl-W / Ctrl-R / Ctrl-T / Ctrl-Tab / Esc / Ctrl-+ /
-//! Ctrl-- / Ctrl-0 / F12 / Ctrl-I) here so the logic stays pure and testable.
+//! Ctrl-- / Ctrl-0 / F12 / Ctrl-I / Ctrl-F) here so the logic stays pure and
+//! testable.
 
 use ironsurf_common::{KeyEvent, Modifiers};
 
@@ -30,6 +31,8 @@ pub enum Shortcut {
     ZoomReset,
     /// F12 / Ctrl-`I`: toggle the DevTools panel of the active tab.
     ToggleDevTools,
+    /// Ctrl-`F`: open the find-in-page bar (and focus its text entry).
+    Find,
     /// Esc: return keyboard focus to the page.
     PageFocus,
 }
@@ -112,6 +115,9 @@ pub fn shortcut_for(text: &str, ctrl: bool, alt: bool, meta: bool) -> Option<Sho
         // chord is `\t`, which already means Ctrl-Tab, so only the letter form
         // — what Slint actually delivers for KeyI — toggles DevTools.
         'i' | 'I' => Some(Shortcut::ToggleDevTools),
+        // Ctrl-`F` opens the find bar. Its control-character spelling is
+        // ACK (`\u{06}`), which X11 backends hand over for the same chord.
+        'f' | 'F' | '\u{06}' => Some(Shortcut::Find),
         _ => None,
     }
 }
@@ -267,6 +273,19 @@ mod tests {
         // shifted form simply arrives as the uppercase letter).
         assert_eq!(shortcut_for("i", true, false, false), Some(Shortcut::ToggleDevTools));
         assert_eq!(shortcut_for("I", true, false, false), Some(Shortcut::ToggleDevTools));
+    }
+
+    #[test]
+    fn find_chord_is_detected() {
+        // Ctrl-F, and the ACK control-character spelling the X11 backend
+        // delivers for the same chord.
+        assert_eq!(shortcut_for("f", true, false, false), Some(Shortcut::Find));
+        assert_eq!(shortcut_for("F", true, false, false), Some(Shortcut::Find));
+        assert_eq!(shortcut_for("\u{06}", true, false, false), Some(Shortcut::Find));
+        // Bare `f` types into the page (and Alt/Meta-F stays with the WM).
+        assert_eq!(shortcut_for("f", false, false, false), None);
+        assert_eq!(shortcut_for("f", false, true, false), None);
+        assert_eq!(shortcut_for("f", false, false, true), None);
     }
 
     #[test]

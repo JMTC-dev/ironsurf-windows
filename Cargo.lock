@@ -3370,6 +3370,7 @@ dependencies = [
  "keyboard-types",
  "kurbo",
  "libc",
+ "parley 0.11.1",
  "peniko",
  "reqwest 0.12.28",
  "rusty_h264-decoder",

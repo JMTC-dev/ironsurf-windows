@@ -91,6 +91,7 @@ use ironsurf_sandbox::SandboxPolicy;
 use ironsurf_storage::{ContainerStore, CookieJar, NetCache};
 use url::Url;
 
+use crate::find;
 use crate::forms::{self, FormMethod, FormSubmission};
 use crate::js::{self, HostRef};
 use crate::media::player::{MediaPlayer, PlayerEvent, PlayerState, MAX_VIDEO_BYTES};
@@ -609,6 +610,19 @@ pub struct Tab {
     /// Per-document bookkeeping for the CSS re-parse seam (content hashes of
     /// already-reported `<style>` bodies / `style="…"` attributes).
     css_scan: CssScanState,
+    /// **Find in page** (task: find bar, `Ctrl-F`): the live query the shell
+    /// installed with [`ToTab::SetFind`] (`""` = none), its hits in reading
+    /// order, and the 0-based index of the **active** (light-blue) hit the
+    /// shell's counter is on. The query outlives the document: every new page
+    /// re-runs it (see [`Tab::find_on_new_document`]).
+    find_query: String,
+    find_hits: Vec<find::Hit>,
+    find_active: Option<usize>,
+    /// The document settled (script, a restyle, a resize, a fresh page) since
+    /// the hits were collected, so the byte ranges — or the text itself — may
+    /// no longer be the ones the search saw. Cleared by the next re-run, which
+    /// happens lazily: only when a jump needs the hits or a frame paints them.
+    find_stale: bool,
     /// Userscripts installed by the shell (`ToTab::SetUserscripts`, task:
     /// userscripts): **replace-wholesale**, in the shell's store order, every
     /// entry enabled (the shell never sends disabled ones). Matching against a
@@ -910,6 +924,10 @@ impl Tab {
             net_events,
             console_events,
             css_scan: CssScanState::new(),
+            find_query: String::new(),
+            find_hits: Vec::new(),
+            find_active: None,
+            find_stale: false,
             userscripts: Vec::new(),
             user_agent,
             archive,
@@ -1252,6 +1270,11 @@ impl Tab {
         }
         self.emit_history_changed();
 
+        // A find bar left open across this navigation keeps searching: re-run
+        // the shell's live query against the new document (it emits the new
+        // counts, and the frame below already paints the highlights).
+        self.find_on_new_document();
+
         // Force a first frame for the new document (bypasses the throttle).
         self.needs_paint = true;
         self.last_paint = None;
@@ -1262,6 +1285,11 @@ impl Tab {
     /// resolve → (drain pending criticals via messages) → resolve, as the
     /// canonical headless flow prescribes (`docs/BLITZ_API_NOTES.md` §1/§3).
     fn settle(&mut self) {
+        // Restyling/relaying can rewrite the laid-out text the hits point into
+        // (script, a lazy load, an animation), so the next use re-runs the
+        // query instead of trusting stale byte ranges. Cheap when idle: only a
+        // live query costs anything, and only once per settle.
+        self.find_stale = true;
         let Some(doc) = self.doc.as_mut() else { return };
         doc.resolve(0.);
         for _ in 0..8 {
@@ -1840,6 +1868,10 @@ impl Tab {
             return;
         }
         let scale = self.scale;
+        // Find-in-page highlights are measured here — before the paint closure
+        // takes the document mutably — and drawn **last**, over the finished
+        // page, so the text underneath them stays readable.
+        let highlights = self.find_highlights(f64::from(scale));
         let buffer = render_to_buffer::<VelloCpuImageRenderer, _>(
             |scene| {
                 scene.fill(
@@ -1862,6 +1894,7 @@ impl Tab {
                     0,
                     0,
                 );
+                find::paint(scene, &highlights);
             },
             width,
             height,
@@ -1910,6 +1943,144 @@ impl Tab {
             self.last_title = Some(title.clone());
             self.emit(FromTab::TitleChanged { title });
         }
+    }
+
+    // -- find in page (Ctrl-F) ------------------------------------------------
+
+    /// Install (or clear, with `""`) the shell's find query and report the count
+    /// back. The first hit becomes active and is scrolled into view — like a
+    /// browser that jumps to a match while you type.
+    fn set_find(&mut self, query: String) {
+        self.find_query = query;
+        self.find_rerun(true);
+        self.emit_find_result();
+        self.needs_paint = true;
+        self.maybe_repaint();
+    }
+
+    /// Jump to the next (forward) or previous (back) hit, **wrapping** at the
+    /// ends of the document — what the shell's Enter/Shift-Enter and the bar's
+    /// ▲/▼ buttons ask for.
+    fn find_jump(&mut self, forward: bool) {
+        if self.find_query.is_empty() {
+            return; // no query: nothing to walk
+        }
+        if self.find_stale || self.find_hits.is_empty() {
+            // The document moved under the hits (or nothing was found yet):
+            // re-run rather than trust byte ranges into text that has changed.
+            self.find_rerun(true);
+        } else {
+            let n = self.find_hits.len();
+            self.find_active = Some(match self.find_active {
+                Some(i) if forward => (i + 1) % n,
+                // Wrapping backwards: the hit before the first is the last one.
+                Some(i) => {
+                    if i == 0 {
+                        n - 1
+                    } else {
+                        i - 1
+                    }
+                }
+                None if forward => 0,
+                None => n - 1,
+            });
+            self.focus_active_hit();
+        }
+        self.emit_find_result();
+        self.needs_paint = true;
+        self.maybe_repaint();
+    }
+
+    /// Re-run the live query against the current document. `jump_first` makes
+    /// the **first** hit active and scrolls to it (a new query, or the document
+    /// having moved); otherwise the counter keeps its position wherever the new
+    /// hit list still has it.
+    fn find_rerun(&mut self, jump_first: bool) {
+        self.find_stale = false;
+        self.find_hits.clear();
+        self.find_active = None;
+        if self.find_query.is_empty() {
+            return;
+        }
+        let Some(doc) = self.doc.as_ref() else { return };
+        self.find_hits = find::collect(doc, &self.find_query);
+        if self.find_hits.is_empty() {
+            return;
+        }
+        let n = self.find_hits.len();
+        self.find_active = Some(if jump_first {
+            0
+        } else {
+            self.find_active.unwrap_or(0).min(n - 1)
+        });
+        if jump_first {
+            self.focus_active_hit();
+        }
+    }
+
+    /// Scroll so the active hit sits in the viewport (see
+    /// [`find::scroll_hit_into_view`]). Script may have dropped the node since
+    /// the search — then there is nothing to scroll to.
+    fn focus_active_hit(&mut self) {
+        let Some(hit) = self
+            .find_active
+            .and_then(|i| self.find_hits.get(i))
+            .copied()
+        else {
+            return;
+        };
+        // The viewport the rectangles are measured against is the window in CSS
+        // px (logical px — the same space `on_key_chord` hit-tests in).
+        let (w, h) = (f64::from(self.width), f64::from(self.height));
+        if let Some(doc) = self.doc.as_mut() {
+            find::scroll_hit_into_view(doc, &hit, w, h);
+        }
+    }
+
+    /// Emit the counts the find bar shows (`active` is 1-based; 0 = none).
+    fn emit_find_result(&mut self) {
+        self.emit(FromTab::FindResult {
+            query: self.find_query.clone(),
+            matches: self.find_hits.len(),
+            active: self.find_active.map(|i| i + 1).unwrap_or(0),
+        });
+    }
+
+    /// A fresh document arrived: re-run the query the shell still holds, because
+    /// browsers keep the find bar open across navigations. The first hit becomes
+    /// active, but the viewport is **not** yanked — a page that just loaded
+    /// should not scroll itself before the reader has seen its top.
+    fn find_on_new_document(&mut self) {
+        self.find_stale = false;
+        if self.find_query.is_empty() {
+            self.find_hits.clear();
+            self.find_active = None;
+            return;
+        }
+        let Some(doc) = self.doc.as_ref() else { return };
+        self.find_hits = find::collect(doc, &self.find_query);
+        self.find_active = if self.find_hits.is_empty() {
+            None
+        } else {
+            Some(0)
+        };
+        self.emit_find_result();
+    }
+
+    /// This frame's highlights, measured from the live layout. A query whose
+    /// text may have moved (the document settled) is re-run first, so a stale
+    /// byte range never paints the wrong glyphs.
+    pub(crate) fn find_highlights(&mut self, scale: f64) -> Vec<find::Highlight> {
+        if self.find_query.is_empty() {
+            return Vec::new();
+        }
+        if self.find_stale {
+            self.find_rerun(false);
+        }
+        let Some(doc) = self.doc.as_ref() else {
+            return Vec::new();
+        };
+        find::highlight_rects(doc, &self.find_hits, self.find_active, scale)
     }
 
     // -- shell event handling -------------------------------------------------
@@ -2050,6 +2221,12 @@ impl Tab {
                 info!("archive mode → {}", if enabled { "on" } else { "off" });
                 self.archive.set_enabled(enabled);
             }
+            // Find in page: the shell owns the find bar (the chord, the text
+            // entry, the counters); the tab owns the document, so matching,
+            // highlighting and jumping happen here (see src/find.rs).
+            ToTab::SetFind { query } => self.set_find(query),
+            ToTab::FindNext => self.find_jump(true),
+            ToTab::FindPrevious => self.find_jump(false),
             ToTab::DialogResponse { dialog_id, .. } => {
                 // A reply with no modal open: it either raced the tab-side
                 // cancel (shell quit mid-dialog) or is stale — nothing to

@@ -61,6 +61,13 @@ pub struct HeadlessArgs {
     pub wait: Duration,
     pub body_out: Option<PathBuf>,
     pub shot: Option<PathBuf>,
+    /// Find-in-page query to run before the shot (`--find QUERY`): lets the
+    /// highlights a live search paints be inspected as pixels.
+    pub find: Option<String>,
+    /// Extra `FindNext` commands after the query (`--find-jumps N`): the shot
+    /// then shows the light-blue marker *N* results further along, which is how
+    /// the jump/scroll/wrap behaviour gets inspected.
+    pub find_jumps: usize,
     pub width: u32,
     pub height: u32,
 }
@@ -71,6 +78,8 @@ impl HeadlessArgs {
         let mut body_out = None;
         let mut shot = None;
         let mut size = (1024u32, 768u32);
+        let mut find = None;
+        let mut find_jumps: usize = 0;
         let mut saw_url = false;
 
         // Every flag the *normal* parser must not see (headless-only surface).
@@ -91,6 +100,12 @@ impl HeadlessArgs {
                 }
                 "--body-out" => body_out = Some(PathBuf::from(value("body-out")?)),
                 "--shot" => shot = Some(PathBuf::from(value("shot")?)),
+                "--find" => find = Some(value("find")?),
+                "--find-jumps" => {
+                    find_jumps = value("find-jumps")?
+                        .parse()
+                        .map_err(|_| "--find-jumps needs a count")?
+                },
                 "--size" => {
                     let v = value("size")?;
                     let (w, h) = v
@@ -133,6 +148,8 @@ impl HeadlessArgs {
             wait: Duration::from_millis(wait_ms),
             body_out,
             shot,
+            find,
+            find_jumps,
             width: size.0.max(1),
             height: size.1.max(1),
         })
@@ -182,6 +199,18 @@ pub fn run(args: &[String]) -> Result<(), Box<dyn Error>> {
         tab.headless_pump();
     }
 
+    // A scripted search (`--find`): exactly the command the shell sends when the
+    // reader types in the find bar, so the shot shows the highlights a live
+    // search paints — every match yellow, the current one light blue.
+    if let Some(query) = args.find.clone() {
+        tab.handle_to_tab(ToTab::SetFind { query });
+        // …and N times the shell's “next” button (Enter): the active marker
+        // walks the results, scrolling each one into view.
+        for _ in 0..args.find_jumps {
+            tab.handle_to_tab(ToTab::FindNext);
+        }
+    }
+
     // Capture from the settled document.
     let title = tab.title_now().unwrap_or_default();
     let body = tab
@@ -195,12 +224,20 @@ pub fn run(args: &[String]) -> Result<(), Box<dyn Error>> {
         }
         fs::write(path, &body)?;
     }
+    // The highlights are measured from the live layout at the shot's own scale
+    // (before the document is borrowed for painting), then drawn over the
+    // finished page scene.
+    let highlights = if args.shot.is_some() {
+        tab.find_highlights(1.0)
+    } else {
+        Vec::new()
+    };
     let shot_len = match (&args.shot, tab.document_mut()) {
         (Some(path), Some(doc)) => {
             if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
                 fs::create_dir_all(parent)?;
             }
-            let len = shot_ppm(doc, args.width, args.height, path)?;
+            let len = shot_ppm(doc, args.width, args.height, &highlights, path)?;
             Some(len)
         }
         (Some(_), None) => {
@@ -238,7 +275,13 @@ fn poll_wake(wake_fd: RawFd, tick: Duration) -> bool {
 
 /// Render the document into a fresh `vello_cpu` RGBA8 buffer at the full
 /// viewport and write it as a P6 PPM; returns the on-disk file size.
-fn shot_ppm(doc: &mut HtmlDocument, width: u32, height: u32, path: &Path) -> Result<u64, Box<dyn Error>> {
+fn shot_ppm(
+    doc: &mut HtmlDocument,
+    width: u32,
+    height: u32,
+    highlights: &[crate::find::Highlight],
+    path: &Path,
+) -> Result<u64, Box<dyn Error>> {
     let buffer = render_to_buffer::<VelloCpuImageRenderer, _>(
         |scene| {
             scene.fill(
@@ -252,6 +295,7 @@ fn shot_ppm(doc: &mut HtmlDocument, width: u32, height: u32, path: &Path) -> Res
                 ),
             );
             paint_scene(scene, doc, 1.0, width, height, 0, 0);
+            crate::find::paint(scene, highlights);
         },
         width,
         height,

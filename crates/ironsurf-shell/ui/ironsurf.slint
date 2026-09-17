@@ -115,6 +115,93 @@ component UrlBar inherits Rectangle {
     }
 }
 
+/// Find-in-page bar (Ctrl-`F`): a strip that floats over the top-right of the
+/// page — the text entry, the live counter the tab reports (`3 / 12`, `No
+/// results`), ▲/▼ to walk the results, and ✕ to close it. Enter jumps forward,
+/// Shift-Enter and the arrow keys backward; every edit re-searches at once.
+/// The highlights themselves are painted by the tab (its document, its pixels):
+/// yellow behind every match, light blue behind the one this bar sits on.
+component FindBar inherits Rectangle {
+    /// Bumped by Rust (Ctrl-`F`) to pull focus into the entry.
+    in property <int> focus-token: 0;
+    /// The tab's counter, verbatim (see `FindState::label` in src/state.rs).
+    in property <string> count: "";
+    /// The query in the entry (two-way with the shell).
+    in-out property <string> text: "";
+    callback query-changed(text: string);
+    callback next();
+    callback previous();
+    callback close();
+
+    width: 372px;
+    height: 40px;
+
+    // The panel: opaque, so the page under it stays legible as a background.
+    Rectangle {
+        width: parent.width;
+        height: parent.height - 8px;
+        background: #242424;
+        border-radius: 6px;
+        border-width: 1px;
+        border-color: #5a5a5a;
+        // Nothing behind the panel may take the click (the page's TouchArea
+        // covers the same pixels and would otherwise swallow the bar's own).
+        find-scrim := TouchArea { }
+
+        HorizontalLayout {
+            x: 0; width: parent.width; height: parent.height;
+            padding-left: 8px; padding-right: 8px;
+            spacing: 6px;
+            alignment: center;
+
+            find-input := LineEdit {
+                placeholder-text: "Find in page";
+                text <=> root.text;
+                // Enter → next, Shift-Enter / ↑ → previous, ↓ → next, Esc →
+                // close. Intercepted here rather than via `accepted` so the
+                // shifted chord reaches Rust too instead of beeping, and
+                // `edited` (below) carries the typing itself.
+                edited(txt) => { root.query-changed(txt); }
+                key-pressed(ev) => {
+                    if (ev.text == Key.Escape) {
+                        root.close();
+                        return EventResult.accept;
+                    }
+                    if (ev.text == Key.Return) {
+                        if (ev.modifiers.shift) { root.previous(); } else { root.next(); }
+                        return EventResult.accept;
+                    }
+                    if (ev.text == Key.UpArrow) {
+                        root.previous();
+                        return EventResult.accept;
+                    }
+                    if (ev.text == Key.DownArrow) {
+                        root.next();
+                        return EventResult.accept;
+                    }
+                    return EventResult.reject;
+                }
+            }
+
+            Text {
+                text: root.count;
+                color: root.count == "No results" ? #e06666 : #a8b8c8;
+                font-size: 12px;
+                vertical-alignment: center;
+            }
+            MiniButton { label: "▲"; clicked => { root.previous(); } }
+            MiniButton { label: "▼"; clicked => { root.next(); } }
+            MiniButton { label: "✕"; clicked => { root.close(); } }
+        }
+    }
+
+    // Armed on token bumps only (> 0), like the URL bar: clicking away into the
+    // page must not yank the caret back into the entry.
+    changed focus-token => {
+        if (root.focus-token > 0) { find-input.focus(); }
+    }
+}
+
 /// The page's keyboard focus holder. Every key press is forwarded to Rust
 /// (consumed so Slint never beeps); Rust either acts on a browser chord or
 /// relays a ToTab::Key to the active tab process.
@@ -202,6 +289,19 @@ export component AppWindow inherits Window {
     // bumped by Rust to move focus programmatically (Ctrl-L / Esc / startup,
     // and every newly opened tab)
     in property <int> focus-url-token: 0;
+    // find-in-page bar (Ctrl-F): `find-open` is per active tab (the tab record
+    // owns the flag, like DevTools), `find-count` is the tab's own reported
+    // counter, `find-text` the query in the entry (two-way: Rust pushes a
+    // surviving query when the bar reopens), and `find-focus-token` is bumped
+    // to pull the caret into the entry.
+    in property <bool> find-open: false;
+    in property <string> find-count: "";
+    in-out property <string> find-text: "";
+    in property <int> find-focus-token: 0;
+    callback find-query-changed(text: string);
+    callback find-next();
+    callback find-previous();
+    callback find-close();
     in-out property <int> focus-page-token: 0;
     // page area size, read by Rust to send ToTab::Resize
     out property <length> page-width: page.width;
@@ -814,6 +914,24 @@ export component AppWindow inherits Window {
                 }
             }
         }
+    }
+
+    // ------------------------------------------------------------------------
+    // find-in-page bar (Ctrl-F): floats over the top-right corner of the page,
+    // declared after the page ⇒ above it (and above the DevTools panel), but
+    // before the modal overlays, which must keep covering everything.
+    // ------------------------------------------------------------------------
+    find-bar := FindBar {
+        x: page-frame.absolute-position.x + page-frame.width - self.width - 16px;
+        y: page-frame.absolute-position.y + 8px;
+        visible: root.find-open;
+        focus-token: root.find-focus-token;
+        count: root.find-count;
+        text <=> root.find-text;
+        query-changed(q) => { root.find-query-changed(q); }
+        next() => { root.find-next(); }
+        previous() => { root.find-previous(); }
+        close() => { root.find-close(); }
     }
 
     // ------------------------------------------------------------------------
