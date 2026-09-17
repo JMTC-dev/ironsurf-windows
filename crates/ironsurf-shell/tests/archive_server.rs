@@ -135,6 +135,15 @@ fn ironsurf_archive_starts_the_server_and_serves_the_folder() {
         assert!(reply.contains("Archived visit"), "{reply}");
     }
 
+    // The front page pre-traverses the timeline: the site saved under a visit
+    // folder is linked directly, no click per timestamp needed to reach it.
+    let reply = get(addr, "/");
+    assert!(reply.starts_with("HTTP/1.1 200 OK"), "{reply}");
+    assert!(
+        reply.contains("2026-01-01T00%3A00%3A00%2B00%3A00/example.com/"),
+        "the saved site is linked straight off the front page: {reply}"
+    );
+
     // The control page is part of the served address: folder, host and port
     // are editable there, and it names the address it lives at.
     let reply = get(addr, "/ironsurf/serve");

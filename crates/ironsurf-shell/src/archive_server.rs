@@ -9,7 +9,8 @@
 //! folder (`$HOME/Downloads/ironsurf-tabs` by default) read-only:
 //!
 //! ```text
-//! GET  /                      → 302 to /ironsurf/serve (the control page)
+//! GET  /                      → the archive front page: the visit timeline, each visit
+//!                               folder pre-traversed to the sites saved under it
 //! GET  /ironsurf/serve        → the control page (status + folder/host/port form)
 //! GET  /ironsurf/serve/apply  → apply form values, rebind, 302 back with a note
 //! GET  /ironsurf/serve/stop   → stop serving (the control page stays up)
@@ -541,6 +542,10 @@ const STYLE: &str = "body { margin: 0; background: #14161a; color: #e6e6e6;
   table { border-collapse: collapse; width: 100%; }
   td { padding: 0.18em 0.6em 0.18em 0; vertical-align: top; }
   .size { color: #6b7178; white-space: nowrap; }
+  .visit td { font-weight: bold; }
+  .child td { padding-left: 1.8em; }
+  .child .size { font-weight: normal; }
+  .dim { color: #6b7178; font-style: italic; }
   input[type=text] { width: 100%; box-sizing: border-box; background: #1f2227;
     color: #e6e6e6; border: 1px solid #2c3037; border-radius: 3px; padding: 0.35em 0.5em;
     font-family: monospace; }
@@ -590,21 +595,73 @@ fn human_size(bytes: u64) -> String {
     }
 }
 
+/// How many visit folders the front page pre-traverses at all.
+const MAX_TIMELINE_VISITS: usize = 250;
+/// How many sites the front page lists under one visit folder.
+const MAX_TIMELINE_SITES: usize = 100;
+
+/// The sites saved under one visit folder — its subdirectories (one per
+/// archived `host[:port]`) first, then stray files, each capped so the front
+/// page stays bounded however the archive grew. `None` when the folder cannot
+/// be read: a broken visit never takes the front page down with it.
+fn timeline_children(dir: &Path) -> Option<(Vec<String>, Vec<(String, u64)>, bool)> {
+    let entries = std::fs::read_dir(dir).ok()?;
+    let mut sites: Vec<String> = Vec::new();
+    let mut files: Vec<(String, u64)> = Vec::new();
+    let mut truncated = false;
+    for entry in entries.flatten() {
+        // `file_type` does not follow symlinks: a link that *points at* a
+        // directory is never treated as a site to name or traverse into.
+        let is_dir = entry
+            .file_type()
+            .map(|t| t.is_dir())
+            .unwrap_or(false);
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if is_dir {
+            if sites.len() < MAX_TIMELINE_SITES {
+                sites.push(name);
+            } else {
+                truncated = true;
+            }
+        } else {
+            let size = entry.metadata().map(|m| m.len()).unwrap_or(0);
+            if files.len() < MAX_TIMELINE_SITES {
+                files.push((name, size));
+            } else {
+                truncated = true;
+            }
+        }
+    }
+    sites.sort();
+    files.sort();
+    Some((sites, files, truncated))
+}
+
 /// A directory listing: parent link, then subdirectories (trailing slash, so
 /// relative links work) and files with their sizes — alphabetically, with the
 /// per-visit ISO8601 folders sorting into a timeline for free.
+///
+/// The **root** listing is the archive front page, so it also *pre-traverses*
+/// each visit folder one level: every site saved under a timestamp is linked
+/// directly (`&lt;visit&gt;/&lt;host[:port]&gt;/`), instead of the user having
+/// to open every timestamp first to find a saved page. The reach is capped
+/// ([`MAX_TIMELINE_VISITS`], [`MAX_TIMELINE_SITES`]) and symlinked folders are
+/// listed but never traversed.
 pub fn render_listing(dir: &Path, url_path: &str) -> Result<String, u16> {
     let entries = std::fs::read_dir(dir).map_err(|_| 404u16)?;
-    let mut rows: Vec<(String, bool, u64)> = Vec::new();
+    let front_page = url_path.is_empty() || url_path == "/";
+    let mut rows: Vec<(String, bool, u64, bool)> = Vec::new();
     for entry in entries.flatten() {
         let name = entry.file_name().to_string_lossy().into_owned();
-        let meta = entry.metadata().ok();
-        let is_dir = meta.as_ref().map(|m| m.is_dir()).unwrap_or(false);
-        let size = meta.as_ref().map(|m| m.len()).unwrap_or(0);
+        let is_dir = entry
+            .file_type()
+            .map(|t| t.is_dir())
+            .unwrap_or(false);
+        let size = entry.metadata().map(|m| m.len()).unwrap_or(0);
         if is_dir {
-            rows.push((format!("{name}/"), true, 0));
+            rows.push((format!("{name}/"), true, 0, true));
         } else {
-            rows.push((name, false, size));
+            rows.push((name, false, size, false));
         }
     }
     rows.sort_by(|a, b| match (a.1, b.1) {
@@ -625,17 +682,64 @@ pub fn render_listing(dir: &Path, url_path: &str) -> Result<String, u16> {
     } else {
         out.push_str("  <table>\n");
     }
-    for (name, is_dir, size) in &rows {
+    let mut expanded = 0usize;
+    let mut capped_note_shown = false;
+    for (name, is_dir, size, traversable) in &rows {
         let href = percent_encode_path(name);
         let size_text = if *is_dir {
             String::new()
         } else {
             human_size(*size)
         };
+        let row_class = if *is_dir && front_page { " class=\"visit\"" } else { "" };
         out.push_str(&format!(
-            "    <tr><td><a href=\"{href}\">{}</a></td><td class=\"size\">{size_text}</td></tr>\n",
+            "    <tr{row_class}><td><a href=\"{href}\">{}</a></td><td class=\"size\">{size_text}</td></tr>\n",
             escape_html(name)
         ));
+        if !(*is_dir && front_page && *traversable) {
+            continue;
+        }
+        // The front page reaches one level down: the sites of this visit,
+        // linked straight to `<visit>/<site>/` so no click per timestamp is
+        // needed to get at a saved page. A folder it cannot read simply
+        // shows nothing under it — the timestamp link still stands.
+        if expanded >= MAX_TIMELINE_VISITS {
+            if !capped_note_shown {
+                capped_note_shown = true;
+                out.push_str("    <tr class=\"child\"><td class=\"dim\">\u{2026} more visit folders than the front page traverses \u{2014} open them one at a time</td><td></td></tr>\n");
+            }
+            continue;
+        }
+        expanded += 1;
+        let child_href_base = name.clone(); // "<visit>/"
+        match timeline_children(&dir.join(name.trim_end_matches('/'))) {
+            None => out.push_str("    <tr class=\"child\"><td class=\"dim\">(cannot be read)</td><td></td></tr>\n"),
+            Some((sites, files, truncated)) => {
+                if sites.is_empty() && files.is_empty() {
+                    out.push_str("    <tr class=\"child\"><td class=\"dim\">(no sites saved here)</td><td></td></tr>\n");
+                }
+                for site in &sites {
+                    let child = format!("{child_href_base}{site}/");
+                    out.push_str(&format!(
+                        "    <tr class=\"child\"><td><a href=\"{}\">{}/</a></td><td class=\"size\"></td></tr>\n",
+                        percent_encode_path(&child),
+                        escape_html(site)
+                    ));
+                }
+                for (file, fsize) in &files {
+                    let child = format!("{child_href_base}{file}");
+                    out.push_str(&format!(
+                        "    <tr class=\"child\"><td><a href=\"{}\">{}</a></td><td class=\"size\">{}</td></tr>\n",
+                        percent_encode_path(&child),
+                        escape_html(file),
+                        human_size(*fsize)
+                    ));
+                }
+                if truncated {
+                    out.push_str("    <tr class=\"child\"><td class=\"dim\">\u{2026} more saved here \u{2014} open the visit folder to see all of it</td><td></td></tr>\n");
+                }
+            }
+        }
     }
     out.push_str("  </table>\n");
     if rows.is_empty() {
@@ -753,7 +857,9 @@ pub fn render_control_page(state: &PageState, note: Option<&str>) -> String {
          <li>The folder defaults to <code>$HOME/Downloads/ironsurf-tabs</code> \u{2014} exactly what \
          the \u{1F4BE} archive mode writes there, as \
          <code>&lt;folder&gt;/&lt;ISO8601 visit timestamp&gt;/&lt;host[:port]&gt;/index.html</code>, \
-         so the top-level listing reads as a timeline of visits.</li>\n    \
+         so the top-level listing reads as a timeline of visits &mdash; and it &lt;em&gt;pre-traverses&lt;/em&gt; \
+         each timestamp, listing every site saved under it with a direct link, so no visit folder \
+         ever has to be opened just to find a saved page.</li>\n    \
          <li>The default address is <code>127.0.0.1</code> on a <strong>random free port</strong>; \
          any port you name is used instead. Only loopback is served \u{2014} the archive never goes \
          out to the network.</li>\n    \
@@ -1748,6 +1854,70 @@ mod tests {
         let head = route_request("HEAD", "/", "", &page(root));
         assert_eq!(head.status, 200);
         assert!(head.no_body);
+    }
+
+    /// The front page is the archive's timeline: it pre-traverses each visit
+    /// folder so its saved sites are linked directly under the timestamp,
+    /// without the user opening one timestamp after another.
+    #[test]
+    fn the_front_page_lists_the_sites_under_every_visit() {
+        let root = sandbox("timeline");
+        let (early, late) = ("2026-01-01T09:00:00+00:00", "2026-01-02T10:00:00+00:00");
+        std::fs::create_dir_all(root.join(format!("{early}/example.com"))).unwrap();
+        std::fs::create_dir_all(root.join(format!("{late}/dev.example"))).unwrap();
+        std::fs::write(
+            root.join(format!("{early}/example.com/index.html")),
+            b"<html>archived</html>",
+        )
+        .unwrap();
+        std::fs::write(root.join(format!("{late}/loose.txt")), b"loose").unwrap();
+        std::fs::create_dir_all(root.join("2026-01-03T11:00:00+00:00")).unwrap();
+
+        let resp = route_request("GET", "/", "", &page(root));
+        assert_eq!(resp.status, 200);
+        let html = String::from_utf8_lossy(&resp.body).into_owned();
+        // Each site is linked straight through its visit folder — the href is
+        // what serves the archived `index.html` without a click per timestamp.
+        assert!(
+            html.contains("href=\"2026-01-01T09%3A00%3A00%2B00%3A00/example.com/\""),
+            "{html}"
+        );
+        assert!(html.contains(">example.com/</a>"), "displayed with a trailing slash");
+        assert!(
+            html.contains("href=\"2026-01-02T10%3A00%3A00%2B00%3A00/dev.example/\""),
+            "{html}"
+        );
+        assert!(html.contains("href=\"2026-01-02T10%3A00%3A00%2B00%3A00/loose.txt\""), "stray files too");
+        // The visits stay a timeline: earlier visit (and its sites) first.
+        assert!(
+            html.find("2026-01-01T09%3A00%3A00%2B00%3A00").unwrap()
+                < html.find("2026-01-02T10%3A00%3A00%2B00%3A00").unwrap()
+        );
+        assert!(
+            html.find("2026-01-02T10%3A00%3A00%2B00%3A00").unwrap()
+                < html.find("2026-01-03T11%3A00%3A00%2B00%3A00").unwrap()
+        );
+        assert!(html.contains("no sites saved here"), "an empty visit says so");
+    }
+
+    /// Pre-traversal reads the tree from the shell side, so it goes one level
+    /// per real folder and never through a symlink — a link standing where a
+    /// visit folder is expected cannot put an outside tree on the front page.
+    #[test]
+    fn the_front_page_traversal_never_follows_a_symlink() {
+        // The name lives *inside* the linked folder: it could reach the page
+        // only by the front page traversing the link.
+        let outer = sandbox("timeline-outside");
+        std::fs::create_dir_all(outer.join("secret-site")).unwrap();
+        let root = sandbox("timeline-link");
+        std::fs::create_dir_all(root.join("2026-01-01T09:00:00+00:00/example.com")).unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&outer, root.join("2026-01-04T12:00:00+00:00")).unwrap();
+
+        let html = String::from_utf8_lossy(&route_request("GET", "/", "", &page(root)).body)
+            .into_owned();
+        assert!(html.contains("example.com/"), "the real visit is expanded");
+        assert!(!html.contains("secret-site"), "the linked tree is never traversed: {html}");
     }
 
     #[test]

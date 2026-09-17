@@ -1,4 +1,9 @@
 # Task log
+## #50 Archive-server front page pre-traverses the timeline: `/` renders each visit row AND its saved sites as
+  `<visit>/<host[:port]>/` child links under it (capped 250 visits x 100 entries, "… more" dim rows, unreadable
+  visits note themselves, never break the page), so no timestamp needs a click to reach an archived page; deeper
+  listings stay flat, symlinked folders are listed but never traversed (file_type, not metadata). 2 units + e2e
+  wire assert + ARCH §Pages synced; shell 96u + all suites green (KMS -dev libs reinstalled via apt for linking).
 ## #48 A new tab opens in the address bar: every tab open (Ctrl-T, ＋, manager New tab, middle-click / OpenLinkInNewTab,
   menu open-in-new-tab) fills url-text with the spawn URL and bumps the SAME focus-url-token Ctrl-L / F6 use — the UrlBar takes
   focus with the **whole address highlighted**, so the first keystroke replaces it; a session's first tab still hands focus to
@@ -57,11 +62,6 @@
   doc) with HostState::userscript naming the running script for that evaluation only: its console.* ships as ConsoleLog source "userscript" "{name}: {text}" (page keeps
   "js" verbatim; ConsoleLine carries the author), a throw as "userscript"/error "{name}: {err}" + StatusText "Userscript error in {name}", caught per script so the tab
   lives. 3 js.rs units + tests/userscripts.rs 3 localhost wire tests (patcher title, 'Boom script' named, unmatched silent, page-first order, empty clears, redirect re-runs, confirm() answered + attributed, alive+frame); tab 180u + every suite green, workspace check clean (fake_tab gained the missing SetUserscripts arm); ARCH/common docs name the source.
-## #38 Userscripts persisted in storage (step 2/5, storage only): global (not per-container) Vec<Userscript> at
-  <root>/userscripts.json, sibling of containers.json — same pattern: load-if-exists (missing = empty, never
-  seeded), write_atomic temp+rename, loaded at Store::open and kept in memory. API on Store: userscripts(),
-  next_userscript_id() (max+1, 1 empty), upsert_userscript (insert/replace by caller-supplied id; name stored
-  trimmed), set_userscript_enabled + delete_userscript (unknown id ⇒ NoSuchUserscript, tested). Validation: EmptyUserscriptName/EmptyUserscriptPatterns/EmptyUserscriptCode + UserscriptNameTooLong (200 chars) / UserscriptCodeTooLarge (1 MiB); rejected upserts leave list + file untouched. lib.rs layout comment synced; tests/userscripts.rs 8 green (+34 pre-existing), common 27 green. tab/shell untouched (steps 3–5).
 ## #37 Userscripts IPC contract (step 1/5, common only): Userscript{id,name,patterns,code,enabled} +
   ToTab::SetUserscripts{scripts} (shell sends all ENABLED scripts; tab filters per document URL every
   navigation; empty vec clears), userscript_matches + userscripts_for_url (case-insensitive; bare `*`;

@@ -789,7 +789,13 @@ host and port are edited on the server's own HTML page.
 - **Traversal is refused, however written** — `..` segments, `%2e%2e`, `%2e`, over-encoded
   forms and symlink escapes all resolve inside the root, and a hostile `..` can only ever mean
   "the root itself" (`resolve_in` is pure and unit-tested; the serve root is canonicalized once).
-- **Pages**: `/` is the archive listing (with a link to the control page), `/ironsurf/serve`
+- **Pages**: `/` is the archive listing (with a link to the control page), **pre-traversed one
+  level**: every top-level visit (ISO8601 timestamp) row is followed by the sites saved under
+  it, each linked straight as `<visit>/<host[:port]>/`, so the front page *is* the timeline of
+  tab visits and no timestamp ever has to be clicked open just to find a saved page. The reach
+  is capped (250 visits traversed, 100 entries per visit, with a dim "… more" row),
+  symlinked folders are listed but never traversed, an unreadable visit shows a note instead of
+  taking the page down, and deeper listings stay flat; `/ironsurf/serve`
   is the control page — the live address, the folder/host/port `GET` form (apply re-points the
   running server, and the form also answers a `POST` with a capped declared body), a stop
   button, and the same folder tree browsable in place. A **blank or absent port field keeps the
