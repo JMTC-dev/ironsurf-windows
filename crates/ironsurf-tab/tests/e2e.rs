@@ -762,6 +762,72 @@ fn tab_runs_external_script() {
     exit_cleanly(&mut tab);
 }
 
+/// The startpage.com crash: `fetch_many` used to spawn ONE OS thread per
+/// `<script src>`, and a script-heavy page under a thread limit died on
+/// `EAGAIN` in `thread::Builder::spawn`. The fetcher pool is now capped
+/// (`MAX_SCRIPT_FETCHERS`), so a page with far more scripts than workers must
+/// still fetch and execute EVERY one — in document order. Each `sN.js` appends
+/// `N,` to a shared `chain` and republishes it as the title; only document
+/// order produces the exact final title, and only a surviving tab reports it.
+#[test]
+fn tab_fetches_many_external_scripts_in_document_order() {
+    const SCRIPT_COUNT: usize = 24; // well past the 8-worker cap
+    let expected: String = (1..=SCRIPT_COUNT).map(|n| format!("{n},")).collect();
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let profile = dir.path().join("profile");
+    std::fs::create_dir_all(&profile).expect("profile dir");
+    let tags: String = (1..=SCRIPT_COUNT)
+        .map(|n| format!("<script src=\"s{n}.js\"></script>\n    "))
+        .collect();
+    let page = format!(
+        r#"<!doctype html>
+<html>
+  <head><title>Base Title</title>
+    <script>var chain = '';</script>
+    {tags}</head>
+  <body style="margin: 0; background: #ffffff">
+    <div style="width: 120px; height: 120px; background: #3200ff"></div>
+  </body>
+</html>
+"#
+    );
+    let fixture = profile.join("index.html");
+    std::fs::write(&fixture, page).expect("write fixture");
+    for n in 1..=SCRIPT_COUNT {
+        std::fs::write(
+            profile.join(format!("s{n}.js")),
+            format!("chain += '{n},'; document.title = chain;\n"),
+        )
+        .expect("write script");
+    }
+
+    let deadline = Instant::now() + DEADLINE;
+    let mut tab = spawn_tab(&fixture, &profile);
+    let mut seen = Vec::new();
+
+    tab.wait_for(
+        "TitleChanged with all 24 script bodies executed in document order",
+        |m| matches!(m, FromTab::TitleChanged { title: Some(t) } if t == &expected),
+        deadline,
+        &mut seen,
+    );
+    // Nothing beyond a clean protocol may have happened in between: an
+    // out-of-order or dropped fetch would surface a wrong intermediate title,
+    // and a thread-exhaustion crash would end the stream before the final one.
+    tab.wait_for(
+        "rendered Frame(1024x768) for the many-script page",
+        |m| {
+            matches!(m, FromTab::Frame { width, height, rgba, .. }
+                if *width == 1024 && *height == 768 && !rgba_is_uniform(rgba))
+        },
+        deadline,
+        &mut seen,
+    );
+
+    exit_cleanly(&mut tab);
+}
+
 /// Task 8: a `<script>` that does not even parse must not take the tab down —
 /// the frame still arrives, the title still arrives, the error is reported as a
 /// status text, and the protocol keeps working.

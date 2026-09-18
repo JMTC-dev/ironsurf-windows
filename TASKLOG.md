@@ -1,4 +1,9 @@
 # Task log
+## #58 Tab no longer dies on script-heavy pages (startpage.com crash): runtime's fetch_many spawned ONE scoped thread per
+  `<script src>`; under a thread limit a script-rich page hit EAGAIN in thread::Builder::spawn (scope.spawn unwraps) and the process
+  died. Now a CAPPED pull pool: MAX_SCRIPT_FETCHERS=8 workers grab indices off a shared AtomicUsize and write positional result slots
+  (execution order unchanged); spawns go through Builder::spawn_scoped (io::Result, not panic) and the tab thread works the queue too,
+  so EAGAIN means fewer workers — never a dead tab. 24-script e2e (3x the cap) proves every body runs in document order; tab 223u + all suites green, ws check clean.
 ## #57 Loading bar in the status bar's left-hand end: AppWindow gains `loading` + `load-progress` (0…11), `Core::tick_spinner`
   (120 ms timer, now pub) drives them from the **active tab's** `loading` state — the step only advances while a load is in flight and
   zeroes when one starts, `load_sweep_position` folds it to a triangle wave (out 0…11, back 11…0, never 3 ticks in one place); ui draws a
@@ -86,15 +91,4 @@
   #[serde(default)] user_agent: Option<String> (legacy containers.json written without the key still loads, as None);
   presets BUILTIN_USER_AGENTS + builtin_user_agent_label/is_builtin_user_agent/MAX_USER_AGENT_CHARS=512. Fallout only:
   inert SetUserAgent arms (tab runtime, fake_tab), user_agent: None (storage literals), ARCH synced; common 30 green, ws clean.
-## #41 JS DOM changes now land in the live document, always: every JS turn that can mutate the tree — page-script
-  batch, each userscript run, timer batches, javascript: programs — settles (restyle + relayout + repaint),
-  and the three silent gaps behind the report are closed in js.rs: document.write/writeln really parse (fragment
-  appended under <body> via a new __ironsurfDomDocumentWrite native — never replaces the running document);
-  element.style is a live CSSStyleDeclaration view over the `style` attribute (member writes via Proxy, cssText,
-  set/get/removeProperty, and whole-string `document.body.style = "…"` — all through ATTR_SET, verified against
-  stylo computed values after resolve); document.dir/lang mirror the <html> attrs. Root cause underneath: html5ever
-  stores HTML attrs in the EMPTY namespace while qual_name_for_attr built ns!(html), so JS attribute writes next
-  to a parsed attr PUSHED shadow duplicates (reads kept answering the stale value) — fixed the mapping + regression
-  test. tab 185u (write/style/dir-attr/restyle units) + userscripts e2e “DOM reflector” (write+style+dir over the
-  wire), common/storage green, workspace check clean; ARCH §JavaScript reflection bullet.
 ## #40 Userscript MENU in the shell (step 4/5): glyph-free "US" toolbar button right of ＋ toggles a right-docked overlay (container-manager pattern, never PopupWindow; the two never stack — each closes the other). Rows: enable CheckBox persisted at once via Store::set_userscript_enabled, bold name, dim ", "-joined patterns, ✕ delete; "+ New script" inline editor (name/patterns LineEdits — patterns comma/space-split — multi-line TextInput for code); a rejected Save keeps the draft, shows the StoreError on one line, script NOT added. Broadcast: every mutation AND tab spawn/respawn sends ToTab::SetUserscripts with all ENABLED scripts to every live tab (crashed/closed skipped, send failures ignored — the crash reporter owns those); disabled never sent. Pure src/userscripts.rs (rows, enabled-only payload, parse_patterns, tempdir-Store reopen round-trips); fake_tab --expect-userscripts echoes "userscripts:[ids]" on its status line; tests/userscripts.rs drives save/validate/toggle/re-toggle/delete/seed/manager-exclusion over the real pipe; state.rs console_rows covers "[userscript] Name: msg"; shell 53u + all suites, common 27, storage green; ARCH §ironsurf-shell bullet added.

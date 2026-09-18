@@ -57,7 +57,10 @@ use std::os::fd::AsRawFd;
 use std::os::fd::RawFd;
 use std::path::PathBuf;
 use std::rc::Rc;
-use std::sync::{Arc, Mutex};
+use std::sync::{
+    atomic::{AtomicUsize, Ordering},
+    Arc, Mutex,
+};
 use std::time::{Duration, Instant};
 
 use anyrender::{render_to_buffer, PaintScene};
@@ -1382,11 +1385,14 @@ impl Tab {
     /// Scripts are collected in document order; `src=` bodies go through the
     /// tab's own document fetcher, so the container net policy (cookies, cache,
     /// https-upgrade) applies to them too. The external bodies are fetched
-    /// CONCURRENTLY (one scoped thread per URL on the shared client) so the
+    /// CONCURRENTLY on a small worker pool over the shared client (capped, NOT
+    /// one thread per URL — an unbounded fan-out is EAGAIN on a page with many
+    /// scripts, which is exactly what killed tab 4 on startpage.com) so the
     /// screen is not blocked for the sum of the script round-trips, but they
     /// are still assembled — and therefore executed — strictly in document
     /// order. Nothing here can kill the tab: extraction failures degrade to
-    /// "no scripts", and every `eval` is caught inside
+    /// "no scripts", thread-spawn failures degrade to fewer workers (the tab
+    /// thread fetches the rest itself), and every `eval` is caught inside
     /// [`js::JsRuntime::run_scripts`].
     fn run_scripts(&mut self, url: &Url) {
         // Fresh document: the CSS seam forgets last document's content hashes
@@ -1444,16 +1450,24 @@ impl Tab {
             }
 
             // Two-phase batch: the document walk hands us every `src` URL at
-            // once, so one scoped thread per URL downloads them in parallel
-            // on the ONE shared client (task D) instead of the screen paying
-            // the sum of the sequential round-trips. Results are collected in
-            // input order, so assembly — and execution — stay in document
-            // order. Cookie visibility note: the old sequential fetch let
-            // script #2 observe a Set-Cookie sent by script #1; with parallel
-            // fetches that ordering is gone (arrivals settle whenever the
-            // wire returns them). Accepted: scripts on distinct hosts almost
-            // never rely on it, and any cookie a script sets is still in the
-            // jar for every later request of the page.
+            // once, so a bounded pool of fetcher threads downloads them in
+            // parallel on the ONE shared client (task D) instead of the screen
+            // paying the sum of the sequential round-trips. Results are
+            // collected positionally, so assembly — and execution — stay in
+            // document order. Cookie visibility note: the old sequential fetch
+            // let script #2 observe a Set-Cookie sent by script #1; with
+            // parallel fetches that ordering is gone (arrivals settle whenever
+            // the wire returns them). Accepted: scripts on distinct hosts
+            // almost never rely on it, and any cookie a script sets is still
+            // in the jar for every later request of the page.
+            //
+            // Fetcher threads are CAPPED: each fetcher is an OS thread, and a
+            // sandboxed tab must never spawn one per `<script src>` — a page
+            // with a hundred scripts under a tight thread limit takes EAGAIN
+            // on thread creation and the whole tab dies (the startpage.com
+            // crash). Eight concurrent fetchers saturate the shared reqwest
+            // pool as well as an unbounded fan-out ever did.
+            const MAX_SCRIPT_FETCHERS: usize = 8;
             let mut fetch_many = |script_urls: &[&Url]| -> Vec<Result<String, String>> {
                 if script_urls.len() < 2 {
                     // Zero or one external script: fetching inline on the tab
@@ -1473,43 +1487,80 @@ impl Tab {
                         })
                         .collect();
                 }
+                // Pull-based work queue: `next` hands out URL indices and
+                // every worker writes its result into ITS slot, so positional
+                // order (and thus execution order) survives whatever order the
+                // responses arrive in. The tab thread is a worker too, and
+                // spawns go through `Builder::spawn_scoped` — which reports
+                // EAGAIN as an error instead of panicking like `scope.spawn`
+                // does — so hitting the OS thread limit degrades to fewer (or
+                // even zero) extra threads, never to a dead tab. (The shared
+                // state lives OUTSIDE the scope: scoped threads may only
+                // borrow data that outlives the scope itself.)
+                let count = script_urls.len();
+                let next = AtomicUsize::new(0);
+                let results: Mutex<Vec<Option<Result<String, String>>>> =
+                    Mutex::new((0..count).map(|_| None).collect());
+                // The fetch loop every worker (and the tab thread) runs:
+                // grab the next index, fetch on per-worker clones of the
+                // tab's shared handles — same jar, cache, UA, event queue,
+                // and archive sink, each locked only per operation — and
+                // store the result positionally.
+                let work = || loop {
+                    let index = next.fetch_add(1, Ordering::Relaxed);
+                    if index >= count {
+                        return;
+                    }
+                    let script_url = script_urls[index].clone();
+                    let jar = Arc::clone(&jar);
+                    let cache = Arc::clone(&cache);
+                    let net_events = Arc::clone(&net_events);
+                    let user_agent = Arc::clone(&user_agent);
+                    let archive = Arc::clone(&archive);
+                    let body = fetch_script_body(
+                        &script_url,
+                        policy,
+                        &jar,
+                        &cache,
+                        &net_events,
+                        &user_agent,
+                        &archive,
+                    );
+                    results.lock().expect("script results mutex")[index] = Some(body);
+                };
                 std::thread::scope(|scope| {
-                    let handles: Vec<_> = script_urls
-                        .iter()
-                        .map(|script_url| {
-                            // Per-thread clones of the tab's shared handles:
-                            // same jar, cache, UA, event queue, and archive
-                            // sink — each locked only per operation.
-                            let script_url = (*script_url).clone();
-                            let jar = Arc::clone(&jar);
-                            let cache = Arc::clone(&cache);
-                            let net_events = Arc::clone(&net_events);
-                            let user_agent = Arc::clone(&user_agent);
-                            let archive = Arc::clone(&archive);
-                            scope.spawn(move || {
-                                fetch_script_body(
-                                    &script_url,
-                                    policy,
-                                    &jar,
-                                    &cache,
-                                    &net_events,
-                                    &user_agent,
-                                    &archive,
-                                )
-                            })
-                        })
-                        .collect();
-                    // Positional collection keeps the input order whatever
-                    // order the responses arrive in.
-                    handles
-                        .into_iter()
-                        .map(|handle| {
-                            handle.join().unwrap_or_else(|_| {
-                                Err("script fetch thread panicked".to_string())
-                            })
-                        })
-                        .collect()
-                })
+                    let mut handles = Vec::new();
+                    for _ in 0..count.min(MAX_SCRIPT_FETCHERS) {
+                        match std::thread::Builder::new().spawn_scoped(scope, || work()) {
+                            Ok(handle) => handles.push(handle),
+                            // Thread creation failed (resource limit): stop
+                            // adding workers; the tab thread below fetches
+                            // whatever is left.
+                            Err(err) => {
+                                warn!(
+                                    "script fetcher spawn failed ({err}); \
+                                     fetching remaining scripts on the tab thread"
+                                );
+                                break;
+                            }
+                        }
+                    }
+                    // The tab thread works the same queue: with zero workers
+                    // this is exactly the old sequential fetch.
+                    work();
+                    for handle in handles.drain(..) {
+                        // A dead worker leaves its in-flight slot `None`; the
+                        // positional read below turns that into a fetch error
+                        // for that one script instead of unwinding the tab.
+                        let _ = handle.join();
+                    }
+                });
+                results
+                    .into_inner()
+                    .expect("script results mutex")
+                    .into_iter()
+                    .map(|slot| slot.unwrap_or_else(|| Err("script fetch thread panicked".to_string())))
+                    .collect()
             };
             extraction = js::extract_scripts_batch(doc, url, &mut fetch_many);
             body_text = js::body_text_snapshot(doc);

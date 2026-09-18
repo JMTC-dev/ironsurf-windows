@@ -305,9 +305,10 @@ pub fn extract_scripts(
 /// [`extract_scripts`] in two phases: walk the document first (cheap, no I/O),
 /// then fetch **all** collected `src` URLs with a single `fetch_many` call
 /// (document order in, positionally matched results out), then assemble.
-/// The runtime implements `fetch_many` with a thread per URL, so a page's
-/// external scripts download concurrently while their execution order stays
-/// document order.
+/// The runtime implements `fetch_many` with a capped pool of fetcher threads
+/// (never one thread per URL — unbounded fan-out is EAGAIN on script-heavy
+/// pages), so a page's external scripts download concurrently while their
+/// execution order stays document order.
 ///
 /// `fetch_many` is called exactly once whenever the page has at least one
 /// fetchable `src` (never for a page with none — e.g. inline-only). A result
