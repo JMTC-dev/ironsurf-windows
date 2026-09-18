@@ -58,6 +58,12 @@ fn main() {
     // and with `--expect-archive-mode` every current value — the launch one
     // and each inbound ToTab::SetArchiveMode — echoes as `archive:on|off`.
     let mut expect_archive_mode = false;
+    let mut expect_copy = false;
+    // Selection-copy harness (task: text-selection copy & paste): Ctrl+C
+    // answers with `FromTab::ClipboardText` (what the real tab's engine
+    // ships when a page copy settles) and a `ToTab::Clipboard` push is
+    // echoed on the status line, so the tests can watch the shell's chord
+    // protocol: clipboard first, keystroke second.
     let mut current_archive = false;
 
     let mut it = args.iter().skip(1);
@@ -101,6 +107,7 @@ fn main() {
             "--expect-user-agent" => expect_user_agent = true,
             "--archive-mode" => current_archive = true,
             "--expect-archive-mode" => expect_archive_mode = true,
+            "--expect-copy" => expect_copy = true,
             // the shell spawns a UA container's tabs with the container's UA;
             // mirror the real tab: blank/absent ⇒ the built-in default.
             "--user-agent" => {
@@ -389,9 +396,26 @@ fn main() {
                     });
                 }
             }
-            ToTab::Key(_) | ToTab::Scroll(_) | ToTab::SetVisible { .. } => {}
+            ToTab::Key(k) => {
+                // The real tab answers Ctrl+C over a selection by shipping
+                // that selection to the shell; the fake page's selection is
+                // the same "fake selection" its right-click target reports.
+                if expect_copy && k.key == "c" && k.mods.ctrl() {
+                    emit(FromTab::ClipboardText {
+                        text: "fake selection".into(),
+                    });
+                }
+            }
+            ToTab::Scroll(_) | ToTab::SetVisible { .. } => {}
 
-            ToTab::Clipboard { .. } => {} // cache push: nothing to edit here
+            ToTab::Clipboard { text } => {
+                // Cache push (Ctrl+V or a menu Paste): echo it when asked.
+                if expect_copy {
+                    emit(FromTab::StatusText {
+                        text: Some(format!("clipboard:{text}")),
+                    });
+                }
+            }
             ToTab::ContextAction(ContextAction::Paste { text }) => {
                 emit(FromTab::StatusText {
                     text: Some(format!("pasted:{text}")),

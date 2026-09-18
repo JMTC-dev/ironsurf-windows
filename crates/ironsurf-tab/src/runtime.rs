@@ -2758,9 +2758,16 @@ impl Tab {
         // Track the held-button set the way the DOM does: Down adds this
         // button, Up clears it (blitz reads `buttons` for drag/caret state,
         // events/mod.rs `may_move_text_input_caret`).
-        match ev.kind {
-            PointerKind::Down => self.mouse_buttons |= MouseEventButtons::from(button),
-            PointerKind::Up => self.mouse_buttons = MouseEventButtons::None,
+        // The right button is not tracked and never reaches blitz below: it
+        // is the context-menu pair only (see the block after the middle
+        // click), so a held right button must not look like a drag.
+        match (ev.kind, ev.button) {
+            (PointerKind::Down, MouseButton::Left | MouseButton::Middle) => {
+                self.mouse_buttons |= MouseEventButtons::from(button)
+            }
+            (PointerKind::Up, MouseButton::Left | MouseButton::Middle) => {
+                self.mouse_buttons = MouseEventButtons::None
+            }
             _ => {}
         }
 
@@ -2775,17 +2782,26 @@ impl Tab {
             }
         }
 
-        // Right-click release → report what the cursor is over (link / image /
-        // video / selection / editable) so the shell can open its context
-        // menu; the event itself keeps flowing to blitz like any other, the
-        // menu is a pure side channel. Menu choices come back as
-        // `ToTab::ContextAction` or are serviced by the shell alone.
-        if matches!(ev.kind, PointerKind::Up) && ev.button == MouseButton::Right {
-            let (x, y) = (ev.x, ev.y);
-            let (target, video) = self.context_target(x, y);
-            self.context_video = video;
-            debug!("context menu at ({x:.0},{y:.0}): {target:?}");
-            self.emit(FromTab::ContextMenu { x, y, target });
+        // The right-button press/release pair is the tab's own: it exists to
+        // report what the cursor is over (link / image / video / selection /
+        // editable) so the shell can open its context menu, and it is
+        // deliberately never fed to blitz. Blitz collapses the text selection
+        // on any button press (events/pointer.rs), which would eat the menu's
+        // own Copy target — the selection would vanish between the press and
+        // the menu opening; real browsers keep a selection through a
+        // right-click. Nothing else is lost: the page never sees right-button
+        // DOM events in this engine (the JS replay above is Left-only, and
+        // blitz's `contextmenu` DomEvent has no consumer here). Menu choices
+        // come back as `ToTab::ContextAction` or are serviced by the shell.
+        if ev.button == MouseButton::Right && matches!(ev.kind, PointerKind::Down | PointerKind::Up) {
+            if matches!(ev.kind, PointerKind::Up) {
+                let (x, y) = (ev.x, ev.y);
+                let (target, video) = self.context_target(x, y);
+                self.context_video = video;
+                debug!("context menu at ({x:.0},{y:.0}): {target:?}");
+                self.emit(FromTab::ContextMenu { x, y, target });
+            }
+            return true;
         }
 
         // blitz synthesises enter/over/out/leave *DOM events* from
@@ -5144,6 +5160,215 @@ mod tests {
         assert!(
             tab.media.iter().all(|e| !e.player.borrow().is_playing()),
             "an Idle player (unfetched src) must not pretend to play"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // Text selection copy & paste (task: selection copy/paste)
+    //
+    // Dragging selects page text (blitz paints the highlight), a right-click
+    // reports the live selection to the shell's menu, and Ctrl+C ships
+    // exactly that selection to the shell as `FromTab::ClipboardText` — the
+    // same hook an editor copy rides on. The shell never consumes the chord;
+    // it pushes its session clipboard in front of every Ctrl+V.
+    // ------------------------------------------------------------------
+
+    const SELECT_PAGE: &str = r#"<!doctype html>
+<html><head><title>S</title></head>
+<body style="margin:0">
+  <p id="t" style="margin:0;font-size:24px">The quick brown fox jumps over the lazy dog</p>
+</body></html>"#;
+
+    fn selection_tab(dir: &std::path::Path) -> (Tab, Arc<std::sync::Mutex<Vec<u8>>>) {
+        std::fs::write(dir.join("s.html"), SELECT_PAGE).expect("write page");
+        let (mut tab, sink) = capturing_tab(dir);
+        tab.handle_to_tab(ToTab::Resize { width: 800, height: 600, scale: 1.0 });
+        tab.navigate(
+            url::Url::from_file_path(dir.join("s.html")).expect("file url").as_str(),
+            NavHistory::Fresh,
+        );
+        (tab, sink)
+    }
+
+    /// Ctrl+`c` exactly as the shell forwards it (the chord is the letter
+    /// with the Ctrl bit — the shell intercepts copy by contract never).
+    fn ctrl_c() -> ToTab {
+        ToTab::Key(KeyEvent {
+            key: "c".into(),
+            code: "KeyC".into(),
+            text: Some("c".into()),
+            repeat: false,
+            mods: Modifiers::NONE.with_ctrl(),
+        })
+    }
+
+    /// Ctrl+`v` as the shell forwards it, right after pushing the session
+    /// clipboard with `ToTab::Clipboard`.
+    fn ctrl_v() -> ToTab {
+        ToTab::Key(KeyEvent {
+            key: "v".into(),
+            code: "KeyV".into(),
+            text: Some("v".into()),
+            repeat: false,
+            mods: Modifiers::NONE.with_ctrl(),
+        })
+    }
+
+    /// Ctrl+`a` (select all) as the shell forwards it — also never a
+    /// shell-intercepted chord.
+    fn ctrl_a() -> ToTab {
+        ToTab::Key(KeyEvent {
+            key: "a".into(),
+            code: "KeyA".into(),
+            text: Some("a".into()),
+            repeat: false,
+            mods: Modifiers::NONE.with_ctrl(),
+        })
+    }
+
+    fn named_key(key: &str, code: &str, shift: bool) -> ToTab {
+        ToTab::Key(KeyEvent {
+            key: key.into(),
+            code: code.into(),
+            text: None,
+            repeat: false,
+            mods: if shift { Modifiers::NONE.with_shift() } else { Modifiers::NONE },
+        })
+    }
+
+    /// Every `FromTab::ClipboardText` a (capturing) tab has shipped.
+    fn clipboard_texts(sink: &Arc<std::sync::Mutex<Vec<u8>>>) -> Vec<String> {
+        emitted(sink)
+            .into_iter()
+            .filter_map(|m| match m {
+                FromTab::ClipboardText { text } => Some(text),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// A mouse drag selects page text; the selection survives to the context
+    /// menu, and Ctrl+C ships exactly the reported selection to the shell —
+    /// so the menu's Copy row and the keyboard chord can never disagree.
+    #[test]
+    fn a_drag_selection_survives_to_the_menu_and_ctrl_c_ships_it() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (mut tab, sink) = selection_tab(dir.path());
+
+        // Press before the first word and drag across two of them.
+        tab.handle_to_tab(ptr(2.0, 12.0, PointerKind::Move));
+        tab.handle_to_tab(ptr(2.0, 12.0, PointerKind::Down));
+        tab.handle_to_tab(ptr(60.0, 12.0, PointerKind::Move));
+        tab.handle_to_tab(ptr(120.0, 12.0, PointerKind::Move));
+        tab.handle_to_tab(ptr(120.0, 12.0, PointerKind::Up));
+
+        let selected = tab
+            .document_mut()
+            .and_then(|doc| doc.get_selected_text())
+            .expect("the drag selected page text");
+        assert!(
+            SELECT_PAGE.contains(selected.as_str()) && !selected.trim().is_empty(),
+            "the selection is real text of the page: {selected:?}"
+        );
+
+        // A right-click over it reports the selection to the shell's menu
+        // (Down+Up, exactly the sequence the shell forwards).
+        for kind in [PointerKind::Down, PointerKind::Up] {
+            tab.handle_to_tab(ToTab::Pointer(PointerEvent {
+                x: 100.0,
+                y: 12.0,
+                kind,
+                button: ironsurf_common::MouseButton::Right,
+            }));
+        }
+        let target = emitted(&sink)
+            .into_iter()
+            .rev()
+            .find_map(|m| match m {
+                FromTab::ContextMenu { target, .. } => Some(target),
+                _ => None,
+            })
+            .expect("the right-click reports its target");
+        assert_eq!(
+            target.selection.as_deref(),
+            Some(selected.as_str()),
+            "the menu Copy row sees the very selection Ctrl+C copies"
+        );
+
+        // Ctrl+C: the page copy surfaces as FromTab::ClipboardText, verbatim.
+        tab.handle_to_tab(ctrl_c());
+        tab.drain_copied();
+        assert_eq!(
+            clipboard_texts(&sink).last().map(String::as_str),
+            Some(selected.as_str()),
+            "Ctrl+C copies the live page selection to the shell"
+        );
+    }
+
+    /// Inside a focused editor the same chords are the engine's: Ctrl+C
+    /// copies the editor selection to the session clipboard, and the next
+    /// Ctrl+V (with `ToTab::Clipboard` pushed first, as the shell does)
+    /// replaces the selection with exactly what was copied.
+    #[test]
+    fn an_editor_round_trips_copy_and_paste_through_the_session_clipboard() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let page = dir.path().join("e.html");
+        std::fs::write(
+            &page,
+            r#"<!doctype html><html><body style="margin:0">
+  <input id="i" style="display:block;width:300px;height:40px">
+</body></html>"#,
+        )
+        .expect("write page");
+        let (mut tab, sink) = capturing_tab(dir.path());
+        tab.handle_to_tab(ToTab::Resize { width: 800, height: 600, scale: 1.0 });
+        tab.navigate(
+            url::Url::from_file_path(&page).expect("file url").as_str(),
+            NavHistory::Fresh,
+        );
+
+        // Focus the input and type a word pair.
+        tab.handle_to_tab(ptr(100.0, 20.0, PointerKind::Move));
+        tab.handle_to_tab(ptr(100.0, 20.0, PointerKind::Down));
+        tab.handle_to_tab(ptr(100.0, 20.0, PointerKind::Up));
+        for c in "hello world".chars() {
+            tab.handle_to_tab(key(c));
+        }
+
+        // Home, Shift+Right x5 → "hello" selected; Ctrl+C copies exactly it.
+        tab.handle_to_tab(named_key("Home", "Home", false));
+        for _ in 0..5 {
+            tab.handle_to_tab(named_key("ArrowRight", "ArrowRight", true));
+        }
+        tab.handle_to_tab(ctrl_c());
+        tab.drain_copied();
+        assert_eq!(
+            clipboard_texts(&sink).last().map(String::as_str),
+            Some("hello"),
+            "Ctrl+C copies the editor selection"
+        );
+
+        // The shell's Ctrl+V protocol: clipboard first, chord second.
+        // Ctrl+A selects all, Ctrl+V replaces the whole value.
+        tab.handle_to_tab(ToTab::Clipboard { text: "hello".into() });
+        tab.handle_to_tab(ctrl_a());
+        tab.handle_to_tab(ctrl_v());
+        assert_eq!(
+            tab.document_mut().and_then(focused_input_value).as_deref(),
+            Some("hello"),
+            "Ctrl+V replaced the selection with the session clipboard"
+        );
+
+        // A later chord with different clipboard text replaces the whole
+        // value again — the push-then-chord protocol is idempotent.
+        tab.handle_to_tab(named_key("End", "End", false));
+        tab.handle_to_tab(ToTab::Clipboard { text: "PASTED".into() });
+        tab.handle_to_tab(ctrl_a());
+        tab.handle_to_tab(ctrl_v());
+        assert_eq!(
+            tab.document_mut().and_then(focused_input_value).as_deref(),
+            Some("PASTED"),
+            "the second paste replaced the whole value again"
         );
     }
 

@@ -38,6 +38,9 @@ fn right_click(ui: &AppWindow) {
 #[test]
 fn right_click_opens_the_menu_the_target_deserves_and_the_rows_act() {
     i_slint_backend_testing::init_no_event_loop();
+    // Deterministic clipboard: the assertions are about the *session*
+    // clipboard, and the desktop X clipboard is mutable global state.
+    std::env::set_var("IRONSURF_NO_OS_CLIPBOARD", "1");
 
     let dir = tempfile::tempdir().unwrap();
     std::env::set_var("IRONSURF_DATA_DIR", dir.path());

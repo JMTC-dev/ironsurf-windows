@@ -15,6 +15,7 @@ slint::include_modules!();
 pub mod archive;
 pub mod archive_server;
 pub mod classify;
+pub mod clipboard;
 pub mod keymap;
 pub mod state;
 pub mod tabs;

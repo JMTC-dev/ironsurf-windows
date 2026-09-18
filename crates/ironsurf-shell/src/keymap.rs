@@ -230,6 +230,32 @@ mod tests {
     }
 
     #[test]
+    fn clipboard_chords_always_reach_the_page() {
+        // Copy lives in the page's engine (its selection), and paste is the
+        // shell's push-then-chord protocol (`is_paste_chord`) — so none of
+        // these may ever be consumed as a browser shortcut, in either the
+        // letter or the control-character spelling X hands over.
+        for (text, ctrl) in [
+            ("c", true),
+            ("C", true),
+            ("\u{03}", true), // Ctrl-C (ETX)
+            ("v", true),
+            ("V", true),
+            ("\u{16}", true), // Ctrl-V (SYN)
+            ("x", true),
+            ("\u{18}", true), // Ctrl-X (CAN)
+            ("a", true),
+            ("\u{01}", true), // Ctrl-A (SOH)
+        ] {
+            assert_eq!(
+                shortcut_for(text, ctrl, false, false),
+                None,
+                "{text:?} ctrl={ctrl} belongs to the page"
+            );
+        }
+    }
+
+    #[test]
     fn f6_focuses_url_bar_like_ctrl_l() {
         // F6 = U+F704 + 5 = U+F709, unmodified, focuses the URL bar.
         assert_eq!(

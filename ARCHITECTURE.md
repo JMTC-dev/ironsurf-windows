@@ -99,6 +99,16 @@ pub enum FromTab {
     HistoryChanged   { can_go_back: bool, can_go_forward: bool },
     StatusText       { text: Option<String> },
     OpenLinkInNewTab { url: String },      // middle-click a link → shell opens url in a new tab (same container)
+    // right-click on the page: the tab has hit-tested what the cursor was over
+    // (`ContextTarget`); the shell opens the context menu at (`x`, `y`) — logical
+    // px in the page viewport — and each choice comes back as `ToTab::ContextAction`
+    // (engine-side) or is serviced by the shell alone (clipboard, new tab,
+    // history). The right-button pair never reaches blitz, so it never disturbs
+    // the text selection the menu's Copy row is about.
+    ContextMenu      { x: f32, y: f32, target: ContextTarget },
+    // the page copied text (Ctrl+C / Ctrl+X / editor cut, surfaced through
+    // blitz's `ShellProvider`): the shell files it on the session clipboard.
+    ClipboardText    { text: String },
     // source: "js" | "css" | "dom" | "page" | "userscript" — which DevTools panel the entry
     // belongs to. A "userscript" entry always names its author first: message is
     // `"{script name}: {text}"` (console line) or `"{script name}: {Error: …}"` (throw).
@@ -167,6 +177,14 @@ pub enum ToTab {
     Pointer      (PointerEvent),
     Key          (KeyEvent),
     Scroll       (ScrollEvent),
+    // replace the clipboard cache the editors' Ctrl+V reads (blitz asks its
+    // `ShellProvider`, which answers from this cache). The tab cannot reach
+    // the session clipboard itself; the shell pushes the current contents
+    // just before relaying a Ctrl+V keystroke.
+    Clipboard    { text: String },
+    // the user picked a context-menu entry the **engine** services (paste,
+    // video play/pause); shell-side entries never reach the tab.
+    ContextAction(ContextAction),
     // answer to `FromTab::DialogRequest`: `confirmed` = OK (vs Cancel/Esc);
     // `text` is `Some` exactly when a Prompt was accepted. Responses for
     // unknown dialog ids are ignored (the request may have been cleared).
@@ -231,6 +249,29 @@ pub struct KeyEvent {
 
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ScrollEvent { pub x: f32, pub y: f32, pub delta_x: f32, pub delta_y: f32 }
+
+/// What the cursor was over when the user right-clicked — every field is
+/// "under the cursor at right-click time", and the shell decides from these
+/// which menu entries exist (Firefox-style: an entry exists exactly when its
+/// thing is there). `selection` is selected page text (whitespace-only and
+/// over-cap count as no selection; cap `MAX_CONTEXT_TEXT` = 256 KiB);
+/// `editable` = a text control (under the cursor **or** the focused one)
+/// that can take a paste.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct ContextTarget {
+    pub link: Option<String>,          // nearest <a href>, resolved
+    pub image: Option<String>,         // <img src>, resolved
+    pub video: Option<String>,         // <video src>, resolved (empty = src-less)
+    pub video_playing: bool,
+    pub selection: Option<String>,
+    pub editable: bool,
+}
+
+/// Context-menu entries the tab process services: `Paste { text }` inserts at
+/// the focused editor (the tab loads the cache and synthesizes the Ctrl+V),
+/// `ToggleVideo` play/pauses the `<video>` that was under the cursor.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub enum ContextAction { Paste { text: String }, ToggleVideo }
 
 /// One page request, reported once when it finishes (or fails).
 /// Completed ⇒ `status` set, `error` None; failed ⇒ `status` None, `error` Some.
@@ -449,6 +490,17 @@ Lifecycle:
    the navigation request via the anchor handling in `blitz-dom/src/events/driver.rs`
    (`EventDriver`); if Blitz only surfaces `DocumentEvent::NavigateIframe`, resolve the
    clicked node's anchor href from the hover/target node id ourselves.
+   6a. **Text selection & copy/paste** is blitz-native and chord-transparent: dragging
+   with the left button selects page text (blitz's `DragMode::Selecting`, painted by
+   `blitz-paint`'s selection highlight) and Ctrl+C copies the live selection — the page's
+   when none of it sits in an editor, the focused editor's otherwise — through
+   `ShellProvider::set_clipboard_text`, which parks it for the poll loop to ship as
+   `FromTab::ClipboardText`. Ctrl+V is the mirror: the editors read
+   `ShellProvider::get_clipboard_text`, answered from the cache `ToTab::Clipboard` pushed.
+   The **right-button pair never reaches blitz** (and never enters the held-button set):
+   blitz collapses the selection on any button press, which would eat the context menu's
+   own Copy target between press and menu; nothing else is lost, as the page never sees
+   right-button DOM events in this engine.
 7. On `Destroy`/EOF: persist cookie jar, flush, `_exit(0)` style shutdown is fine (no GPU
    teardown hazard anymore, but staying consistent with the shell is harmless).
 
@@ -724,6 +776,17 @@ Process/tab management (`src/tabs.rs`):
 - Keyboard focus routing: Slint focus on page area → forward keys; Ctrl-L focuses URL bar;
   Esc unfocuses; F12 / Ctrl-I toggle the DevTools panel (consumed by the shell, never sent
   to the page; they act on the focused page, i.e. not while the URL bar holds focus).
+- **Text selection & copy/paste — the shell owns the session clipboard**: copy chords are
+  never consumed (Ctrl-C/V/X/A always reach the tab — `keymap::clipboard_chords_always_reach_the_page`),
+  every `FromTab::ClipboardText` (page Ctrl+C, editor copy/cut) is filed on the shell's
+  session clipboard, and a detected Ctrl+V pushes `ToTab::Clipboard` **before** relaying
+  the keystroke (the sandboxed tab cannot read any clipboard itself). The right-click opens
+  a pure-Slint menu built from the tab's `ContextTarget` — rows exist exactly when their
+  thing is there: Back/Forward/Reload, Open link/image in new tab, **Copy** (the selection),
+  Copy link/image/video/page address, Play/Pause video, **Paste** (only with a control that
+  can take a caret *and* a non-empty clipboard) — shell-side rows are serviced here, engine-side
+  rows return as `ToTab::ContextAction` (Paste = cache push + synthesized Ctrl+V in the tab).
+  The clipboard is session-private by design: nothing crosses to the OS clipboard.
 - **A new tab opens in the address bar**: every tab open (`Ctrl-T`, the ＋ button, the
   container manager's New tab, a middle-click / `FromTab::OpenLinkInNewTab`, a context-menu
   Open link in new tab) fills the bar with the tab's start URL, bumps the same

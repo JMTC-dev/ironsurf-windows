@@ -183,7 +183,13 @@ pub struct Core {
     /// system clipboard from inside the sandbox, so every copy — menu
     /// entries, page Ctrl+C/X — funnels here, and every paste source (menu
     /// Paste, Ctrl+V) is pushed back out through `ToTab::Clipboard`.
+    /// With a system clipboard reachable ([`crate::clipboard::OsClipboard`])
+    /// every copy is mirrored out and every paste source prefers the system
+    /// text (task: text-selection copy & paste).
     clipboard: RefCell<String>,
+    /// Bridge to the desktop clipboard; `None`-inside = no system clipboard,
+    /// and the session clipboard alone is the whole story (as before).
+    os_clip: RefCell<crate::clipboard::OsClipboard>,
     /// The actions behind the currently-open context menu, index-aligned
     /// with the Slint `menu-items` model.
     menu_items: RefCell<Vec<MenuAction>>,
@@ -288,6 +294,7 @@ impl App {
             last_move_at: Cell::new(None),
             pending_move: Cell::new(None),
             clipboard: RefCell::new(String::new()),
+            os_clip: RefCell::new(crate::clipboard::OsClipboard::new()),
             menu_items: RefCell::new(Vec::new()),
             pending_dialogs: RefCell::new(VecDeque::new()),
             dialog_shown: RefCell::new(None),
@@ -892,7 +899,9 @@ impl Core {
         // the paste from `ShellProvider::get_clipboard_text`, which answers
         // from this cache).
         if is_paste_chord(text, ctrl, alt, meta) {
-            let clip = self.clipboard.borrow().clone();
+            // The system clipboard wins when it has text (the user copied
+            // from another app a moment ago); else the session copy stands.
+            let clip = self.paste_text();
             debug!("clipboard: pushed {} char(s) ahead of Ctrl+V", clip.chars().count());
             self.send_active(ToTab::Clipboard { text: clip });
         }
@@ -1215,7 +1224,9 @@ impl Core {
             }
             None => (None, false, false),
         };
-        let clipboard_empty = self.clipboard.borrow().is_empty();
+        // Pull the system clipboard before deciding rows, so the Paste row's
+        // presence matches exactly what picking it will insert.
+        let clipboard_empty = self.paste_text().is_empty();
         let items = context_menu_items(target, url.as_deref(), can_back, can_forward, clipboard_empty);
         debug!("context menu: {} entries", items.len());
         self.menu_items
@@ -1264,7 +1275,7 @@ impl Core {
             }
             MenuAction::CopyText(text) => self.clipboard_set(&text),
             MenuAction::Paste => {
-                let text = self.clipboard.borrow().clone();
+                let text = self.paste_text();
                 if !text.is_empty() {
                     // One stdin batch, two messages: the tab loads the
                     // clipboard into its engine, then synthesizes the Ctrl+V
@@ -1279,14 +1290,32 @@ impl Core {
         }
     }
 
-    /// Put text on the session clipboard. An empty copy is dropped — the
-    /// clipboard keeps whatever it held, as every browser does.
+    /// Put text on the session clipboard **and** mirror it to the system
+    /// clipboard (task: text-selection copy & paste — what the user copies
+    /// in a page must be pasteable outside the browser too). An empty copy
+    /// is dropped — the clipboard keeps whatever it held, as every browser
+    /// does. A system failure is only a log line: the session copy stands.
     fn clipboard_set(&self, text: &str) {
         if text.is_empty() {
             return;
         }
         info!("clipboard: copied {} char(s)", text.chars().count());
         *self.clipboard.borrow_mut() = text.to_owned();
+        self.os_clip.borrow_mut().set(text);
+    }
+
+    /// The text a paste (Ctrl+V chord or the menu's Paste row) carries:
+    /// the system clipboard when it holds text — pulled into the session
+    /// clipboard on the way, so the two never diverge backwards — else the
+    /// session copy of the last in-browser copy.
+    fn paste_text(&self) -> String {
+        if let Some(text) = self.os_clip.borrow_mut().get() {
+            if *self.clipboard.borrow() != text {
+                debug!("clipboard: pulled {} char(s) from the system clipboard", text.chars().count());
+                *self.clipboard.borrow_mut() = text.clone();
+            }
+        }
+        self.clipboard.borrow().clone()
     }
 
     // ---- container manager -----------------------------------------------------
