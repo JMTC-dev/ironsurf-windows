@@ -1,4 +1,9 @@
 # Task log
+## #54 `<script src>` bodies download CONCURRENTLY: js.rs splits extraction into a shared `walk_scripts` (type/src rules, notes
+  kept in document order via `PendingScript::{Inline,External,Note}`) + shared `assemble_scripts`, driven from the unchanged
+  `extract_scripts` (sequential, tests/compat) and new `extract_scripts_batch` (ONE `fetch_many(&[&Url])` call); runtime.rs runs fetch_many via
+  `std::thread::scope` — one thread per URL on the shared client, jar/cache/UA/events/archive Arc-cloned, locked only per-operation, results positional
+  so execution stays document order (≤1 script inline; concurrent cookie semantics noted). 5 batch unit tests; tab 220u + ws suites green.
 ## #53 No jar/cache mutex is held across the wire any more: netmod gains `JarAccess`/`CacheAccess` (impl'd for CookieJar/NetCache, `Mutex<..>`,
   `MutexGuard<..>`) and `managed_http_fetch_report`/`fetch_document_*_report` go generic over them, touching state only per operation
   (`cookie_header_at`/`capture_set_cookies_at`/`lookup_at`/`store_at`); spawn_http + document + `<script src>` + media pass the shared

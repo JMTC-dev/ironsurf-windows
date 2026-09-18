@@ -1381,9 +1381,13 @@ impl Tab {
     ///
     /// Scripts are collected in document order; `src=` bodies go through the
     /// tab's own document fetcher, so the container net policy (cookies, cache,
-    /// https-upgrade) applies to them too. Nothing here can kill the tab:
-    /// extraction failures degrade to "no scripts", and every `eval` is caught
-    /// inside [`js::JsRuntime::run_scripts`].
+    /// https-upgrade) applies to them too. The external bodies are fetched
+    /// CONCURRENTLY (one scoped thread per URL on the shared client) so the
+    /// screen is not blocked for the sum of the script round-trips, but they
+    /// are still assembled — and therefore executed — strictly in document
+    /// order. Nothing here can kill the tab: extraction failures degrade to
+    /// "no scripts", and every `eval` is caught inside
+    /// [`js::JsRuntime::run_scripts`].
     fn run_scripts(&mut self, url: &Url) {
         // Fresh document: the CSS seam forgets last document's content hashes
         // so the same sheet on a new page is reported once again.
@@ -1401,27 +1405,113 @@ impl Tab {
             // they report into the same DevTools queue the poll loop drains
             // (one `FromTab::NetworkEvent` per script, like any subresource).
             let net_events = Arc::clone(&self.net_events);
-            let mut fetch = |script_url: &Url| -> Result<String, String> {
-                let events = Arc::clone(&net_events);
+            let user_agent = Arc::clone(&self.user_agent);
+            let archive = Arc::clone(&self.archive);
+
+            /// Fetch one `<script src>` body on cloned shared handles: the
+            /// jar/cache mutexes are locked **per cookie/cache operation**
+            /// (via the `JarAccess`/`CacheAccess` adapters `fetch_document_*_
+            /// report_shared` takes), so parallel script threads never
+            /// serialise on each other, and every body reports into the tab's
+            /// DevTools queue and the archive sink exactly like the old
+            /// sequential fetch did.
+            fn fetch_script_body(
+                script_url: &Url,
+                policy: NetPolicy,
+                jar: &Arc<Mutex<CookieJar>>,
+                cache: &Arc<Mutex<NetCache>>,
+                net_events: &Arc<Mutex<Vec<NetEvent>>>,
+                user_agent: &netmod::SharedUserAgent,
+                archive: &Arc<crate::archive::ArchiveState>,
+            ) -> Result<String, String> {
+                let events = Arc::clone(net_events);
                 netmod::fetch_document_report_shared(
                     script_url,
                     policy,
-                    &jar,
-                    &cache,
+                    jar,
+                    cache,
                     netmod::now_unix(),
-                    &self.user_agent,
+                    user_agent,
                     Some(&|event| events.lock().expect("net events mutex").push(event)),
                 )
                 .map(|script| {
                     // Archive mode: an external script payload is a
                     // subresource, whatever its scheme ended up being.
-                    self.archive
-                        .store(&script.url, false, &script.body);
+                    archive.store(&script.url, false, &script.body);
                     script.body_text()
                 })
                 .map_err(|err| err.to_string())
+            }
+
+            // Two-phase batch: the document walk hands us every `src` URL at
+            // once, so one scoped thread per URL downloads them in parallel
+            // on the ONE shared client (task D) instead of the screen paying
+            // the sum of the sequential round-trips. Results are collected in
+            // input order, so assembly — and execution — stay in document
+            // order. Cookie visibility note: the old sequential fetch let
+            // script #2 observe a Set-Cookie sent by script #1; with parallel
+            // fetches that ordering is gone (arrivals settle whenever the
+            // wire returns them). Accepted: scripts on distinct hosts almost
+            // never rely on it, and any cookie a script sets is still in the
+            // jar for every later request of the page.
+            let mut fetch_many = |script_urls: &[&Url]| -> Vec<Result<String, String>> {
+                if script_urls.len() < 2 {
+                    // Zero or one external script: fetching inline on the tab
+                    // thread is exactly as fast and skips the thread overhead.
+                    return script_urls
+                        .iter()
+                        .map(|script_url| {
+                            fetch_script_body(
+                                script_url,
+                                policy,
+                                &jar,
+                                &cache,
+                                &net_events,
+                                &user_agent,
+                                &archive,
+                            )
+                        })
+                        .collect();
+                }
+                std::thread::scope(|scope| {
+                    let handles: Vec<_> = script_urls
+                        .iter()
+                        .map(|script_url| {
+                            // Per-thread clones of the tab's shared handles:
+                            // same jar, cache, UA, event queue, and archive
+                            // sink — each locked only per operation.
+                            let script_url = (*script_url).clone();
+                            let jar = Arc::clone(&jar);
+                            let cache = Arc::clone(&cache);
+                            let net_events = Arc::clone(&net_events);
+                            let user_agent = Arc::clone(&user_agent);
+                            let archive = Arc::clone(&archive);
+                            scope.spawn(move || {
+                                fetch_script_body(
+                                    &script_url,
+                                    policy,
+                                    &jar,
+                                    &cache,
+                                    &net_events,
+                                    &user_agent,
+                                    &archive,
+                                )
+                            })
+                        })
+                        .collect();
+                    // Positional collection keeps the input order whatever
+                    // order the responses arrive in.
+                    handles
+                        .into_iter()
+                        .map(|handle| {
+                            handle.join().unwrap_or_else(|_| {
+                                Err("script fetch thread panicked".to_string())
+                            })
+                        })
+                        .collect()
+                })
             };
-            extraction = js::extract_scripts(doc, url, &mut fetch);
+            extraction = js::extract_scripts_batch(doc, url, &mut fetch_many);
             body_text = js::body_text_snapshot(doc);
         }
 

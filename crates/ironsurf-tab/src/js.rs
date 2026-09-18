@@ -146,20 +146,29 @@ fn is_module_type(type_attr: Option<&str>) -> bool {
         .is_some_and(|t| t.eq_ignore_ascii_case("module"))
 }
 
-/// Collect the `<script>` elements of `doc` **in document order**.
+/// One script discovered by the document walk, before its body is known.
 ///
-/// Inline scripts contribute their text content; `src=` scripts are resolved
-/// against `base` and fetched through `fetch` (the runtime passes its own
-/// document fetcher, so the tab's net policy applies to scripts too). A script
-/// that cannot be fetched, or whose `type` we do not execute, is recorded in
-/// [`Extraction::notes`] and skipped — it must never abort the page.
-pub fn extract_scripts(
-    doc: &BaseDocument,
-    base: &Url,
-    fetch: &mut dyn FnMut(&Url) -> Result<String, String>,
-) -> Extraction {
-    let mut extraction = Extraction::default();
+/// The walk ([`walk_scripts`]) resolves `src=` URLs and applies the type
+/// filters, but defers the network. Entries keep their **document order**, and
+/// skips already decided during the walk become [`PendingScript::Note`] so the
+/// assembly step can interleave them with fetch-failure notes exactly where
+/// the sequential fetcher would have produced them.
+enum PendingScript {
+    /// Inline `<script>` body, ready as-is.
+    Inline { code: String },
+    /// A resolved `src=` script awaiting its body. `raw` is the attribute
+    /// value, kept verbatim for the failure note.
+    External { url: Url, raw: String },
+    /// A script the walk deliberately skipped (module, unknown type,
+    /// unresolvable `src`) with the note it contributes.
+    Note(String),
+}
 
+/// The shared `<script>` element walk: document order, `type` filtering,
+/// `src` resolution. Both [`extract_scripts`] (sequential) and
+/// [`extract_scripts_batch`] (two-phase) go through here, so the rules — and
+/// their notes — can never diverge between the two variants.
+fn walk_scripts(doc: &BaseDocument, base: &Url) -> Vec<PendingScript> {
     let ids = match doc.query_selector_all("script") {
         Ok(ids) => ids.to_vec(),
         Err(_) => {
@@ -169,23 +178,24 @@ pub fn extract_scripts(
         }
     };
 
+    let mut pending = Vec::new();
     for id in ids {
         let Some(node) = doc.get_node(id) else { continue };
         let Some(element) = node.element_data() else { continue };
         let type_attr = element.attr(local_name!("type"));
 
         if is_module_type(type_attr) {
-            extraction
-                .notes
-                .push("skipped type=\"module\" script (module loading TODO)".to_string());
+            pending.push(PendingScript::Note(
+                "skipped type=\"module\" script (module loading TODO)".to_string(),
+            ));
             continue;
         }
         if !is_classic_script_type(type_attr) {
             // JSON blobs, `<template>`-style data, unknown languages.
-            extraction.notes.push(format!(
+            pending.push(PendingScript::Note(format!(
                 "skipped script with unsupported type {:?}",
                 type_attr.unwrap_or_default().trim()
-            ));
+            )));
             continue;
         }
 
@@ -195,33 +205,132 @@ pub fn extract_scripts(
             .filter(|src| !src.is_empty())
             .map(str::to_owned);
 
-        let (code, origin) = match src {
+        match src {
+            // External: resolved now (so unresolvable `src` notes keep their
+            // document position), fetched by the caller's pass.
             Some(raw) => match base.join(&raw) {
-                Ok(url) => match fetch(&url) {
-                    Ok(body) => (body, url.as_str().to_string()),
-                    Err(err) => {
-                        extraction.notes.push(format!("script {raw:?} failed: {err}"));
-                        continue;
-                    }
-                },
-                Err(err) => {
-                    extraction
-                        .notes
-                        .push(format!("script src {raw:?} could not be resolved: {err}"));
-                    continue;
-                }
+                Ok(url) => pending.push(PendingScript::External { url, raw }),
+                Err(err) => pending.push(PendingScript::Note(format!(
+                    "script src {raw:?} could not be resolved: {err}"
+                ))),
             },
             // Inline: the parser keeps `<script>` bodies as raw text nodes.
-            None => (node.text_content(), "inline".to_string()),
-        };
-
-        if code.trim().is_empty() {
-            continue;
+            None => pending.push(PendingScript::Inline {
+                code: node.text_content(),
+            }),
         }
-        extraction.scripts.push(ScriptSource { code, origin });
+    }
+
+    pending
+}
+
+/// The shared assembly step: turn the walk's pending list plus the fetch
+/// results (positionally matched to the [`PendingScript::External`] entries,
+/// in document order) into the final [`Extraction`]. Empty bodies are
+/// skipped; failed fetches note in their **original relative order** because
+/// the note is emitted at the pending item's own position, not at fetch time.
+fn assemble_scripts(pending: Vec<PendingScript>, results: Vec<Result<String, String>>) -> Extraction {
+    // A misbehaving fetcher never aborts the page: missing results read as
+    // fetch failures, extras are ignored.
+    let external_count = pending
+        .iter()
+        .filter(|item| matches!(item, PendingScript::External { .. }))
+        .count();
+    let mut results = results;
+    results.truncate(external_count);
+    results.extend(
+        (results.len()..external_count).map(|_| Err("script fetcher returned no result".to_string())),
+    );
+
+    let mut extraction = Extraction::default();
+    let mut next = 0usize;
+    for item in pending {
+        match item {
+            PendingScript::Note(note) => extraction.notes.push(note),
+            PendingScript::Inline { code } => {
+                if !code.trim().is_empty() {
+                    extraction.scripts.push(ScriptSource {
+                        code,
+                        origin: "inline".to_string(),
+                    });
+                }
+            }
+            PendingScript::External { url, raw } => {
+                let index = next;
+                next += 1;
+                match &results[index] {
+                    Ok(body) => extraction.scripts.push(ScriptSource {
+                        code: body.clone(),
+                        origin: url.as_str().to_string(),
+                    }),
+                    Err(err) => extraction
+                        .notes
+                        .push(format!("script {raw:?} failed: {err}")),
+                }
+            }
+        }
     }
 
     extraction
+}
+
+/// Collect the `<script>` elements of `doc` **in document order**.
+///
+/// Inline scripts contribute their text content; `src=` scripts are resolved
+/// against `base` and fetched through `fetch` (the runtime passes its own
+/// document fetcher, so the tab's net policy applies to scripts too). A script
+/// that cannot be fetched, or whose `type` we do not execute, is recorded in
+/// [`Extraction::notes`] and skipped — it must never abort the page.
+///
+/// This is the sequential variant: one `fetch` per external script, inline on
+/// the caller's thread. The live tab uses [`extract_scripts_batch`], which
+/// defers every `src` body to a single batch callback so the runtime can
+/// download them concurrently; both share the exact same walk and assembly.
+#[allow(dead_code)] // compat shape: the live tab batches (task D), the unit tests drive this one
+pub fn extract_scripts(
+    doc: &BaseDocument,
+    base: &Url,
+    fetch: &mut dyn FnMut(&Url) -> Result<String, String>,
+) -> Extraction {
+    let pending = walk_scripts(doc, base);
+    let mut results = Vec::new();
+    for item in &pending {
+        if let PendingScript::External { url, .. } = item {
+            results.push(fetch(url));
+        }
+    }
+    assemble_scripts(pending, results)
+}
+
+/// [`extract_scripts`] in two phases: walk the document first (cheap, no I/O),
+/// then fetch **all** collected `src` URLs with a single `fetch_many` call
+/// (document order in, positionally matched results out), then assemble.
+/// The runtime implements `fetch_many` with a thread per URL, so a page's
+/// external scripts download concurrently while their execution order stays
+/// document order.
+///
+/// `fetch_many` is called exactly once whenever the page has at least one
+/// fetchable `src` (never for a page with none — e.g. inline-only). A result
+/// list shorter than the URL list reads as fetch failures.
+pub fn extract_scripts_batch(
+    doc: &BaseDocument,
+    base: &Url,
+    fetch_many: &mut dyn FnMut(&[&Url]) -> Vec<Result<String, String>>,
+) -> Extraction {
+    let pending = walk_scripts(doc, base);
+    let urls: Vec<&Url> = pending
+        .iter()
+        .filter_map(|item| match item {
+            PendingScript::External { url, .. } => Some(url),
+            _ => None,
+        })
+        .collect();
+    let results = if urls.is_empty() {
+        Vec::new()
+    } else {
+        fetch_many(&urls)
+    };
+    assemble_scripts(pending, results)
 }
 
 // ---------------------------------------------------------------------------
@@ -4838,6 +4947,117 @@ mod tests {
         fetch: &mut dyn FnMut(&Url) -> Result<String, String>,
     ) -> Extraction {
         extract_scripts(doc, base, fetch)
+    }
+
+    // -----------------------------------------------------------------
+    // Batch extraction (task D): ONE fetch_many call, document order kept
+
+    /// The faked fetcher both extraction variants are driven with: every URL
+    /// whose path mentions "gone" fails, the rest answer with a tagged body.
+    fn fake_answer(url: &Url) -> Result<String, String> {
+        if url.path().contains("gone") {
+            Err("nope: not found".to_string())
+        } else {
+            Ok(format!("JS {}", url.path().rsplit('/').next().unwrap_or("?")))
+        }
+    }
+
+    #[test]
+    fn batch_extraction_calls_fetch_many_once_with_all_urls_in_document_order() {
+        let doc = dom(SCRIPT_PAGE);
+        let base = Url::parse("file:///srv/site/index.html").expect("base");
+        let mut calls: Vec<Vec<String>> = Vec::new();
+        let extraction = extract_scripts_batch(&doc, &base, &mut |urls| {
+            calls.push(urls.iter().map(|u| u.as_str().to_string()).collect());
+            urls.iter().map(|u| fake_answer(u)).collect()
+        });
+        assert_eq!(calls.len(), 1, "fetch_many is called exactly once");
+        assert_eq!(
+            calls[0],
+            vec![
+                "file:///srv/site/a.js",
+                "file:///srv/site/nested/b.js",
+                "file:///srv/site/gone.js",
+            ],
+            "every fetchable src= URL in document order; inline bodies are not URLs"
+        );
+        assert_eq!(
+            extraction
+                .scripts
+                .iter()
+                .map(|s| s.origin.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "inline",
+                "file:///srv/site/a.js",
+                "file:///srv/site/nested/b.js",
+            ],
+            "assembled in document order; the failed fetch yields no script"
+        );
+        assert_eq!(extraction.scripts[1].code, "JS a.js");
+    }
+
+    #[test]
+    fn batch_extraction_notes_keep_document_order_around_failures() {
+        let doc = dom(SCRIPT_PAGE);
+        let base = Url::parse("file:///srv/site/index.html").expect("base");
+        let extraction = extract_scripts_batch(&doc, &base, &mut |urls| {
+            urls.iter().map(|u| fake_answer(u)).collect()
+        });
+        // Walk order decides note order, wherever the fetches settled: the
+        // JSON note (before b.js), then the module note, then the gone.js
+        // failure — identical to what the sequential fetcher produced.
+        assert_eq!(extraction.notes.len(), 3, "{:?}", extraction.notes);
+        assert!(extraction.notes[0].contains("unsupported type"));
+        assert!(extraction.notes[1].contains("module"));
+        assert!(extraction.notes[2].contains("gone.js"));
+        assert!(extraction.notes[2].contains("nope: not found"));
+    }
+
+    #[test]
+    fn batch_extraction_matches_sequential_extraction_exactly() {
+        let doc = dom(SCRIPT_PAGE);
+        let base = Url::parse("file:///srv/site/index.html").expect("base");
+        let sequential = js_extract(&doc, &base, &mut fake_answer);
+        let batch =
+            extract_scripts_batch(&doc, &base, &mut |urls| urls.iter().map(|u| fake_answer(u)).collect());
+        assert_eq!(
+            sequential, batch,
+            "both variants share the walk and the assembly — identical output"
+        );
+    }
+
+    #[test]
+    fn batch_extraction_skips_fetch_many_for_inline_only_pages() {
+        let doc = dom("<!doctype html><html><body><script>var x = 1;</script>  <script>   </script></body></html>");
+        let base = Url::parse("file:///srv/site/index.html").expect("base");
+        let extraction =
+            extract_scripts_batch(&doc, &base, &mut |_urls| -> Vec<Result<String, String>> {
+                panic!("an inline-only page must not reach the fetcher")
+            });
+        assert_eq!(extraction.scripts.len(), 1, "the whitespace-only body is skipped");
+        assert_eq!(extraction.scripts[0].origin, "inline");
+    }
+
+    #[test]
+    fn batch_extraction_treats_missing_results_as_failures() {
+        let doc = dom(SCRIPT_PAGE);
+        let base = Url::parse("file:///srv/site/index.html").expect("base");
+        let extraction = extract_scripts_batch(&doc, &base, &mut |urls| {
+            assert_eq!(urls.len(), 3, "the fake is asked for all three srcs at once");
+            // A misbehaving fetcher answers only the first URL…
+            vec![Ok("JS a.js".to_string())]
+        });
+        assert_eq!(extraction.scripts.len(), 2, "inline + a.js");
+        // …the unanswered ones degrade to notes, exactly like fetch errors.
+        assert!(extraction
+            .notes
+            .iter()
+            .any(|note| note.contains("nested/b.js") && note.contains("returned no result")));
+        assert!(extraction
+            .notes
+            .iter()
+            .any(|note| note.contains("gone.js") && note.contains("returned no result")));
     }
 
     #[test]
