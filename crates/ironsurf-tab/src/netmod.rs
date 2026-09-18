@@ -36,8 +36,12 @@
 //! a failed fetch drops the `Box<dyn NetHandler>` (same failure mode as
 //! upstream `blitz-net`), see [`deliver`].
 
+use std::collections::VecDeque;
 use std::fmt;
-use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
+use std::io;
+use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock};
 
 use blitz_traits::net::{Bytes, HeaderMap, NetHandler, NetProvider, NetWaker, Request};
 use ironsurf_storage::{fresh_until, CachedEntry, CookieJar, NetCache, StoreError};
@@ -964,12 +968,6 @@ impl FetchWorker {
         &self.redirect_manual
     }
 
-    /// Execute a blocking fetch job on a spawned thread. The job's closure
-    /// owns the `Box<dyn NetHandler>` and must call `deliver`/drop exactly
-    /// once (the trait has no error path).
-    pub fn spawn<F: FnOnce() + Send + 'static>(&self, job: F) {
-        std::thread::spawn(job);
-    }
 }
 
 impl Default for FetchWorker {
@@ -977,6 +975,217 @@ impl Default for FetchWorker {
         Self::built(std::time::Duration::from_secs(30))
     }
 }
+
+// ---------------------------------------------------------------------------
+// Subresource fetch pool (CAPPED, EAGAIN-tolerant)
+
+/// Subresource fetch threads ONE provider runs at a time. A page carries
+/// hundreds of `<img>`/`<link>` loads and Blitz hands every one of them to
+/// `NetProvider::fetch` in a single parse pass, so the historical "one
+/// `std::thread::spawn` per subresource" design made thread count a function
+/// of page size: an image-heavy page under a thread limit took `EAGAIN` in
+/// `thread::spawn` — which panics — and the whole tab died (the tube-"scan"
+/// page crash: 24 000 threads and a dead process). Eight concurrent fetchers
+/// saturate the shared reqwest pool as well as an unbounded fan-out ever did,
+/// and put a hard ceiling on the tab's thread count.
+pub const MAX_SUBRESOURCE_FETCHERS: usize = 8;
+
+/// One settled subresource load: fetch on the wire, then deliver (or drop)
+/// the `Box<dyn NetHandler>` — the closure owns the handler and must settle
+/// it exactly once, because `NetHandler` has no error path.
+type FetchJob = Box<dyn FnOnce() + Send + 'static>;
+
+/// A capped, self-healing work queue for [`FetchJob`]s: the queue a page's
+/// subresources run on.
+///
+/// Three properties, all load-bearing:
+///
+/// * **Bounded** — at most `cap` threads, however many jobs the page submits
+///   (a 5 000-image page gets `cap` fetch threads, not 5 000).
+/// * **Never panics on thread creation** — spawns go through
+///   `thread::Builder::spawn`, which reports `EAGAIN` as an error instead of
+///   panicking like `thread::spawn` does. A failed spawn is not fatal and not
+///   final: the job stays queued and every worker that goes looking for more
+///   work retries the spawn, so the pool heals itself once the limit passes.
+///   If the pool has NO thread at all (creation failed from the start), the
+///   submitter runs a queued job itself — slow (that is Blitz's parse thread),
+///   but alive and never stalled.
+/// * **Nothing is dropped** — every submitted job eventually settles its
+///   handler; jobs are never discarded to save resources, and a panicking job
+///   is contained so it cannot take the worker (and every later fetch) down.
+pub struct FetchQueue {
+    /// Worker threads this queue may run (never exceeded).
+    cap: usize,
+    /// Jobs waiting for a worker; workers sleep on `ready` when it is empty.
+    pending: Mutex<VecDeque<FetchJob>>,
+    ready: Condvar,
+    /// Live worker threads. Workers never exit (they park on `ready`), so the
+    /// count never drifts and the cap can be enforced without exit races.
+    threads: AtomicUsize,
+    /// Serialises spawn attempts so two concurrent submits can never
+    /// co-operate their way past `cap`.
+    spawning: Mutex<()>,
+    /// Test seam: while positive, that many spawn attempts fail with `EAGAIN`
+    /// (`WouldBlock`) — the sandbox thread limit, deterministically.
+    fail_spawns: AtomicUsize,
+}
+
+impl FetchQueue {
+    /// A pool of at most `cap` fetch threads (always at least one).
+    fn new(cap: usize) -> Arc<Self> {
+        Arc::new(FetchQueue {
+            cap: cap.max(1),
+            pending: Mutex::new(VecDeque::new()),
+            ready: Condvar::new(),
+            threads: AtomicUsize::new(0),
+            spawning: Mutex::new(()),
+            fail_spawns: AtomicUsize::new(0),
+        })
+    }
+
+    /// Threads this queue is willing to run (observational).
+    pub fn capacity(&self) -> usize {
+        self.cap
+    }
+
+    /// Live worker threads (observational).
+    pub fn threads(&self) -> usize {
+        self.threads.load(Ordering::SeqCst)
+    }
+
+    /// Jobs not yet picked up by a worker (observational).
+    pub fn queued(&self) -> usize {
+        self.pending
+            .lock()
+            .map(|jobs| jobs.len())
+            .unwrap_or_default()
+    }
+
+    /// Make the next `n` worker-spawn attempts fail with `EAGAIN` — the OS
+    /// thread limit under test (see the pool tests).
+    fn fail_next_spawns(&self, n: usize) {
+        self.fail_spawns.store(n, Ordering::SeqCst);
+    }
+
+    /// Queue a job and make sure somebody runs it. Returns immediately except
+    /// in the degraded case where the pool has no thread to hand the work to.
+    pub fn submit(self: &Arc<Self>, job: FetchJob) {
+        self.pending
+            .lock()
+            .expect("fetch queue mutex poisoned")
+            .push_back(job);
+        self.ready.notify_one();
+        self.top_up();
+        if self.threads() == 0 {
+            // No workers exist and none could be created: run one queued job
+            // on the calling thread rather than strand it. Thread creation
+            // failures are self-healing afterwards — every later submit and
+            // every finished job retries the spawn.
+            warn!("no subresource fetch thread could be created; running one fetch inline");
+            self.run_next();
+        }
+    }
+
+    /// Grow the pool towards `min(cap, jobs waiting)`, stopping at the first
+    /// failed spawn (`EAGAIN`) — retried by the next submit or the next worker
+    /// to finish a job.
+    fn top_up(self: &Arc<Self>) {
+        // Held across the spawn attempts: only one thread may be growing the
+        // pool at a time, or the cap becomes advisory.
+        let _gate = self
+            .spawning
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        while self.threads() < self.cap {
+            // Grow only while there is more backlog than workers: a queue
+            // holding one job needs one thread, not `cap`.
+            if self.threads() >= self.queued() {
+                break;
+            }
+            match self.spawn_worker() {
+                Ok(()) => (),
+                Err(err) => {
+                    trace!("subresource fetch worker unavailable ({err}); queueing the rest");
+                    break;
+                }
+            }
+        }
+    }
+
+    fn spawn_worker(self: &Arc<Self>) -> io::Result<()> {
+        // Test seam (`top_up` is the only caller, and it holds the `spawning`
+        // gate, so the load/subtract pair cannot race).
+        if self.fail_spawns.load(Ordering::SeqCst) > 0 {
+            self.fail_spawns.fetch_sub(1, Ordering::SeqCst);
+            return Err(io::Error::from(io::ErrorKind::WouldBlock));
+        }
+        self.threads.fetch_add(1, Ordering::SeqCst);
+        let queue = Arc::clone(self);
+        match std::thread::Builder::new()
+            .name("ironsurf-fetch".to_string())
+            .spawn(move || queue.worker())
+        {
+            // Detached on purpose: the worker parks on the queue instead of
+            // exiting, so it costs nothing between loads and needs no join.
+            Ok(_worker) => Ok(()),
+            Err(err) => {
+                self.threads.fetch_sub(1, Ordering::SeqCst);
+                Err(err)
+            }
+        }
+    }
+
+    /// Run the next queued job on the calling thread (a no-op when idle).
+    fn run_next(&self) {
+        let job = self
+            .pending
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .pop_front();
+        if let Some(job) = job {
+            run_guarded(job);
+        }
+    }
+
+    /// The worker loop: sleep while idle, run jobs as they arrive, and try to
+    /// bring up more of the pool whenever a backlog built up on the wire.
+    fn worker(self: Arc<Self>) {
+        loop {
+            let job = {
+                let mut pending = self
+                    .pending
+                    .lock()
+                    .expect("fetch queue mutex poisoned");
+                while pending.is_empty() {
+                    pending = self.ready.wait(pending).expect("fetch queue condvar poisoned");
+                }
+                pending.pop_front()
+            };
+            if let Some(job) = job {
+                run_guarded(job);
+                // While we were on the wire the queue may have grown, and the
+                // resource limit that blocked the last spawn may have passed.
+                if self.queued() > 0 {
+                    self.top_up();
+                }
+            }
+        }
+    }
+}
+
+/// Settle one job, containing its panic: a broken fetch must cost that one
+/// resource, not the worker thread and everything still queued behind it.
+fn run_guarded(job: FetchJob) {
+    if let Err(err) = catch_unwind(AssertUnwindSafe(job)) {
+        let detail = err
+            .downcast_ref::<&str>()
+            .map(|s| (*s).to_owned())
+            .or_else(|| err.downcast_ref::<String>().cloned())
+            .unwrap_or_else(|| "unspecified panic".to_owned());
+        warn!("subresource fetch job panicked ({detail}); the fetch worker survives");
+    }
+}
+
 
 /// Everything an intercepted load yields after cookies/validators were fed.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1568,6 +1777,10 @@ where
 pub struct BlitzNetProvider {
     policy: NetPolicy,
     worker: Arc<FetchWorker>,
+    /// The CAPPED pool this tab's subresource loads run on (see
+    /// [`FetchQueue`]): one page's thousands of `<img>`/`<link>` fetches never
+    /// become thousands of threads.
+    subresources: Arc<FetchQueue>,
     jar: Arc<Mutex<CookieJar>>,
     cache: Arc<Mutex<NetCache>>,
     waker: Arc<Mutex<Option<Arc<dyn NetWaker>>>>,
@@ -1601,6 +1814,10 @@ impl BlitzNetProvider {
             // One process-wide FetchWorker: documents, scripts, subresources
             // and media share a single reqwest pool (keep-alive, TLS, DNS).
             worker: shared_worker(),
+            // One capped fetch pool per tab (per process in practice): thread
+            // count is a constant, not a function of how many images the page
+            // happens to carry.
+            subresources: FetchQueue::new(MAX_SUBRESOURCE_FETCHERS),
             jar: Arc::new(Mutex::new(jar)),
             cache: Arc::new(Mutex::new(cache)),
             waker: Arc::new(Mutex::new(None)),
@@ -1659,6 +1876,16 @@ impl BlitzNetProvider {
     #[allow(dead_code)] // worker sharing is wired when fetch_document moves in-process
     pub fn with_worker(mut self, worker: Arc<FetchWorker>) -> Self {
         self.worker = worker;
+        self
+    }
+
+    /// Builder: run this provider's subresources on a pool of `cap` threads
+    /// instead of the default [`MAX_SUBRESOURCE_FETCHERS`] (also the seam the
+    /// pool tests use to prove the cap holds and that `EAGAIN` on thread
+    /// creation degrades rather than kills).
+    #[must_use]
+    pub fn with_subresource_pool(mut self, cap: usize) -> Self {
+        self.subresources = FetchQueue::new(cap);
         self
     }
 
@@ -1727,8 +1954,19 @@ impl BlitzNetProvider {
             "subresource GET {url} (doc {doc_id}, {})",
             if managed { "managed" } else { "passthrough" }
         );
-        self.worker.spawn(move || {
+        let job: FetchJob = Box::new(move || {
             let signal = request.signal.clone();
+            // A load Blitz has already cancelled (the document it belonged to
+            // is gone) must not sit in the pool queue taking a slot from live
+            // loads: settle it and get out of the way.
+            if signal.as_ref().is_some_and(|s| s.aborted()) {
+                trace!("subresource {url} was aborted before it fetched");
+                if let Some(waker) = waker {
+                    waker.wake(doc_id);
+                }
+                deliver(None, String::new(), Vec::new());
+                return;
+            }
             // Every settled request lands in the tab loop's DevTools queue
             // (redirect hops report individually — same rule as documents).
             let report = |event: NetEvent| events.lock().expect("net events mutex").push(event);
@@ -1804,6 +2042,10 @@ impl BlitzNetProvider {
                 }
             }
         });
+        // Queued, not spawned: however many subresources this page declares,
+        // at most `MAX_SUBRESOURCE_FETCHERS` of them are ever on the wire, and
+        // a thread-limit `EAGAIN` degrades instead of panicking the tab.
+        self.subresources.submit(job);
     }
 }
 
@@ -3639,6 +3881,273 @@ mod tests {
             assert_eq!(hits, 2, "{path}: both fetches must reach the server");
         }
     }
+
+    // -- subresource fetch pool (thread limits must degrade, never kill) -----
+
+    /// Loopback HTTP fixture that counts the requests it was actually served
+    /// and answers every one with `body`. Returns `(port, hits)`.
+    fn spawn_counting_http(body: &'static [u8]) -> (u16, Arc<AtomicUsize>) {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind loopback");
+        let port = listener.local_addr().expect("addr").port();
+        let hits = Arc::new(AtomicUsize::new(0));
+        let counted = Arc::clone(&hits);
+        std::thread::spawn(move || {
+            for stream in listener.incoming().flatten() {
+                let mut stream = stream;
+                let mut head: Vec<u8> = Vec::new();
+                let mut byte = [0u8; 1];
+                while !head.ends_with(b"\r\n\r\n") {
+                    match stream.read(&mut byte) {
+                        Ok(0) | Err(_) => break,
+                        Ok(_) => head.push(byte[0]),
+                    }
+                    if head.len() > 64 * 1024 {
+                        break;
+                    }
+                }
+                counted.fetch_add(1, Ordering::SeqCst);
+                let response = format!(
+                    "HTTP/1.0 200 OK\r\nContent-Type: image/png\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = stream.write_all(response.as_bytes());
+                let _ = stream.write_all(body);
+                let _ = stream.flush();
+            }
+        });
+        (port, hits)
+    }
+
+    /// Poll `log` until it holds `want` deliveries (a `wait_for` for pages
+    /// whose whole point is that many handlers settle, not one).
+    fn wait_for_deliveries(
+        log: &Arc<Mutex<Vec<(String, Vec<u8>)>>>,
+        want: usize,
+    ) -> Vec<(String, Vec<u8>)> {
+        for _ in 0..800 {
+            {
+                let guard = log.lock().unwrap();
+                if guard.len() >= want {
+                    return guard.clone();
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+        let got = log.lock().expect("log mutex").len();
+        panic!("only {got} of {want} handler.bytes() deliveries landed within 20s");
+    }
+
+    /// A `NetHandler` that APPENDS its delivery: the shared `MockHandler`
+    /// replaces its log (one delivery per handler), which would hide all but
+    /// the last of a page's subresources.
+    struct AppendingHandler {
+        log: Arc<Mutex<Vec<(String, Vec<u8>)>>>,
+    }
+
+    impl NetHandler for AppendingHandler {
+        fn bytes(self: Box<Self>, resolved_url: String, bytes: Bytes) {
+            self.log
+                .lock()
+                .unwrap()
+                .push((resolved_url, bytes.to_vec()));
+        }
+    }
+
+    fn provider_for_pool(policy: NetPolicy) -> (BlitzNetProvider, tempfile::TempDir) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = ironsurf_storage::ContainerStore::from_profile_dir(
+            ironsurf_common::ContainerId(7),
+            dir.path(),
+        );
+        (
+            BlitzNetProvider::new(policy, store.cookie_jar(), store.cache()),
+            dir,
+        )
+    }
+
+    /// The pool is a POOL, not a fan-out: far more jobs than threads must all
+    /// run, and the thread count must stay where the cap put it.
+    #[test]
+    fn fetch_pool_runs_every_job_and_never_exceeds_its_cap() {
+        let queue = FetchQueue::new(4);
+        let done = Arc::new(AtomicUsize::new(0));
+        let inflight = Arc::new(AtomicUsize::new(0));
+        let high_water = Arc::new(AtomicUsize::new(0));
+        for _ in 0..40 {
+            let (done, inflight, high_water) = (
+                Arc::clone(&done),
+                Arc::clone(&inflight),
+                Arc::clone(&high_water),
+            );
+            queue.submit(Box::new(move || {
+                let now = inflight.fetch_add(1, Ordering::SeqCst) + 1;
+                high_water.fetch_max(now, Ordering::SeqCst);
+                std::thread::sleep(std::time::Duration::from_millis(2));
+                inflight.fetch_sub(1, Ordering::SeqCst);
+                done.fetch_add(1, Ordering::SeqCst);
+            }));
+        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        while done.load(Ordering::SeqCst) < 40 && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert_eq!(
+            done.load(Ordering::SeqCst),
+            40,
+            "all 40 jobs (10x the cap) must run"
+        );
+        assert!(
+            high_water.load(Ordering::SeqCst) <= 4,
+            "{} jobs ran at once with a cap of 4",
+            high_water.load(Ordering::SeqCst)
+        );
+        assert!(
+            queue.threads() <= queue.capacity(),
+            "pool grew to {} threads (cap {})",
+            queue.threads(),
+            queue.capacity()
+        );
+        assert!(
+            high_water.load(Ordering::SeqCst) >= 2,
+            "a capped pool must still fetch in parallel (peak {})",
+            high_water.load(Ordering::SeqCst)
+        );
+    }
+
+    /// The tube-"scan"-page crash, deterministically: `thread::spawn` panics
+    /// on `EAGAIN`, so a page's worth of `<img>` fetches under a thread limit
+    /// used to take the process down. With the seam that refuses every spawn,
+    /// a full page of subresources must still be fetched and delivered — zero
+    /// fetch threads, zero panics, nothing lost.
+    #[test]
+    fn provider_delivers_every_subresource_with_no_fetch_threads_at_all() {
+        const IMAGES: usize = 24;
+        let (port, hits) = spawn_counting_http(b"png-bytes");
+        let (provider, _dir) = provider_for_pool(NetPolicy::Passthrough);
+        provider.subresources.fail_next_spawns(usize::MAX);
+
+        let log = Arc::new(Mutex::new(Vec::new()));
+        for i in 0..IMAGES {
+            let image = url(&format!("http://127.0.0.1:{port}/img?i={i}"));
+            provider.fetch(
+                1,
+                Request::get(image),
+                Box::new(AppendingHandler {
+                    log: Arc::clone(&log),
+                }),
+            );
+        }
+
+        let delivered = wait_for_deliveries(&log, IMAGES);
+        assert_eq!(delivered.len(), IMAGES, "one delivery per image");
+        for i in 0..IMAGES {
+            let want = format!("http://127.0.0.1:{port}/img?i={i}");
+            assert_eq!(
+                delivered.iter().filter(|(url, _)| *url == want).count(),
+                1,
+                "{want} must settle exactly once"
+            );
+        }
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            IMAGES,
+            "every image was fetched on the wire"
+        );
+        assert_eq!(
+            provider.subresources.threads(),
+            0,
+            "the whole page settled without a single fetch thread"
+        );
+    }
+
+    /// A thread limit that clears is not fatal and not permanent: jobs
+    /// submitted while spawns were refused still run, and the pool grows back
+    /// on its own afterwards.
+    #[test]
+    fn fetch_pool_heals_itself_once_thread_creation_works_again() {
+        const JOBS: usize = 16;
+        let queue = FetchQueue::new(4);
+        queue.fail_next_spawns(3);
+        let done = Arc::new(AtomicUsize::new(0));
+        for _ in 0..JOBS {
+            let done = Arc::clone(&done);
+            queue.submit(Box::new(move || {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+                done.fetch_add(1, Ordering::SeqCst);
+            }));
+        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        while done.load(Ordering::SeqCst) < JOBS && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert_eq!(done.load(Ordering::SeqCst), JOBS, "nothing was stranded");
+        assert!(
+            queue.threads() >= 1,
+            "the pool retried the refused spawn (threads: {})",
+            queue.threads()
+        );
+    }
+
+    /// A panicking fetch costs that one resource, not the worker: the pool
+    /// keeps serving everything queued behind it.
+    #[test]
+    fn fetch_pool_survives_a_job_that_panics() {
+        let queue = FetchQueue::new(1); // one worker: a lost thread would stall
+        let done = Arc::new(AtomicUsize::new(0));
+        queue.submit({
+            let done = Arc::clone(&done);
+            Box::new(move || {
+                done.fetch_add(1, Ordering::SeqCst);
+                panic!("the fetch job blew up");
+            })
+        });
+        for _ in 0..200 {
+            if done.load(Ordering::SeqCst) == 1 {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert_eq!(done.load(Ordering::SeqCst), 1, "the panicking job ran");
+        // And the worker is still there to take the next job.
+        let after = Arc::new(AtomicUsize::new(0));
+        {
+            let after = Arc::clone(&after);
+            queue.submit(Box::new(move || {
+                after.fetch_add(1, Ordering::SeqCst);
+            }));
+        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while after.load(Ordering::SeqCst) == 0 && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert_eq!(after.load(Ordering::SeqCst), 1, "the queue kept working");
+    }
+
+    /// A load Blitz already cancelled must not occupy a pool slot behind the
+    /// queue: it settles (by dropping the handler) without touching the wire.
+    #[test]
+    fn aborted_subresource_is_settled_without_reaching_the_network() {
+        let (port, hits) = spawn_counting_http(b"png-bytes");
+        let (provider, _dir) = provider_for_pool(NetPolicy::Passthrough);
+        let controller = blitz_traits::net::AbortController::default();
+        let signal = controller.signal.clone();
+        controller.abort(); // deterministic: cancelled before it is queued
+        let (handler, log) = mock_handler();
+        provider.fetch(
+            1,
+            Request::get(url(&format!("http://127.0.0.1:{port}/gone"))).signal(signal),
+            handler,
+        );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
+        while hits.load(Ordering::SeqCst) == 0 && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert_eq!(hits.load(Ordering::SeqCst), 0, "no wire request");
+        assert!(
+            log.lock().expect("log mutex").is_empty(),
+            "an aborted load delivers nothing"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -3682,4 +4191,5 @@ mod user_agent_tests {
         *cell.lock().expect("ua mutex") = resolve_user_agent(None);
         assert_eq!(read_user_agent(&cell), USER_AGENT);
     }
+
 }
