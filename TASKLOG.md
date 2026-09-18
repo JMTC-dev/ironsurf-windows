@@ -1,4 +1,10 @@
 # Task log
+## #60 startpage search bar still unclickable/untypeable — ROOT CAUSE FOUND + fix verified LIVE, stopped mid-test-writing; WIP (runtime.rs UA patch + forms::UA_PATCH_CSS + new e2e test) is in `git stash` (stash@{0}) — pop it to finish.
+  Root cause (#59 was necessary but insufficient; proven via live element_from_point probes on :2.0): blitz-dom beta.2's default.css lacks `input[type=hidden]{display:none}`, so
+  startpage's flexed search `<form>` lets its ten hidden inputs eat every flex pixel and query `#q` collapses to width 0 — painted by its container but unhittable (right-click ⇒ editable:false, click focuses nothing).
+  Fix = `ua_stylesheets: Some(vec![blitz_dom::DEFAULT_CSS, forms::UA_PATCH_CSS])` in `Tab::load_html` (Some REPLACES the default); UA_PATCH_CSS = `input[type="hidden"]{display:none}`; verified live — click focuses #q and typed glyphs paint.
+  Values still submit (forms.rs reads attributes, not boxes). The console's CSS errors (-webkit/-ms input-placeholder, -webkit-scrollbar SelectorError) are benign — those rules are correctly dropped and unrelated. TODO next session: the stashed
+  e2e `search_bar_with_hidden_inputs_is_clickable_and_typeable` passes the editable-wait but fails its paint assert (band ink 19 vs >100 — frame timing/band geometry); fix that, run the suites, commit.
 ## #59 startpage.com search bar usable again: its first inline script (matchMedia → `.dataset.siteTheme` → revealRoot, which
   lifts the page-shipped `#root { opacity: 0 }`) died at :2:51 with "TypeError: not a callable function", leaving the WHOLE page —
   search bar included — invisible. js.rs glue gains **window.matchMedia** (MediaQueryList; matches only for ""/all/screen/only
@@ -89,12 +95,3 @@
   feeds every request — documents (fetch_document* report forms take it; wrappers default), form POSTs, redirect hops, subresources
   (with_user_agent), media — and navigator.userAgent via live __ironsurfUserAgent over HostState.user_agent (same Arc as .dialog). 9 unit
   + tests/user_agent.rs 2 wire tests; tab 196u all green, ws check clean.
-## #43 Per-container User-Agent persisted (step 2/5, storage only): Store::set_container_user_agent(id, Option<&str>) writes Container::user_agent
-  into containers.json via the atomic save(), shaped like set_container_color; Some(v) stores v trimmed, all-blank Some("") and None both store
-  None (= the tab default); validation precedes mutation (upsert_userscript pattern) so rejects leave memory + the file byte-identical — control
-  chars ⇒ InvalidUserAgent, > MAX_USER_AGENT_CHARS ⇒ UserAgentTooLong{length,max}, unknown id ⇒ NoSuchContainer. Docs synced; tests/user_agent.rs
-  8 green (reopen, clear, A/B independence, trim, blank⇒None, cap boundary, control chars, bogus id) + 42 pre-existing, ws check clean.
-## #42 Per-container User-Agent contract (step 1/5, common only): ToTab::SetUserAgent{user_agent} — Some(v) = send
-  exactly v as the HTTP User-Agent on every later request, None = the tab's built-in default; Container gains
-  #[serde(default)] user_agent: Option<String> (legacy containers.json written without the key still loads, as None);
-  presets BUILTIN_USER_AGENTS + builtin_user_agent_label/is_builtin_user_agent/MAX_USER_AGENT_CHARS=512. Fallout only:
