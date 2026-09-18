@@ -260,3 +260,128 @@ fn dom_bridge_paints_red_box_and_serializes_it() {
         "expected a painted red box (200x120), found {red_pixels} red pixels"
     );
 }
+
+// ---------------------------------------------------------------------------
+// startpage.com search bar regression (task): its first inline script calls
+// `window.matchMedia("(prefers-color-scheme: dark)")` and reads
+// `#site_theme`.dataset.siteTheme before running `revealRoot()`, which lifts
+// the `#root { opacity: 0 }` the page ships (in a `.theme-flash-mitigation`
+// <style>) to prevent a theme flash. Before `matchMedia`/`dataset` existed,
+// the script died with "TypeError: not a callable function" at :2:51, the
+// reveal never ran, and the ENTIRE page — search bar included — stayed at
+// opacity 0: invisible and untypeable. The fixture reproduces the reveal
+// verbatim over a painted box; the control ships the same hidden CSS with no
+// script, proving the pixels below come from the script's reveal, not luck.
+
+/// startpage.com's theme-reveal script (verbatim), gating a 200x120 box.
+const REVEAL_FIXTURE: &str = r##"<!doctype html>
+<html>
+<head>
+<style class="theme-flash-mitigation">
+@media (prefers-color-scheme: dark) { html { background: #171B25; } }
+#root { opacity: 0; }
+</style>
+<meta id="site_theme" name="site_theme" data-site-theme="device"/>
+</head>
+<body>
+<div id="root"><div style="width: 200px; height: 120px; background: #ff0000;"></div></div>
+<script>
+      const osPrefersDarkTheme = window.matchMedia("(prefers-color-scheme: dark)");
+      const themeFlashStyleTag = document.querySelector(".theme-flash-mitigation");
+      const siteTheme = document.querySelector("#site_theme").dataset.siteTheme;
+      const isDarkOsThemeOnly = osPrefersDarkTheme.matches && siteTheme === "device";
+      const isSiteThemeDark = ["dark", "night"].includes(siteTheme);
+      const isSiteThemeLight = ["light", "air"].includes(siteTheme);
+      function revealRoot() {
+        themeFlashStyleTag.innerHTML += `
+          #root {
+            opacity: 1;
+          }
+        `;
+      }
+      if (isDarkOsThemeOnly) {
+        window.prefersDark = true;
+        window.addEventListener('darkThemeLoaded', function() {
+          revealRoot();
+        });
+      } else {
+        revealRoot();
+      }
+</script>
+</body>
+</html>
+"##;
+
+/// The same hidden document with the script removed: the control proving
+/// `#root { opacity: 0 }` genuinely suppresses the box's pixels.
+const HIDDEN_CONTROL: &str = r#"<!doctype html>
+<html>
+<head>
+<style class="theme-flash-mitigation">
+#root { opacity: 0; }
+</style>
+</head>
+<body>
+<div id="root"><div style="width: 200px; height: 120px; background: #ff0000;"></div></div>
+</body>
+</html>
+"#;
+
+/// Non-white RGB pixels in a --shot PPM (content the paper does not have).
+fn non_white_pixels(ppm: &[u8]) -> usize {
+    let header_end = ppm
+        .windows(4)
+        .position(|w| w == b"255\n")
+        .expect("ppm maxbyte header")
+        + 4;
+    ppm[header_end..]
+        .chunks_exact(3)
+        .filter(|rgb| rgb.iter().any(|&c| c < 240))
+        .count()
+}
+
+fn shoot(dir: &std::path::Path, name: &str, html: &str) -> (Vec<u8>, String) {
+    let fixture = dir.join(name);
+    fs::write(&fixture, html).expect("write fixture");
+    let shot = dir.join(format!("{name}.ppm"));
+    let output = Command::new(env!("CARGO_BIN_EXE_ironsurf-tab"))
+        .arg("--headless")
+        .arg("--url")
+        .arg(url::Url::from_file_path(&fixture).expect("file url").as_str())
+        .args(["--wait", "200", "--shot", shot.to_str().unwrap(), "--size", "400x240"])
+        .output()
+        .expect("spawn ironsurf-tab --headless");
+    assert!(
+        output.status.success(),
+        "exit {:?}\nstderr:\n{}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    (fs::read(&shot).expect("shot"), String::from_utf8_lossy(&output.stderr).into_owned())
+}
+
+#[test]
+fn matchmedia_reveal_script_unhides_the_page_it_gates() {
+    let dir = tempfile::tempdir().expect("tempdir");
+
+    // Control: with no reveal script the gated content is NOT painted.
+    let (hidden, _) = shoot(dir.path(), "hidden.html", HIDDEN_CONTROL);
+    assert!(
+        non_white_pixels(&hidden) < 100,
+        "opacity: 0 must hide the box, saw {} content pixels",
+        non_white_pixels(&hidden)
+    );
+
+    // The startpage reveal: matchMedia + dataset + innerHTML += all survive,
+    // raise the opacity, and the box paints. No TypeError anywhere.
+    let (revealed, stderr) = shoot(dir.path(), "reveal.html", REVEAL_FIXTURE);
+    assert!(
+        !stderr.contains("TypeError"),
+        "the reveal script must run clean:\n{stderr}"
+    );
+    let content = non_white_pixels(&revealed);
+    assert!(
+        content > 20_000,
+        "the reveal must paint the 200x120 box (~24 000 px), found {content}"
+    );
+}

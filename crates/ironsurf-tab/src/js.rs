@@ -2607,6 +2607,36 @@ const PRELUDE: &str = r##"
   host.scroll = noop;
 
   // ---------------------------------------------------------------------
+  // window.matchMedia (task: startpage.com search bar). Media features are
+  // never evaluated for scripts here, so `matches` answers only the trivial
+  // whole-media queries (`""`, `all`, `screen`) and reports false for
+  // everything else — `prefers-color-scheme: dark` included. Listeners
+  // register and unregister as no-ops and never fire, so `change` events
+  // never arrive. What the platform lacked was a CALLABLE matchMedia: its
+  // absence made the first inline script of startpage.com's home page die
+  // with "TypeError: not a callable function" at `window.matchMedia(...)`,
+  // aborting the theme-reveal that lifts the `#root { opacity: 0 }` the
+  // page ships to prevent a theme flash — the whole page, search bar
+  // included, stayed invisible and unusable.
+  // ---------------------------------------------------------------------
+  host.matchMedia = function (query) {
+    var media = query === undefined || query === null ? "" : String(query);
+    var q = media.replace(/^\s+/, "").toLowerCase();
+    var matches =
+      q === "" || q === "all" || q === "screen" || q === "only screen";
+    return {
+      media: media,
+      matches: matches,
+      onchange: null,
+      addListener: noop,
+      removeListener: noop,
+      addEventListener: noop,
+      removeEventListener: noop,
+      dispatchEvent: function () { return returnTrue(); },
+    };
+  };
+
+  // ---------------------------------------------------------------------
   // The DOM bridge (design: wrappers are plain {__d, __n} objects sharing
   // one prototype; every behaviour is a native taking docId+nodeId ints;
   // live lists are Proxies re-reading the document at access time).
@@ -2860,6 +2890,83 @@ const PRELUDE: &str = r##"
     function (v) { host.__ironsurfDomSetInner(this.__d, this.__n, String(v)); }
   );
   protoGet("outerHTML", function () { return host.__ironsurfDomSerialize(this.__d, this.__n, true); });
+
+  // ---------------------------------------------------------------------
+  // element.dataset — a DOMStringMap view over `data-*` attributes (task:
+  // startpage.com search bar, where `#site_theme`.dataset.siteTheme reads
+  // `data-site-theme`). Live like `style`: every access re-reads the
+  // document, and writes go through the same ATTR_SET native as
+  // setAttribute, so they restyle and repaint like any attribute mutation.
+  // The spec's camel-case mapping both ways: siteTheme ⇄ data-site-theme,
+  // col2 ⇄ data-col2; a leading capital takes no dash (X → data-x). Keys
+  // are enumerable (`for (var k in el.dataset)`), and
+  // `delete el.dataset.foo` removes the attribute.
+  // ---------------------------------------------------------------------
+  function datasetAttrName(key) {
+    var s = String(key);
+    var out = "data-";
+    for (var i = 0; i < s.length; i++) {
+      var c = s.charAt(i);
+      if (c >= "A" && c <= "Z") {
+        if (i > 0) out += "-";
+        out += c.toLowerCase();
+      } else {
+        out += c;
+      }
+    }
+    return out;
+  }
+  function datasetKey(name) {
+    var s = String(name).slice(5); // strip "data-"
+    return s.replace(/-(.)/g, function (_, c) { return c.toUpperCase(); });
+  }
+  function makeDataset(d, n) {
+    function read(key) {
+      var v = host.__ironsurfDomAttr(d, n, datasetAttrName(key));
+      return v === null ? undefined : v;
+    }
+    var handlers = {
+      get: function (t, key) {
+        if (typeof key === "symbol")
+          return key === Symbol.toStringTag ? "DOMStringMap" : undefined;
+        return read(key);
+      },
+      set: function (t, key, value) {
+        host.__ironsurfDomAttrSet(
+          d,
+          n,
+          datasetAttrName(key),
+          value === null || value === undefined ? "" : String(value)
+        );
+        return true;
+      },
+      has: function (t, key) {
+        return typeof key !== "symbol" && read(key) !== undefined;
+      },
+      ownKeys: function () {
+        var keys = [];
+        var count = host.__ironsurfDomAttrCount(d, n);
+        for (var i = 0; i < count; i++) {
+          var pair = host.__ironsurfDomAttrAt(d, n, i);
+          if (pair !== null && String(pair[0]).indexOf("data-") === 0) {
+            keys.push(datasetKey(pair[0]));
+          }
+        }
+        return keys;
+      },
+      getOwnPropertyDescriptor: function (t, key) {
+        if (typeof key === "string" && read(key) !== undefined)
+          return { value: read(key), writable: true, enumerable: true, configurable: true };
+        return undefined;
+      },
+      deleteProperty: function (t, key) {
+        host.__ironsurfDomAttrRemove(d, n, datasetAttrName(key));
+        return true;
+      },
+    };
+    return new Proxy({}, handlers);
+  }
+  protoGet("dataset", function () { return makeDataset(this.__d, this.__n); });
 
   // Form control value/checked (task: `<form>`): the natives read the live
   // parley editor text blitz keeps for text inputs and textareas (falling
@@ -4325,6 +4432,73 @@ mod tests {
         assert!(host.borrow().console.is_empty());
     }
 
+    /// `window.matchMedia` (task: startpage.com search bar): callable, with a
+    /// MediaQueryList that answers trivial whole-media queries and reports
+    /// `matches: false` otherwise — no media features are evaluated for
+    /// scripts, and `change` never fires. What matters is that the very first
+    /// inline script of startpage.com survives `window.matchMedia(...)`;
+    /// before this existed it threw "not a callable function" and the page
+    /// stayed `opacity: 0` forever.
+    #[test]
+    fn window_match_media_answers_without_evaluating_features() {
+        let host = sample_host();
+        assert!(
+            eval_snippet("typeof window.matchMedia === 'function'", &host)
+                .as_boolean()
+                .unwrap_or(false),
+            "matchMedia must be a callable function on window"
+        );
+        assert!(
+            eval_snippet(
+                r#"
+            var mql = window.matchMedia("(prefers-color-scheme: dark)");
+            mql.matches === false &&
+            mql.media === "(prefers-color-scheme: dark)" &&
+            typeof mql.addListener === "function" &&
+            typeof mql.removeEventListener === "function" &&
+            mql.onchange === null;
+            "#,
+                &host
+            )
+            .as_boolean()
+            .unwrap_or(false),
+            "a dark-scheme query must answer (matches=false), never throw"
+        );
+        // Listeners register and unregister as no-ops; nothing fires.
+        assert!(
+            eval_snippet(
+                r#"
+            var m = window.matchMedia("screen");
+            m.addEventListener("change", function () {});
+            m.addListener(function () {});
+            m.removeListener(function () {});
+            m.removeEventListener("change", function () {});
+            m.matches === true;
+            "#,
+                &host
+            )
+            .as_boolean()
+            .unwrap_or(false)
+        );
+        // Only the trivial whole-media queries match.
+        assert!(
+            eval_snippet(
+                r#"
+            window.matchMedia("").matches &&
+            window.matchMedia("all").matches &&
+            window.matchMedia("  screen").matches &&
+            window.matchMedia("only screen").matches &&
+            !window.matchMedia("print").matches &&
+            !window.matchMedia("(min-width: 100px)").matches &&
+            window.matchMedia(undefined).matches;
+            "#,
+                &host
+            )
+            .as_boolean()
+            .unwrap_or(false)
+        );
+    }
+
     #[test]
     fn location_href_reflects_the_document_url() {
         let host = sample_host();
@@ -5216,6 +5390,61 @@ mod tests {
             try { el.setAttribute("<bad>", "x"); } catch (e) { threw = e instanceof RangeError; }
             a1 && a2 && a3 && has && indexed && a4 && threw;
             "#,
+        );
+    }
+
+    /// `element.dataset` (task: startpage.com search bar): a live view over
+    /// `data-*` with the spec's camel-case mapping; writes/deletes go through
+    /// the attribute natives like `setAttribute`/`removeAttribute`.
+    #[test]
+    fn dom_dataset_views_data_attributes() {
+        dom_true(
+            r#"
+            var el = document.querySelector("span[data-x]");
+            var read = el.dataset.x === "v";
+            var missing = el.dataset.siteTheme === undefined && !("siteTheme" in el.dataset);
+            el.dataset.siteTheme = "device";
+            var written = el.getAttribute("data-site-theme") === "device" && el.dataset.siteTheme === "device";
+            el.dataset.col2 = "9";
+            var digits = el.getAttribute("data-col2") === "9";
+            var keys = []; for (var k in el.dataset) keys.push(k);
+            var enumerated = keys.indexOf("x") >= 0 && keys.indexOf("siteTheme") >= 0 && keys.indexOf("col2") >= 0;
+            delete el.dataset.x;
+            var deleted = el.getAttribute("data-x") === null && el.dataset.x === undefined;
+            read && missing && written && digits && enumerated && deleted;
+            "#,
+        );
+    }
+
+    /// The whole startpage.com theme-reveal script (the calls that used to
+    /// die at :2:51): matchMedia + dataset + `innerHTML +=` on the mitigation
+    /// <style> all survive, and the reveal adds its `opacity: 1` rule while
+    /// keeping the original hidden one in the stylesheet text.
+    #[test]
+    fn dom_startpage_reveal_script_runs_end_to_end() {
+        dom_true(
+            r##"
+            var st = document.createElement("style");
+            st.setAttribute("class", "theme-flash-mitigation");
+            st.textContent = "#root { opacity: 0; }";
+            document.body.appendChild(st);
+            var meta = document.createElement("meta");
+            meta.setAttribute("id", "site_theme");
+            meta.setAttribute("data-site-theme", "device");
+            document.body.appendChild(meta);
+
+            var osPrefersDarkTheme = window.matchMedia("(prefers-color-scheme: dark)");
+            var themeFlashStyleTag = document.querySelector(".theme-flash-mitigation");
+            var siteTheme = document.querySelector("#site_theme").dataset.siteTheme;
+            var isDarkOsThemeOnly = osPrefersDarkTheme.matches && siteTheme === "device";
+            var isSiteThemeDark = ["dark", "night"].includes(siteTheme);
+            if (!isSiteThemeDark && !isDarkOsThemeOnly) {
+                themeFlashStyleTag.innerHTML += " #root { opacity: 1; }";
+            }
+            siteTheme === "device" &&
+                themeFlashStyleTag.innerHTML.indexOf("opacity: 1") >= 0 &&
+                themeFlashStyleTag.innerHTML.indexOf("opacity: 0") >= 0;
+            "##,
         );
     }
 

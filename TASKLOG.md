@@ -1,4 +1,12 @@
 # Task log
+## #59 startpage.com search bar usable again: its first inline script (matchMedia → `.dataset.siteTheme` → revealRoot, which
+  lifts the page-shipped `#root { opacity: 0 }`) died at :2:51 with "TypeError: not a callable function", leaving the WHOLE page —
+  search bar included — invisible. js.rs glue gains **window.matchMedia** (MediaQueryList; matches only for ""/all/screen/only
+  screen, listeners register-and-never-fire — no feature evaluation) and **element.dataset** (live Proxy over data-*, spec camel
+  mapping siteTheme⇄data-site-theme, writes via ATTR_SET so they restyle, enumerable + delete). Plain <form action=/sp/search
+  method=post> then submits through the existing forms.rs path. 3 units (matchMedia surface, dataset round-trip, reveal e2e) +
+  tests/headless.rs pixel regression (same CSS: no script ⇒ box unpainted; reveal script ⇒ ~24 000 px paint, no TypeError); real
+  startpage.com load logs ZERO js errors and paints; tab 225u + all suites green, ws check clean; ARCH §JavaScript synced.
 ## #58 Tab no longer dies on script-heavy pages (startpage.com crash): runtime's fetch_many spawned ONE scoped thread per
   `<script src>`; under a thread limit a script-rich page hit EAGAIN in thread::Builder::spawn (scope.spawn unwraps) and the process
   died. Now a CAPPED pull pool: MAX_SCRIPT_FETCHERS=8 workers grab indices off a shared AtomicUsize and write positional result slots
@@ -90,5 +98,3 @@
   exactly v as the HTTP User-Agent on every later request, None = the tab's built-in default; Container gains
   #[serde(default)] user_agent: Option<String> (legacy containers.json written without the key still loads, as None);
   presets BUILTIN_USER_AGENTS + builtin_user_agent_label/is_builtin_user_agent/MAX_USER_AGENT_CHARS=512. Fallout only:
-  inert SetUserAgent arms (tab runtime, fake_tab), user_agent: None (storage literals), ARCH synced; common 30 green, ws clean.
-## #40 Userscript MENU in the shell (step 4/5): glyph-free "US" toolbar button right of ＋ toggles a right-docked overlay (container-manager pattern, never PopupWindow; the two never stack — each closes the other). Rows: enable CheckBox persisted at once via Store::set_userscript_enabled, bold name, dim ", "-joined patterns, ✕ delete; "+ New script" inline editor (name/patterns LineEdits — patterns comma/space-split — multi-line TextInput for code); a rejected Save keeps the draft, shows the StoreError on one line, script NOT added. Broadcast: every mutation AND tab spawn/respawn sends ToTab::SetUserscripts with all ENABLED scripts to every live tab (crashed/closed skipped, send failures ignored — the crash reporter owns those); disabled never sent. Pure src/userscripts.rs (rows, enabled-only payload, parse_patterns, tempdir-Store reopen round-trips); fake_tab --expect-userscripts echoes "userscripts:[ids]" on its status line; tests/userscripts.rs drives save/validate/toggle/re-toggle/delete/seed/manager-exclusion over the real pipe; state.rs console_rows covers "[userscript] Name: msg"; shell 53u + all suites, common 27, storage green; ARCH §ironsurf-shell bullet added.

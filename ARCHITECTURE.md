@@ -592,6 +592,17 @@ order in **one** `boa_engine::Context` per tab (per navigation: rebuild context)
 are a small, DOM-shaped surface:
 - `window` (eventTarget-ish no-ops), `document.title` get/set (set → `FromTab::TitleChanged`
   and repaint), `document.body.textContent` read-only snapshot,
+- **`window.matchMedia(query)`** returns a MediaQueryList without evaluating media features:
+  `matches` is true only for the whole-media queries `""`/`all`/`screen`/`only screen` and false
+  otherwise (`prefers-color-scheme: dark` included); listeners register as no-ops and `change`
+  never fires. A *callable* `matchMedia` is what such reveal scripts need — its absence killed
+  startpage.com's first inline script ("TypeError: not a callable function") before it could lift
+  the page-shipped `#root { opacity: 0 }`, leaving the whole page (search bar included) invisible.
+- **`element.dataset`** is a live `DOMStringMap` Proxy over the `data-*` attributes with the
+  spec's camel-case mapping (`siteTheme` ⇄ `data-site-theme`, `col2` ⇄ `data-col2`, leading
+  capitals take no dash); reads re-read the document, writes/deletes go through the same
+  `__ironsurfDomAttr*` natives as `setAttribute`, so they restyle and repaint like any attribute
+  mutation, and the keys enumerate (`for (k in el.dataset)`).
   `console.log/info/warn/error` → tab stderr + `FromTab::StatusText` **and** a
   `FromTab::ConsoleLog { source: "js", level, message }` per line (all four levels, page order).
 - **`window.alert`/`confirm`/`prompt` are implemented as real synchronous modals**: the native
