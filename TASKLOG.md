@@ -1,4 +1,11 @@
 # Task log
+## #55 Fresh cache entries skip the network: storage gains pure `fresh_until(headers, cached_at)` — explicit
+  freshness only (Cache-Control s-maxage>max-age>Expires via a tiny IMF-fixdate parser; no-store/no-cache/
+  must-revalidate/proxy-revalidate ⇒ None; quoted values, folded headers, `-1`/garbage ⇒ revalidate), nothing new
+  stored on CachedEntry; managed_http_fetch_report serves status<400 explicitly-fresh hits directly (from_cache, ONE
+  net_ok on the original URL, duration 0, **no Set-Cookie re-capture**), everything else keeps the 304 path. 8 storage
+  + 2 localhost tab tests (fresh ⇒ server sees exactly 1 request; no-store/no-cache/must-revalidate/proxy-revalidate ⇒
+  always 2); storage 58 green, tab 222u, ws green; ARCH §Network layer + DevTools bullets synced.
 ## #54 `<script src>` bodies download CONCURRENTLY: js.rs splits extraction into a shared `walk_scripts` (type/src rules, notes
   kept in document order via `PendingScript::{Inline,External,Note}`) + shared `assemble_scripts`, driven from the unchanged
   `extract_scripts` (sequential, tests/compat) and new `extract_scripts_batch` (ONE `fetch_many(&[&Url])` call); runtime.rs runs fetch_many via

@@ -11,7 +11,9 @@
 //!   our own `reqwest` (rustls) client so we control `Cookie`-header injection
 //!   from the container's [`ironsurf_storage::CookieJar`], capture `Set-Cookie`
 //!   responses into the jar, answer from [`ironsurf_storage::NetCache`] (with
-//!   ETag/`If-None-Match` revalidation), and enforce https-only: `http:`
+//!   ETag/`If-None-Match` revalidation — except entries the server declared
+//!   explicitly fresh, which are served without touching the wire at all),
+//!   and enforce https-only: `http:`
 //!   **main-document** navigations are upgraded to `https:`; if the upgrade
 //!   fetch fails the load is blocked with an error page. `http:` sub-resources
 //!   and `about:`/`file:`/`data:` fixtures keep working unmodified (the
@@ -38,7 +40,7 @@ use std::fmt;
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 
 use blitz_traits::net::{Bytes, HeaderMap, NetHandler, NetProvider, NetWaker, Request};
-use ironsurf_storage::{CachedEntry, CookieJar, NetCache, StoreError};
+use ironsurf_storage::{fresh_until, CachedEntry, CookieJar, NetCache, StoreError};
 use url::Url;
 
 // Every request/response decision is logged to stderr at `debug`; only things
@@ -52,9 +54,11 @@ use ironsurf_common::NetEvent;
 
 /// Sink for network events: called exactly once per *completed or failed*
 /// request (redirect hops count as their own events; a response served
-/// entirely from [`NetCache`] without touching the wire is not a request and
-/// stays silent). `None` keeps the fetcher quiet — every call site that does
-/// not care about the DevTools network panel passes `None`.
+/// entirely from [`NetCache`] reports one event carrying the cached entry's
+/// status/size — duration 0 for a direct fresh serve, the measured
+/// revalidation time for a 304 round trip). `None` keeps the fetcher quiet —
+/// every call site that does not care about the DevTools network panel
+/// passes `None`.
 pub type NetReport<'a> = Option<&'a (dyn Fn(NetEvent) + Send + Sync)>;
 
 /// A completed request: status + size + measured wall clock, no error.
@@ -981,7 +985,8 @@ pub struct FetchOutcome {
     /// Header list (original casing, `Set-Cookie`s still included).
     pub headers: Vec<(String, String)>,
     pub body: Vec<u8>,
-    /// True when the body came from [`NetCache`] (304 revalidation).
+    /// True when the body came from [`NetCache`] (304 revalidation or a
+    /// direct serve of an explicitly fresh entry).
     pub from_cache: bool,
 }
 
@@ -1283,9 +1288,9 @@ pub fn managed_http_fetch(
 /// event per completed or failed request: every followed redirect hop gets
 /// its own event (that hop's method, URL, 3xx status, declared body size),
 /// the terminating response gets the final event, and a send/body failure
-/// gets a single failure event (`status: None`). A response served entirely
-/// from [`NetCache`] without touching the wire is not a request and emits
-/// nothing (the caller sees `from_cache` and may report it itself).
+/// gets a single failure event (`status: None`). An explicitly fresh
+/// [`NetCache`] hit emits exactly one event for the original URL (the cached
+/// entry's status/size, duration 0) and never touches the network.
 pub fn managed_http_fetch_report<J, C>(
     client: &reqwest::blocking::Client,
     url: &Url,
@@ -1308,12 +1313,50 @@ where
     let cached = if cacheable {
         let cached = cache.lookup_at(url.as_str());
         if cached.is_some() {
-            debug!("cache entry for {url}: revalidating");
+            debug!("cache entry for {url}: checking explicit freshness");
         }
         cached
     } else {
         None
     };
+
+    // Direct serve: an entry the server declared *explicitly* fresh
+    // (Cache-Control max-age/s-maxage/Expires, and none of no-store/no-cache/
+    // must-revalidate/proxy-revalidate — see `fresh_until`) costs no network
+    // round trip at all: RFC 9111 says exactly that. Everything else keeps
+    // the conditional-revalidation path below unchanged.
+    //
+    // Cookie note: this path must NOT re-capture Set-Cookie. The entry's
+    // Set-Cookies were already captured into the jar when the response was
+    // first received and stored; replaying them from the cached headers on
+    // every serve would resurrect stale (possibly superseded or expired)
+    // session cookies over and over.
+    if let Some(entry) = cached.as_ref() {
+        if entry.status < 400
+            && fresh_until(&entry.headers, entry.cached_at).is_some_and(|until| until > now)
+        {
+            debug!(
+                "GET {url} served fresh from cache ({} B, cached at {}, no revalidation)",
+                entry.body.len(),
+                entry.cached_at
+            );
+            // DevTools sees the served document as one completed request for
+            // the original URL, mirroring the revalidated-hit rule (the
+            // cached entry's status/size); there is no wire time, so the
+            // duration is 0.
+            if let Some(report) = report {
+                report(net_ok("GET", url, entry.status, entry.body.len() as u64, 0));
+            }
+            let entry = cached.expect("fresh hit implies a cached entry");
+            return Ok(FetchOutcome {
+                final_url: url.clone(),
+                status: entry.status,
+                headers: entry.headers,
+                body: entry.body,
+                from_cache: true,
+            });
+        }
+    }
 
     let mut current = url.clone();
     let mut method = post; // POST -> GET conversions happen on redirect
@@ -3436,6 +3479,163 @@ mod tests {
         .expect("navigation 2");
         let echoed = String::from_utf8_lossy(&second.body).to_string();
         assert_eq!(echoed, "back=1", "Passthrough navigation never returned the cookie");
+    }
+
+    // -- explicit freshness: a fresh entry never costs a round trip ---------
+    //
+    // A counting HTTP/1.0 server that answers each route with a fixed
+    // `Cache-Control` and records EVERY request path. The assertion that
+    // matters is on the counter: an explicitly fresh second fetch must be
+    // invisible to the server (zero requests), while no-store/no-cache/
+    // must-revalidate responses keep hitting the wire twice, as before.
+
+    /// Spawn the counting `Cache-Control` server: `(path, cache_control)`
+    /// routes, plus the shared request log (`path` per request received).
+    fn spawn_cache_control_server(
+        routes: Vec<(&str, &str)>,
+    ) -> (u16, std::sync::Arc<Mutex<Vec<String>>>) {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind loopback");
+        let port = listener.local_addr().expect("addr").port();
+        let seen: std::sync::Arc<Mutex<Vec<String>>> = Default::default();
+        let routes: Vec<(String, String)> = routes
+            .into_iter()
+            .map(|(p, cc)| (p.to_string(), cc.to_string()))
+            .collect();
+        let seen_thread = std::sync::Arc::clone(&seen);
+        std::thread::spawn(move || {
+            for stream in listener.incoming().flatten() {
+                let mut stream = stream;
+                let mut buf: Vec<u8> = Vec::new();
+                let mut byte = [0u8; 1];
+                while !buf.ends_with(b"\r\n\r\n") {
+                    match stream.read(&mut byte) {
+                        Ok(0) | Err(_) => break,
+                        Ok(_) => buf.push(byte[0]),
+                    }
+                    if buf.len() > 64 * 1024 {
+                        break;
+                    }
+                }
+                let head = String::from_utf8_lossy(&buf).to_string();
+                let path = head.split_whitespace().nth(1).unwrap_or("/").to_string();
+                seen_thread.lock().expect("seen").push(path.clone());
+                let cache_control = routes
+                    .iter()
+                    .find(|(p, _)| *p == path)
+                    .map(|(_, cc)| cc.clone())
+                    .unwrap_or_default();
+                let body = format!("served {path}");
+                let mut response = format!(
+                    "HTTP/1.0 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\n",
+                    body.len()
+                );
+                if !cache_control.is_empty() {
+                    response.push_str(&format!("Cache-Control: {cache_control}\r\n"));
+                }
+                response.push_str("Connection: close\r\n\r\n");
+                response.push_str(&body);
+                let _ = stream.write_all(response.as_bytes());
+                let _ = stream.flush();
+            }
+        });
+        (port, seen)
+    }
+
+    #[test]
+    fn explicitly_fresh_entry_is_served_with_zero_network_requests() {
+        let (port, seen) = spawn_cache_control_server(vec![("/f", "max-age=3600")]);
+        let mut jar = CookieJar::new();
+        let cache = test_cache("fresh-direct");
+        let url = get(&format!("http://127.0.0.1:{port}/f"));
+        let client = worker_for_test().managed_client();
+
+        let events: std::sync::Arc<Mutex<Vec<NetEvent>>> = Default::default();
+        let report = |event: NetEvent| events.lock().expect("events").push(event);
+
+        let first = managed_http_fetch_report(
+            client,
+            &url,
+            &mut jar,
+            &cache,
+            now_unix(),
+            None,
+            None,
+            true,
+            USER_AGENT,
+            Some(&report),
+        )
+        .expect("first fetch");
+        assert!(!first.from_cache, "the first fetch has no entry to serve");
+
+        let second = managed_http_fetch_report(
+            client,
+            &url,
+            &mut jar,
+            &cache,
+            now_unix(),
+            None,
+            None,
+            true,
+            USER_AGENT,
+            Some(&report),
+        )
+        .expect("second fetch");
+        assert!(second.from_cache, "a max-age=3600 entry must be served fresh");
+        assert_eq!(second.status, 200);
+        assert_eq!(String::from_utf8_lossy(&second.body), "served /f");
+
+        // The wire is the judge: the server saw exactly ONE request — the
+        // second fetch never happened on the network at all.
+        let requests = seen.lock().expect("seen").clone();
+        assert_eq!(
+            requests,
+            vec!["/f".to_string()],
+            "a fresh entry must not cost a revalidation round trip"
+        );
+
+        // DevTools: one event per fetch, the direct serve reporting the
+        // cached entry's status/size with duration 0.
+        let events = events.lock().expect("events").clone();
+        assert_eq!(events.len(), 2, "one event per fetch");
+        assert_eq!(events[1].status, Some(200));
+        assert_eq!(events[1].duration_ms, Some(0));
+        assert_eq!(
+            events[1].url,
+            format!("http://127.0.0.1:{port}/f"),
+            "the direct serve reports the ORIGINAL url"
+        );
+    }
+
+    #[test]
+    fn no_store_no_cache_and_must_revalidate_always_hit_the_wire() {
+        let (port, seen) = spawn_cache_control_server(vec![
+            ("/ns", "no-store, max-age=3600"),
+            ("/nc", "no-cache, max-age=3600"),
+            ("/mr", "must-revalidate, max-age=3600"),
+            ("/pr", "proxy-revalidate, max-age=3600"),
+        ]);
+        for path in ["/ns", "/nc", "/mr", "/pr"] {
+            let mut jar = CookieJar::new();
+            let cache = test_cache(&format!("stale-{path}").replace('/', "-"));
+            let url = get(&format!("http://127.0.0.1:{port}{path}"));
+            let client = worker_for_test().managed_client();
+            for round in 1..=2 {
+                let outcome =
+                    managed_http_fetch(client, &url, &mut jar, &cache, now_unix(), None, None, true)
+                        .unwrap_or_else(|e| panic!("{path} round {round}: {e}"));
+                assert!(
+                    !outcome.from_cache,
+                    "{path} round {round} must never be served from cache"
+                );
+            }
+            let hits = seen
+                .lock()
+                .expect("seen")
+                .iter()
+                .filter(|p| p.as_str() == path)
+                .count();
+            assert_eq!(hits, 2, "{path}: both fetches must reach the server");
+        }
     }
 }
 

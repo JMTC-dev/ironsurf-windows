@@ -24,7 +24,9 @@ mod cache;
 mod cookies;
 mod registry;
 
-pub use cache::{CachedEntry, NetCache, DEFAULT_MAX_ENTRIES, DEFAULT_MAX_TOTAL_BYTES};
+pub use cache::{
+    fresh_until, CachedEntry, NetCache, DEFAULT_MAX_ENTRIES, DEFAULT_MAX_TOTAL_BYTES,
+};
 pub use cookies::{Cookie, CookieJar};
 pub use registry::{Store, StoreError, MAX_USERSCRIPT_CODE_BYTES, MAX_USERSCRIPT_NAME_CHARS};
 

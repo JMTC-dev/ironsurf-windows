@@ -514,6 +514,13 @@ in `ironsurf-tab/src/netmod.rs` and pass `Arc<OurProvider>` as `DocumentConfig.n
   `CookieJar`, capture `Set-Cookie` into the jar, serve from `NetCache` with ETag/
   If-None-Match revalidation, and enforce https-upgrade policy (http: → try https, block
   page on failure; `about:`/`file://`/local fixtures exempt).
+  Companion rule: entries the server declared **explicitly fresh** (`Cache-Control`
+  `max-age`/`s-maxage`/`Expires`, explicit freshness only — no heuristics, and none of
+  `no-store`/`no-cache`/`must-revalidate`/`proxy-revalidate`; analysed by the pure
+  `ironsurf_storage::fresh_until` from the cached headers at lookup time) are served
+  straight from the cache without touching the network — and without re-capturing the
+  stored `Set-Cookie`s, which were already applied when the response first arrived;
+  everything else keeps the revalidation path.
 - Main-document navigations always go through our own reqwest fetcher in the tab process
   (not via NetProvider), so the managed policy always applies to top-level requests
   regardless of provider mode. Concretely: **the container cookie jar is always
@@ -562,7 +569,9 @@ in `ironsurf-tab/src/netmod.rs` and pass `Arc<OurProvider>` as `DocumentConfig.n
   and provider subresources (`<img>`, `<script src>`, CSS) alike. A completed request carries
   method/status/bytes/duration; a failed one carries `error: Some(…)`, `status: None` — never
   both. `data:` and unsupported schemes report nothing (no-spam); revalidated cache hits
-  report the cached entry's status/size. The shell appends these into the per-tab network log.
+  report the cached entry's status/size, and a direct fresh serve (no network at all) is
+  one event for the original URL with that same status/size and duration 0. The shell
+  appends these into the per-tab network log.
 
 ### DevTools CSS seam (`src/logging.rs`)
 
