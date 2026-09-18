@@ -920,6 +920,13 @@ impl FetchWorker {
             .use_rustls_tls()
             .redirect(reqwest::redirect::Policy::limited(10))
             .timeout(timeout)
+            .pool_max_idle_per_host(16)
+            .connect_timeout(std::time::Duration::from_secs(10))
+            .tcp_nodelay(true)
+            // HTTP/2 keep-alive + adaptive flow control (multiplexed tabs).
+            .http2_keep_alive_interval(std::time::Duration::from_secs(30))
+            .http2_keep_alive_timeout(std::time::Duration::from_secs(10))
+            .http2_adaptive_window(true)
             .build()
             .expect("reqwest client");
         // Managed fetches follow redirects themselves: reqwest's automatic
@@ -930,6 +937,9 @@ impl FetchWorker {
             .use_rustls_tls()
             .redirect(reqwest::redirect::Policy::none())
             .timeout(timeout)
+            .pool_max_idle_per_host(16)
+            .connect_timeout(std::time::Duration::from_secs(10))
+            .tcp_nodelay(true)
             .build()
             .expect("reqwest manual-redirect client");
         FetchWorker {

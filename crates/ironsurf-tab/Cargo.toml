@@ -11,7 +11,10 @@ ironsurf-sandbox = { path = "../ironsurf-sandbox" }
 url = { workspace = true }
 libc = "0.2"
 euclid = "0.22"
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "blocking"] }
+# 0.13 (same major blitz-net pins — one reqwest in the tree): its blocking
+# builder is where the HTTP/2 keep-alive/adaptive-window knobs live, and
+# `rustls-tls` was renamed `rustls` there.
+reqwest = { version = "0.13", default-features = false, features = ["rustls", "blocking", "gzip", "brotli", "deflate", "http2", "charset"] }
 
 # Engine stack (ARCHITECTURE.md, pinned; pure Rust — no mozjs, no wgpu/GPU)
 blitz-dom = "0.3.0-beta.2"
