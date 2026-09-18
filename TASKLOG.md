@@ -1,4 +1,11 @@
 # Task log
+## #56 Alt-1 … Alt-9 switch to the N-th tab, dynamically: keymap reports the digit only (`Shortcut::SelectTab(n)`);
+  `tab_index_for_digit(n, tab_count)` resolves it **at press time** (1…8 = that position while it exists, 9 = **last** tab
+  from nine on, no tab behind it ⇒ dropped), so closing a tab re-slots every shortcut by itself; inverse `tab_shortcut_digit`
+  feeds the new `TabInfo.shortcut` so each tab paints the Alt-key reaching it today (positions behind the last show none).
+  Alt-digits accepted plain, meta-escaped (`0xB1`…`0xB9`) and shifted (`!`…`(`); 3 keymap units + tests/tab_switch_shortcuts.rs
+  (real App/fake_tab: 3 tabs → Alt-1/2/3, Alt-9 dropped, close front tab ⇒ old Alt-3 tab answers Alt-2, 11 tabs ⇒ Alt-9 = last,
+  badges 8/""/9, close last ⇒ Alt-9 follows the end), welcome page + ARCH §ironsurf-shell synced; shell 104u green, ws check clean.
 ## #55 Fresh cache entries skip the network: storage gains pure `fresh_until(headers, cached_at)` — explicit
   freshness only (Cache-Control s-maxage>max-age>Expires via a tiny IMF-fixdate parser; no-store/no-cache/
   must-revalidate/proxy-revalidate ⇒ None; quoted values, folded headers, `-1`/garbage ⇒ revalidate), nothing new
@@ -83,15 +90,3 @@
   test. tab 185u (write/style/dir-attr/restyle units) + userscripts e2e “DOM reflector” (write+style+dir over the
   wire), common/storage green, workspace check clean; ARCH §JavaScript reflection bullet.
 ## #40 Userscript MENU in the shell (step 4/5): glyph-free "US" toolbar button right of ＋ toggles a right-docked overlay (container-manager pattern, never PopupWindow; the two never stack — each closes the other). Rows: enable CheckBox persisted at once via Store::set_userscript_enabled, bold name, dim ", "-joined patterns, ✕ delete; "+ New script" inline editor (name/patterns LineEdits — patterns comma/space-split — multi-line TextInput for code); a rejected Save keeps the draft, shows the StoreError on one line, script NOT added. Broadcast: every mutation AND tab spawn/respawn sends ToTab::SetUserscripts with all ENABLED scripts to every live tab (crashed/closed skipped, send failures ignored — the crash reporter owns those); disabled never sent. Pure src/userscripts.rs (rows, enabled-only payload, parse_patterns, tempdir-Store reopen round-trips); fake_tab --expect-userscripts echoes "userscripts:[ids]" on its status line; tests/userscripts.rs drives save/validate/toggle/re-toggle/delete/seed/manager-exclusion over the real pipe; state.rs console_rows covers "[userscript] Name: msg"; shell 53u + all suites, common 27, storage green; ARCH §ironsurf-shell bullet added.
-## #39 Userscripts execute in the tab (step 3/5): Tab stores ToTab::SetUserscripts (replace-wholesale; empty clears) and run_scripts ends with run_userscripts(url) —
-  once per document (incl. JS-redirect targets), userscripts_for_url filtered at run time, shell store order, same Boa realm via JsRuntime::run_userscript(name, code,
-  doc) with HostState::userscript naming the running script for that evaluation only: its console.* ships as ConsoleLog source "userscript" "{name}: {text}" (page keeps
-  "js" verbatim; ConsoleLine carries the author), a throw as "userscript"/error "{name}: {err}" + StatusText "Userscript error in {name}", caught per script so the tab
-  lives. 3 js.rs units + tests/userscripts.rs 3 localhost wire tests (patcher title, 'Boom script' named, unmatched silent, page-first order, empty clears, redirect re-runs, confirm() answered + attributed, alive+frame); tab 180u + every suite green, workspace check clean (fake_tab gained the missing SetUserscripts arm); ARCH/common docs name the source.
-## #37 Userscripts IPC contract (step 1/5, common only): Userscript{id,name,patterns,code,enabled} +
-  ToTab::SetUserscripts{scripts} (shell sends all ENABLED scripts; tab filters per document URL every
-  navigation; empty vec clears), userscript_matches + userscripts_for_url (case-insensitive; bare `*`;
-  exact full-URL; `host/path` no-scheme sugar; `*domain[/path]` host-boundary wildcard — subdomains yes,
-  notexample.com never; non-http(s) schemes exact-only). ARCH snippet synced; common 27 green (round-trip
-  empty/one/unicode + table-driven matching + enabled filtering); tab/shell untouched (expected to gain
-  the match arm in later steps).

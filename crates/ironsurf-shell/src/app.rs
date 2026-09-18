@@ -781,6 +781,23 @@ impl Core {
         }
     }
 
+    /// `Alt-1` … `Alt-9`: activate the N-th tab, resolved against the tab list
+    /// **as it is right now** (see [`keymap::tab_index_for_digit`]): `Alt-9` is
+    /// the last tab from nine tabs on, so the mapping slides with every tab
+    /// that opens or closes. A digit with no tab behind it does nothing.
+    fn select_tab_by_digit(&self, digit: u8) {
+        let count = self.procs.borrow().len();
+        let Some(idx) = keymap::tab_index_for_digit(digit, count) else {
+            debug!("Alt-{digit} dropped: no tab for that key with {count} tab(s)");
+            return;
+        };
+        if Some(idx) == self.active_proc_index() {
+            debug!("Alt-{digit}: tab {idx} is already active");
+            return;
+        }
+        self.activate_tab(idx);
+    }
+
     /// Only the active tab renders; background tabs throttle themselves.
     fn set_visible_except(&self) {
         let active = self.active_tab_id();
@@ -848,6 +865,10 @@ impl Core {
             }
             Some(Shortcut::CycleTab) => {
                 self.cycle_tab();
+                return;
+            }
+            Some(Shortcut::SelectTab(digit)) => {
+                self.select_tab_by_digit(digit);
                 return;
             }
             Some(Shortcut::ZoomIn) => {
@@ -2572,6 +2593,12 @@ impl Core {
                         .unwrap_or("#9e9e9e"),
                 ),
                 active: i == active,
+                // Which Alt-digit reaches this tab today (empty when none
+                // does), recomputed on every snapshot so the strip always
+                // shows the live mapping.
+                shortcut: keymap::tab_shortcut_digit(i, procs.len())
+                    .map(|d| format!("{d}").into())
+                    .unwrap_or_default(),
             })
             .collect();
         ui.set_tabs(ModelRc::from(Rc::new(VecModel::from(tabs))));

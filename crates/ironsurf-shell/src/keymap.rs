@@ -4,9 +4,9 @@
 //! characters for special keys, e.g. `Tab` is `"\t"`, arrows are the
 //! private-use code points from the Slint key table). We map those to the
 //! DOM `key`/`code` strings the tab hands to Servo, and we detect browser
-//! chords (Ctrl-L / F6 / Ctrl-W / Ctrl-R / Ctrl-T / Ctrl-Tab / Esc / Ctrl-+ /
-//! Ctrl-- / Ctrl-0 / F12 / Ctrl-I / Ctrl-F) here so the logic stays pure and
-//! testable.
+//! chords (Ctrl-L / F6 / Ctrl-W / Ctrl-R / Ctrl-T / Ctrl-Tab / Alt-1…Alt-9 /
+//! Esc / Ctrl-+ / Ctrl-- / Ctrl-0 / F12 / Ctrl-I / Ctrl-F) here so the logic
+//! stays pure and testable.
 
 use ironsurf_common::{KeyEvent, Modifiers};
 
@@ -23,6 +23,12 @@ pub enum Shortcut {
     NewTab,
     /// Ctrl-Tab: cycle to the next tab.
     CycleTab,
+    /// Alt-`1` … Alt-`9`: switch to the N-th tab. The digit is reported
+    /// verbatim — **which tab it lands on is resolved at press time** by
+    /// [`tab_index_for_digit`] against the live tab count, so the mapping
+    /// follows every open and close (Alt-`9` is "the last tab" from nine tabs
+    /// on, exactly like Chrome/Firefox).
+    SelectTab(u8),
     /// Ctrl-`+` (Ctrl-`=`, Ctrl-`+`): zoom the page in one step.
     ZoomIn,
     /// Ctrl-`-`: zoom the page out one step.
@@ -61,6 +67,58 @@ pub fn zoom_out(zoom: f32) -> f32 {
     round_zoom(base / ZOOM_STEP).clamp(ZOOM_MIN, ZOOM_MAX)
 }
 
+/// Highest digit an Alt-digit tab chord can use (`Alt-1` … [`ALT_TAB_DIGITS`]).
+pub const ALT_TAB_DIGITS: u8 = 9;
+
+/// Digit of an Alt-digit chord, from the character Slint hands over.
+///
+/// Plain digits (`Alt-1` … `Alt-9`) and the two spellings X11 backends deliver
+/// for the same physical keys — the meta-escaped codes `0xB1` … `0xB9` (digit
+/// | 0x80) and the shifted glyphs `!` … `(` (`Alt-Shift-1`, which `shortcut_for`
+/// cannot tell apart since it takes no shift flag).
+fn alt_tab_digit(c: char) -> Option<u8> {
+    match c {
+        '1'..='9' => Some(c as u8 - b'0'),
+        '\u{b1}'..='\u{b9}' => Some(c as u8 - 0xb0), // Alt-1 … Alt-9 (meta-escaped)
+        '!'..='(' => Some(c as u8 - 0x20),           // Alt-Shift-1 … Alt-Shift-9
+        _ => None,
+    }
+}
+
+/// Which tab does `Alt-{digit}` select in a strip of `tab_count` tabs?
+///
+/// `Alt-1` … `Alt-8` address the first eight positions literally; `Alt-9`
+/// selects the **last** tab once there are nine or more. `None` means the
+/// chord reaches no tab (the position does not exist) and the keystroke is
+/// dropped rather than guessed at.
+///
+/// This is the whole dynamic mapping: callers resolve it on every press, so a
+/// tab closing shifts every later shortcut onto a different tab by itself.
+pub fn tab_index_for_digit(digit: u8, tab_count: usize) -> Option<usize> {
+    if digit == 0 || digit > ALT_TAB_DIGITS || tab_count == 0 {
+        return None;
+    }
+    if digit == ALT_TAB_DIGITS && tab_count >= ALT_TAB_DIGITS as usize {
+        return Some(tab_count - 1); // Alt-9 = last tab
+    }
+    let idx = (digit - 1) as usize;
+    (idx < tab_count).then_some(idx)
+}
+
+/// Digit of the Alt-chord that reaches the tab at `index` of `tab_count`
+/// tabs — the inverse of [`tab_index_for_digit`], used to paint the mapping
+/// onto the tab strip so it stays visible as tabs come and go.
+pub fn tab_shortcut_digit(index: usize, tab_count: usize) -> Option<u8> {
+    if index >= tab_count {
+        return None;
+    }
+    if index + 1 >= ALT_TAB_DIGITS as usize {
+        // Positions 9 and beyond share Alt-9, which lands on the last tab only.
+        return (index + 1 == tab_count).then_some(ALT_TAB_DIGITS);
+    }
+    Some((index + 1) as u8)
+}
+
 #[inline]
 pub fn mods(ctrl: bool, shift: bool, alt: bool, meta: bool) -> Modifiers {
     Modifiers::new(
@@ -95,6 +153,11 @@ pub fn shortcut_for(text: &str, ctrl: bool, alt: bool, meta: bool) -> Option<Sho
     // U+F704 + 5 = U+F709 in the same private-use table as F12 above.
     if c == '\u{F709}' && !ctrl && !alt && !meta {
         return Some(Shortcut::FocusUrl);
+    }
+    // Alt-digit: switch to the N-th tab. Resolution against the live tab list
+    // happens in the shell, so the chord stays valid as tabs open and close.
+    if alt && !ctrl && !meta {
+        return alt_tab_digit(c).map(Shortcut::SelectTab);
     }
     if !ctrl || alt || meta {
         return None;
@@ -368,6 +431,90 @@ mod tests {
         // Alt/Meta chords are not browser chords (window manager etc.)
         assert_eq!(shortcut_for("l", true, true, false), None);
         assert_eq!(shortcut_for("w", true, false, true), None);
+    }
+
+    #[test]
+    fn alt_digit_chords_select_tabs_in_either_x11_spelling() {
+        for d in '1'..='9' {
+            let digit = d as u8 - b'0';
+            // each digit resolves to itself, plain and meta-escaped (0x80 | d)
+            assert_eq!(
+                shortcut_for(d.to_string().as_str(), false, true, false),
+                Some(Shortcut::SelectTab(digit)),
+                "Alt-{d}"
+            );
+            let escaped = char::from_u32(0x80 + d as u32).unwrap();
+            assert_eq!(
+                shortcut_for(escaped.to_string().as_str(), false, true, false),
+                Some(Shortcut::SelectTab(digit)),
+                "Alt-{d} (meta-escaped)"
+            );
+        }
+        assert_eq!(shortcut_for("!", false, true, false), Some(Shortcut::SelectTab(1)));
+        assert_eq!(shortcut_for("(", false, true, false), Some(Shortcut::SelectTab(8)));
+        // Alt-0 is not a tab chord (and Ctrl-0 stays zoom reset).
+        assert_eq!(shortcut_for("0", false, true, false), None);
+        // Bare digits and other modifier combos stay with the page / WM.
+        assert_eq!(shortcut_for("3", false, false, false), None);
+        assert_eq!(shortcut_for("3", true, false, false), None); // Ctrl-3: nobody's
+        assert_eq!(shortcut_for("3", true, true, false), None); // Ctrl-Alt-3
+        assert_eq!(shortcut_for("3", false, false, true), None); // Meta-3
+        assert_eq!(shortcut_for("c", false, true, false), None); // Alt-C
+        assert_eq!(shortcut_for("l", false, true, false), None); // Alt-L
+        // Alt-Tab is still nobody's tab chord (the WM cycles windows).
+        assert_eq!(shortcut_for("\t", false, true, false), None);
+    }
+
+    #[test]
+    fn alt_digit_mapping_is_resolved_against_the_live_tab_count() {
+        // Positions 1..8 are addressed literally while they exist.
+        assert_eq!(tab_index_for_digit(1, 1), Some(0));
+        assert_eq!(tab_index_for_digit(2, 3), Some(1));
+        assert_eq!(tab_index_for_digit(3, 3), Some(2));
+        // A digit past the end reaches nothing — including Alt-9 with 8 tabs.
+        assert_eq!(tab_index_for_digit(4, 3), None);
+        assert_eq!(tab_index_for_digit(9, 3), None);
+        assert_eq!(tab_index_for_digit(9, 8), None);
+        assert_eq!(tab_index_for_digit(0, 12), None);
+        assert_eq!(tab_index_for_digit(1, 0), None);
+        assert_eq!(tab_index_for_digit(10, 12), None);
+        // Alt-9 becomes "the last tab" from nine tabs on, and keeps following
+        // the end as tabs open and close underneath it.
+        assert_eq!(tab_index_for_digit(9, 9), Some(8));
+        assert_eq!(tab_index_for_digit(9, 12), Some(11));
+        assert_eq!(tab_index_for_digit(9, 250), Some(249));
+        assert_eq!(tab_index_for_digit(8, 12), Some(7));
+    }
+
+    #[test]
+    fn tab_strip_badges_are_the_inverse_of_the_chord_mapping() {
+        // Three tabs: each shows its own digit.
+        assert_eq!(tab_shortcut_digit(0, 3), Some(1));
+        assert_eq!(tab_shortcut_digit(1, 3), Some(2));
+        assert_eq!(tab_shortcut_digit(2, 3), Some(3));
+        assert_eq!(tab_shortcut_digit(3, 3), None);
+        // Closing tab 1 moves every badge (and every chord) onto a new tab:
+        // what was Alt-3 is Alt-2 now, and Alt-2's old tab answers Alt-1.
+        let before: Vec<Option<u8>> = (0..3).map(|i| tab_shortcut_digit(i, 3)).collect();
+        let after: Vec<Option<u8>> = (0..2).map(|i| tab_shortcut_digit(i, 2)).collect();
+        assert_eq!(before, vec![Some(1), Some(2), Some(3)]);
+        assert_eq!(after, vec![Some(1), Some(2)]);
+        // Eight positions keep their digits; Alt-9 takes the last tab, and the
+        // tabs behind it carry no badge.
+        assert_eq!(tab_shortcut_digit(7, 12), Some(8));
+        assert_eq!(tab_shortcut_digit(8, 12), None);
+        assert_eq!(tab_shortcut_digit(11, 12), Some(9));
+        // Exactly nine tabs: every one of them is reachable.
+        let nine: Vec<Option<u8>> = (0..9).map(|i| tab_shortcut_digit(i, 9)).collect();
+        assert_eq!(nine, (1..=9).map(Some).collect::<Vec<_>>());
+        // Every badge round-trips through the chord mapping.
+        for count in [1usize, 2, 8, 9, 10, 30] {
+            for idx in 0..count {
+                if let Some(d) = tab_shortcut_digit(idx, count) {
+                    assert_eq!(tab_index_for_digit(d, count), Some(idx), "{idx} of {count}");
+                }
+            }
+        }
     }
 
     #[test]

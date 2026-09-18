@@ -16,6 +16,10 @@ export struct TabInfo {
     title: string,
     color: color,
     active: bool,
+    /// Digit of the Alt-chord that reaches this tab today ("1" … "9"; empty
+    /// when no chord does). Rust recomputes it from the live tab order, so the
+    /// badge always shows where Alt-1 … Alt-9 land right now.
+    shortcut: string,
 }
 
 export struct ContainerInfo {
@@ -572,7 +576,7 @@ export component AppWindow inherits Window {
 
                     for tab[idx] in tabs: Rectangle {
                         height: 24px;
-                        width: Math.min(220px, Math.max(90px, tt.preferred-width + 44px));
+                        width: Math.min(220px, Math.max(90px, tt.preferred-width + (tab.shortcut == "" ? 44px : 61px)));
                         tbgr := Rectangle {
                             background: tab.active ? #3a3a3a : #2e2e2e;
                             border-radius: 4px;
@@ -586,12 +590,23 @@ export component AppWindow inherits Window {
                             border-radius: 2px;
                             background: tab.color;
                         }
+                        // Alt-digit badge: which Alt-N lands here today. It is
+                        // re-rendered from the tab order on every snapshot, so
+                        // opening/closing tabs moves the numbers by itself.
+                        alt := Text {
+                            text: tab.shortcut;
+                            color: tab.active ? #c8c8c8 : #7a7a7a;
+                            x: 15px;
+                            width: 14px;
+                            vertical-alignment: center;
+                            horizontal-alignment: right;
+                        }
                         tt := Text {
                             text: tab.title == "" ? "New Tab" : tab.title;
                             color: tab.active ? #f0f0f0 : #999999;
-                            x: 16px;
+                            x: tab.shortcut == "" ? 16px : 33px;
                             vertical-alignment: center;
-                            max-width: parent.width - 40px;
+                            max-width: parent.width - (tab.shortcut == "" ? 40px : 57px);
                             overflow: elide;
                         }
                         xbtn := Text {

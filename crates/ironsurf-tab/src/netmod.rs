@@ -518,6 +518,8 @@ const WELCOME_PAGE: &str = r#"<!doctype html>
     <li><kbd>Ctrl-L</kbd> &mdash; focus the URL bar; type a host or a search</li>
     <li><kbd>Ctrl-T</kbd> &mdash; new tab &middot; <kbd>Ctrl-W</kbd> &mdash; close tab</li>
     <li><kbd>Ctrl-Tab</kbd> &mdash; switch tab &middot; <kbd>Ctrl-R</kbd> &mdash; reload</li>
+    <li><kbd>Alt-1</kbd> &hellip; <kbd>Alt-9</kbd> &mdash; jump to the 1st&hellip;9th tab
+     (the last tab from the ninth on); the number on each tab is its key right now</li>
     <li>middle-click a link &mdash; open it in a new tab of this container</li>
   </ul>
 

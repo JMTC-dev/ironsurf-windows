@@ -783,6 +783,14 @@ UI (`crates/ironsurf-shell/ui/ironsurf.slint`):
   the status line counts the saves, failures are logged, never fatal.
 - Menu (native or in-toolbar): New Window(v1: new tab), Close Tab (Ctrl-W), Tab Next/Prev
   (Ctrl-Tab), Open Container Manager, Clear Container Data.
+- **Alt-`1` … Alt-`9` jump to the N-th tab** (Chrome/Firefox convention): `keymap::shortcut_for`
+  reports the digit only (`Shortcut::SelectTab(n)`) and `tab_index_for_digit(n, tab_count)` resolves
+  it **at press time** against the live tab list — `Alt-1`…`Alt-8` address those positions while they
+  exist, `Alt-9` selects the **last** tab from nine tabs on, a digit with no tab behind it does
+  nothing. The mapping is therefore dynamic by construction (no stored per-tab key): closing a tab
+  re-slots every remaining shortcut. The inverse, `tab_shortcut_digit(index, tab_count)`, feeds
+  `TabInfo.shortcut` so each tab paints the Alt-key that reaches it today (tabs 9+ behind the last
+  show none).
 
 Process/tab management (`src/tabs.rs`):
 - `struct TabProc { id, container, child: Child, stdin, stdout, title, url, loading, can_back, can_fwd, frame: slint::Image, last_frame_age }`
