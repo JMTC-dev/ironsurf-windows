@@ -1,4 +1,9 @@
 # Task log
+## #52 One shared FetchWorker per process: BlitzNetProvider::new now takes shared_worker() (the static OnceLock already
+  used by fetch_document_report) instead of FetchWorker::new(), so a tab's document, scripts, subresources and media all ride
+  ONE reqwest pool (keep-alive, TLS sessions, DNS cache) — previously two clients could never share connections. Grep-verified
+  no other production FetchWorker::new/default/with_timeout remains (only test-only worker_for_test with_timeout left);
+  with_worker() override kept for custom-timeout tests. tab all suites green, cargo check --workspace clean.
 ## #51 Transport tuning (tab): reqwest 0.12→0.13 (one reqwest in the tree with blitz-net; `rustls-tls`→`rustls`) + gzip/brotli/
   deflate/charset features; FetchWorker::built both clients gain pool_max_idle_per_host(16), connect_timeout(10s), tcp_nodelay; main
   client also HTTP/2 keep-alive interval 30s/timeout 10s + adaptive window (0.12's blocking builder lacked the keep-alive knobs — reason

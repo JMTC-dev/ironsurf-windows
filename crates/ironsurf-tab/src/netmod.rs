@@ -1402,7 +1402,9 @@ impl BlitzNetProvider {
     pub fn new(policy: NetPolicy, jar: CookieJar, cache: NetCache) -> Self {
         BlitzNetProvider {
             policy,
-            worker: FetchWorker::new(),
+            // One process-wide FetchWorker: documents, scripts, subresources
+            // and media share a single reqwest pool (keep-alive, TLS, DNS).
+            worker: shared_worker(),
             jar: Arc::new(Mutex::new(jar)),
             cache: Arc::new(Mutex::new(cache)),
             waker: Arc::new(Mutex::new(None)),
