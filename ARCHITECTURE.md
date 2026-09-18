@@ -713,8 +713,14 @@ UI (`crates/ironsurf-shell/ui/ironsurf.slint`):
 - Container manager popup: list containers (color swatch), add/rename/choose color (fixed
   palette), "delete container (+ data)", per-tab "Move tab to container ▸" submenu (move =
   respawn tab process keeping URL), "New tab in container".
-- Status bar: status text + loading spinner (timer animation) + https/lock indicator
-  (⛬ / http warning).
+- Status bar: **loading progress bar** at the left-hand end (visible only while the active
+  tab loads): a 96 px recessed track with a 24 px lit segment sweeping along it
+  (`load-progress` 0…11, 4 px a step, ping-ponging; the spinner timer's 120 ms tick
+  advances it and every load start zeroes it — `load_sweep_position`), and the text
+  column indents past it while it is up. The tab protocol reports a load as one bool
+  (no byte counts), so the progress is honestly indeterminate and the sweep is the
+  progress. Then status text + loading spinner (timer animation) + https/lock
+  indicator (⛬ / http warning).
 - DevTools panel (F12 / Ctrl-I toggle, per tab): bottom-docked overlay Rectangle over the
   page area (never a `PopupWindow` — LinuxKMS has no popups), header [Console ‹n› |
   Network ‹n› | ✕] plus a Console view (level icon + colour, `[source] message`) and a

@@ -66,6 +66,29 @@ pub const PALETTE: [&str; 7] = [
 
 const SPINNER_FRAMES: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
 
+/// Half-length of the loading-bar sweep, in 4 px steps along the status bar's
+/// 96 px track: the lit segment walks positions 0 … 11 out and back, one full
+/// round trip every 24 spinner ticks (≈ 2.9 s at 120 ms a tick). Keep in sync
+/// with the `load-track` geometry in ui/ironsurf.slint.
+pub const LOAD_SWEEP_STEPS: usize = 12;
+
+/// Sweep position of the loading bar after `step` ticks: a triangle wave
+/// between the track's ends — out (`0 … 11`), then back (`11 … 0`) — so the
+/// segment moves on every tick but the single one where it turns, and an
+/// in-flight load never reads as a stalled bar.
+/// `LOAD_SWEEP_STEPS` (one track length) is not a position; the far end is
+/// `LOAD_SWEEP_STEPS - 1`, where the lit segment shrinks against the track's
+/// end instead of hanging off it.
+pub fn load_sweep_position(step: usize) -> usize {
+    let period = LOAD_SWEEP_STEPS * 2;
+    let n = step % period;
+    if n < LOAD_SWEEP_STEPS {
+        n
+    } else {
+        (period - 1) - n
+    }
+}
+
 struct Proc {
     tab: TabProc,
     state: TabState,
@@ -172,6 +195,12 @@ pub struct Core {
     extra_tab_args: Vec<String>,
     spawn_error: RefCell<Option<String>>,
     spinner: Cell<usize>,
+    /// Loading-bar state (status bar, left-hand end): the sweep step (0…12
+    /// along the track) and whether the **previous** spin-tick saw the active
+    /// tab loading — the transition between the two is what re-arms the sweep
+    /// from the left edge (see [`Core::tick_spinner`]).
+    load_step: Cell<usize>,
+    prev_loading: Cell<bool>,
     last_page: Cell<(f32, f32)>,
     /// Pointer-move rate limiting (see [`move_due`]): when the last move was
     /// forwarded, and the newest move that was dropped because it was sent too
@@ -290,6 +319,8 @@ impl App {
             extra_tab_args,
             spawn_error: RefCell::new(None),
             spinner: Cell::new(0),
+            load_step: Cell::new(0),
+            prev_loading: Cell::new(false),
             last_page: Cell::new((0.0, 0.0)),
             last_move_at: Cell::new(None),
             pending_move: Cell::new(None),
@@ -2555,12 +2586,38 @@ impl Core {
         }
     }
 
-    fn tick_spinner(&self) {
+    /// Advance the status-bar spinner **and** the loading bar one tick. The
+    /// spinner timer calls this every 120 ms whether or not anything is
+    /// loading; everything below is a no-op (`" "`, hidden bar, step 0) while
+    /// the active tab is idle.
+    pub fn tick_spinner(&self) {
         let Some(ui) = self.ui() else { return };
         let loading = self
             .active_proc_index()
             .map(|i| self.procs.borrow()[i].state.loading)
             .unwrap_or(false);
+        // Loading bar: the step only advances while a load is in flight, and
+        // starts over the moment one begins — so every navigation sweeps from
+        // the track's left end, wherever a previous (or background tab's)
+        // load had got to.
+        let step = if loading {
+            if self.prev_loading.get() {
+                (self.load_step.get() + 1) % (LOAD_SWEEP_STEPS * 2)
+            } else {
+                0
+            }
+        } else {
+            0
+        };
+        self.prev_loading.set(loading);
+        self.load_step.set(step);
+        if ui.get_loading() != loading {
+            ui.set_loading(loading);
+        }
+        let progress = load_sweep_position(step) as i32;
+        if ui.get_load_progress() != progress {
+            ui.set_load_progress(progress);
+        }
         let want: SharedString = if loading {
             let i = (self.spinner.get() + 1) % SPINNER_FRAMES.len();
             self.spinner.set(i);
@@ -3115,6 +3172,36 @@ fn follows_archive_root(saved_root: Option<&str>) -> bool {
 mod tests {
     use super::*;
 
+    #[test]
+    fn the_loading_bar_sweep_rolls_the_full_track_and_back() {
+        // Positions over one round trip (24 ticks), straight out and back.
+        let out: Vec<usize> = (0..LOAD_SWEEP_STEPS).collect();
+        let back: Vec<usize> = (0..LOAD_SWEEP_STEPS).rev().collect();
+        let trip: Vec<usize> = out.iter().chain(back.iter()).copied().collect();
+        for step in 0..60 {
+            let p = load_sweep_position(step);
+            assert_eq!(
+                p, trip[step % trip.len()],
+                "step {step}: sweep drifted off the triangle wave"
+            );
+            assert!(p < LOAD_SWEEP_STEPS, "step {step} left the track: {p}");
+        }
+        // A position never repeats for three ticks running: the triangle wave
+        // touches each end once per round trip and keeps rolling, so an
+        // in-flight load cannot sit painted in one place long enough to read
+        // as a stalled bar.
+        for step in 2..60 {
+            let (a, b, c) = (
+                load_sweep_position(step - 2),
+                load_sweep_position(step - 1),
+                load_sweep_position(step),
+            );
+            assert!(
+                !(a == b && b == c),
+                "step {step}: the segment stood still ({a}) for three ticks"
+            );
+        }
+    }
     #[test]
     fn the_first_move_always_passes() {
         let now = Instant::now();

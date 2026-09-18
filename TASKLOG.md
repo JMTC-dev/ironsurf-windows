@@ -1,4 +1,12 @@
 # Task log
+## #57 Loading bar in the status bar's left-hand end: AppWindow gains `loading` + `load-progress` (0…11), `Core::tick_spinner`
+  (120 ms timer, now pub) drives them from the **active tab's** `loading` state — the step only advances while a load is in flight and
+  zeroes when one starts, `load_sweep_position` folds it to a triangle wave (out 0…11, back 11…0, never 3 ticks in one place); ui draws a
+  96×4 recessed track (#3a3a3a) with a 24 px lit segment (#5b9dd9) shrinking at the far end, and the text column indents 106 px while it is up
+  (rects live outside the layout so an empty one cannot push the spinner). Loading is one bool on the wire — no byte counts — so the sweep is
+  the progress honestly. Sweep unit test + tests/loading_bar.rs (real ironsurf-tab: fast fixture idle → navigate to a 3 s blocking-script page →
+  window shows the load in flight, segment travels, both drop when the tab finishes; :2.0 screenshots confirm 4 px/tick travel); shell 102u + all
+  suites green, ws check clean; ARCH §Status bar synced.
 ## #56 Alt-1 … Alt-9 switch to the N-th tab, dynamically: keymap reports the digit only (`Shortcut::SelectTab(n)`);
   `tab_index_for_digit(n, tab_count)` resolves it **at press time** (1…8 = that position while it exists, 9 = **last** tab
   from nine on, no tab behind it ⇒ dropped), so closing a tab re-slots every shortcut by itself; inverse `tab_shortcut_digit`

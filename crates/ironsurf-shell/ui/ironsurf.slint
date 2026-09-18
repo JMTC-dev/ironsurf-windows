@@ -282,6 +282,18 @@ export component AppWindow inherits Window {
     in property <string> sec-glyph: "";
     in property <color> sec-color: #888888;
     in property <string> spinner: " ";
+    /// Whether the **active** tab is loading (a copy of its `loading` state,
+    /// pushed by Rust with every `LoadingChanged` / UI sync). Drives the
+    /// indeterminate progress bar at the left end of the status bar: the bar
+    /// only exists while this is true, and each transition re-triggers its
+    /// sweep animation from the left edge.
+    in property <bool> loading: false;
+    /// Sweep position of the loading bar: 0 … 12, where 0 sits the lit
+    /// segment at the track's left end and 12 at its right end (4 px a step,
+    /// 96 px wide track). Rust advances it from the spinner timer — one step
+    /// per 120 ms while a load is in flight, ping-ponging — and zeroes it the
+    /// instant a load starts, so every navigation begins the sweep afresh.
+    in property <int> load-progress: 0;
     in property <string> container-label: "";
     in property <bool> can-back: false;
     in property <bool> can-fwd: false;
@@ -850,12 +862,49 @@ export component AppWindow inherits Window {
             height: 24px;
             background: #2b2b2b;
 
+            // ---- loading progress bar -----------------------------------------
+            // Website loading progress, left-hand end of the status bar: a
+            // recessed track with a brighter segment sweeping across it while
+            // the active tab loads. The tab protocol reports loading as a
+            // single bool (no byte counts), so the progress is honestly
+            // indeterminate — the sweep *is* the progress.
+            //
+            // The rects sit *outside* the layout below, pinned to the track:
+            // a layout gives its items no geometry until they have content,
+            // and an always-empty Rectangle must never push the spinner text
+            // off the left edge.
+            load-track := Rectangle {
+                x: 10px;
+                y: (parent.height - self.height) / 2;
+                width: 96px;
+                height: 4px;
+                visible: root.loading;
+                border-radius: 2px;
+                background: #3a3a3a;
+
+                // The lit segment: a fixed-size (a quarter of the track)
+                // window sliding from the left end to the right end and back.
+                load-segment := Rectangle {
+                    // 12 steps × 4 px = the 96 px track; the track's own
+                    // border-radius keeps the segment's corners round when it
+                    // sits at either end.
+                    x: root.load-progress * 4px;
+                    width: Math.min(24px, parent.width - root.load-progress * 4px);
+                    height: parent.height;
+                    background: #5b9dd9;
+                    border-radius: 2px;
+                }
+            }
+
             HorizontalLayout {
                 x: 10px;
                 height: parent.height;
                 cross-axis-alignment: center;
                 spacing: 8px;
 
+                // The bar owns the left edge: while it is up the text column
+                // starts after it instead of under it.
+                Rectangle { width: root.loading ? 106px : 0px; height: 1px; }
                 Text { text: root.spinner; color: #bbbbbb; }
                 Text { text: root.sec-glyph; color: root.sec-color; }
                 st := Text {
