@@ -1374,3 +1374,162 @@ fn search_bar_with_hidden_inputs_is_clickable_and_typeable() {
 
     exit_cleanly(&mut tab);
 }
+
+// ---------------------------------------------------------------------------
+// DDG html-lite anomaly challenge: "select all squares with a duck" tiles.
+// The page ships NO JavaScript at all — selection is pure HTML: every tile is
+// `<label for=image-check_X>` wrapping a `display:none` checkbox, and the
+// checked state paints via `:checked` CSS (blitz's label-activation forwards
+// a click on the image/label to the bound input, which toggles CHECKED and
+// restyles). The user reported the tiles cannot be selected. The fixture
+// reproduces the modal's real CSS verbatim (lc.css anomaly rules), a
+// transparent 1x1 GIF stretched over a red tile background stands in for the
+// JPEGs, and the probe is pixel-honest: clicking a tile must change THAT
+// tile's pixels (the checked checkbox appears at the tile corner per
+// `.anomaly-modal__check:checked{position:absolute;top:12px;left:12px;
+// display:block}`) and clicking must not do nothing.
+
+const ANOMALY_FIXTURE: &str = r#"<!doctype html>
+<html>
+<head><title>Challenge</title>
+<style>
+  body { margin: 0; background: #ffffff; }
+  .anomaly-modal__mask{position:absolute;top:0;right:0;left:0;width:100vw;min-height:100vh;z-index:15;display:flex;justify-content:center;align-items:center;background:#ddd}
+  .anomaly-modal__modal{width:424px;max-width:75vw;min-height:540px;background:white;border-radius:12px;display:flex;flex-direction:column;align-items:center;padding:29px 29px 0 29px}
+  .anomaly-modal__title{margin:0 0 6px 0;font-size:20px;line-height:28px;text-align:center}
+  .anomaly-modal__instructions{text-align:center;font-size:16px;line-height:20px;width:100%}
+  .anomaly-modal__puzzle{display:flex;flex-direction:row;flex-wrap:wrap;margin:0 -2.5px}
+  .anomaly-modal__puzzle-margins{max-width:310px;margin:14px auto 20px auto}
+  .anomaly-modal__box{position:relative;flex-grow:1;width:100px;height:100px;flex-basis:30%;box-sizing:border-box;overflow:hidden;padding:1px}
+  .anomaly-modal__box:before{content:"";display:block;padding-top:100%;float:left}
+  .anomaly-modal__box label::before{display:block;content:"█";font-size:1000px;position:absolute;color:rgba(0,0,0,0)}
+  .anomaly-modal__check{display:none;top:12px;left:12px}
+  .anomaly-modal__check:checked{position:absolute;display:block}
+  .anomaly-modal__image{width:100%;height:100%;padding:0;flex-grow:1;max-width:100%;z-index:-1}
+  label{cursor:pointer}
+  .box-bg { background: #ff0000; display: block; width: 100%; height: 100%; }
+</style></head>
+<body>
+<form id="challenge-form" action="/html/" method="POST">
+<div class="anomaly-modal__mask">
+  <div class="anomaly-modal__modal">
+    <div class="anomaly-modal__title">Unfortunately, bots use DuckDuckGo too.</div>
+    <div class="anomaly-modal__instructions">Select all squares containing a duck:</div>
+    <div class="anomaly-modal__puzzle-margins">
+      <div class="anomaly-modal__puzzle">
+"#;
+
+fn anomaly_tiles(n: usize) -> String {
+    let mut s = String::new();
+    for i in 0..n {
+        s.push_str(&format!(
+            "<div class=\"anomaly-modal__box\" data-index=\"{i}\"><label class=\"box-bg\" for=\"image-check_{i}\">\
+             <input type=\"checkbox\" class=\"anomaly-modal__check\" name=\"image-check_{i}\" id=\"image-check_{i}\">\
+             <img class=\"anomaly-modal__image\" alt=\" \" src=\"data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP{slash}/yH5BAEAAAAALAAAAAABAAEAAAIBRAA7\"></label></div>",
+            slash = "/"
+        ));
+    }
+    s
+}
+
+fn anomaly_tail() -> &'static str {
+    r#"</div></div></div></form></body></html>"#
+}
+
+/// Red-pixel count inside a rectangle of a 1024-wide RGBA frame.
+fn rect_red(rgba: &[u8], x0: usize, y0: usize, x1: usize, y1: usize) -> usize {
+    let w = 1024usize;
+    (y0..y1)
+        .flat_map(|y| (x0..x1).map(move |x| (y * w + x) * 4))
+        .filter(|&o| rgba[o] > 200 && rgba[o + 1] < 60 && rgba[o + 2] < 60)
+        .count()
+}
+
+/// Locate the top-left red tile in the frame: smallest-y row containing ≥ 50
+/// red pixels, then the leftmost red pixel of that row; the tile is assumed
+/// square-ish (~100 px). Returns its centre.
+fn find_red_tile_centre(rgba: &[u8]) -> Option<(f32, f32)> {
+    let w = 1024usize;
+    let h = rgba.len() / 4 / w;
+    for y in 0..h {
+        let row = (0..w).filter(|&x| {
+            let o = (y * w + x) * 4;
+            rgba[o] > 200 && rgba[o + 1] < 60 && rgba[o + 2] < 60
+        });
+        let xs: Vec<usize> = row.collect();
+        if xs.len() >= 50 {
+            let x = xs[0] + 50;
+            return Some((x as f32 + 0.5, y as f32 + 50.0));
+        }
+    }
+    None
+}
+
+#[test]
+fn anomaly_modal_tile_click_checks_the_hidden_checkbox() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let profile = dir.path().join("profile");
+    std::fs::create_dir_all(&profile).expect("profile dir");
+    let fixture = profile.join("challenge.html");
+    std::fs::write(
+        &fixture,
+        format!("{ANOMALY_FIXTURE}{}{}", anomaly_tiles(9), anomaly_tail()),
+    )
+    .expect("write fixture");
+
+    let deadline = Instant::now() + DEADLINE;
+    let mut tab = spawn_tab(&fixture, &profile);
+    let mut seen = Vec::new();
+
+    // First full frame: the modal must be painted (red tiles findable).
+    let first = tab
+        .wait_for(
+            "modal frame with red tiles",
+            |m| {
+                matches!(m, FromTab::Frame { width, height, .. }
+                    if *width == 1024 && *height == 768)
+            },
+            deadline,
+            &mut seen,
+        );
+    let first = match &first {
+        FromTab::Frame { rgba, .. } => rgba.clone(),
+        _ => panic!("frame"),
+    };
+    let centre = find_red_tile_centre(&first).expect("a red tile is painted");
+    let before = rect_red(&first, centre.0 as usize - 50, centre.1 as usize - 50, centre.0 as usize + 50, centre.1 as usize + 50);
+    assert!(before > 8_000, "tile interior red area = {before}");
+
+    let pointer = |kind, button, x, y| {
+        ToTab::Pointer(ironsurf_common::PointerEvent { x, y, kind, button })
+    };
+    use ironsurf_common::{MouseButton, PointerKind};
+    tab.send(pointer(PointerKind::Move, MouseButton::Left, centre.0, centre.1));
+    tab.send(pointer(PointerKind::Down, MouseButton::Left, centre.0, centre.1));
+    tab.send(pointer(PointerKind::Up, MouseButton::Left, centre.0, centre.1));
+
+    // Collect frames for a window; the tile changed iff the checkbox painted.
+    let mut best_change = 0usize;
+    let collect_deadline = Instant::now() + Duration::from_millis(2000);
+    while Instant::now() < collect_deadline {
+        let frames = tab.collect(Duration::from_millis(600));
+        for m in frames {
+            if let FromTab::Frame { rgba, width, .. } = m {
+                if width != 1024 {
+                    continue;
+                }
+                let red = rect_red(&rgba, centre.0 as usize - 50, centre.1 as usize - 50, centre.0 as usize + 50, centre.1 as usize + 50);
+                best_change = best_change.max(before.saturating_sub(red));
+            }
+        }
+        if best_change > 50 {
+            break;
+        }
+    }
+    assert!(
+        best_change > 50,
+        "clicking the tile must check its hidden checkbox and repaint it (tile red lost = {best_change} px; the :checked checkbox must appear at the tile corner)"
+    );
+
+    exit_cleanly(&mut tab);
+}

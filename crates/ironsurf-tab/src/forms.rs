@@ -43,6 +43,7 @@
 //! `select` that never marked an option.
 
 use blitz_dom::{local_name, BaseDocument, ElementData, LocalName, NodeId, QualName};
+use blitz_dom::node::SpecialElementData;
 
 /// The HTML input types that render as single-line text editors (the ones
 /// whose Enter key means "submit", per the single- vs multiline flag of the
@@ -760,6 +761,175 @@ pub fn prepare_document(doc: &mut BaseDocument) {
     mutator.flush();
 }
 
+// ---------------------------------------------------------------------------
+// Label activation (DDG anomaly-challenge tiles)
+//
+// The challenge modal is 9 tiles of `<label for=image-check_X><input
+// type=checkbox class=hidden><img></label>` — clicking an image must check
+// its bound box. blitz beta.2 has label-forwarding in `handle_click`, but
+// it demonstrably dies when the input is NESTED inside the label (proven
+// with a shape matrix over the live engine: sibling-bound inputs toggle,
+// nested ones — hidden or visible — never do; implicit bindings never
+// fire). The tab therefore resolves and applies the activation itself,
+// using the same mutation pair as the JS `checked` setter (element state
+// bit + `checked` attribute via the mutator), and only where blitz's own
+// default left the state untouched — see the pointer-up wiring in runtime.
+
+/// What a label click activates, resolved while the press is still cheap to
+/// re-check (the click pair's JS `click` `preventDefault` cancels it).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LabelActivation {
+    /// The checkbox/radio `<input>` bound to the clicked `<label>`.
+    pub input: NodeId,
+    /// true ⇒ radio (click selects, never unselects), false ⇒ checkbox (toggle).
+    pub radio: bool,
+}
+
+/// Resolve a click that hit `hit` (any node) to a label activation: the
+/// nearest `<label>` at or above the hit, its bound `<input>` — `for="id"`
+/// searched across the document, else the label's first `<input>` descendant
+/// — restricted to checkbox/radio inputs.
+pub fn label_activation_target(doc: &BaseDocument, hit: NodeId) -> Option<LabelActivation> {
+    let is_label = |id: NodeId| element(doc, id).is_some_and(|el| is_tag(el, &local_name!("label")));
+    let label = if is_label(hit) {
+        hit
+    } else {
+        find_ancestor(doc, hit, is_label)?
+    };
+    let input = match attr(doc, label, local_name!("for")) {
+        // `for` wins even when the matching input is also a descendant; the
+        // search is document-wide, in document order, like the spec's id lookup.
+        Some(target) => {
+            let mut found = None;
+            let mut stack = doc.root_node().children.iter().rev().copied().collect::<Vec<_>>();
+            while let Some(id) = stack.pop() {
+                if let Some(el) = element(doc, id) {
+                    if is_tag(el, &local_name!("input"))
+                        && el.id.as_ref().is_some_and(|i| i.as_ref() == target)
+                    {
+                        found = Some(id);
+                        break;
+                    }
+                }
+                if let Some(node) = doc.get_node(id) {
+                    stack.extend(node.children.iter().rev().copied());
+                }
+            }
+            found?
+        }
+        // No `for`: the first descendant input of the label (HTML's implicit
+        // binding — the shape blitz never activates at all).
+        None => {
+            let mut stack = doc.get_node(label)?.children.iter().rev().copied().collect::<Vec<_>>();
+            let mut found = None;
+            while let Some(id) = stack.pop() {
+                if let Some(el) = element(doc, id) {
+                    if is_tag(el, &local_name!("input")) {
+                        found = Some(id);
+                        break;
+                    }
+                }
+                if let Some(node) = doc.get_node(id) {
+                    stack.extend(node.children.iter().rev().copied());
+                }
+            }
+            found?
+        }
+    };
+    let el = element(doc, input)?;
+    if !is_tag(el, &local_name!("input")) {
+        return None;
+    }
+    match el.attr(local_name!("type")) {
+        Some("checkbox") => Some(LabelActivation { input, radio: false }),
+        Some("radio") => Some(LabelActivation { input, radio: true }),
+        _ => None,
+    }
+}
+
+/// The activation target's live checkedness; `None` when the node vanished
+/// (or stopped being a checkbox/radio) — the caller then drops the press.
+pub fn activation_checked(doc: &BaseDocument, act: LabelActivation) -> Option<bool> {
+    element(doc, act.input)?
+        .checkbox_input_checked()
+        .or(Some(false))
+}
+
+/// Apply the click activation: a checkbox flips; a radio selects (clearing
+/// the same-`name` radio group, as blitz's own radio path does). Both the
+/// `ElementState::CHECKED` bit (which drives `:checked` style matching) and
+/// the `checked` **attribute** are written, so the tile restyles immediately
+/// and the state survives into the form entry list.
+pub fn apply_label_activation(doc: &mut BaseDocument, act: LabelActivation) {
+    let name = attr(doc, act.input, local_name!("name")).map(str::to_owned);
+    // Radio group to clear (everything but the target) resolved BEFORE any
+    // mutation, while immutable reads are still cheap.
+    let group: Vec<NodeId> = if act.radio {
+        let mut out = Vec::new();
+        let mut stack = doc
+            .root_node()
+            .children
+            .iter()
+            .rev()
+            .copied()
+            .collect::<Vec<_>>();
+        while let Some(id) = stack.pop() {
+            if let Some(el) = element(doc, id) {
+                if is_tag(el, &local_name!("input"))
+                    && el.attr(local_name!("type")) == Some("radio")
+                    && id != act.input
+                    && el.attr(local_name!("name")) == name.as_deref()
+                {
+                    out.push(id);
+                }
+            }
+            if let Some(node) = doc.get_node(id) {
+                stack.extend(node.children.iter().rev().copied());
+            }
+        }
+        out
+    } else {
+        Vec::new()
+    };
+    let target_now = element(doc, act.input)
+        .and_then(|el| el.checkbox_input_checked())
+        .unwrap_or(false);
+    let new_state = if act.radio { true } else { !target_now };
+    let mut mutator = doc.mutate();
+    for other in group {
+        if new_state {
+            if let Some(node) = mutator.doc.get_node_mut(other) {
+                if let Some(el) = node.element_data_mut() {
+                    el.set_checkbox_input_checked(false);
+                }
+                node.mark_ancestors_dirty();
+            }
+            mutator.clear_attribute(other, html_attr(local_name!("checked")));
+        }
+    }
+    if let Some(node) = mutator.doc.get_node_mut(act.input) {
+        if let Some(el) = node.element_data_mut() {
+            // `display:none` inputs never reach blitz's layout construction,
+            // which is the ONLY place beta.2 attaches `CheckboxInput`
+            // special-data — so a checkbox that was never laid out has
+            // `special_data: None` and silently rejects checkedness writes
+            // (blitz's own label path fails on nested inputs for the same
+            // family of reasons). Attach the state here, exactly as
+            // `create_checkbox_input` would have.
+            if !matches!(el.special_data, SpecialElementData::CheckboxInput(_)) {
+                el.special_data = SpecialElementData::CheckboxInput(new_state);
+            }
+            el.set_checkbox_input_checked(new_state);
+        }
+        node.mark_ancestors_dirty();
+    }
+    if new_state {
+        mutator.set_attribute(act.input, html_attr(local_name!("checked")), "");
+    } else {
+        mutator.clear_attribute(act.input, html_attr(local_name!("checked")));
+    }
+}
+
 #[cfg(test)]
 mod preparation_notes {
     // This module documents the one quirk of `prepare_document` above: a
@@ -1071,6 +1241,73 @@ line two</textarea>
         let form = find_form(&doc);
         let entries = entry_list(&doc, form, None);
         assert_eq!(entries, vec![("q".to_string(), "keep".to_string())]);
+    }
+
+    #[test]
+    fn label_activation_checks_unchecked_and_resyncs_attr() {
+        let mut doc = parse(
+            r#"<form>
+                 <label for=t0 class=tile><input type="checkbox" id="t0"><img alt=" " src="x.jpg"></label>
+                 <label class="tile"><input type="checkbox" id="t1"><img alt=" " src="y.jpg"></label>
+                 <input type="radio" name="r" id="r0"><input type="radio" name="r" id="r1">
+               </form>"#,
+        );
+        // The DDG tile shape: clicking the img inside the label resolves to
+        // the nested (layout-invisible, special-data-less) checkbox...
+        let img = find_tag_in(&doc, &doc.root_node().id, local_name!("img")).expect("img");
+        let act = label_activation_target(&doc, img).expect("nested tile input is a target");
+        assert!(!act.radio);
+        assert_eq!(activation_checked(&doc, act), Some(false));
+        apply_label_activation(&mut doc, act);
+        assert_eq!(activation_checked(&doc, act), Some(true));
+        // ...and a second click on the same target unchecks it again.
+        apply_label_activation(&mut doc, act);
+        assert_eq!(activation_checked(&doc, act), Some(false));
+
+        // Implicit binding (label wraps the input, no `for`): resolves via
+        // the descendant search.
+        let img2 = {
+            let mut imgs = tree_order(&doc)
+                .into_iter()
+                .filter(|id| element(&doc, *id).is_some_and(|el| is_tag(el, &local_name!("img"))));
+            imgs.nth(1).expect("second img")
+        };
+        let act2 = label_activation_target(&doc, img2).expect("implicit binding");
+        apply_label_activation(&mut doc, act2);
+        assert_eq!(activation_checked(&doc, act2), Some(true));
+
+        // Radios: selecting one clears the same-name group.
+        let radios: Vec<NodeId> = tree_order(&doc)
+            .into_iter()
+            .filter(|id| {
+                element(&doc, *id).is_some_and(|el| {
+                    is_tag(el, &local_name!("input"))
+                        && el.attr(local_name!("type")) == Some("radio")
+                })
+            })
+            .collect();
+        let r0 = LabelActivation { input: radios[0], radio: true };
+        let r1 = LabelActivation { input: radios[1], radio: true };
+        apply_label_activation(&mut doc, r0);
+        assert_eq!(activation_checked(&doc, r0), Some(true));
+        apply_label_activation(&mut doc, r1);
+        assert_eq!(activation_checked(&doc, r1), Some(true));
+        assert_eq!(activation_checked(&doc, r0), Some(false), "radio group");
+    }
+
+    fn find_tag_in(doc: &BaseDocument, root: &NodeId, name: LocalName) -> Option<NodeId> {
+        let mut stack = vec![*root];
+        while let Some(id) = stack.pop() {
+            if let Some(el) = element(doc, id) {
+                if is_tag(el, &name) {
+                    return Some(id);
+                }
+            }
+            if let Some(node) = doc.get_node(id) {
+                stack.extend(node.children.iter().copied());
+            }
+        }
+        None
     }
 
     #[test]

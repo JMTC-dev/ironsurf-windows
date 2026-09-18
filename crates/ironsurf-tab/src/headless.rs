@@ -70,6 +70,12 @@ pub struct HeadlessArgs {
     pub find_jumps: usize,
     pub width: u32,
     pub height: u32,
+    /// Synthetic left-clicks (`--click X,Y`, repeatable): Move/Down/Up sent
+    /// through the same `ToTab::Pointer` path the shell drives, executed
+    /// after the `--wait` window; `--dump-inputs` then serialises every
+    /// `<input>`'s id/type/checked state to stderr for harness diagnostics.
+    pub clicks: Vec<(f32, f32)>,
+    pub dump_inputs: bool,
 }
 
 impl HeadlessArgs {
@@ -80,6 +86,8 @@ impl HeadlessArgs {
         let mut size = (1024u32, 768u32);
         let mut find = None;
         let mut find_jumps: usize = 0;
+        let mut clicks = Vec::new();
+        let mut dump_inputs = false;
         let mut saw_url = false;
 
         // Every flag the *normal* parser must not see (headless-only surface).
@@ -106,6 +114,17 @@ impl HeadlessArgs {
                         .parse()
                         .map_err(|_| "--find-jumps needs a count")?
                 },
+                "--click" => {
+                    let v = value("click")?;
+                    let (x, y) = v
+                        .split_once(',')
+                        .ok_or_else(|| format!("--click must be X,Y, got {v:?}"))?;
+                    clicks.push((
+                        x.parse().map_err(|_| format!("bad x in --click {v:?}"))?,
+                        y.parse().map_err(|_| format!("bad y in --click {v:?}"))?,
+                    ));
+                }
+                "--dump-inputs" => dump_inputs = true,
                 "--size" => {
                     let v = value("size")?;
                     let (w, h) = v
@@ -150,6 +169,8 @@ impl HeadlessArgs {
             shot,
             find,
             find_jumps,
+            clicks,
+            dump_inputs,
             width: size.0.max(1),
             height: size.1.max(1),
         })
@@ -197,6 +218,30 @@ pub fn run(args: &[String]) -> Result<(), Box<dyn Error>> {
         poll_wake(pipe.read_fd(), slice);
         pipe.drain();
         tab.headless_pump();
+    }
+
+    // Synthetic clicks (`--click X,Y`): the full Move/Down/Up triple through
+    // the shell-facing pointer path, then a settle pump so any restyle the
+    // click's default action produced is reflected before capture.
+    for (x, y) in args.clicks.clone() {
+        for kind in [
+            ironsurf_common::PointerKind::Move,
+            ironsurf_common::PointerKind::Down,
+            ironsurf_common::PointerKind::Up,
+        ] {
+            tab.handle_to_tab(ToTab::Pointer(ironsurf_common::PointerEvent {
+                x,
+                y,
+                kind,
+                button: ironsurf_common::MouseButton::Left,
+            }));
+        }
+        tab.headless_pump();
+    }
+    if args.dump_inputs {
+        if let Some(doc) = tab.document_mut() {
+            dump_input_state(doc);
+        }
     }
 
     // A scripted search (`--find`): exactly the command the shell sends when the
@@ -259,6 +304,84 @@ pub fn run(args: &[String]) -> Result<(), Box<dyn Error>> {
         body.len()
     );
     Ok(())
+}
+
+/// Serialise every `<input>` element's `id`/`type`/checkedness to stderr
+/// (`INPUT id=… type=… checked=true|false`) — the diagnostics twin of
+/// `--click`, so a harness can watch a checkbox toggle from the DOM side.
+/// Serialise every `<input>` element's `id`/`type`/checkedness to stderr
+/// (`INPUT id=… type=… checked=true|false`) — the diagnostics twin of
+/// `--click`, so a harness can watch a checkbox toggle from the DOM side.
+/// Serialise every `<input>` element's `id`/`type`/checkedness to stderr
+/// (`INPUT id=… type=… checked=true|false`) — the diagnostics twin of
+/// `--click`, so a harness can watch a checkbox toggle from the DOM side.
+/// Serialise every `<input>` element's `id`/`type`/checkedness to stderr
+/// (`INPUT id=… type=… checked=true|false`) — the diagnostics twin of
+/// `--click`, so a harness can watch a checkbox toggle from the DOM side.
+/// Serialise every `<input>` element's `id`/`type`/checkedness to stderr
+/// (`INPUT id=… type=… checked=true|false`) — the diagnostics twin of
+/// `--click`, so a harness can watch a checkbox toggle from the DOM side.
+/// Serialise every `<input>` element's `id`/`type`/checkedness to stderr
+/// (`INPUT id=… type=… checked=true|false`) — the diagnostics twin of
+/// `--click`, so a harness can watch a checkbox toggle from the DOM side.
+/// Serialise every `<input>` element's `id`/`type`/checkedness to stderr
+/// (`INPUT id=… type=… checked=true|false`) — the diagnostics twin of
+/// `--click`, so a harness can watch a checkbox toggle from the DOM side.
+/// Serialise every `<input>` element's `id`/`type`/checkedness to stderr
+/// (`INPUT id=… type=… checked=true|false`) — the diagnostics twin of
+/// `--click`, so a harness can watch a checkbox toggle from the DOM side.
+/// Print the element chain under a viewport point, hit-test style.
+fn dump_hit_chain(doc: &blitz_html::HtmlDocument, x: f32, y: f32) {
+    let Some(start) = doc.element_from_point(x, y) else {
+        eprintln!("HIT {x},{y}: <nothing>");
+        return;
+    };
+    let mut names = Vec::new();
+    let mut cur = Some(start);
+    while let Some(id) = cur {
+        let Some(node) = doc.get_node(id) else { break };
+        if let Some(el) = node.element_data() {
+            names.push(format!(
+                "{}{}",
+                el.name.local,
+                match el.id.as_ref().map(|a| &**a) {
+                    Some(i) => format!("#{i}"),
+                    None => match el.attr(blitz_dom::local_name!("class")) {
+                        Some(c) if !c.is_empty() => {
+                            format!(".{}", c.split_whitespace().next().unwrap_or(""))
+                        }
+                        _ => String::new(),
+                    },
+                }
+            ));
+        }
+        cur = node.parent;
+    }
+    eprintln!("HIT {x},{y}: {}", names.join(" < "));
+}
+
+fn dump_input_state(doc: &blitz_html::HtmlDocument) {
+    fn walk(doc: &blitz_html::HtmlDocument, id: blitz_dom::NodeId) {
+        let Some(node) = doc.get_node(id) else { return };
+        if let Some(el) = node.element_data() {
+            if el.name.local == blitz_dom::local_name!("input") {
+                let checked = el.checkbox_input_checked().unwrap_or(false);
+                eprintln!(
+                    "INPUT id={} type={:?} checked={checked} attr_checked={}",
+                    el.id.as_ref().map(|a| &**a).unwrap_or("-"),
+                    el.attr(blitz_dom::local_name!("type")),
+                    el.has_attr(blitz_dom::local_name!("checked"))
+                );
+            }
+        }
+        let children: Vec<blitz_dom::NodeId> = node.children.iter().copied().collect();
+        for child in children {
+            walk(doc, child);
+        }
+    }
+    if let Some(body) = doc.find_body_node() {
+        walk(doc, body.id);
+    }
 }
 
 /// Poll the wake pipe for up to `tick`; true when a wake-up was pending.

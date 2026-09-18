@@ -571,6 +571,11 @@ pub struct Tab {
     /// A submit-control press armed on mouse-down and finalised on release
     /// (a JS `click` handler may cancel it; task: `<form>`).
     form_press: Option<FormPress>,
+    /// Left-press on a `<label>` (task: DDG anomaly tiles): the bound
+    /// checkbox/radio and its checkedness at press time. On release, if
+    /// blitz's own (buggy for nested inputs) default left the state
+    /// untouched, the tab applies the activation itself.
+    label_press: Option<(forms::LabelActivation, Option<bool>)>,
     /// The `<video>` under the cursor at the last right-click (task: context
     /// menu); `ContextAction::ToggleVideo` plays/pauses exactly that element.
     /// Cleared with the document it points into.
@@ -931,6 +936,7 @@ impl Tab {
             cursor_status: None,
             pending_form: None,
             form_press: None,
+            label_press: None,
             context_video: None,
             media: Vec::new(),
             media_inflight: HashSet::new(),
@@ -2908,6 +2914,18 @@ impl Tab {
                             submitter,
                             form,
                         });
+                    // Label-bound checkbox/radio under the cursor (task:
+                    // DDG anomaly tiles): resolve now, apply on release.
+                    self.label_press = None;
+                    if let Some(doc) = self.doc.as_ref() {
+                        let z = self.zoom();
+                        if let Some(hit) = doc.element_from_point(ev.x / z, ev.y / z) {
+                            if let Some(act) = forms::label_activation_target(doc, hit) {
+                                let before = forms::activation_checked(doc, act);
+                                self.label_press = Some((act, before));
+                            }
+                        }
+                    }
                 }
                 // The page sees the press too (mousedown handlers, :active
                 // styling logic of any page script); its cancellation is the
@@ -2996,6 +3014,28 @@ impl Tab {
         {
             self.fire_js_pointer("mouseup", ev);
             let prevented = self.fire_js_pointer("click", ev);
+            if let Some((act, before)) = self.label_press.take() {
+                // blitz ran its click default during the Up above; if the
+                // bound input is still exactly as the press found it, that
+                // default never fired (its label-forwarding is dead for
+                // inputs nested inside the label — the DDG tile shape).
+                let now = self
+                    .doc
+                    .as_ref()
+                    .and_then(|doc| forms::activation_checked(doc, act));
+                if prevented {
+                    debug!("label: activation cancelled by a JS click handler");
+                } else if now.is_some() && now == before {
+                    if let Some(doc) = self.doc.as_mut() {
+                        forms::apply_label_activation(doc, act);
+                        self.needs_paint = true;
+                        debug!(
+                            "label: click activated the bound {} input",
+                            if act.radio { "radio" } else { "checkbox" }
+                        );
+                    }
+                }
+            }
             if let Some(press) = self.form_press.take() {
                 // Whatever blitz's hook now holds was produced by this very
                 // press — the tab's entry list replaces it either way.
@@ -3234,6 +3274,7 @@ impl Tab {
     fn drain_nav_hook(&mut self) -> bool {
         // A press that never got its release is not a click; forget it.
         self.form_press = None;
+        self.label_press = None;
         if let Some(sub) = self.pending_form.take() {
             self.navigate_submission(&sub);
             return true;
