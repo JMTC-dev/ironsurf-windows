@@ -1219,3 +1219,153 @@ fn tab_timer_callback_fires_from_the_poll_loop() {
 
     exit_cleanly(&mut tab);
 }
+
+/// The startpage.com search bar: the page's `<form>` ships ten
+/// `<input type=hidden>` siblings beside the query field inside a flexed
+/// layout. blitz's default UA sheet lacks `input[type=hidden] { display: none }`,
+/// so the hidden controls got layout boxes, ate every flex pixel, and the
+/// query input collapsed to width **0** — the bar painted (via its container)
+/// but clicking it focused nothing and typing went nowhere. The tab now feeds
+/// blitz's DEFAULT_CSS back plus a one-rule patch
+/// (`forms::UA_PATCH_CSS`, task: startpage.com search bar); this fixture
+/// mirrors startpage's real search-form markup and CSS, and the test walks the
+/// user's exact moves: right-click the bar (the engine's hit test must report
+/// an editable target), left-click it (focus), type, and see the glyphs paint.
+const HIDDEN_INPUT_SEARCH_FORM: &str = r#"<!doctype html>
+<html>
+<head><title>Search bar fixture</title>
+<style>
+  body { margin: 0; background: #ffffff; }
+  /* startpage's emotion rules, transcribed */
+  .search-form-form { position: relative; display: flex; align-items: center;
+    justify-content: space-between; height: 56px; background: #ffffff; }
+  .search-input-container { flex: 1; padding: 10px 85px 10px 0; margin-left: 16px; width: 100%; }
+  .search-form-input { font-size: 16px; width: 100%; color: #000000; border: none;
+    background: transparent; outline: none; }
+</style></head>
+<body>
+<form action="/sp/search" method="post" class="search-form-form" id="search">
+  <div class="search-input-container"><input aria-label="search" id="q" maxlength="2048"
+    name="query" placeholder="Search privately" spellcheck="false" title="Search"
+    type="text" class="search-form-input" value=""></div>
+  <input type="hidden" name="sc" value="tok">
+  <input type="hidden" name="t" value="device">
+  <input type="hidden" name="segment" value="startpage.udog">
+  <input type="hidden" name="lui" value="english">
+  <input type="hidden" name="language" value="english">
+  <input type="hidden" name="cat" value="web">
+  <input type="hidden" name="abd" value="0">
+  <input type="hidden" name="abe" value="0">
+  <input type="hidden" name="page" value="1">
+  <input type="hidden" name="with_date" value="">
+  <div class="btns"></div>
+</form>
+<div style="margin-top: 100px; height: 4px; background: #123456"></div>
+</body>
+</html>
+"#;
+
+/// Black glyph pixels in the query field's band (y 16..44, x 16..400) of a
+/// frame — zero before anything is typed there, hundreds once "search" is.
+fn query_band_ink(rgba: &[u8], width: u32) -> usize {
+    let (w, h) = (width as usize, (rgba.len() / 4 / width as usize));
+    let mut n = 0;
+    for y in 16usize..44.min(h) {
+        for x in 16usize..400.min(w) {
+            let o = (y * w + x) * 4;
+            if rgba[o] < 60 && rgba[o + 1] < 60 && rgba[o + 2] < 60 {
+                n += 1;
+            }
+        }
+    }
+    n
+}
+
+#[test]
+fn search_bar_with_hidden_inputs_is_clickable_and_typeable() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let profile = dir.path().join("profile");
+    std::fs::create_dir_all(&profile).expect("profile dir");
+    let fixture = profile.join("search.html");
+    std::fs::write(&fixture, HIDDEN_INPUT_SEARCH_FORM).expect("write fixture");
+
+    let deadline = Instant::now() + DEADLINE;
+    let mut tab = spawn_tab(&fixture, &profile);
+    let mut seen = Vec::new();
+
+    tab.wait_for(
+        "rendered Frame(1024x768)",
+        |m| {
+            matches!(m, FromTab::Frame { width, height, rgba, .. }
+                if *width == 1024 && *height == 768 && !rgba_is_uniform(rgba))
+        },
+        deadline,
+        &mut seen,
+    );
+
+    let pointer = |kind, button, x, y| {
+        ToTab::Pointer(ironsurf_common::PointerEvent {
+            x,
+            y,
+            kind,
+            button,
+        })
+    };
+    use ironsurf_common::{MouseButton, PointerKind};
+    // The query line sits at y ≈ 18..38 inside the 56 px-tall flexed form.
+    let (cx, cy) = (200.0f32, 28.0f32);
+
+    // 1. Hit test: right-clicking the painted bar must report an EDITABLE
+    //    target — pre-patch the query field had width 0 and the container
+    //    div answered instead.
+    tab.send(pointer(PointerKind::Move, MouseButton::Right, cx, cy));
+    tab.send(pointer(PointerKind::Down, MouseButton::Right, cx, cy));
+    tab.send(pointer(PointerKind::Up, MouseButton::Right, cx, cy));
+    tab.wait_for_new(
+        "ContextMenu over the query field (editable)",
+        |m| matches!(m, FromTab::ContextMenu { target, .. } if target.editable),
+        deadline,
+        &mut seen,
+    );
+
+    // 2. Focus: a left click lands the caret in `#q` (the shell keys only
+    //    reach the page while the page holds focus; blitz's insert needs the
+    //    focused editor, which only a hit on the input itself produces).
+    tab.send(pointer(PointerKind::Move, MouseButton::Left, cx, cy));
+    tab.send(pointer(PointerKind::Down, MouseButton::Left, cx, cy));
+    tab.send(pointer(PointerKind::Up, MouseButton::Left, cx, cy));
+
+    // 3. Type a query and watch it paint: the field rendered empty before, so
+    //    black ink in its band can only be the typed text.
+    for ch in "search".chars() {
+        let k = ch.to_string();
+        tab.send(ToTab::Key(ironsurf_common::KeyEvent {
+            key: k.clone(),
+            code: format!("Key{}", k.to_uppercase()),
+            text: Some(k),
+            repeat: false,
+            mods: ironsurf_common::Modifiers::NONE,
+        }));
+    }
+    let painted = loop {
+        let frames = tab.collect(Duration::from_millis(1200));
+        let best = frames
+            .iter()
+            .filter_map(|m| match m {
+                FromTab::Frame { width, rgba, .. } => Some(query_band_ink(rgba, *width)),
+                _ => None,
+            })
+            .max()
+            .unwrap_or(0);
+        if best > 0 || Instant::now() >= deadline {
+            break best;
+        }
+    };
+    assert!(
+        painted > 100,
+        "typed query must paint in the search field (band ink = {painted}); \
+         a width-0 input paints nothing"
+    );
+
+    exit_cleanly(&mut tab);
+}

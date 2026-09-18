@@ -670,6 +670,20 @@ fn encode_multipart(boundary: &str, entries: &[(String, String)]) -> Vec<u8> {
 // ---------------------------------------------------------------------------
 // Per-document preparation
 
+/// UA-level CSS blitz's own `assets/default.css` lacks, appended after it via
+/// `DocumentConfig::ua_stylesheets` (which **replaces** the default when
+/// `Some`, so the runtime feeds back `blitz_dom::DEFAULT_CSS` first — see
+/// `runtime::Tab::load_html`).
+///
+/// `input[type=hidden] { display: none }` is mandated by the HTML spec's UA
+/// stylesheet ("hidden controls generate no box") but missing from blitz
+/// beta.2, so hidden controls got layout boxes: on startpage.com the search
+/// form ships ~11 `<input type=hidden>` siblings inside a flexed `<form>`,
+/// they ate every flex pixel, and the query field collapsed to width 0 — the
+/// painted search bar was real but unhittable, so clicking it focused nothing
+/// (task: startpage.com search bar).
+pub const UA_PATCH_CSS: &str = r#"input[type="hidden"] { display: none; }"#;
+
 /// Prepare a freshly parsed document, before its first layout:
 ///
 /// * **textarea**: blitz's parley editor starts from the `value` *attribute*

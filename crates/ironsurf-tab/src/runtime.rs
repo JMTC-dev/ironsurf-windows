@@ -1292,6 +1292,19 @@ impl Tab {
             shell_provider: Some(
                 Arc::clone(&self.shell) as Arc<dyn blitz_traits::shell::ShellProvider>
             ),
+            // blitz's default UA sheet (blitz-dom `assets/default.css`) has no
+            // `input[type=hidden] { display: none }`, so hidden controls got real
+            // layout boxes: inside a flexed `<form>` they ate every pixel and the
+            // query field collapsed to width 0 — startpage.com's search bar was
+            // painted by its container but unhittable/unclickable. Feed blitz's
+            // own DEFAULT_CSS back plus this one-rule patch (config
+            // `ua_stylesheets` *replaces* the default when `Some`, so it goes
+            // first); the values still submit — forms.rs reads attributes, not
+            // boxes (task: startpage.com search bar).
+            ua_stylesheets: Some(vec![
+                blitz_dom::DEFAULT_CSS.to_owned(),
+                forms::UA_PATCH_CSS.to_owned(),
+            ]),
             ..Default::default()
         };
         let parsed = Instant::now();
