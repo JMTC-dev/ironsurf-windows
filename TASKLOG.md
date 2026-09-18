@@ -1,4 +1,9 @@
 # Task log
+## #53 No jar/cache mutex is held across the wire any more: netmod gains `JarAccess`/`CacheAccess` (impl'd for CookieJar/NetCache, `Mutex<..>`,
+  `MutexGuard<..>`) and `managed_http_fetch_report`/`fetch_document_*_report` go generic over them, touching state only per operation
+  (`cookie_header_at`/`capture_set_cookies_at`/`lookup_at`/`store_at`); spawn_http + document + `<script src>` + media pass the shared
+  `Arc<Mutex<..>>` handles instead of guards, so a page's images/CSS/fonts download in parallel and `Tab.cache` is `provider.cache_handle()`
+  (ONE NetCache per tab). New rendezvous unit test (503 if a lock serialises the pair), tab 215u + all suites green, ws check clean.
 ## #52 One shared FetchWorker per process: BlitzNetProvider::new now takes shared_worker() (the static OnceLock already
   used by fetch_document_report) instead of FetchWorker::new(), so a tab's document, scripts, subresources and media all ride
   ONE reqwest pool (keep-alive, TLS sessions, DNS cache) — previously two clients could never share connections. Grep-verified
@@ -78,23 +83,3 @@
   notexample.com never; non-http(s) schemes exact-only). ARCH snippet synced; common 27 green (round-trip
   empty/one/unicode + table-driven matching + enabled filtering); tab/shell untouched (expected to gain
   the match arm in later steps).
-## #36 Hover cursor completed (hand over <a>): the Slint half was broken — `Rectangle.absolute-x/-y` do not exist (Slint 1.17 exposes only
-  `absolute-position`), and Rust has no `slint::MouseCursor` root export (it is `slint::private_unstable_api::re_exports::MouseCursor`, the very
-  type the generated `set_page_cursor` takes). Page-point now maps through `page-frame.absolute-position`, the pump re-dispatches a synthetic
-  PointerMoved (LogicalPosition) so a shape arriving while the mouse sits still still paints, and tab switches re-arm the per-tab shape.
-  Tests: common 30-variant CursorChanged round-trip, shell state/map units + tests/cursor.rs (fake_tab --cursor: transitions only, in order,
-  unchanged shapes silent), tab tests/hover_cursor.rs (REAL blitz engine over localhost: hand on `<a>`, `cursor: crosshair` overrides CSS-quiet
-  heuristics, Out ⇒ arrow, no duplicate emits); live :2.0 xdotool hover over link/text/blank — alive, no panic, no dispatch loop. Workspace +
-  release green (tab 177u+8 suites, shell 47u+12, common 24); ARCH FromTab snippet synced.
-## #35 window.alert/confirm/prompt as real synchronous modals: common +FromTab::DialogRequest{dialog_id,kind,message,default}
-  +ToTab::DialogResponse{dialog_id,confirmed,text} (DialogKind, MAX_DIALOG_MESSAGE 64 KiB, round-trip tests). Tab: DialogHost
-  (runtime.rs) blocks the calling script in place — poll+read+decode stdin, every other ToTab deferred FIFO (take_deferred) and
-  replayed by drain_stdin after the answer; js.rs __ironsurfDialog native + prelude trio (alert undefined, confirm bool, prompt
-  string|null; default prefills only the box). EOF/broken stdout/no host ⇒ cancelled, never a hang. Shell: FIFO dialog queue
-  (several tabs may each block), centred Slint overlay (scrim dead TouchArea, prompt LineEdit, OK/Cancel, prompt-Enter), requesting
-  tab activated; answer/rollback on close/crash/reap (state.rs DialogRequest ⇒ false). fake_tab --dialog (+--crash order); tests:
-  tab tests/dialogs.rs (3 real-engine localhost: trio return shapes, deferred Navigate in order, cancel false/null, EOF-cancel + exit
-  0), shell tests/dialogs.rs (queue/activation/prompt text/cancel) + tests/dialog_crash.rs (crash closes the overlay); tab 178u,
-  shell 60, common 23 all green; live :2.0 run (xdotool --window hover-then-XTEST click): alert OK, confirm Cancel, prompt default
-  "Marty" edited → Enter, page title reads the answers. CLI: -u/--url start URL (usage error without value) and -h/--help usage.
-  persists root/host/bound port.

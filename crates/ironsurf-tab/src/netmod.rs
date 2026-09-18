@@ -35,7 +35,7 @@
 //! upstream `blitz-net`), see [`deliver`].
 
 use std::fmt;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 
 use blitz_traits::net::{Bytes, HeaderMap, NetHandler, NetProvider, NetWaker, Request};
 use ironsurf_storage::{CachedEntry, CookieJar, NetCache, StoreError};
@@ -1098,6 +1098,153 @@ pub fn plain_http_fetch_report(
     })
 }
 
+/// Cookie-jar work a managed fetch needs, in three shapes: the jar itself
+/// (a caller that already owns one — tests, the media worker's private jar),
+/// a [`MutexGuard`] the caller holds, and a [`Mutex`] **shared** with other
+/// fetch threads.
+///
+/// The point of the split is *lock scope*: with a `Mutex` implementation the
+/// mutex is taken for the instant of one map operation and released before
+/// the request is built, so no fetch ever holds container state across
+/// `send()`/`bytes()`. With `Passthrough`-free managed fetching that used to
+/// mean every image/CSS/font in a tab downloaded strictly one-by-one.
+pub trait JarAccess {
+    /// The `Cookie` header the jar assembles for `url` at `now` (none when
+    /// nothing matches).
+    fn cookie_header_at(&mut self, url: &Url, now: i64) -> Option<String>;
+    /// Bind every `Set-Cookie` header of a response to `url` at `now`.
+    fn capture_set_cookies_at(
+        &mut self,
+        url: &Url,
+        set_cookies: Vec<String>,
+        now: i64,
+    );
+}
+
+impl JarAccess for CookieJar {
+    fn cookie_header_at(&mut self, url: &Url, now: i64) -> Option<String> {
+        self.cookie_header(url, now)
+    }
+    fn capture_set_cookies_at(&mut self, url: &Url, set_cookies: Vec<String>, now: i64) {
+        capture_set_cookies(self, url, set_cookies.iter().map(String::as_str), now);
+    }
+}
+
+impl JarAccess for Mutex<CookieJar> {
+    fn cookie_header_at(&mut self, url: &Url, now: i64) -> Option<String> {
+        self.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).cookie_header(url, now)
+    }
+    fn capture_set_cookies_at(&mut self, url: &Url, set_cookies: Vec<String>, now: i64) {
+        let mut jar = self.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        capture_set_cookies(&mut jar, url, set_cookies.iter().map(String::as_str), now);
+    }
+}
+
+impl<'jar> JarAccess for &'jar Mutex<CookieJar> {
+    fn cookie_header_at(&mut self, url: &Url, now: i64) -> Option<String> {
+        self.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).cookie_header(url, now)
+    }
+    fn capture_set_cookies_at(&mut self, url: &Url, set_cookies: Vec<String>, now: i64) {
+        let mut jar = self.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        capture_set_cookies(&mut jar, url, set_cookies.iter().map(String::as_str), now);
+    }
+}
+
+impl JarAccess for MutexGuard<'_, CookieJar> {
+    fn cookie_header_at(&mut self, url: &Url, now: i64) -> Option<String> {
+        self.cookie_header(url, now)
+    }
+    fn capture_set_cookies_at(&mut self, url: &Url, set_cookies: Vec<String>, now: i64) {
+        capture_set_cookies(self, url, set_cookies.iter().map(String::as_str), now);
+    }
+}
+
+/// The two cache reads/writes a managed fetch performs, in the same three
+/// shapes as [`JarAccess`]. `CachedEntry` is cloned out of the cache, so a
+/// shared cache never hands a reference (or its lock) to a fetch thread
+/// across the network exchange.
+pub trait CacheAccess {
+    /// Clone of the cached response for `url` (misses are `None`).
+    fn lookup_at(&self, url: &str) -> Option<CachedEntry>;
+    /// Insert/replace the response for `url` (LRU bounds apply).
+    fn store_at(
+        &self,
+        url: &str,
+        status: u16,
+        headers: &[(String, String)],
+        body: Vec<u8>,
+        now: i64,
+    );
+}
+
+impl CacheAccess for NetCache {
+    fn lookup_at(&self, url: &str) -> Option<CachedEntry> {
+        self.lookup(url)
+    }
+    fn store_at(
+        &self,
+        url: &str,
+        status: u16,
+        headers: &[(String, String)],
+        body: Vec<u8>,
+        now: i64,
+    ) {
+        self.store(url, status, headers, body, now)
+    }
+}
+
+impl CacheAccess for Mutex<NetCache> {
+    fn lookup_at(&self, url: &str) -> Option<CachedEntry> {
+        self.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).lookup(url)
+    }
+    fn store_at(
+        &self,
+        url: &str,
+        status: u16,
+        headers: &[(String, String)],
+        body: Vec<u8>,
+        now: i64,
+    ) {
+        self.lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .store(url, status, headers, body, now)
+    }
+}
+
+impl<'cache> CacheAccess for &'cache Mutex<NetCache> {
+    fn lookup_at(&self, url: &str) -> Option<CachedEntry> {
+        self.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).lookup(url)
+    }
+    fn store_at(
+        &self,
+        url: &str,
+        status: u16,
+        headers: &[(String, String)],
+        body: Vec<u8>,
+        now: i64,
+    ) {
+        self.lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .store(url, status, headers, body, now)
+    }
+}
+
+impl CacheAccess for MutexGuard<'_, NetCache> {
+    fn lookup_at(&self, url: &str) -> Option<CachedEntry> {
+        self.lookup(url)
+    }
+    fn store_at(
+        &self,
+        url: &str,
+        status: u16,
+        headers: &[(String, String)],
+        body: Vec<u8>,
+        now: i64,
+    ) {
+        self.store(url, status, headers, body, now)
+    }
+}
+
 /// Maximum redirects a single managed fetch follows before giving up.
 const MAX_MANAGED_REDIRECTS: u32 = 10;
 
@@ -1139,23 +1286,27 @@ pub fn managed_http_fetch(
 /// gets a single failure event (`status: None`). A response served entirely
 /// from [`NetCache`] without touching the wire is not a request and emits
 /// nothing (the caller sees `from_cache` and may report it itself).
-pub fn managed_http_fetch_report(
+pub fn managed_http_fetch_report<J, C>(
     client: &reqwest::blocking::Client,
     url: &Url,
-    jar: &mut CookieJar,
-    cache: &NetCache,
+    jar: &mut J,
+    cache: &C,
     now: i64,
     extra: Option<&HeaderMap>,
     post: Option<&MainDocPost>,
     cacheable: bool,
     user_agent: &str,
     report: NetReport,
-) -> Result<FetchOutcome, String> {
+) -> Result<FetchOutcome, String>
+where
+    J: JarAccess + ?Sized,
+    C: CacheAccess + ?Sized,
+{
     let is_post = post.is_some();
     let cacheable = cacheable && !is_post;
     let started = std::time::Instant::now();
     let cached = if cacheable {
-        let cached = cache.lookup(url.as_str());
+        let cached = cache.lookup_at(url.as_str());
         if cached.is_some() {
             debug!("cache entry for {url}: revalidating");
         }
@@ -1180,7 +1331,7 @@ pub fn managed_http_fetch_report(
         }
         // The jar answers for this hop's origin, at this hop's URL — a
         // redirect into another host must never inherit cookies blindly.
-        if let Some(cookie) = jar.cookie_header(&current, now) {
+        if let Some(cookie) = jar.cookie_header_at(&current, now) {
             req = req.header(reqwest::header::COOKIE, cookie);
         }
         if first_hop {
@@ -1218,7 +1369,7 @@ pub fn managed_http_fetch_report(
             .filter_map(|v| v.to_str().ok())
             .map(str::to_owned)
             .collect();
-        capture_set_cookies(jar, &current, set_cookies.iter().map(String::as_str), now);
+        jar.capture_set_cookies_at(&current, set_cookies.clone(), now);
         if !set_cookies.is_empty() {
             debug!(
                 "captured {} Set-Cookie header(s) for {}",
@@ -1334,7 +1485,7 @@ pub fn managed_http_fetch_report(
         Revalidate::UseFresh { .. } => {
             if cacheable && status < 400 {
                 debug!("GET {url} -> {status} ({} B, stored in cache)", body.len());
-                cache.store(url.as_str(), status, &headers, body.clone(), now);
+                cache.store_at(url.as_str(), status, &headers, body.clone(), now);
             } else if is_post {
                 debug!("POST {url} -> {status} ({} B, never cached)", body.len());
             } else {
@@ -1501,6 +1652,14 @@ impl BlitzNetProvider {
         Arc::clone(&self.jar)
     }
 
+    /// The tab's handle on the **same** [`NetCache`] the provider serves
+    /// subresources from — one cache per tab, so a document (or an external
+    /// `<script src>`) and the images/CSS/fonts of the same page share hits,
+    /// validators and LRU bounds instead of keeping two private copies.
+    pub fn cache_handle(&self) -> Arc<Mutex<NetCache>> {
+        Arc::clone(&self.cache)
+    }
+
     #[allow(dead_code)] // waker fires via the NetWaker installed by with_waker
     fn wake(&self, doc_id: usize) {
         let guard = self.waker.lock().expect("waker mutex poisoned");
@@ -1529,8 +1688,13 @@ impl BlitzNetProvider {
             // (redirect hops report individually — same rule as documents).
             let report = |event: NetEvent| events.lock().expect("net events mutex").push(event);
             let outcome = if managed {
-                let mut jar = jar.lock().expect("jar mutex poisoned");
-                let cache = cache.lock().expect("cache mutex poisoned");
+                // No lock rides along with the fetch: the jar and the cache
+                // are shared `Mutex`es and the fetch takes each one only for
+                // the instant of its own map operation (see [`JarAccess`],
+                // [`CacheAccess`]), so every subresource of a page really
+                // does download in parallel.
+                let mut jar: &Mutex<CookieJar> = &jar;
+                let cache: &Mutex<NetCache> = &cache;
                 managed_http_fetch_report(
                     worker.managed_client(),
                     &url,
@@ -1788,7 +1952,9 @@ fn default_user_agent() -> SharedUserAgent {
 }
 
 /// [`fetch_document`] with the DevTools reporter attached (see
-/// [`fetch_document_post_report`]).
+/// [`fetch_document_post_report`]). The live tab uses
+/// [`fetch_document_report_shared`] (the shared jar/cache handles).
+#[allow(dead_code)] // quiet convenience wrapper (tests and embedders; the live tab shares)
 pub fn fetch_document_report(
     url: &Url,
     policy: NetPolicy,
@@ -1848,6 +2014,45 @@ pub fn fetch_document_post_report(
     fetch_document_with_worker_report(url, post, policy, jar, cache, now, &worker, user_agent, report)
 }
 
+/// [`fetch_document_post_report`] for a jar and a cache the tab shares with
+/// the Blitz subresource provider (`Arc<Mutex<..>>` handles, one per tab).
+///
+/// The locks are taken **per cookie/cache operation** instead of around the
+/// exchange: a main-document load can never serialise the images, stylesheets
+/// and fonts that the provider is downloading at the same moment (nor block
+/// on them), and every shape of request reads and writes the very same jar
+/// and cache entries.
+#[allow(clippy::too_many_arguments)]
+pub fn fetch_document_post_report_shared(
+    url: &Url,
+    post: Option<&MainDocPost>,
+    policy: NetPolicy,
+    jar: &Mutex<CookieJar>,
+    cache: &Mutex<NetCache>,
+    now: i64,
+    user_agent: &SharedUserAgent,
+    report: NetReport,
+) -> Result<DocFetch, NetError> {
+    let worker = shared_worker();
+    let mut jar: &Mutex<CookieJar> = jar;
+    fetch_document_with_worker_report(url, post, policy, &mut jar, cache, now, &worker, user_agent, report)
+}
+
+/// [`fetch_document_report`] against the tab's shared (mutex-guarded) jar and
+/// cache — the shape the live tab uses for documents and `<script src>`
+/// bodies. See [`fetch_document_post_report_shared`].
+pub fn fetch_document_report_shared(
+    url: &Url,
+    policy: NetPolicy,
+    jar: &Mutex<CookieJar>,
+    cache: &Mutex<NetCache>,
+    now: i64,
+    user_agent: &SharedUserAgent,
+    report: NetReport,
+) -> Result<DocFetch, NetError> {
+    fetch_document_post_report_shared(url, None, policy, jar, cache, now, user_agent, report)
+}
+
 #[allow(dead_code)] // quiet convenience wrapper (tests drive it; the runtime reports)
 fn fetch_document_with_worker(
     url: &Url,
@@ -1872,17 +2077,21 @@ fn fetch_document_with_worker(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn fetch_document_with_worker_report(
+fn fetch_document_with_worker_report<J, C>(
     url: &Url,
     post: Option<&MainDocPost>,
     policy: NetPolicy,
-    jar: &mut CookieJar,
-    cache: &NetCache,
+    jar: &mut J,
+    cache: &C,
     now: i64,
     worker: &FetchWorker,
     user_agent: &SharedUserAgent,
     report: NetReport,
-) -> Result<DocFetch, NetError> {
+) -> Result<DocFetch, NetError>
+where
+    J: JarAccess + ?Sized,
+    C: CacheAccess + ?Sized
+{
     // Snapshot the effective UA once per document load: a mid-load
     // `SetUserAgent` applies to the NEXT request, never mid-flight.
     let user_agent = read_user_agent(user_agent);
@@ -3071,6 +3280,121 @@ mod tests {
         let echoed = String::from_utf8_lossy(&out.body).to_string();
         assert_eq!(echoed, "-", "host-only cookie leaked to the other host: {echoed:?}");
         assert!(jar.cookies().iter().any(|c| c.name == "mk" && c.domain == "localhost"));
+    }
+
+    /// The load-time fix: two managed fetches that share ONE
+    /// `Mutex<CookieJar>` and ONE `Mutex<NetCache>` overlap on the wire. The
+    /// test server holds both responses until **both** requests have landed
+    /// (a rendezvous counter), so a fetch that held the jar or the cache
+    /// across `send()`/`bytes()` could never let the pair finish — the first
+    /// request would sit waiting for the second until the 2 s deadline and
+    /// answer 503, which the assertions below catch. (The wait is bounded on
+    /// purpose: the bug fails the test, it never wedges the suite.)
+    #[test]
+    fn managed_fetches_share_the_jar_and_cache_without_serialising() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind loopback");
+        let port = listener.local_addr().expect("addr").port();
+        let arrived = Arc::new(AtomicUsize::new(0));
+        std::thread::spawn(move || {
+            for stream in listener.incoming().flatten() {
+                let arrived = Arc::clone(&arrived);
+                // One thread per connection: the whole point is that two
+                // requests are open at the same moment.
+                std::thread::spawn(move || {
+                    let mut stream = stream;
+                    let mut buf: Vec<u8> = Vec::new();
+                    let mut byte = [0u8; 1];
+                    while !buf.ends_with(b"\r\n\r\n") {
+                        match stream.read(&mut byte) {
+                            Ok(0) | Err(_) => break,
+                            Ok(_) => buf.push(byte[0]),
+                        }
+                    }
+                    let head = String::from_utf8_lossy(&buf).to_string();
+                    let path = head.split_whitespace().nth(1).unwrap_or("/").to_string();
+                    // Rendezvous: this connection only gets an answer once the
+                    // other one has arrived too (bounded, so a serialising
+                    // regression fails the test instead of hanging it).
+                    arrived.fetch_add(1, Ordering::SeqCst);
+                    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+                    while arrived.load(Ordering::SeqCst) < 2
+                        && std::time::Instant::now() < deadline
+                    {
+                        std::thread::sleep(std::time::Duration::from_millis(20));
+                    }
+                    let response = if arrived.load(Ordering::SeqCst) >= 2 {
+                        // Both requests are in flight together: answer now.
+                        {
+                            let label = path.trim_start_matches('/').to_owned();
+                            let body = format!("served {label}");
+                            format!(
+                                "HTTP/1.0 200 OK\r\nContent-Type: text/plain\r\nSet-Cookie: seen{label}=1; Path=/\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                                body.len()
+                            )
+                        }
+                    } else {
+                        // The other fetch never arrived: something serialised
+                        // them (a lock held across the network exchange).
+                        "HTTP/1.0 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_string()
+                    };
+                    let _ = stream.write_all(response.as_bytes());
+                    let _ = stream.flush();
+                });
+            }
+        });
+
+        // One jar, one cache — the very handles the Blitz provider owns.
+        let jar = Arc::new(Mutex::new(CookieJar::new()));
+        let cache = Arc::new(Mutex::new(test_cache("interleave")));
+        std::thread::scope(|scope| {
+            for path in ["/a", "/b"] {
+                let jar = Arc::clone(&jar);
+                let cache = Arc::clone(&cache);
+                scope.spawn(move || {
+                    let label = path.trim_start_matches('/').to_owned();
+                    let mut jar: &Mutex<CookieJar> = &jar;
+                    let cache: &Mutex<NetCache> = &cache;
+                    let outcome = managed_http_fetch_report(
+                        worker_for_test().managed_client(),
+                        &get(&format!("http://127.0.0.1:{port}{path}")),
+                        &mut jar,
+                        &cache,
+                        now_unix(),
+                        None,
+                        None,
+                        true,
+                        USER_AGENT,
+                        None,
+                    )
+                    .expect("interleaved localhost fetch");
+                    assert_eq!(outcome.status, 200, "{path}: the pair serialised");
+                    assert_eq!(
+                        String::from_utf8_lossy(&outcome.body),
+                        format!("served {label}")
+                    );
+                });
+            }
+        });
+
+        // And the shared state really was shared: both `Set-Cookie`s landed in
+        // the one jar, both responses in the one cache.
+        let names: std::collections::BTreeSet<String> = jar
+            .lock()
+            .expect("jar mutex")
+            .cookies()
+            .iter()
+            .map(|c| c.name.clone())
+            .collect();
+        assert_eq!(
+            names,
+            std::collections::BTreeSet::from(["seena".to_string(), "seenb".to_string()]),
+            "both fetches must write the one shared jar"
+        );
+        let cache = cache.lock().expect("cache mutex");
+        assert_eq!(cache.len(), 2, "both responses must land in the one shared cache");
+        assert!(cache.lookup(&format!("http://127.0.0.1:{port}/a")).is_some());
+        assert!(cache.lookup(&format!("http://127.0.0.1:{port}/b")).is_some());
     }
 
     #[test]

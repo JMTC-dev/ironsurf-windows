@@ -524,7 +524,12 @@ pub struct Tab {
     /// vice versa), and shutdown persistence can no longer let one handle
     /// overwrite the other's cookies.
     jar: Arc<Mutex<CookieJar>>,
-    cache: NetCache,
+    /// The tab's response cache — the very same `Arc<Mutex<..>>` the Blitz
+    /// provider serves subresources from (see
+    /// [`BlitzNetProvider::cache_handle`]). One cache per tab: documents,
+    /// `<script src>` bodies and images/CSS/fonts all see each other's hits,
+    /// validators and LRU bounds.
+    cache: Arc<Mutex<NetCache>>,
     provider: Arc<BlitzNetProvider>,
     shell: Arc<ShellHook>,
     nav: Arc<NavHook>,
@@ -893,7 +898,9 @@ impl Tab {
             visible: true,
             doc: None,
             jar: provider.jar(),
-            cache: store.cache(),
+            // …and the same single cache the provider serves subresources
+            // from, taken from the provider itself (never a second copy).
+            cache: provider.cache_handle(),
             provider,
             shell: Arc::new(ShellHook {
                 pipe: Arc::clone(&pipe),
@@ -1138,13 +1145,14 @@ impl Tab {
         // one per redirect hop) queue locally and ship right after the fetch
         // — before any subresource event, exactly like Firefox's panel.
         let doc_events = Mutex::new(Vec::<NetEvent>::new());
-        let jar = Arc::clone(&self.jar);
-        let mut jar = jar.lock().expect("jar mutex poisoned");
-        let fetch = netmod::fetch_document_post_report(
+        // Shared handles, locked per cookie/cache operation only: the
+        // navigation never blocks the subresources the provider is fetching
+        // for the same page (and is not blocked by them).
+        let fetch = netmod::fetch_document_post_report_shared(
             &url,
             post,
             self_provider_policy(&self.provider),
-            &mut jar,
+            &self.jar,
             &self.cache,
             netmod::now_unix(),
             &self.user_agent,
@@ -1155,7 +1163,6 @@ impl Tab {
                     .push(event)
             }),
         );
-        drop(jar);
         for event in doc_events.lock().expect("doc net events mutex").drain(..) {
             self.emit(FromTab::NetworkEvent { event });
         }
@@ -1385,22 +1392,22 @@ impl Tab {
         let mut extraction = js::Extraction::default();
         let mut body_text = None;
         if let Some(doc) = self.doc.as_ref() {
-            // Disjoint field borrows: `doc` stays immutable while the fetcher
-            // mutably borrows the jar (subresources may also flow through the
-            // Blitz provider, which owns its own handle to the same state).
+            // Disjoint field borrows: `doc` stays immutable while scripts are
+            // fetched through the SAME jar/cache handles the Blitz provider
+            // owns — one shared state, locked per operation, not per request.
             let jar = Arc::clone(&self.jar);
+            let cache = Arc::clone(&self.cache);
             // External `<script src>` bodies ride the document fetcher, so
             // they report into the same DevTools queue the poll loop drains
             // (one `FromTab::NetworkEvent` per script, like any subresource).
             let net_events = Arc::clone(&self.net_events);
             let mut fetch = |script_url: &Url| -> Result<String, String> {
-                let mut jar = jar.lock().expect("jar mutex poisoned");
                 let events = Arc::clone(&net_events);
-                netmod::fetch_document_report(
+                netmod::fetch_document_report_shared(
                     script_url,
                     policy,
-                    &mut jar,
-                    &self.cache,
+                    &jar,
+                    &cache,
                     netmod::now_unix(),
                     &self.user_agent,
                     Some(&|event| events.lock().expect("net events mutex").push(event)),
@@ -3778,20 +3785,18 @@ fn fetch_media_bytes(
     user_agent: netmod::SharedUserAgent,
     href: &str,
 ) -> Result<Vec<u8>, MediaError> {
-    // The tab's own disk cache stays on the tab thread (NetCache is not
-    // shareable); this worker gets a private temp cache for its one URL,
-    // deleted before it returns — media never touches the container cache.
+    // The tab's own cache stays on the tab thread; this worker gets a private
+    // temp cache for its one URL, deleted before it returns — media never
+    // touches the container cache. Neither the shared jar nor this private
+    // cache is held across the wire: the fetch locks per operation.
     let cache_dir = private_media_cache_dir(href);
     let fetched = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let mut jar = jar
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let mut cache = NetCache::with_limits(cache_dir.clone(), 1, MAX_VIDEO_BYTES * 2);
-        netmod::fetch_document_report(
+        let cache = Mutex::new(NetCache::with_limits(cache_dir.clone(), 1, MAX_VIDEO_BYTES * 2));
+        netmod::fetch_document_report_shared(
             url,
             policy,
-            &mut jar,
-            &mut cache,
+            &jar,
+            &cache,
             netmod::now_unix(),
             &user_agent,
             None,
@@ -4713,6 +4718,12 @@ mod tests {
         assert!(
             Arc::ptr_eq(&tab.jar, &tab.provider.jar()),
             "Tab::jar and the provider must alias one jar, not two copies"
+        );
+        // Same rule for the cache: documents, `<script src>` bodies and
+        // subresources all read and write ONE NetCache per tab.
+        assert!(
+            Arc::ptr_eq(&tab.cache, &tab.provider.cache_handle()),
+            "Tab::cache and the provider must alias one cache, not two copies"
         );
         // Set through the tab's main-document handle, flush through the
         // provider (the Destroy path) — the cookie must land on disk.

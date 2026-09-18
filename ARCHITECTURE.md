@@ -527,7 +527,15 @@ in `ironsurf-tab/src/netmod.rs` and pass `Arc<OurProvider>` as `DocumentConfig.n
   on navigations. One jar instance (`Arc<Mutex<CookieJar>>`) is shared by the
   tab's main-document fetches and the provider's subresource fetches — cookies
   set by either are instantly visible to the other, and shutdown persistence
-  flushes the one jar (never two copies overwriting each other).
+  flushes the one jar (never two copies overwriting each other). The response
+  cache is shared the same way (`BlitzNetProvider::cache_handle()` gives the
+  tab the very `Arc<Mutex<NetCache>>` the provider serves from), so documents,
+  `<script src>` bodies and images/css/fonts all read and write one cache.
+  Shared jar/cache state is reached through the `JarAccess`/`CacheAccess`
+  traits, which take the mutex for the instant of one map operation only — no
+  fetch ever holds a jar or cache lock across `send()`/`bytes()`, so every
+  subresource of a page really does download in parallel (and a navigation
+  never serialises behind the subresources it just spawned).
 - `data:` URLs (RFC 2397) are decoded by us, never fetched: `parse_data_url` returns the media
   type, optional `charset`, whether the payload was `;base64`, and the bytes; both the percent-
   encoded and base64 forms work for top-level documents and for subresources (`<script src=…>`,
