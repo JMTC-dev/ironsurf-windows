@@ -1,4 +1,8 @@
 # Task log
+## #51 Transport tuning (tab): reqwest 0.12→0.13 (one reqwest in the tree with blitz-net; `rustls-tls`→`rustls`) + gzip/brotli/
+  deflate/charset features; FetchWorker::built both clients gain pool_max_idle_per_host(16), connect_timeout(10s), tcp_nodelay; main
+  client also HTTP/2 keep-alive interval 30s/timeout 10s + adaptive window (0.12's blocking builder lacked the keep-alive knobs — reason
+  for the bump). No test touched Accept-Encoding (grep-verified); tab 256u green, ws check clean (KMS -dev libs reinstalled via apt).
 ## #50 Archive-server front page pre-traverses the timeline: `/` renders each visit row AND its saved sites as
   `<visit>/<host[:port]>/` child links under it (capped 250 visits x 100 entries, "… more" dim rows, unreadable
   visits note themselves, never break the page), so no timestamp needs a click to reach an archived page; deeper
@@ -88,14 +92,4 @@
   0), shell tests/dialogs.rs (queue/activation/prompt text/cancel) + tests/dialog_crash.rs (crash closes the overlay); tab 178u,
   shell 60, common 23 all green; live :2.0 run (xdotool --window hover-then-XTEST click): alert OK, confirm Cancel, prompt default
   "Marty" edited → Enter, page title reads the answers. CLI: -u/--url start URL (usage error without value) and -h/--help usage.
-## #49 Archive **browsing** server: `ironsurf://archive` brings up a shell-side localhost server over the archive
-  folder (default `$HOME/Downloads/ironsurf-tabs`) so saved visits browse in a tab. common: FromTab::ArchiveServerStart
-  {root,host,port,open_in_new_tab} + ArchiveServerSettingsChanged + ToTab::ArchiveServerInfo. shell src/archive_server.rs:
-  one control thread (page, /apply, /stop, command pipe) + a serve thread per *generation* (wake via loopback `libc::poll`
-  self-pipe; a stale thread can never kill its successor; a same-address apply re-points the live listener because rebinding
-  your own port is EADDRINUSE), traversal-proof resolve_in (`+` is never a space — ISO8601 folder names), extension sniff for
-  archived pages with no extension, 512 MiB read cap, listing + control page (GET or capped POST form; blank port keeps the
-  bound port; the serve socket's deferral carries the query). tab: internal `archive` page shows the shell's answer and steps
-  itself to `<addr>/ironsurf/serve`, `?open=1` opens the listing in a NEW tab; welcome documents it. 24 shell units + 2 e2e +
-  5 tab units, 48 suites green; :2.0 live — tab loads the listing, apply over the served address moves the folder, ui.json
   persists root/host/bound port.
