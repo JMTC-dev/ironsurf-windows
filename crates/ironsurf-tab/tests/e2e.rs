@@ -1347,6 +1347,11 @@ fn search_bar_with_hidden_inputs_is_clickable_and_typeable() {
             mods: ironsurf_common::Modifiers::NONE,
         }));
     }
+    // Glyphs paint PROGRESSIVELY — one keystroke lands per resolve/frame hop
+    // (band ink climbs 0→19→33→55→…→121 on the wire), so the first non-zero
+    // frame is only the caret plus maybe one letter: that early frame is what
+    // the original version of this test asserted on (#60's "band ink 19").
+    // Keep draining frames until the band holds a whole word (or the deadline).
     let painted = loop {
         let frames = tab.collect(Duration::from_millis(1200));
         let best = frames
@@ -1357,7 +1362,7 @@ fn search_bar_with_hidden_inputs_is_clickable_and_typeable() {
             })
             .max()
             .unwrap_or(0);
-        if best > 0 || Instant::now() >= deadline {
+        if best > 100 || Instant::now() >= deadline {
             break best;
         }
     };

@@ -360,6 +360,68 @@ fn shoot(dir: &std::path::Path, name: &str, html: &str) -> (Vec<u8>, String) {
     (fs::read(&shot).expect("shot"), String::from_utf8_lossy(&output.stderr).into_owned())
 }
 
+// ---------------------------------------------------------------------------
+// CSS float regression (DDG-lite blank page): blitz-dom registers every
+// `float:` element as a parley `CustomOutOfFlow` inline box, and ONLY the
+// `floats`-feature layout driver consumes those `InlineBoxBreak` yields. With
+// blitz-dom's `floats` Cargo feature off, `break_all_lines` loops on
+// `break_next().is_some()` forever: the document fetches, "loading finished"
+// arrives, and layout NEVER returns — a permanently blank tab. DuckDuckGo's
+// html-lite anomaly modal hit exactly this (`.box:before{float:left}`). The
+// process must COMPLETE (the hang is the regression — this test would simply
+// never finish on the broken feature set) and the float must really float:
+// the red square paints AND the text flows to its right, on its own lines.
+const FLOAT_FIXTURE: &str = r#"<!doctype html>
+<html>
+<head>
+<style>
+  .tile { position: relative; width: 100px; height: 100px; overflow: hidden; padding: 1px }
+  .tile:before { content: ""; display: block; padding-top: 100%; float: left }
+  .box { position: relative; width: 100px; height: 100px; float: left; background: #ff0000 }
+  p { margin: 0; font-size: 16px; color: #000000 }
+</style>
+</head>
+<body>
+  <div class="box"></div>
+  <p>the quick brown fox jumps over the lazy dog and keeps on running past the float</p>
+  <div class="tile"></div>
+</body>
+</html>
+"#;
+
+/// Non-white RGB pixels in a window of a --shot PPM: `x in x0..x1, y in y0..y1`.
+fn non_white_in(ppm: &[u8], width: usize, x0: usize, x1: usize, y0: usize, y1: usize) -> usize {
+    let header_end = ppm.windows(4).position(|w| w == b"255\n").expect("ppm maxbyte header") + 4;
+    let px = &ppm[header_end..];
+    (y0..y1)
+        .flat_map(|y| (x0..x1).map(move |x| (y * width + x) * 3))
+        .filter(|&i| px[i] < 240 || px[i + 1] < 240 || px[i + 2] < 240)
+        .count()
+}
+
+#[test]
+fn css_float_does_not_hang_layout_and_wraps_text() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    // 400x240 keeps each prose line inside the first ~5 text rows.
+    let (shot, _stderr) = shoot(dir.path(), "float.html", FLOAT_FIXTURE);
+
+    // The floated red square paints (top-left, 100x100).
+    let red = shot
+        .windows(3)
+        .filter(|rgb| rgb == b"\xff\x00\x00")
+        .count();
+    assert!(red > 9_000, "floated 100x100 red box must paint ~10 000 px, found {red}");
+
+    // With the float honoured, the prose flows to its RIGHT (x>110) on the
+    // first text lines (y<60). Without floating the text starts at x=0 and
+    // the strip right of the box stays paper for those lines.
+    let right_of_float = non_white_in(&shot, 400, 115, 400, 0, 60);
+    assert!(
+        right_of_float > 100,
+        "text must wrap beside the float (ink right of x=115 in the top 60 rows), saw {right_of_float}"
+    );
+}
+
 #[test]
 fn matchmedia_reveal_script_unhides_the_page_it_gates() {
     let dir = tempfile::tempdir().expect("tempdir");

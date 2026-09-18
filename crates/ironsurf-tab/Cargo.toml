@@ -17,7 +17,12 @@ euclid = "0.22"
 reqwest = { version = "0.13", default-features = false, features = ["rustls", "blocking", "gzip", "brotli", "deflate", "http2", "charset"] }
 
 # Engine stack (ARCHITECTURE.md, pinned; pure Rust — no mozjs, no wgpu/GPU)
-blitz-dom = "0.3.0-beta.2"
+# `floats` is MANDATORY, not an optimisation: blitz-dom registers every CSS
+# `float:` element as a parley `CustomOutOfFlow` inline box, and only the
+# floats-enabled layout driver consumes those `InlineBoxBreak` yields — with
+# the feature off `break_all_lines` spins forever on any page with a float
+# (DDG-lite's anomaly modal) → tab hangs, blank page. Enable explicitly.
+blitz-dom = { version = "0.3.0-beta.2", features = ["floats"] }
 blitz-html = "0.3.0-beta.2"
 blitz-net = "0.3.0-beta.2"
 # `custom-widget` is what lets a `<video>` element be painted by the tab's own
