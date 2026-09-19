@@ -594,6 +594,16 @@ After parse & resolve, extract `<script>` elements from the DOM (`document.root_
 walk or `query_selector("script")`), fetch `src=` through our network layer, and execute in
 order in **one** `boa_engine::Context` per tab (per navigation: rebuild context). Bindings
 are a small, DOM-shaped surface.
+**`<script type="importmap">` is supported** (task: importmap support): the extraction walk
+recognises the type, never fetches (`src=` maps are invalid — import maps are inline-only)
+and never executes it; the JSON body is parsed with the spec's forgiving rules (unknown
+members ignored, malformed entries dropped, but invalid JSON or non-object top-level
+`imports`/`scopes` discards the whole map with a note). The first valid map wins — a second
+is ignored — and lands on `Extraction::import_map` and then `JsRuntime` for the document's
+lifetime; `ImportMap::resolve` implements the spec's resolution (exact keys, longest
+`/`-terminated prefix keys with remainder replacement, `null` unmappings, `scopes` shadowing
+`imports` for requests from inside a URL prefix, bare-vs-relative specifier split). Module
+loading itself remains TODO; the map is the piece it will consume.
 **Full Boa support is switched on** (task: as much JavaScript as possible): every
 `boa_engine` language feature is compiled in — `annex-b` (legacy web compat: `substr`/`trimLeft`,
 legacy escapes/regex quirks), `intl_bundled` (`Intl` with ICU data shipped *in the binary* —

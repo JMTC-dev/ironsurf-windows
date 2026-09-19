@@ -98,6 +98,9 @@ pub struct ScriptSource {
 pub struct Extraction {
     pub scripts: Vec<ScriptSource>,
     pub notes: Vec<String>,
+    /// The document's import map (first valid `<script type="importmap">`),
+    /// parsed and validated during the walk — never executed as a script.
+    pub import_map: Option<ImportMap>,
 }
 
 fn is_script(node: &Node) -> bool {
@@ -146,6 +149,210 @@ fn is_module_type(type_attr: Option<&str>) -> bool {
         .is_some_and(|t| t.eq_ignore_ascii_case("module"))
 }
 
+/// The import-map `type` (`<script type="importmap">`): a JSON declarative
+/// module specifier map. Never executed as code — the body is *parsed*, and a
+/// valid one becomes [`Extraction::import_map`] for the runtime.
+fn is_importmap_type(type_attr: Option<&str>) -> bool {
+    type_attr
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+        .is_some_and(|t| t.eq_ignore_ascii_case("importmap"))
+}
+
+/// A parsed `<script type="importmap">`: the document's declarative module
+/// specifier map (WHATWG import-maps). Stored verbatim enough to run the
+/// spec's resolution algorithm: exact keys, `/`-terminated prefix keys
+/// (`"lib/"` rewrites every deeper specifier), `null` values that *unmap*
+/// (resolution failure), and `scopes` overriding `imports` for specifiers
+/// requested from inside a URL prefix.
+///
+/// The JSON walk is as forgiving as the spec's parse algorithm: unknown
+/// members are ignored and individually malformed entries are dropped, while
+/// invalid JSON (or non-object top-level `imports`/`scopes`) invalidates the
+/// whole map — the HTML spec discards the script instead of half-applying it.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ImportMap {
+    /// `imports` entries, `(key, address)` in document order; `None` address
+    /// is a spec `null` (unmap the key / prefix).
+    imports: Vec<(String, Option<String>)>,
+    /// `scopes` entries: `(scope URL prefix, entries)` in document order.
+    scopes: Vec<(String, Vec<(String, Option<String>)>)>,
+}
+
+impl ImportMap {
+    /// Parse an import-map JSON body. `Ok` only for a spec-valid map; the
+    /// `Err` string is the human-readable reason it was thrown out.
+    pub fn parse(json: &str) -> Result<Self, String> {
+        let value: serde_json::Value =
+            serde_json::from_str(json).map_err(|err| err.to_string())?;
+        let top = value
+            .as_object()
+            .ok_or_else(|| "the import map is not a JSON object".to_string())?;
+        let mut map = ImportMap::default();
+        match top.get("imports") {
+            None => {}
+            Some(serde_json::Value::Object(entries)) => {
+                map.imports = parse_entries(entries);
+            }
+            Some(_) => return Err("\"imports\" is present but not an object".to_string()),
+        }
+        match top.get("scopes") {
+            None => {}
+            Some(serde_json::Value::Object(scopes)) => {
+                for (prefix, entries) in scopes {
+                    // A scope whose value is not an object is dropped whole.
+                    if let Some(entries) = entries.as_object() {
+                        let entries = parse_entries(entries);
+                        if !entries.is_empty() {
+                            map.scopes.push((prefix.clone(), entries));
+                        }
+                    }
+                }
+                // Stable document order despite serde_json's map iteration.
+                map.scopes.sort_by(|a, b| a.0.cmp(&b.0));
+            }
+            Some(_) => return Err("\"scopes\" is present but not an object".to_string()),
+        }
+        Ok(map)
+    }
+
+    /// Number of `imports` entries (diagnostics; excludes `scopes`).
+    pub fn len(&self) -> usize {
+        self.imports.len()
+    }
+
+    /// Number of `scopes` entries (diagnostics).
+    pub fn scopes_len(&self) -> usize {
+        self.scopes.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.imports.is_empty() && self.scopes.is_empty()
+    }
+
+    /// Resolve `specifier` (a bare specifier, relative path, or absolute URL)
+    /// against the document/module `base`. `None` = unresolvable: a bare
+    /// specifier no entry covers, an explicit `null` unmapping, or a mapped
+    /// address that is itself not a URL.
+    pub fn resolve(&self, specifier: &str, base: &Url) -> Option<Url> {
+        self.resolve_for(specifier, base, None)
+    }
+
+    /// [`resolve`](Self::resolve) with a requesting module's URL, which lets
+    /// `scopes` shadow `imports` for requests from inside a scope prefix.
+    pub fn resolve_for(
+        &self,
+        specifier: &str,
+        base: &Url,
+        referrer: Option<&Url>,
+    ) -> Option<Url> {
+        // The spec splits specifiers *before* parsing: scheme-absolute URLs
+        // and relative-URL references (`/`, `//`, `./`, `../`, `#` starts) are
+        // resolved and matched on their absolute form; everything else is a
+        // *bare* specifier, matched raw and unresolvable without a map hit
+        // (`Url::join` alone cannot tell them apart — it happily resolves
+        // `"react"` against any http base).
+        let is_relative_url = specifier.starts_with('/')
+            || specifier.starts_with("./")
+            || specifier.starts_with("../")
+            || specifier.starts_with('#')
+            || Url::parse(specifier).is_ok();
+        let resolved = if is_relative_url { base.join(specifier).ok() } else { None };
+        let key = resolved.as_ref().map(Url::as_str).unwrap_or(specifier);
+
+        // Scopes: innermost (longest matching prefix the referrer lives in)
+        // wins, then document order on ties.
+        if let Some(referrer) = referrer {
+            let mut best: Option<(usize, &[(String, Option<String>)])> = None;
+            for (prefix, entries) in &self.scopes {
+                let Ok(scope) = base.join(prefix) else { continue };
+                let scope = scope.as_str();
+                if referrer.as_str().starts_with(scope)
+                    && best.is_none_or(|(len, _)| scope.len() > len)
+                {
+                    best = Some((scope.len(), entries.as_slice()));
+                }
+            }
+            if let Some((_, entries)) = best {
+                if let Some(entry) = match_entries(entries, key) {
+                    return mapped_address(entry, key)
+                        .and_then(|address| base.join(&address).ok());
+                }
+            }
+        }
+
+        if let Some(entry) = match_entries(&self.imports, key) {
+            // `null` (unmapping) and mapped addresses that are not URLs both
+            // fail resolution per spec.
+            return mapped_address(entry, key)
+                .and_then(|address| base.join(&address).ok());
+        }
+        // Unmatched URL-ish specifier: pass through; unmatched bare fails.
+        resolved
+    }
+}
+
+/// Flat `(key, address)` entries of one `imports` object: string addresses
+/// and `null` (unmap) are kept, every other JSON shape is silently dropped.
+fn parse_entries(
+    entries: &serde_json::Map<String, serde_json::Value>,
+) -> Vec<(String, Option<String>)> {
+    let mut out: Vec<_> = entries
+        .iter()
+        .filter_map(|(key, value)| match value {
+            serde_json::Value::String(address) => Some((key.clone(), Some(address.clone()))),
+            serde_json::Value::Null => Some((key.clone(), None)),
+            _ => None,
+        })
+        .collect();
+    out.sort_by(|a, b| a.0.cmp(&b.0));
+    out
+}
+
+/// The address a matched entry yields for `key`: verbatim for an exact key,
+/// and the matched prefix **replaced** — key `"lib/"` → address `"/v/lib/"`
+/// turns `"lib/util.js"` into `"/v/lib/util.js"`. A `null` address fails
+/// resolution (unmapping).
+fn mapped_address(entry: &(String, Option<String>), key: &str) -> Option<String> {
+    let address = entry.1.as_ref()?;
+    let map_key = &entry.0;
+    if map_key != key && (map_key.ends_with('/') || map_key.ends_with('\\')) {
+        let mut out = address.clone();
+        out.push_str(&key[map_key.len()..]);
+        Some(out)
+    } else {
+        Some(address.clone())
+    }
+}
+
+/// The spec's *match* over one flat entry list: an exact key hit wins;
+/// otherwise the **longest** `/`-terminated key that is a prefix of `key`
+/// (a `/`-terminated specifier may also complete an unterminated key, e.g.
+/// `"react/"` completing `"react"` — the only way a trailing-slash specifier
+/// can reach a bare key).
+fn match_entries<'a>(
+    entries: &'a [(String, Option<String>)],
+    key: &str,
+) -> Option<&'a (String, Option<String>)> {
+    let mut best: Option<(usize, &(String, Option<String>))> = None;
+    for entry @ (map_key, _) in entries {
+        let hit = if map_key == key {
+            // Exact match always wins outright.
+            return Some(entry);
+        } else if map_key.ends_with('/') || map_key.ends_with('\\') {
+            key.starts_with(map_key.as_str())
+        } else if key.ends_with('/') {
+            key == format!("{map_key}/")
+        } else {
+            false
+        };
+        if hit && best.is_none_or(|(len, _)| map_key.len() > len) {
+            best = Some((map_key.len(), entry));
+        }
+    }
+    best.map(|(_, entry)| entry)
+}
+
 /// One script discovered by the document walk, before its body is known.
 ///
 /// The walk ([`walk_scripts`]) resolves `src=` URLs and applies the type
@@ -159,6 +366,8 @@ enum PendingScript {
     /// A resolved `src=` script awaiting its body. `raw` is the attribute
     /// value, kept verbatim for the failure note.
     External { url: Url, raw: String },
+    /// The JSON body of a `<script type="importmap">`, awaiting validation.
+    ImportMap { json: String },
     /// A script the walk deliberately skipped (module, unknown type,
     /// unresolvable `src`) with the note it contributes.
     Note(String),
@@ -183,6 +392,25 @@ fn walk_scripts(doc: &BaseDocument, base: &Url) -> Vec<PendingScript> {
         let Some(node) = doc.get_node(id) else { continue };
         let Some(element) = node.element_data() else { continue };
         let type_attr = element.attr(local_name!("type"));
+        let src = element
+            .attr(local_name!("src"))
+            .map(str::trim)
+            .filter(|src| !src.is_empty())
+            .map(str::to_owned);
+
+        if is_importmap_type(type_attr) {
+            // Import maps are declarative JSON, inline only (a `src=` one is
+            // a spec-invalid map and never fetched).
+            match src {
+                None => pending.push(PendingScript::ImportMap {
+                    json: node.text_content(),
+                }),
+                Some(raw) => pending.push(PendingScript::Note(format!(
+                    "importmap with src {raw:?} ignored (import maps must be inline)"
+                ))),
+            }
+            continue;
+        }
 
         if is_module_type(type_attr) {
             pending.push(PendingScript::Note(
@@ -198,12 +426,6 @@ fn walk_scripts(doc: &BaseDocument, base: &Url) -> Vec<PendingScript> {
             )));
             continue;
         }
-
-        let src = element
-            .attr(local_name!("src"))
-            .map(str::trim)
-            .filter(|src| !src.is_empty())
-            .map(str::to_owned);
 
         match src {
             // External: resolved now (so unresolvable `src` notes keep their
@@ -247,6 +469,22 @@ fn assemble_scripts(pending: Vec<PendingScript>, results: Vec<Result<String, Str
     for item in pending {
         match item {
             PendingScript::Note(note) => extraction.notes.push(note),
+            PendingScript::ImportMap { json } => {
+                // One map per document (HTML spec): the first that parses
+                // wins; the rest are ignored with a note, never merged.
+                if extraction.import_map.is_some() {
+                    extraction.notes.push(
+                        "skipped additional importmap (the document already has one)".to_string(),
+                    );
+                } else {
+                    match ImportMap::parse(&json) {
+                        Ok(map) => extraction.import_map = Some(map),
+                        Err(err) => extraction
+                            .notes
+                            .push(format!("importmap ignored: invalid import map — {err}")),
+                    }
+                }
+            }
             PendingScript::Inline { code } => {
                 if !code.trim().is_empty() {
                     extraction.scripts.push(ScriptSource {
@@ -3981,6 +4219,10 @@ pub struct JsRuntime {
     timers: Rc<RefCell<TimerQueue>>,
     /// Monotonic origin for rAF timestamps.
     started: Instant,
+    /// The document's `<script type="importmap">` (task: importmap support),
+    /// installed by the tab right after extraction. Module loading (still
+    /// TODO) resolves its bare specifiers through this map.
+    import_map: Option<ImportMap>,
 }
 
 impl JsRuntime {
@@ -3993,7 +4235,19 @@ impl JsRuntime {
             host,
             timers,
             started: Instant::now(),
+            import_map: None,
         }
+    }
+
+    /// Install the document's import map (from [`Extraction::import_map`]).
+    /// `None` clears it (a document without a map, or with an invalid one).
+    pub fn set_import_map(&mut self, import_map: Option<ImportMap>) {
+        self.import_map = import_map;
+    }
+
+    /// The document's import map, if it declared a valid one.
+    pub fn import_map(&self) -> Option<&ImportMap> {
+        self.import_map.as_ref()
     }
 
     /// The host cell the bindings write through (title, console, notes).
@@ -5349,6 +5603,169 @@ mod tests {
             sequential, batch,
             "both variants share the walk and the assembly — identical output"
         );
+    }
+
+    // -----------------------------------------------------------------
+    // `<script type="importmap">` (task: importmap support)
+
+    const IMPORTMAP_PAGE: &str = r#"<!doctype html>
+<html><head>
+<script type="importmap">
+{ "imports": { "react": "https://cdn.example/react.js", "lib/": "/vendor/lib/" },
+  "scopes": { "/admin/": { "helper": "/special/helper.js" } } }
+</script>
+<script>window.x = 1;</script>
+</head><body><p>map</p></body></html>"#;
+
+    #[test]
+    fn importmap_script_is_parsed_not_executed() {
+        let doc = dom(IMPORTMAP_PAGE);
+        let base = Url::parse("https://shop.example/page.html").expect("base");
+        let extraction = js_extract(&doc, &base, &mut |_| Err("unused".to_string()));
+        // Only the classic script is executable; the map never reaches the
+        // engine and contributes no "unsupported type" note.
+        assert_eq!(extraction.scripts.len(), 1);
+        assert!(
+            !extraction.notes.iter().any(|n| n.contains("unsupported type")),
+            "an importmap is a known type: {:?}",
+            extraction.notes
+        );
+        let map = extraction.import_map.expect("the map parsed");
+        assert_eq!(map.len(), 2);
+        assert_eq!(map.scopes_len(), 1);
+        // Exact key, prefix key (against the document base), and a scope.
+        assert_eq!(
+            map.resolve("react", &base).map(|u| u.to_string()),
+            Some("https://cdn.example/react.js".to_string())
+        );
+        assert_eq!(
+            map.resolve("lib/util.js", &base).map(|u| u.to_string()),
+            Some("https://shop.example/vendor/lib/util.js".to_string())
+        );
+        assert_eq!(
+            map.resolve("helper", &base).map(|u| u.to_string()),
+            None,
+            "the scope entry does not leak into plain resolution"
+        );
+        let admin = Url::parse("https://shop.example/admin/app.html").expect("referrer");
+        assert_eq!(
+            map.resolve_for("helper", &base, Some(&admin)).map(|u| u.to_string()),
+            Some("https://shop.example/special/helper.js".to_string()),
+            "from inside the scope prefix the scoped entry wins"
+        );
+    }
+
+    #[test]
+    fn invalid_importmap_json_is_dropped_with_a_note() {
+        let doc = dom(
+            "<!doctype html><html><head><script type=importmap>{ oops }</script></head><body></body></html>",
+        );
+        let base = Url::parse("file:///i/index.html").expect("base");
+        let extraction = js_extract(&doc, &base, &mut |_| Err("unused".to_string()));
+        assert_eq!(extraction.scripts.len(), 0);
+        assert_eq!(extraction.import_map, None);
+        assert!(
+            extraction.notes.iter().any(|n| n.contains("importmap ignored")),
+            "{:?}",
+            extraction.notes
+        );
+    }
+
+    #[test]
+    fn second_importmap_is_ignored_first_valid_wins() {
+        let doc = dom(
+            "<!doctype html><html><head>\
+             <script type=importmap>{\"imports\":{\"a\":\"/one.js\"}}</script>\
+             <script type=importmap>{\"imports\":{\"a\":\"/two.js\"}}</script>\
+             </head><body></body></html>",
+        );
+        let base = Url::parse("file:///i/index.html").expect("base");
+        let extraction = js_extract(&doc, &base, &mut |_| Err("unused".to_string()));
+        let map = extraction.import_map.expect("first map kept");
+        assert_eq!(
+            map.resolve("a", &base).map(|u| u.path().to_string()),
+            Some("/one.js".to_string())
+        );
+        assert!(
+            extraction.notes.iter().any(|n| n.contains("already has one")),
+            "{:?}",
+            extraction.notes
+        );
+    }
+
+    #[test]
+    fn importmap_with_src_is_never_fetched() {
+        let doc = dom(
+            "<!doctype html><html><head><script type=importmap src=/map.json></script></head><body></body></html>",
+        );
+        let base = Url::parse("file:///i/index.html").expect("base");
+        let mut fetched = 0usize;
+        let extraction = extract_scripts_batch(&doc, &base, &mut |urls| {
+            fetched += urls.len();
+            urls.iter().map(|_| Ok(String::new())).collect()
+        });
+        assert_eq!(fetched, 0, "importmap src= is not a fetchable script");
+        assert_eq!(extraction.import_map, None);
+        assert!(
+            extraction.notes.iter().any(|n| n.contains("must be inline")),
+            "{:?}",
+            extraction.notes
+        );
+    }
+
+    #[test]
+    fn importmap_resolution_follows_the_spec_rules() {
+        let base = Url::parse("https://app.example/deep/index.html").expect("base");
+        let map = ImportMap::parse(
+            r#"{ "imports": {
+                 "exact": "https://cdn.example/e.js",
+                 "pkg/": "https://cdn.example/pkg/",
+                 "pkg/special.js": "/local/special.js",
+                 "pkg/hidden/": null,
+                 "geva": "/geva.js"
+               },
+               "unknown-member": 42 }"#,
+        )
+        .expect("valid map");
+        assert_eq!(
+            map.resolve("exact", &base).map(|u| u.to_string()),
+            Some("https://cdn.example/e.js".to_string())
+        );
+        // Longest prefix wins over the shallower one.
+        assert_eq!(
+            map.resolve("pkg/special.js", &base).map(|u| u.path().to_string()),
+            Some("/local/special.js".to_string())
+        );
+        assert_eq!(
+            map.resolve("pkg/other.js", &base).map(|u| u.to_string()),
+            Some("https://cdn.example/pkg/other.js".to_string())
+        );
+        // A null prefix unmaps: resolution fails instead of falling through.
+        assert_eq!(map.resolve("pkg/hidden/x.js", &base), None);
+        // Bare specifier no entry covers: unresolvable.
+        assert_eq!(map.resolve("nope", &base), None);
+        // Relative specifiers pass through untouched by the map.
+        assert_eq!(
+            map.resolve("./sib.js", &base).map(|u| u.to_string()),
+            Some("https://app.example/deep/sib.js".to_string())
+        );
+        // Unknown top-level members are ignored, never fatal.
+        assert_eq!(map.len(), 5);
+    }
+
+    #[test]
+    fn importmap_parser_is_forgiving_per_entry_but_not_per_map() {
+        // Per-entry: numbers/objects inside imports are dropped silently.
+        let map = ImportMap::parse(
+            r#"{ "imports": { "ok": "/ok.js", "bad": 7, "nested": {"a":"b"}, "gone": null } }"#,
+        )
+        .expect("entries are individually droppable");
+        assert_eq!(map.len(), 2, "ok + gone(null)");
+        // Per-map: non-object imports/scopes invalidates the WHOLE map.
+        assert!(ImportMap::parse("[]").is_err());
+        assert!(ImportMap::parse("not json").is_err());
+        assert!(ImportMap::parse("{\"imports\": \"react\"}").is_err());
+        assert!(ImportMap::parse("{\"scopes\": []}").is_err());
     }
 
     #[test]

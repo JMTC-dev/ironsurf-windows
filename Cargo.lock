@@ -3819,6 +3819,7 @@ dependencies = [
  "reqwest",
  "rusty_h264-decoder",
  "selectors",
+ "serde_json",
  "stylo",
  "tempfile",
  "url",

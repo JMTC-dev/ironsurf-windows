@@ -9,6 +9,9 @@ ironsurf-common = { path = "../ironsurf-common" }
 ironsurf-storage = { path = "../ironsurf-storage" }
 ironsurf-sandbox = { path = "../ironsurf-sandbox" }
 url = { workspace = true }
+# `<script type="importmap">` bodies are JSON (task: importmap support); the
+# crate is already locked and compiled in the graph (boa_engine's `deser`).
+serde_json = "1"
 libc = "0.2"
 euclid = "0.22"
 # 0.13 (same major blitz-net pins — one reqwest in the tree): its blocking

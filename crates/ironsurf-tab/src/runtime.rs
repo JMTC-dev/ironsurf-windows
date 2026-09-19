@@ -1618,6 +1618,17 @@ impl Tab {
         // The runtime (Context + host + timer queue) survives this call: it
         // lives on as `self.js` until the next navigation replaces it.
         let mut runtime = js::JsRuntime::new(host);
+        // `<script type="importmap">` (task: importmap support): the walk
+        // parsed + validated the map during extraction — the runtime keeps it
+        // for the document's lifetime (module resolution consumes it).
+        if let Some(map) = extraction.import_map.clone() {
+            debug!(
+                "importmap registered for {url}: {} specifier(s), {} scope(s)",
+                map.len(),
+                map.scopes_len()
+            );
+            runtime.set_import_map(Some(map));
+        }
         // The live document is registered for the duration of the run, so
         // page JS can read and mutate the real DOM (docId 0).
         let errors = runtime.run_scripts(&extraction.scripts, self.doc.as_mut());
