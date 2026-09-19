@@ -703,6 +703,15 @@ pub struct HostState {
     /// so a mid-session `SetUserAgent` reaches scripts with no reload and no
     /// new context. `None` (bare JS tests) reports [`crate::netmod::USER_AGENT`].
     pub user_agent: Option<crate::netmod::SharedUserAgent>,
+    /// The container's `localStorage` store cell (task: per-origin DOM
+    /// storage). `window.localStorage` reads and writes through it, and
+    /// every operation is keyed by the document **origin** re-resolved from
+    /// [`HostState::url`] at call time — one origin can never touch
+    /// another's area, and documents without a durable origin (`about:`,
+    /// `data:`, `file:`, `javascript:`…) get a `SecurityError` on every
+    /// access. `None` behaves exactly like an opaque origin: the surface
+    /// exists but every access is denied (bare JS tests without a store).
+    pub local_storage: Option<SharedLocalStorage>,
 }
 
 impl HostState {
@@ -738,6 +747,14 @@ pub struct PendingNav {
 /// Shared handle (the tab keeps ownership, the bindings borrow it while the
 /// scripts run on the same thread).
 pub type HostRef = Rc<RefCell<HostState>>;
+
+/// The tab's per-container DOM-storage handle (task: per-origin
+/// `localStorage`): the very store built from the container profile dir
+/// ([`ironsurf_storage::ContainerStore::local_storage`]). Handed to the JS
+/// host the same way the UA cell is — the bindings only ever reach an area
+/// through an origin re-resolved from the CURRENT document URL, so the
+/// per-origin security rule is enforced on the Rust side of the native.
+pub type SharedLocalStorage = Arc<std::sync::Mutex<ironsurf_storage::LocalStorage>>;
 
 /// One scheduled timer. Callbacks are `JsValue`s from the owning [`JsRuntime`]'s
 /// realm (boa 0.22 keeps GC objects alive while a `JsValue` handle exists, so
@@ -2419,11 +2436,28 @@ mod native {
     pub(super) const MEDIA_GET: &str = "__ironsurfMediaGet";
     pub(super) const MEDIA_CMD: &str = "__ironsurfMediaCmd";
     pub(super) const DIALOG: &str = "__ironsurfDialog";
+    pub(super) const STORAGE: &str = "__ironsurfStorage";
 }
 
 /// One-shot delay used for `requestAnimationFrame` (~60 Hz; the tab has no
 /// vsync source, a fixed 16 ms frame is good enough).
 const RAF_INTERVAL: Duration = Duration::from_millis(16);
+
+/// Storage-area argument (task: per-origin `localStorage`): `null`/`undefined`
+/// read as "absent", everything else stringifies — and the coercion runs
+/// **before** the host cell is touched, so a page's own `toString` never
+/// re-enters through a held borrow (the rule every other native follows).
+fn arg_opt_string(
+    value: Option<&JsValue>,
+    context: &mut Context,
+) -> Result<Option<String>, boa_engine::JsError> {
+    match value {
+        Some(value) if !value.is_undefined() && !value.is_null() => {
+            Ok(Some(value.to_string(context)?.to_std_string_escaped()))
+        }
+        _ => Ok(None),
+    }
+}
 
 /// Coerce a `setTimeout`/`setInterval` delay argument: non-numbers and
 /// non-finite values read as 0, and everything is clamped so
@@ -3798,6 +3832,120 @@ const PRELUDE: &str = r##"
     return host.__ironsurfDialog("prompt", dialogMessage(message), fallback);
   };
 
+  // ---------------------------------------------------------------------
+  // window.localStorage (task: per-origin DOM storage). The area lookup —
+  // and the whole per-origin security rule — lives in the Rust native:
+  // every operation re-resolves the document origin from the host URL at
+  // CALL time (never cached here), documents without a durable origin
+  // (about:, data:, file:, javascript:…) get a SecurityError out of every
+  // access, and a 5 MiB per-origin quota surfaces as QuotaExceededError.
+  // The object is a Proxy so `localStorage.foo = 1` stores like setItem
+  // and `Object.keys(localStorage)` enumerates the stored names, per spec.
+  // ---------------------------------------------------------------------
+  function storageError(name, message) {
+    var e = new Error(message);
+    e.name = name;
+    return e;
+  }
+  function storageKeyArg(value) {
+    return value === undefined ? "undefined" : String(value);
+  }
+  function storageCall(op, key, value, index) {
+    return host.__ironsurfStorage(op, key === undefined ? null : key, value === undefined ? null : value, index === undefined ? -1 : index);
+  }
+  function storageUnwrap(res, what) {
+    if (res[0] === "denied") {
+      throw storageError(
+        "SecurityError",
+        "The document has no storage origin; localStorage is not available (" + what + " denied)"
+      );
+    }
+    return res[1];
+  }
+  var localStorage = (function () {
+    var api = {
+      getItem: function (key) {
+        var value = storageUnwrap(storageCall("get", storageKeyArg(key)), "getItem");
+        return value === null || value === undefined ? null : String(value);
+      },
+      setItem: function (key, value) {
+        var res = storageCall("set", storageKeyArg(key), value === undefined ? "undefined" : String(value));
+        if (res[0] === "denied") {
+          throw storageError("SecurityError", "The document has no storage origin; localStorage is not available (setItem denied)");
+        }
+        if (res[0] === "quota") {
+          throw storageError("QuotaExceededError", "localStorage quota exceeded for this origin (5 MiB of names + values)");
+        }
+      },
+      removeItem: function (key) {
+        return storageUnwrap(storageCall("remove", storageKeyArg(key)), "removeItem") === true;
+      },
+      clear: function () {
+        storageUnwrap(storageCall("clear"), "clear");
+      },
+      key: function (index) {
+        var i = Math.floor(Number(index));
+        if (!isFinite(i) || i < 0) return null;
+        var name = storageUnwrap(storageCall("key", null, null, i), "key");
+        return name === null || name === undefined ? null : String(name);
+      },
+    };
+    function storageLen() {
+      return Number(storageUnwrap(storageCall("len"), "length"));
+    }
+    var handlers = {
+      get: function (t, k) {
+        if (typeof k === "symbol") return t[k];
+        if (k === "length") return storageLen();
+        if (Object.prototype.hasOwnProperty.call(t, k)) return t[k];
+        return api.getItem(k);
+      },
+      // `localStorage.foo = v` stores (spec: the Proxy treats every unknown
+      // name as an item); `delete localStorage.foo` removes it.
+      set: function (t, k, v) {
+        if (typeof k === "symbol" || Object.prototype.hasOwnProperty.call(t, k) || k === "length") {
+          return Reflect.set(t, k, v);
+        }
+        api.setItem(k, v);
+        return true;
+      },
+      has: function (t, k) {
+        if (typeof k === "symbol") return false;
+        if (k === "length" || Object.prototype.hasOwnProperty.call(t, k)) return true;
+        return api.getItem(k) !== null;
+      },
+      deleteProperty: function (t, k) {
+        if (typeof k === "symbol" || Object.prototype.hasOwnProperty.call(t, k)) {
+          return Reflect.deleteProperty(t, k);
+        }
+        api.removeItem(k);
+        return true;
+      },
+      ownKeys: function (t) {
+        var res = storageCall("keys");
+        if (res[0] === "denied") return Object.keys(t);
+        var names = Object.keys(t);
+        var items = res[1];
+        for (var i = 0; i < items.length; i++) names.push(String(items[i]));
+        return names;
+      },
+      getOwnPropertyDescriptor: function (t, k) {
+        if (k === "length") {
+          return { value: storageLen(), writable: false, enumerable: false, configurable: false };
+        }
+        if (Object.prototype.hasOwnProperty.call(t, k)) {
+          return { value: t[k], writable: true, enumerable: false, configurable: true };
+        }
+        if (typeof k === "symbol") return undefined;
+        var v = api.getItem(k);
+        if (v === null) return undefined;
+        return { value: v, writable: true, enumerable: true, configurable: true };
+      },
+    };
+    return new Proxy(api, handlers);
+  })();
+  host.localStorage = localStorage;
+
   // `document`/`console` as globals (and thus as `window.document`/etc, since
   // window IS the global object).
   host.document = document;
@@ -4044,6 +4192,126 @@ pub fn build_context(host: &HostRef, _timers: &Rc<RefCell<TimerQueue>>) -> Conte
     ) {
         error!("js binding `dialog` failed to install: {err}");
     }
+    // window.localStorage (task: per-origin DOM storage): the whole Storage
+    // surface funnels through this ONE native, and every call answers an
+    // envelope `[status, payload]` — "ok", "denied" or "quota" — that the
+    // prelude turns into a SecurityError / QuotaExceededError. The security
+    // lives HERE, not in JavaScript: the area key is the document origin
+    // re-resolved from the host URL on EVERY call (never cached across
+    // documents or calls), only http/https have an area at all, and every
+    // operation on an opaque origin answers "denied". A missing store cell
+    // (bare tests) denies the same way. Coercion runs before the host is
+    // touched — the convention every native follows.
+    if let Err(err) = context.register_global_builtin_callable(
+        JsString::from(native::STORAGE),
+        4,
+        NativeFunction::from_copy_closure(|_this, args, context| {
+            let envelope = |status: &str, payload: JsValue, context: &mut Context| {
+                JsValue::from(boa_engine::object::builtins::JsArray::from_iter(
+                    [JsValue::from(JsString::from(status)), payload],
+                    context,
+                ))
+            };
+            let op = args
+                .first()
+                .cloned()
+                .unwrap_or(JsValue::undefined())
+                .to_string(context)?
+                .to_std_string_escaped();
+            let key = arg_opt_string(args.get(1), context)?;
+            let value = arg_opt_string(args.get(2), context)?;
+            let index = args
+                .get(3)
+                .cloned()
+                .unwrap_or(JsValue::undefined())
+                .to_number(context)
+                .map(|n| if n.is_finite() && n >= 0.0 { n as usize } else { usize::MAX })?;
+            let (store, url) = with_host(|host| (host.local_storage.clone(), host.url.clone()))
+                .unwrap_or((None, String::new()));
+            let origin = ironsurf_storage::storage_origin_key(&url);
+            if op == "origin" {
+                // Non-throwing probe (tests, diagnostics): the area key this
+                // document's calls read/write, or null for no durable origin.
+                let payload = origin
+                    .as_ref()
+                    .map(|key| JsValue::from(JsString::from(key.clone())))
+                    .unwrap_or(JsValue::null());
+                return Ok(envelope("ok", payload, context));
+            }
+            let (Some(store), Some(origin)) = (store.as_ref(), origin.as_deref()) else {
+                return Ok(envelope("denied", JsValue::null(), context));
+            };
+            let mut store = store
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            match op.as_str() {
+                "get" => {
+                    let got = key
+                        .as_deref()
+                        .and_then(|key| store.get(origin, key))
+                        .map(|value| JsValue::from(JsString::from(value)))
+                        .unwrap_or(JsValue::null());
+                    Ok(envelope("ok", got, context))
+                }
+                "len" => Ok(envelope(
+                    "ok",
+                    JsValue::new(store.len(origin) as u32),
+                    context,
+                )),
+                "key" => {
+                    let name = store
+                        .key(origin, index)
+                        .map(|name| JsValue::from(JsString::from(name)))
+                        .unwrap_or(JsValue::null());
+                    Ok(envelope("ok", name, context))
+                }
+                "set" => match store.set(origin, &key.unwrap_or_default(), &value.unwrap_or_default()) {
+                    Ok(()) => Ok(envelope("ok", JsValue::null(), context)),
+                    Err(ironsurf_storage::StoreError::QuotaExceeded { .. }) => {
+                        Ok(envelope("quota", JsValue::null(), context))
+                    }
+                    Err(err) => {
+                        // The in-memory area updated fine; only persistence
+                        // failed. The page keeps its data — the tab complains.
+                        warn!("localStorage persist failed for {origin}: {err}");
+                        Ok(envelope("ok", JsValue::null(), context))
+                    }
+                },
+                "remove" => {
+                    let removed = match store.remove(origin, &key.unwrap_or_default()) {
+                        Ok(removed) => removed,
+                        Err(err) => {
+                            warn!("localStorage persist failed for {origin}: {err}");
+                            false
+                        }
+                    };
+                    Ok(envelope("ok", JsValue::from(removed), context))
+                }
+                "clear" => {
+                    if let Err(err) = store.clear(origin) {
+                        warn!("localStorage persist failed for {origin}: {err}");
+                    }
+                    Ok(envelope("ok", JsValue::null(), context))
+                }
+                "keys" => {
+                    // Insertion order — the same sequence `key(i)` reports,
+                    // which is what `Object.keys(localStorage)` must show.
+                    let len = store.len(origin);
+                    let keys: Vec<JsValue> = (0..len)
+                        .filter_map(|i| store.key(origin, i))
+                        .map(|name| JsValue::from(JsString::from(name)))
+                        .collect();
+                    let array = boa_engine::object::builtins::JsArray::from_iter(keys, context);
+                    Ok(envelope("ok", JsValue::from(array), context))
+                }
+                // Unknown ops are inert (only our prelude calls this native).
+                _ => Ok(envelope("ok", JsValue::null(), context)),
+            }
+        }),
+    ) {
+        error!("js binding `localStorage` failed to install: {err}");
+    }
+
     // Timers: real queue entries the tab's poll loop executes. A non-callable
     // callback schedules nothing and reads as id 0 (what browsers do).
     let schedule = |interval: bool, raf: bool, delay_arg: Option<usize>| {
@@ -6651,6 +6919,233 @@ mod user_agent_tests {
             crate::netmod::USER_AGENT
                 .strip_prefix("Mozilla/")
                 .unwrap_or(crate::netmod::USER_AGENT)
+        );
+    }
+}
+
+#[cfg(test)]
+mod local_storage_tests {
+    use super::*;
+
+    fn store(dir: &std::path::Path) -> SharedLocalStorage {
+        Arc::new(std::sync::Mutex::new(
+            ironsurf_storage::LocalStorage::open(dir.join("local-storage")),
+        ))
+    }
+
+    fn host_for(url: &str, cell: Option<SharedLocalStorage>) -> HostRef {
+        let mut state = HostState::new(url, None, None);
+        state.local_storage = cell;
+        Rc::new(RefCell::new(state))
+    }
+
+    /// Evaluate a snippet in a fresh per-document world (prelude + natives).
+    fn eval_in(host: &HostRef, source: &str) -> JsValue {
+        let mut runtime = JsRuntime::new(Rc::clone(host));
+        runtime.eval(source).expect("snippet should evaluate")
+    }
+
+    fn eval_str(host: &HostRef, source: &str) -> String {
+        eval_in(host, source)
+            .as_string()
+            .map(|s| s.to_std_string_escaped())
+            .unwrap_or_default()
+    }
+
+    /// The whole WinterTC Storage surface works — methods, `length`,
+    /// `key(i)`, and the Proxy forms (`ls.foo = v`, `Object.keys`) — all
+    /// landing in the container store, and `window.localStorage ===
+    /// localStorage` like browsers.
+    #[test]
+    fn storage_surface_round_trips_through_the_native() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let host = host_for(
+            "https://app.example.test:8443/path/page.html",
+            Some(store(dir.path())),
+        );
+        let ok = eval_in(
+            &host,
+            r#"
+            localStorage.setItem("theme", "dark");
+            localStorage.setItem("count", "7");
+            var ok =
+                localStorage.getItem("theme") === "dark" &&
+                localStorage.getItem("missing") === null &&
+                localStorage.length === 2 &&
+                localStorage.key(0) === "theme" &&
+                localStorage.key(1) === "count" &&
+                localStorage.key(9) === null;
+            localStorage.bag = "kitchen";                    // Proxy set = setItem
+            ok = ok &&
+                localStorage["bag"] === "kitchen" &&
+                Object.keys(localStorage).join(",") === "theme,count,bag" &&
+                "theme" in localStorage &&
+                !("nope" in localStorage);
+            delete localStorage.theme;                       // Proxy delete = removeItem
+            ok = ok &&
+                localStorage.getItem("theme") === null &&
+                localStorage.length === 2 &&
+                localStorage.removeItem("count") === true &&
+                localStorage.length === 1 &&
+                window.localStorage === localStorage;
+            ok;
+            "#,
+        );
+        assert_eq!(ok.as_boolean(), Some(true), "storage surface failed: {ok:?}");
+    }
+
+    /// THE security property: the area is the document origin. Two documents
+    /// in one container (one store!) on different origins cannot read or
+    /// overwrite each other; same-origin reloads see the same area.
+    #[test]
+    fn areas_are_isolated_per_origin_and_shared_same_origin() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cell = store(dir.path());
+        let http_a = host_for("http://shared.test:8080/one", Some(Arc::clone(&cell)));
+        let http_b = host_for("http://other.test:8080/two", Some(Arc::clone(&cell)));
+        let https_a = host_for("https://shared.test:8080/", Some(Arc::clone(&cell)));
+        let same_a = host_for("http://shared.test:8080/elsewhere", Some(Arc::clone(&cell)));
+
+        eval_in(&http_a, r#"localStorage.setItem("session", "alpha")"#);
+        eval_in(&http_b, r#"localStorage.setItem("session", "beta")"#);
+
+        assert_eq!(
+            eval_str(&http_a, r#"localStorage.getItem("session")"#),
+            "alpha",
+            "the first origin keeps its own value"
+        );
+        assert_eq!(
+            eval_str(&http_b, r#"localStorage.getItem("session")"#),
+            "beta",
+            "the second origin never sees the first's data"
+        );
+        assert!(
+            eval_in(&https_a, r#"localStorage.getItem("session")"#).is_null(),
+            "https://shared.test:8080 is a DIFFERENT origin than http://shared.test:8080"
+        );
+        assert_eq!(
+            eval_str(&same_a, r#"localStorage.getItem("session")"#),
+            "alpha",
+            "same origin, any path — the area is shared like browsers"
+        );
+        // The origin the native reports matches the storage crate's key.
+        assert_eq!(
+            eval_str(
+                &http_a,
+                r#"(function(){ var r = __ironsurfStorage("origin"); return String(r[1]); })()"#
+            ),
+            "http://shared.test:8080"
+        );
+    }
+
+    /// Documents WITHOUT a durable origin — `about:blank`, `data:`, `file:`,
+    /// `javascript:` — get no area at all: every access throws an error
+    /// named `SecurityError`, and nothing is written to the store. This is
+    /// what stops a `data:` iframe or a sandboxed about:blank page from
+    /// riding on some real origin's cookies-of-the-web.
+    #[test]
+    fn opaque_origins_throw_security_error_on_every_access() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cell = store(dir.path());
+        for url in [
+            "about:blank",
+            "data:text/html,<script>steal()</script>",
+            "file:///home/user/private.html",
+            "javascript:alert(1)",
+        ] {
+            let host = host_for(url, Some(Arc::clone(&cell)));
+            let name = eval_str(
+                &host,
+                r#"
+                try { localStorage.setItem("pwned", "yes"); "no-throw"; }
+                catch (e) { e.name; }
+                "#,
+            );
+            assert_eq!(name, "SecurityError", "{url} must be denied access");
+            let name = eval_str(
+                &host,
+                r#"try { localStorage.getItem("x"); "no-throw"; } catch (e) { e.name; }"#,
+            );
+            assert_eq!(name, "SecurityError", "{url}: getItem must throw too");
+            let name = eval_str(
+                &host,
+                r#"try { localStorage.length; "no-throw"; } catch (e) { e.name; }"#,
+            );
+            assert_eq!(name, "SecurityError", "{url}: length must throw too");
+            let name = eval_str(
+                &host,
+                r#"try { localStorage.clear(); "no-throw"; } catch (e) { e.name; }"#,
+            );
+            assert_eq!(name, "SecurityError", "{url}: clear must throw too");
+        }
+        // Nothing from the denied documents reached the container store.
+        let area_origin = ironsurf_storage::storage_origin_key("http://shared.test:8080")
+            .expect("origin");
+        assert!(
+            cell.lock().expect("store lock").entries(&area_origin).is_empty(),
+            "no opaque document wrote anything"
+        );
+    }
+
+    /// Without a store cell at all (bare tests) the surface behaves exactly
+    /// like an opaque origin: present, callable, denied — never a crash.
+    #[test]
+    fn missing_store_denies_like_an_opaque_origin() {
+        let host = host_for("https://example.test/", None);
+        let name = eval_str(
+            &host,
+            r#"try { localStorage.setItem("a", "b"); "no-throw"; } catch (e) { e.name; }"#,
+        );
+        assert_eq!(name, "SecurityError");
+    }
+
+    /// The per-origin 5 MiB quota surfaces as `QuotaExceededError`, and a
+    /// refused write changes nothing.
+    #[test]
+    fn quota_surfaces_as_quota_exceeded_error() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let host = host_for("https://quota.test/", Some(store(dir.path())));
+        let outcome = eval_str(
+            &host,
+            r#"
+            localStorage.setItem("small", "fits");
+            var big = "x".repeat(5 * 1024 * 1024);   // the whole 5 MiB quota in one value
+            var name = "no-throw";
+            try { localStorage.setItem("huge", big); }
+            catch (e) { name = e.name; }
+            name + "|" + localStorage.getItem("small") + "|" + localStorage.length;
+            "#,
+        );
+        assert_eq!(outcome, "QuotaExceededError|fits|1");
+    }
+
+    /// Persistence: values a document stored are there for the NEXT
+    /// navigation (a fresh realm over the same store) and after a process
+    /// restart (a fresh store over the same directory).
+    #[test]
+    fn values_survive_navigation_and_restart() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cell = store(dir.path());
+        let writer = host_for("https://persist.test/", Some(Arc::clone(&cell)));
+        eval_in(&writer, r#"localStorage.setItem("keep", "me")"#);
+        drop(writer);
+
+        let reader = host_for("https://persist.test/next", Some(Arc::clone(&cell)));
+        assert_eq!(
+            eval_str(&reader, r#"localStorage.getItem("keep")"#),
+            "me",
+            "a fresh realm on the same origin reads the stored value"
+        );
+        drop(reader);
+        drop(cell);
+
+        // Simulated tab restart: a brand-new store over the same directory.
+        let restarted = store(dir.path());
+        let late = host_for("https://persist.test/", Some(restarted));
+        assert_eq!(
+            eval_str(&late, r#"localStorage.getItem("keep")"#),
+            "me",
+            "localStorage is durable on disk, per origin"
         );
     }
 }

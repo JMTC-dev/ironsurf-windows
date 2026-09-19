@@ -22,12 +22,14 @@
 
 mod cache;
 mod cookies;
+mod local_storage;
 mod registry;
 
 pub use cache::{
     fresh_until, CachedEntry, NetCache, DEFAULT_MAX_ENTRIES, DEFAULT_MAX_TOTAL_BYTES,
 };
 pub use cookies::{Cookie, CookieJar};
+pub use local_storage::{storage_origin_key, LocalStorage, MAX_LOCAL_STORAGE_BYTES};
 pub use registry::{Store, StoreError, MAX_USERSCRIPT_CODE_BYTES, MAX_USERSCRIPT_NAME_CHARS};
 
 use ironsurf_common::ContainerId;
@@ -78,6 +80,14 @@ impl ContainerStore {
     /// In-memory bounded response cache for this container.
     pub fn cache(&self) -> NetCache {
         NetCache::new(self.profile_dir.join(cache::CACHE_DIR))
+    }
+
+    /// This container's DOM `localStorage` store (task: per-origin local
+    /// storage): areas live one JSON file per origin under
+    /// `local-storage/`, so every area is bound to this container and the
+    /// key is the document origin — see [`local_storage`].
+    pub fn local_storage(&self) -> LocalStorage {
+        LocalStorage::open(self.profile_dir.join(local_storage::LOCAL_STORAGE_DIR))
     }
 
     /// Append one navigation to this container's `history.jsonl`.

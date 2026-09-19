@@ -339,7 +339,7 @@ containers.json                       # registry (Vec<Container>), written atomi
 profiles/<container-name-slug>-<id>/  # tab data path; owned by container
   cookies.json                        # our persistent jar (see below)
   net-cache/                          # bounded response cache (our layer)
-  local-storage/                      # reserved for engine/localStorage persistence
+  local-storage/                      # DOM localStorage: one JSON area file per origin
   history.jsonl
 ```
 
@@ -363,6 +363,7 @@ impl ContainerStore {
     pub fn open(store: &Store, id: ContainerId) -> Self;
     pub fn cookie_jar(&self) -> CookieJar;         // loads cookies.json
     pub fn cache(&self) -> NetCache;
+    pub fn local_storage(&self) -> LocalStorage;   // areas under local-storage/ (task: per-origin DOM storage)
     pub fn append_history(&self, url: &str, title: Option<&str>) -> Result<(), StoreError>;
 }
 
@@ -399,6 +400,30 @@ impl NetCache {
     pub fn store(&self, url: &str, status: u16, headers: &[(String, String)], body: Vec<u8>, now_unix: i64);
     pub fn clear(&self);
 }
+
+pub struct LocalStorage; // DOM localStorage: one lazily-loaded JSON area per origin (task: per-origin storage)
+impl LocalStorage {
+    pub fn open(dir: impl AsRef<Path>) -> Self;
+    pub fn get(&mut self, origin: &str, key: &str) -> Option<String>;
+    pub fn set(&mut self, origin: &str, key: &str, value: &str) -> Result<(), StoreError>; // StoreError::QuotaExceeded over the per-origin cap
+    pub fn remove(&mut self, origin: &str, key: &str) -> Result<bool, StoreError>;
+    pub fn clear(&mut self, origin: &str) -> Result<(), StoreError>;
+    pub fn len(&mut self, origin: &str) -> usize;
+    pub fn key(&mut self, origin: &str, index: usize) -> Option<String>; // insertion order
+}
+pub fn storage_origin_key(url: &str) -> Option<String>; // durable storage origin, None = opaque
+
+// localStorage rules (must be unit-tested):
+//  - the area key is the serialized origin `scheme://host:port` with default ports folded in
+//    (`http://example.com` == `http://example.com:80`; `https://example.com` is a DIFFERENT
+//    origin), so path/query/fragment/user never split or merge an area;
+//  - only `http`/`https` have a durable area — `about:`, `data:`, `file:`, `javascript:`,
+//    `ws:`, `blob:`… resolve to no origin, and the caller (the tab) throws SecurityError for them;
+//  - one JSON file per area under `local-storage/`, named by the lowercase hex of the origin key
+//    (no host name in file names), written atomically (tmp+rename); corrupt files read as empty;
+//  - quota is `MAX_LOCAL_STORAGE_BYTES` (5 MiB of UTF-16 code units over names + values, like
+//    browsers) **per origin**, checked before anything changes — a refused write stores nothing;
+//  - areas are container-scoped by construction: the store's directory is the container profile.
 ```
 
 ---
@@ -634,6 +659,19 @@ and `fetch` promises settle; a throwing job is reported as a script error (origi
   capitals take no dash); reads re-read the document, writes/deletes go through the same
   `__ironsurfDomAttr*` natives as `setAttribute`, so they restyle and repaint like any attribute
   mutation, and the keys enumerate (`for (k in el.dataset)`).
+- **`window.localStorage` is a real `Storage`** (task: per-origin DOM storage): `getItem`/
+  `setItem`/`removeItem`/`clear`/`key(i)`/`length`, plus the spec's Proxy forms — `localStorage.foo = 1`
+  stores, `localStorage.foo` reads, `delete localStorage.foo` removes, `Object.keys` enumerates the
+  stored names. Every operation funnels through ONE native answering a `[status, payload]` envelope,
+  and **the per-origin security rule is enforced on the Rust side, never in JS**: the area key is the
+  document's origin re-resolved from the host URL on *every* call (never cached across documents or
+  calls), only `http`/`https` documents have an area, and opaque documents (`about:`, `data:`, `file:`,
+  `javascript:`…) get a `SecurityError` (a JS `Error` with `name = "SecurityError"`) out of every
+  access; over the per-origin 5 MiB quota `setItem` throws `QuotaExceededError`. Areas persist under
+  the container profile's `local-storage/` (ironsurf-storage) as one JSON file per origin — so
+  storage is per container *and* per origin (two tabs of one container on different origins never
+  read each other's data; a tab restart keeps its areas; the sandbox hides them from other
+  containers).
   `console.log/info/warn/error` → tab stderr + `FromTab::StatusText` **and** a
   `FromTab::ConsoleLog { source: "js", level, message }` per line (all four levels, page order).
 - **`window.alert`/`confirm`/`prompt` are implemented as real synchronous modals**: the native

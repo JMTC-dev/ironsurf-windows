@@ -533,6 +533,13 @@ pub struct Tab {
     /// `<script src>` bodies and images/CSS/fonts all see each other's hits,
     /// validators and LRU bounds.
     cache: Arc<Mutex<NetCache>>,
+    /// The container's `localStorage` store (task: per-origin DOM storage):
+    /// opened from the profile dir, so every area physically lives inside
+    /// this container's files (the sandbox hides them from other
+    /// containers). The JS host gets the very same handle — the native
+    /// keys every operation by the origin re-resolved from the CURRENT
+    /// document URL, so areas never cross origins.
+    local_storage: js::SharedLocalStorage,
     provider: Arc<BlitzNetProvider>,
     shell: Arc<ShellHook>,
     nav: Arc<NavHook>,
@@ -871,6 +878,11 @@ impl Tab {
 
     fn new(args: &TabArgs, pipe: Arc<SelfPipe>) -> Self {
         let store = ContainerStore::from_profile_dir(args.container_id, &args.profile_dir);
+        // One DOM-storage store per container per tab (task: per-origin
+        // `localStorage`): areas are one JSON file per origin under the
+        // profile dir's `local-storage/`.
+        let local_storage: js::SharedLocalStorage =
+            Arc::new(Mutex::new(store.local_storage()));
         // One cookie jar per container per tab: the provider owns it, and
         // the tab holds the same Arc handle for main-document fetches
         // (cookies flow both ways; a single save flushes everything).
@@ -909,6 +921,7 @@ impl Tab {
             // …and the same single cache the provider serves subresources
             // from, taken from the provider itself (never a second copy).
             cache: provider.cache_handle(),
+            local_storage,
             provider,
             shell: Arc::new(ShellHook {
                 pipe: Arc::clone(&pipe),
@@ -1609,6 +1622,10 @@ impl Tab {
         // `navigator.userAgent` reads the tab's live effective-UA cell
         // (same shared-handle pattern as the dialog host above).
         host.borrow_mut().user_agent = Some(Arc::clone(&self.user_agent));
+        // `window.localStorage` reaches the container store through this
+        // handle (task: per-origin DOM storage); the per-origin rule is
+        // enforced natively against the host URL set just above.
+        host.borrow_mut().local_storage = Some(Arc::clone(&self.local_storage));
         debug!(
             "running {} script(s) for {url}; skipped: {:?}",
             extraction.scripts.len(),

@@ -33,6 +33,8 @@ pub enum StoreError {
     InvalidUserAgent,
     #[error("no such userscript: {0}")]
     NoSuchUserscript(u64),
+    #[error("local storage quota exceeded for origin {origin} (max {max} bytes)")]
+    QuotaExceeded { origin: String, max: usize },
     #[error("userscript name must not be empty")]
     EmptyUserscriptName,
     #[error("userscript name too long: {length} chars (max {max})")]
@@ -58,7 +60,7 @@ impl StoreError {
             source,
         }
     }
-    fn json(path: impl AsRef<Path>, source: serde_json::Error) -> Self {
+    pub(crate) fn json(path: impl AsRef<Path>, source: serde_json::Error) -> Self {
         StoreError::Json {
             path: path.as_ref().display().to_string(),
             source,
