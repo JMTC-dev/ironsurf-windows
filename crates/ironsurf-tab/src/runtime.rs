@@ -1426,6 +1426,42 @@ impl Tab {
     /// "no scripts", thread-spawn failures degrade to fewer workers (the tab
     /// thread fetches the rest itself), and every `eval` is caught inside
     /// [`js::JsRuntime::run_scripts`].
+    /// Fetch one `<script src>` (or ES-module) body on cloned shared handles:
+    /// the jar/cache mutexes are locked **per cookie/cache operation** (via
+    /// the `JarAccess`/`CacheAccess` adapters `fetch_document_*_report_shared`
+    /// takes), so parallel script threads never serialise on each other, and
+    /// every body reports into the tab's DevTools queue and the archive sink
+    /// exactly like the old sequential fetch did. Also handed to the
+    /// [`js::UrlModuleLoader`] (task: `<script type="module">` loading), whose
+    /// lazy graph fetches run on the tab thread during evaluation.
+    fn fetch_script_body(
+        script_url: &Url,
+        policy: NetPolicy,
+        jar: &Arc<Mutex<CookieJar>>,
+        cache: &Arc<Mutex<NetCache>>,
+        net_events: &Arc<Mutex<Vec<NetEvent>>>,
+        user_agent: &netmod::SharedUserAgent,
+        archive: &Arc<crate::archive::ArchiveState>,
+    ) -> Result<String, String> {
+        let events = Arc::clone(net_events);
+        netmod::fetch_document_report_shared(
+            script_url,
+            policy,
+            jar,
+            cache,
+            netmod::now_unix(),
+            user_agent,
+            Some(&|event| events.lock().expect("net events mutex").push(event)),
+        )
+        .map(|script| {
+            // Archive mode: an external script payload is a
+            // subresource, whatever its scheme ended up being.
+            archive.store(&script.url, false, &script.body);
+            script.body_text()
+        })
+        .map_err(|err| err.to_string())
+    }
+
     fn run_scripts(&mut self, url: &Url) {
         // Fresh document: the CSS seam forgets last document's content hashes
         // so the same sheet on a new page is reported once again.
@@ -1445,41 +1481,6 @@ impl Tab {
             let net_events = Arc::clone(&self.net_events);
             let user_agent = Arc::clone(&self.user_agent);
             let archive = Arc::clone(&self.archive);
-
-            /// Fetch one `<script src>` body on cloned shared handles: the
-            /// jar/cache mutexes are locked **per cookie/cache operation**
-            /// (via the `JarAccess`/`CacheAccess` adapters `fetch_document_*_
-            /// report_shared` takes), so parallel script threads never
-            /// serialise on each other, and every body reports into the tab's
-            /// DevTools queue and the archive sink exactly like the old
-            /// sequential fetch did.
-            fn fetch_script_body(
-                script_url: &Url,
-                policy: NetPolicy,
-                jar: &Arc<Mutex<CookieJar>>,
-                cache: &Arc<Mutex<NetCache>>,
-                net_events: &Arc<Mutex<Vec<NetEvent>>>,
-                user_agent: &netmod::SharedUserAgent,
-                archive: &Arc<crate::archive::ArchiveState>,
-            ) -> Result<String, String> {
-                let events = Arc::clone(net_events);
-                netmod::fetch_document_report_shared(
-                    script_url,
-                    policy,
-                    jar,
-                    cache,
-                    netmod::now_unix(),
-                    user_agent,
-                    Some(&|event| events.lock().expect("net events mutex").push(event)),
-                )
-                .map(|script| {
-                    // Archive mode: an external script payload is a
-                    // subresource, whatever its scheme ended up being.
-                    archive.store(&script.url, false, &script.body);
-                    script.body_text()
-                })
-                .map_err(|err| err.to_string())
-            }
 
             // Two-phase batch: the document walk hands us every `src` URL at
             // once, so a bounded pool of fetcher threads downloads them in
@@ -1507,7 +1508,7 @@ impl Tab {
                     return script_urls
                         .iter()
                         .map(|script_url| {
-                            fetch_script_body(
+                            Self::fetch_script_body(
                                 script_url,
                                 policy,
                                 &jar,
@@ -1549,7 +1550,7 @@ impl Tab {
                     let net_events = Arc::clone(&net_events);
                     let user_agent = Arc::clone(&user_agent);
                     let archive = Arc::clone(&archive);
-                    let body = fetch_script_body(
+                    let body = Self::fetch_script_body(
                         &script_url,
                         policy,
                         &jar,
@@ -1632,9 +1633,33 @@ impl Tab {
             extraction.notes
         );
         let js_started = Instant::now();
+        // `<script type="module">` (task: module loading): the module graph
+        // fetches its dependencies LAZILY, during evaluation — so the loader
+        // gets the tab's own network handle: the same `fetch_script_body`
+        // path the `<script src>` pool uses (one jar/cache, locked per
+        // operation; every module body reports into the DevTools queue and
+        // the archive sink like any other subresource).
+        let module_fetch: js::ModuleFetch = {
+            let jar = Arc::clone(&self.jar);
+            let cache = Arc::clone(&self.cache);
+            let net_events = Arc::clone(&self.net_events);
+            let user_agent = Arc::clone(&self.user_agent);
+            let archive = Arc::clone(&self.archive);
+            Rc::new(move |module_url: &Url| {
+                Self::fetch_script_body(
+                    module_url,
+                    policy,
+                    &jar,
+                    &cache,
+                    &net_events,
+                    &user_agent,
+                    &archive,
+                )
+            })
+        };
         // The runtime (Context + host + timer queue) survives this call: it
         // lives on as `self.js` until the next navigation replaces it.
-        let mut runtime = js::JsRuntime::new(host);
+        let mut runtime = js::JsRuntime::new_with_modules(host, url, module_fetch);
         // `<script type="importmap">` (task: importmap support): the walk
         // parsed + validated the map during extraction — the runtime keeps it
         // for the document's lifetime (module resolution consumes it).

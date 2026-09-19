@@ -627,8 +627,24 @@ members ignored, malformed entries dropped, but invalid JSON or non-object top-l
 is ignored — and lands on `Extraction::import_map` and then `JsRuntime` for the document's
 lifetime; `ImportMap::resolve` implements the spec's resolution (exact keys, longest
 `/`-terminated prefix keys with remainder replacement, `null` unmappings, `scopes` shadowing
-`imports` for requests from inside a URL prefix, bare-vs-relative specifier split). Module
-loading itself remains TODO; the map is the piece it will consume.
+`imports` for requests from inside a URL prefix, bare-vs-relative specifier split).
+**`<script type="module">` loading is implemented on top of it** (task: module loading): the
+extraction walk treats `type="module"` as a first-class script — inline bodies collected,
+`src=` bodies fetched through the same capped concurrent pool as classic scripts — and each
+becomes a `ScriptSource` with `kind: Module` and its **authoritative URL** (its resolved
+`src`, or the document URL when inline) as its origin. Every realm is built with a
+`UrlModuleLoader` (boa 0.22's `ModuleLoader` host hook, replacing the default
+*filesystem* loader) that resolves specifiers through the document's import map —
+`ImportMap::resolve_for`, keyed by the importing module's URL so `scopes` apply — and
+fetches bodies through the tab's own network layer, so lazily-imported dependencies ride
+the same cookie jar, cache and DevTools `NetworkEvent` reporting (and archive sink) as
+`<script src>` does. Modules are cached by absolute URL: two importers share one instance
+(fetched and evaluated once), and cycles work — the entry module is registered before its
+imports load. Top-level `await`, static and dynamic `import()`, and `import.meta.url` are
+real; a module graph failure (unresolvable bare specifier, failed dep fetch, link clash,
+thrown body) reports a `ScriptError` like any classic-script throw and never kills the tab.
+Honest gaps: no MIME check on module responses (the classic-script fetcher answers any
+2xx body as script text), and import attributes (`with { type: "json" }`) are ignored.
 **Full Boa support is switched on** (task: as much JavaScript as possible): every
 `boa_engine` language feature is compiled in — `annex-b` (legacy web compat: `substr`/`trimLeft`,
 legacy escapes/regex quirks), `intl_bundled` (`Intl` with ICU data shipped *in the binary* —

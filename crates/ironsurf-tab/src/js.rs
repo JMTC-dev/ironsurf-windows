@@ -45,12 +45,19 @@
 //! code that can re-enter JavaScript.
 
 use std::cell::RefCell;
+use std::collections::HashMap;
+use std::future::Future;
+use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use boa_engine::builtins::promise::PromiseState;
+use boa_engine::js_string;
+use boa_engine::module::{ModuleLoader, ModuleRequest, Referrer};
+use boa_engine::object::JsObject;
 use boa_engine::property::Attribute;
-use boa_engine::{Context, JsNativeError, JsString, JsValue, NativeFunction, Source};
+use boa_engine::{Context, JsNativeError, JsString, JsValue, Module, NativeFunction, Source};
 use blitz_dom::node::{ImageData, SpecialElementData};
 use blitz_dom::{local_name, BaseDocument, LocalName, Node, NodeData, NodeId, Prefix, QualName};
 use blitz_html::HtmlDocument;
@@ -88,9 +95,26 @@ fn log_console(level: ConsoleLevel, url: &str, text: &str, userscript: Option<&s
 pub struct ScriptSource {
     /// The JavaScript text.
     pub code: String,
-    /// Where it came from: `"inline"` for `<script>` bodies, otherwise the
-    /// resolved `src` URL (used in diagnostics and status texts).
+    /// Where it came from: `"inline"` for classic `<script>` bodies, otherwise
+    /// the resolved `src` URL (used in diagnostics and status texts). ES
+    /// modules instead carry the **absolute URL they execute as** (their
+    /// resolved `src`, or the document URL for inline modules) — that URL is
+    /// their `import.meta.url` and the base their imports resolve against.
     pub origin: String,
+    /// Classic or module evaluation (task: `<script type="module">` loading).
+    pub kind: ScriptKind,
+}
+
+/// How a collected [`ScriptSource`] must be evaluated.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ScriptKind {
+    /// A classic `<script>`: evaluated directly in the realm's global scope.
+    Classic,
+    /// `<script type="module">`: parsed as an ES module and run through the
+    /// document's [`UrlModuleLoader`] — static/dynamic imports resolve
+    /// through the document's import map, each dependency is fetched once and
+    /// instantiated once, shared by every importer.
+    Module,
 }
 
 /// What [`extract_scripts`] found: executable scripts in document order, plus
@@ -121,8 +145,8 @@ fn walk_preorder(doc: &BaseDocument, node_id: NodeId, out: &mut Vec<NodeId>) {
 }
 
 /// Classic-script `type` values we execute. `None`/empty means "no type
-/// attribute" (a classic script); ES modules are *not* included — they need a
-/// module resolver we do not have yet (TODO).
+/// attribute" (a classic script); ES modules are handled separately, as
+/// [`ScriptKind::Module`] (task: `<script type="module">` loading).
 fn is_classic_script_type(type_attr: Option<&str>) -> bool {
     let Some(raw) = type_attr.map(str::trim).filter(|t| !t.is_empty()) else {
         return true;
@@ -142,7 +166,9 @@ fn is_classic_script_type(type_attr: Option<&str>) -> bool {
     ) || lowered.starts_with("text/javascript;")
 }
 
-/// ES-module `type` values (skipped with a note, not executed).
+/// ES-module `type` (`<script type="module">`): executed as an ES module
+/// through the document's [`UrlModuleLoader`] (task: module loading), not as
+/// a classic script.
 fn is_module_type(type_attr: Option<&str>) -> bool {
     type_attr
         .map(str::trim)
@@ -367,10 +393,17 @@ enum PendingScript {
     /// A resolved `src=` script awaiting its body. `raw` is the attribute
     /// value, kept verbatim for the failure note.
     External { url: Url, raw: String },
+    /// Inline `<script type="module">` body. `document_url` is the document's
+    /// own URL: the module's identity (`import.meta.url`) and the base its
+    /// relative imports resolve against.
+    ModuleInline { code: String, document_url: String },
+    /// A resolved `src=` module script awaiting its body (fetched exactly
+    /// like a classic `src` — same pool, same DevTools reporting).
+    ModuleExternal { url: Url, raw: String },
     /// The JSON body of a `<script type="importmap">`, awaiting validation.
     ImportMap { json: String },
-    /// A script the walk deliberately skipped (module, unknown type,
-    /// unresolvable `src`) with the note it contributes.
+    /// A script the walk deliberately skipped (unknown type, unresolvable
+    /// `src`) with the note it contributes.
     Note(String),
 }
 
@@ -414,9 +447,22 @@ fn walk_scripts(doc: &BaseDocument, base: &Url) -> Vec<PendingScript> {
         }
 
         if is_module_type(type_attr) {
-            pending.push(PendingScript::Note(
-                "skipped type=\"module\" script (module loading TODO)".to_string(),
-            ));
+            // Task: `<script type="module">` loading. The body (inline, or
+            // fetched from `src` like any external script) is executed as an
+            // ES module; its imports resolve later through the document's
+            // import map + loader (`UrlModuleLoader`), never here.
+            match src {
+                Some(raw) => match base.join(&raw) {
+                    Ok(url) => pending.push(PendingScript::ModuleExternal { url, raw }),
+                    Err(err) => pending.push(PendingScript::Note(format!(
+                        "module script src {raw:?} could not be resolved: {err}"
+                    ))),
+                },
+                None => pending.push(PendingScript::ModuleInline {
+                    code: node.text_content(),
+                    document_url: base.as_str().to_string(),
+                }),
+            }
             continue;
         }
         if !is_classic_script_type(type_attr) {
@@ -457,7 +503,12 @@ fn assemble_scripts(pending: Vec<PendingScript>, results: Vec<Result<String, Str
     // fetch failures, extras are ignored.
     let external_count = pending
         .iter()
-        .filter(|item| matches!(item, PendingScript::External { .. }))
+        .filter(|item| {
+            matches!(
+                item,
+                PendingScript::External { .. } | PendingScript::ModuleExternal { .. }
+            )
+        })
         .count();
     let mut results = results;
     results.truncate(external_count);
@@ -491,7 +542,31 @@ fn assemble_scripts(pending: Vec<PendingScript>, results: Vec<Result<String, Str
                     extraction.scripts.push(ScriptSource {
                         code,
                         origin: "inline".to_string(),
+                        kind: ScriptKind::Classic,
                     });
+                }
+            }
+            PendingScript::ModuleInline { code, document_url } => {
+                if !code.trim().is_empty() {
+                    extraction.scripts.push(ScriptSource {
+                        code,
+                        origin: document_url,
+                        kind: ScriptKind::Module,
+                    });
+                }
+            }
+            PendingScript::ModuleExternal { url, raw } => {
+                let index = next;
+                next += 1;
+                match &results[index] {
+                    Ok(body) => extraction.scripts.push(ScriptSource {
+                        code: body.clone(),
+                        origin: url.as_str().to_string(),
+                        kind: ScriptKind::Module,
+                    }),
+                    Err(err) => extraction
+                        .notes
+                        .push(format!("module script {raw:?} failed: {err}")),
                 }
             }
             PendingScript::External { url, raw } => {
@@ -501,6 +576,7 @@ fn assemble_scripts(pending: Vec<PendingScript>, results: Vec<Result<String, Str
                     Ok(body) => extraction.scripts.push(ScriptSource {
                         code: body.clone(),
                         origin: url.as_str().to_string(),
+                        kind: ScriptKind::Classic,
                     }),
                     Err(err) => extraction
                         .notes
@@ -534,8 +610,11 @@ pub fn extract_scripts(
     let pending = walk_scripts(doc, base);
     let mut results = Vec::new();
     for item in &pending {
-        if let PendingScript::External { url, .. } = item {
-            results.push(fetch(url));
+        match item {
+            PendingScript::External { url, .. } | PendingScript::ModuleExternal { url, .. } => {
+                results.push(fetch(url));
+            }
+            _ => {}
         }
     }
     assemble_scripts(pending, results)
@@ -561,7 +640,9 @@ pub fn extract_scripts_batch(
     let urls: Vec<&Url> = pending
         .iter()
         .filter_map(|item| match item {
-            PendingScript::External { url, .. } => Some(url),
+            PendingScript::External { url, .. } | PendingScript::ModuleExternal { url, .. } => {
+                Some(url)
+            }
             _ => None,
         })
         .collect();
@@ -571,6 +652,182 @@ pub fn extract_scripts_batch(
         fetch_many(&urls)
     };
     assemble_scripts(pending, results)
+}
+
+// ---------------------------------------------------------------------------
+// ES-module loading (task: `<script type="module">`)
+
+/// The fetcher the module graph runs through: absolute URL in, module body
+/// out. The tab hands in its own `<script src>` fetcher, so lazily-imported
+/// dependencies ride the same cookie jar, cache, DevTools reporting and
+/// archive sink as the rest of the page.
+pub type ModuleFetch = Rc<dyn Fn(&Url) -> Result<String, String>>;
+
+/// The document's ES-module loader (task: `<script type="module">` loading):
+/// resolves every specifier through the document's [`ImportMap`] when it has
+/// one (read at resolution time — the map is installed before the first
+/// module runs), fetches bodies through the tab's own network layer, and
+/// parses them with Boa.
+///
+/// Modules are keyed by their **absolute URL string**, so every importer of
+/// the same specifier gets the same `Module` instance — the spec's dedup
+/// requirement, and also what makes cycles work: [`register`](Self::register)
+/// files an entry module before its own imports load.
+///
+/// Boa 0.22 drives loading through job-queue futures; this loader fetches
+/// synchronously (the tab's blocking client, like every other tab fetch) and
+/// hands out an already-ready future, so a whole import graph settles within
+/// one job-queue drain.
+pub struct UrlModuleLoader {
+    /// The document URL: referrer for loads with no module/script path of
+    /// their own — dynamic `import()` from a classic script or a `javascript:`
+    /// URL resolves against it, like a referrer-less HTML base.
+    base: Url,
+    /// The document's import map, installed by [`JsRuntime::set_import_map`].
+    import_map: RefCell<Option<ImportMap>>,
+    /// The tab's fetcher (jar, cache, net events, archive — locked per
+    /// operation, never across another module's fetch).
+    fetch: ModuleFetch,
+    /// Absolute URL string → parsed module: entries and dependencies alike.
+    modules: RefCell<HashMap<String, Module>>,
+}
+
+impl UrlModuleLoader {
+    /// A loader for one document: `base` is the document URL, `fetch` the
+    /// tab's network handle for module bodies.
+    pub fn new(base: Url, fetch: ModuleFetch) -> Self {
+        UrlModuleLoader {
+            base,
+            import_map: RefCell::new(None),
+            fetch,
+            modules: RefCell::new(HashMap::new()),
+        }
+    }
+
+    /// Install/replace the document's import map (module resolution reads it
+    /// per lookup, never caches a decision across maps).
+    pub fn set_import_map(&self, import_map: Option<ImportMap>) {
+        *self.import_map.borrow_mut() = import_map;
+    }
+
+    /// File a module parsed outside the loader — an inline entry module — so
+    /// the loader hands its own URL back as this very instance.
+    pub fn register(&self, url: &Url, module: &Module) {
+        self.modules
+            .borrow_mut()
+            .insert(url.as_str().to_string(), module.clone());
+    }
+
+    /// The module count resolved so far (diagnostics and tests).
+    pub fn len(&self) -> usize {
+        self.modules.borrow().len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.modules.borrow().is_empty()
+    }
+
+    /// The absolute URL a referrer lives at: the module path is the URL
+    /// string this host gave it ([`Module::parse`] was called with
+    /// `PathBuf::from(url.as_str())`), so it round-trips. A realm/script
+    /// referrer has no path — the document URL answers for it.
+    fn referrer_url(referrer: &Referrer) -> Option<Url> {
+        referrer
+            .path()
+            .and_then(|path| Url::parse(&path.to_string_lossy()).ok())
+    }
+
+    /// Resolve `specifier` requested by `referrer` (already an absolute URL).
+    /// With an import map its rules run first — exact/prefix keys, `null`
+    /// unmappings, `scopes` keyed on the referrer; without one (or for a
+    /// specifier the map leaves alone), the default applies: a *relative-URL*
+    /// specifier joins the referrer, a **bare** specifier fails, exactly like
+    /// a browser with no map (`ImportMap`'s empty-map path implements that
+    /// split — the bare-vs-relative discrimination is the map's own).
+    pub fn resolve_specifier(&self, specifier: &str, referrer: &Url) -> Result<Url, String> {
+        let import_map = self.import_map.borrow();
+        let resolved = match import_map.as_ref() {
+            Some(map) => map.resolve_for(specifier, referrer, Some(referrer)),
+            None => ImportMap::default().resolve_for(specifier, referrer, Some(referrer)),
+        };
+        resolved.ok_or_else(|| {
+            format!("Failed to resolve module specifier \"{specifier}\" relative to {referrer}")
+        })
+    }
+}
+
+impl ModuleLoader for UrlModuleLoader {
+    fn load_imported_module(
+        self: Rc<Self>,
+        referrer: Referrer,
+        request: ModuleRequest,
+        context: &RefCell<&mut Context>,
+    ) -> impl Future<Output = Result<Module, boa_engine::JsError>> {
+        // Everything below is synchronous: the fetch is the tab's blocking
+        // request and parsing needs the live context — the "future" is born
+        // complete, and boa runs the whole graph in its job-queue drain.
+        let specifier = request.specifier().to_std_string_escaped();
+        let referrer = Self::referrer_url(&referrer).unwrap_or_else(|| self.base.clone());
+        let resolved = match self.resolve_specifier(&specifier, &referrer) {
+            Ok(url) => url,
+            Err(err) => return std::future::ready(Err(JsNativeError::typ().with_message(err).into())),
+        };
+        let key = resolved.as_str().to_string();
+        if let Some(module) = self.modules.borrow().get(&key) {
+            // Same specifier, same instance: fetched once, one namespace,
+            // cycles included.
+            return std::future::ready(Ok(module.clone()));
+        }
+        // The context is borrowed for parsing only, never across the fetch.
+        let body = match (self.fetch)(&resolved) {
+            Ok(body) => body,
+            Err(err) => {
+                let message = format!("error fetching module {resolved}: {err}");
+                return std::future::ready(Err(JsNativeError::typ().with_message(message).into()));
+            }
+        };
+        let path = PathBuf::from(resolved.as_str());
+        let mut context = context.borrow_mut();
+        let parsed = Module::parse(
+            Source::from_bytes(body.as_bytes()).with_path(&path),
+            None,
+            &mut context,
+        );
+        drop(context);
+        let module = match parsed {
+            Ok(module) => module,
+            Err(err) => return std::future::ready(Err(err)),
+        };
+        self.modules.borrow_mut().insert(key, module.clone());
+        std::future::ready(Ok(module))
+    }
+
+    fn init_import_meta(self: Rc<Self>, import_meta: &JsObject, module: &Module, context: &mut Context) {
+        if let Some(path) = module.path() {
+            let url = path.to_string_lossy().to_string();
+            // `import.meta.url` is the member pages actually use; this host
+            // has no other import.meta properties to report.
+            let _ = import_meta.set(js_string!("url"), JsValue::from(js_string!(url)), false, context);
+        }
+    }
+}
+
+/// The human-readable message of a module-evaluation rejection: a `message`
+/// property when the value carries one, the stringified value otherwise.
+fn rejection_message(context: &mut Context, value: &JsValue) -> String {
+    if let Some(object) = value.as_object() {
+        if let Ok(message) = object.get(js_string!("message"), context) {
+            if !message.is_undefined() {
+                if let Ok(text) = message.to_string(context) {
+                    return text.to_std_string_escaped();
+                }
+            }
+        }
+    }
+    value
+        .to_string(context)
+        .map(|text| text.to_std_string_escaped())
+        .unwrap_or_else(|_| "module evaluation rejected".to_string())
 }
 
 // ---------------------------------------------------------------------------
@@ -4196,7 +4453,22 @@ const PRELUDE: &str = r##"
 /// Build a fresh boa context for one navigation, with the tiny binding surface
 /// bound to `host`. The context is intentionally thrown away at the next
 /// navigation (per `ARCHITECTURE.md` §JavaScript (Boa)).
-pub fn build_context(host: &HostRef, _timers: &Rc<RefCell<TimerQueue>>) -> Context {
+pub fn build_context(host: &HostRef, timers: &Rc<RefCell<TimerQueue>>) -> Context {
+    build_context_with_modules(host, timers, None)
+}
+
+/// [`build_context`] with the document's ES-module loader installed on the
+/// realm (task: `<script type="module">` loading). Boa's default module
+/// loader is a **filesystem** loader (`SimpleModuleLoader` over the cwd) — a
+/// browser tab has no business with one; when `module_loader` is given the
+/// realm is built so every static and dynamic import of the realm resolves
+/// through [`UrlModuleLoader`]: the document's import map, then the tab's own
+/// network layer.
+fn build_context_with_modules(
+    host: &HostRef,
+    _timers: &Rc<RefCell<TimerQueue>>,
+    module_loader: Option<Rc<UrlModuleLoader>>,
+) -> Context {
     // `_timers` documents the pairing (natives reach the queue through the
     // active-scope stack a [`JsRuntime`] pushes around every evaluation).
     let (url, body_text, has_body) = {
@@ -4208,7 +4480,16 @@ pub fn build_context(host: &HostRef, _timers: &Rc<RefCell<TimerQueue>>) -> Conte
         )
     };
 
-    let mut context = Context::default();
+    let mut context = match module_loader {
+        None => Context::default(),
+        Some(loader) => match Context::builder().module_loader(loader).build() {
+            Ok(context) => context,
+            Err(err) => {
+                error!("module-loader realm failed to build: {err}; falling back to the default realm (modules will not load)");
+                Context::default()
+            }
+        },
+    };
 
     // Full Boa runtime Web API (task: as much JavaScript as possible): every
     // boa_engine language feature is compiled in (annex-b, bundled-ICU Intl,
@@ -4727,13 +5008,21 @@ pub struct JsRuntime {
     /// Monotonic origin for rAF timestamps.
     started: Instant,
     /// The document's `<script type="importmap">` (task: importmap support),
-    /// installed by the tab right after extraction. Module loading (still
-    /// TODO) resolves its bare specifiers through this map.
+    /// installed by the tab right after extraction — and pushed on to the
+    /// module loader, which resolves every specifier through it (task:
+    /// `<script type="module">` loading).
     import_map: Option<ImportMap>,
+    /// The document's module graph (task: `<script type="module">` loading):
+    /// installed on the realm at construction, fed the import map above.
+    /// `None` (the [`JsRuntime::new`] shape) = no module ever loads: every
+    /// specifier the engine asks about is reported unresolvable.
+    modules: Option<Rc<UrlModuleLoader>>,
 }
 
 impl JsRuntime {
-    /// Fresh realm for one navigation, seeded from `host`.
+    /// Fresh realm for one navigation, seeded from `host` — **without**
+    /// module support (a realm whose module graph nobody can fetch): the live
+    /// tab builds its runtime through [`new_with_modules`](Self::new_with_modules).
     pub fn new(host: HostRef) -> Self {
         let timers = Rc::new(RefCell::new(TimerQueue::default()));
         let context = build_context(&host, &timers);
@@ -4743,12 +5032,44 @@ impl JsRuntime {
             timers,
             started: Instant::now(),
             import_map: None,
+            modules: None,
         }
+    }
+
+    /// Fresh realm for one navigation **with** ES-module support (task:
+    /// `<script type="module">` loading): `base` is the document URL (the
+    /// referrer inline modules and referrer-less `import()` calls resolve
+    /// against), `fetch` the tab's own network handle — module bodies ride
+    /// the same jar, cache, DevTools reporting and archive sink as classic
+    /// `<script src>` bodies.
+    pub fn new_with_modules(host: HostRef, base: &Url, fetch: ModuleFetch) -> Self {
+        let timers = Rc::new(RefCell::new(TimerQueue::default()));
+        let loader = Rc::new(UrlModuleLoader::new(base.clone(), fetch));
+        let context = build_context_with_modules(&host, &timers, Some(Rc::clone(&loader)));
+        JsRuntime {
+            context,
+            host,
+            timers,
+            started: Instant::now(),
+            import_map: None,
+            modules: Some(loader),
+        }
+    }
+
+    /// The document's module loader, if this realm has one (diagnostics,
+    /// tests: the resolved module count).
+    pub fn module_loader(&self) -> Option<&Rc<UrlModuleLoader>> {
+        self.modules.as_ref()
     }
 
     /// Install the document's import map (from [`Extraction::import_map`]).
     /// `None` clears it (a document without a map, or with an invalid one).
+    /// The module loader is fed the same map: bare specifiers resolve through
+    /// it, `scopes` key on the importing module's URL (task: module loading).
     pub fn set_import_map(&mut self, import_map: Option<ImportMap>) {
+        if let Some(loader) = &self.modules {
+            loader.set_import_map(import_map.clone());
+        }
         self.import_map = import_map;
     }
 
@@ -4886,6 +5207,17 @@ impl JsRuntime {
                 started.elapsed().as_millis()
             );
             let dom_before = self.host.borrow().dom_throws.len();
+            if script.kind == ScriptKind::Module {
+                // `<script type="module">` (task: module loading): parsed as
+                // a module, its graph fetched + evaluated through the
+                // document loader, the completion promise driven to rest
+                // before the NEXT script runs (modules are deferred; the
+                // document-order batch already put them in order).
+                if let Some(err) = self.run_module(&script.code, &script.origin, dom_before) {
+                    errors.push(err);
+                }
+                continue;
+            }
             match self.context.eval(Source::from_bytes(script.code.as_str())) {
                 Ok(_) => {}
                 Err(err) => {
@@ -4908,6 +5240,107 @@ impl JsRuntime {
             errors.push(err);
         }
         errors
+    }
+
+    /// Evaluate one ES module (task: `<script type="module">` loading): parse
+    /// as a module whose path is its URL (`import.meta.url`, and the base
+    /// `UrlModuleLoader` resolves its imports from), file it with the loader
+    /// so its own URL round-trips to this very instance, then run Boa's
+    /// `load → link → evaluate` pipeline and drive the job queue until the
+    /// completion promise settles — the graph fetches (one job per import,
+    /// our loader's futures born ready) and any microtask the module body
+    /// queued all land here. A graph failure (unresolvable specifier, failed
+    /// fetch, link clash, thrown body) becomes a [`ScriptError`] like any
+    /// classic script's throw: reported, never fatal.
+    fn run_module(
+        &mut self,
+        code: &str,
+        url: &str,
+        dom_before: usize,
+    ) -> Option<ScriptError> {
+        let report = |message: String, source: &'static str| ScriptError {
+            origin: url.to_string(),
+            message,
+            source,
+        };
+        let Some(loader) = self.modules.clone() else {
+            return Some(report(
+                "module loading is unavailable in this realm".to_string(),
+                "js",
+            ));
+        };
+        let base = match Url::parse(url) {
+            Ok(base) => base,
+            Err(err) => {
+                return Some(report(
+                    format!("module url {url:?} is not absolute: {err}"),
+                    "js",
+                ))
+            }
+        };
+        let path = PathBuf::from(url);
+        let module = match Module::parse(
+            Source::from_bytes(code.as_bytes()).with_path(&path),
+            None,
+            &mut self.context,
+        ) {
+            Ok(module) => module,
+            Err(err) => {
+                let message = first_line(&err);
+                let source = self.classify_throw(dom_before, &message);
+                error!("javascript error in module {url}: {message}");
+                return Some(report(message, source));
+            }
+        };
+        // The entry module is part of the document's module map before its
+        // imports load: a dependency importing this URL (a cycle, or a dep
+        // importing the page itself) gets THIS instance, not a second fetch.
+        loader.register(&base, &module);
+        let promise = module.load_link_evaluate(&mut self.context);
+        // Boa drives the load graph and evaluation through job-queue futures;
+        // with a synchronous loader the whole graph settles in the first
+        // drain, so the extra rounds are a safety net, not the normal path.
+        let mut outcome: Option<Result<(), String>> = None;
+        for _ in 0..64 {
+            match promise.state() {
+                PromiseState::Fulfilled(_) => {
+                    outcome = Some(Ok(()));
+                    break;
+                }
+                PromiseState::Rejected(value) => {
+                    outcome = Some(Err(rejection_message(&mut self.context, &value)));
+                    break;
+                }
+                PromiseState::Pending => match self.context.run_jobs() {
+                    Ok(()) => {}
+                    Err(err) => {
+                        // A job threw on the engine's side: if the promise
+                        // settled alongside, report the rejection itself;
+                        // this is the fallback reading.
+                        let message = first_line(&err);
+                        outcome = Some(Err(if message.is_empty() {
+                            "module graph failed".to_string()
+                        } else {
+                            message
+                        }));
+                        break;
+                    }
+                },
+            }
+        }
+        match outcome.unwrap_or_else(|| {
+            Err("module graph never settled (loader stalled pending)".to_string())
+        }) {
+            Ok(()) => {
+                debug!("module {url} evaluated (graph: {} module(s))", loader.len());
+                None
+            }
+            Err(message) => {
+                let source = self.classify_throw(dom_before, &message);
+                error!("javascript error in module {url}: {message}");
+                Some(report(message, source))
+            }
+        }
     }
 
     /// Run **one userscript** (task: userscripts) in this document's realm —
@@ -5696,10 +6129,12 @@ mod tests {
             ScriptSource {
                 code: "throw new Error('nope');".to_string(),
                 origin: "inline".to_string(),
+            kind: ScriptKind::Classic,
             },
             ScriptSource {
                 code: "document.title = 'still-running';".to_string(),
                 origin: "second.js".to_string(),
+            kind: ScriptKind::Classic,
             },
         ];
         let mut runtime = JsRuntime::new(Rc::clone(&host));
@@ -5772,6 +6207,7 @@ mod tests {
         let scripts = [ScriptSource {
             code: "console.log('from the page');".to_string(),
             origin: "inline".to_string(),
+        kind: ScriptKind::Classic,
         }];
         assert!(runtime.run_scripts(&scripts, None).is_empty());
         assert!(runtime
@@ -5829,6 +6265,7 @@ mod tests {
         let scripts = [ScriptSource {
             code: "function broken( {".to_string(),
             origin: "inline".to_string(),
+            kind: ScriptKind::Classic,
         }];
         let mut runtime = JsRuntime::new(Rc::clone(&host));
         let errors = runtime.run_scripts(&scripts, None);
@@ -5847,6 +6284,7 @@ mod tests {
             &[ScriptSource {
                 code: "document.querySelector('[');".to_string(),
                 origin: "inline".to_string(),
+            kind: ScriptKind::Classic,
             }],
             Some(&mut doc),
         );
@@ -5868,6 +6306,7 @@ mod tests {
             &[ScriptSource {
                 code: "throw new SyntaxError('mine-not-the-native');".to_string(),
                 origin: "inline".to_string(),
+            kind: ScriptKind::Classic,
             }],
             Some(&mut doc),
         );
@@ -5879,6 +6318,7 @@ mod tests {
             &[ScriptSource {
                 code: "null.x;".to_string(),
                 origin: "inline".to_string(),
+            kind: ScriptKind::Classic,
             }],
             Some(&mut doc),
         );
@@ -5894,6 +6334,7 @@ mod tests {
             &[ScriptSource {
                 code: "var leaked = 1; document.title = 'one';".to_string(),
                 origin: "inline".to_string(),
+            kind: ScriptKind::Classic,
             }],
             None,
         );
@@ -5957,18 +6398,44 @@ mod tests {
                 "inline",
                 "file:///srv/site/a.js",
                 "file:///srv/site/nested/b.js",
+                "file:///srv/site/index.html",
                 "file:///srv/site/gone.js",
             ],
-            "head first, then body, in tree order (only the JSON/module scripts are skipped)"
+            "head first, then body, in tree order; the inline module keeps its place and is collected too"
         );
         assert_eq!(scripts[0].1, "document.title = \"head\";");
         assert_eq!(scripts[1].1, "JS a.js", "src= bodies come from the fetcher");
-        // The two non-executed scripts are reported, not silently dropped.
-        assert_eq!(notes.len(), 2, "{notes:?}");
-        assert!(notes.iter().any(|note| note.contains("module")));
-        assert!(notes
+        // The only skipped script is the JSON blob; the module is collected
+        // (task: `<script type="module">` loading), not dropped.
+        assert_eq!(notes.len(), 1, "{notes:?}");
+        assert!(notes[0].contains("unsupported type"));
+    }
+
+    /// The extraction half of `<script type="module">` (task: module loading):
+    /// the module's body is collected with `kind = Module`, its origin is the
+    /// **absolute URL it runs as** (the document URL when inline) — the base
+    /// its imports resolve against and its `import.meta.url`.
+    #[test]
+    fn module_scripts_collect_with_module_kind_and_url_origin() {
+        let doc = dom(SCRIPT_PAGE);
+        let base = Url::parse("file:///srv/site/index.html").expect("base");
+        let extraction = js_extract(&doc, &base, &mut fake_answer);
+        let module = extraction
+            .scripts
             .iter()
-            .any(|note| note.contains("unsupported type")));
+            .find(|script| script.kind == ScriptKind::Module)
+            .expect("the inline module is collected, not skipped");
+        assert_eq!(module.origin, "file:///srv/site/index.html");
+        assert!(module.code.contains("import { x } from \"./c.js\""));
+        assert_eq!(
+            extraction
+                .scripts
+                .iter()
+                .filter(|script| script.kind == ScriptKind::Classic)
+                .count(),
+            3,
+            "classic scripts stay classic (the fake fetcher drops gone.js, as always)"
+        );
     }
 
     #[test]
@@ -5998,9 +6465,13 @@ mod tests {
                 Ok("// ok".to_string())
             }
         });
-        // The broken src is skipped but its siblings still execute.
-        assert_eq!(extraction.scripts.len(), 3);
-        assert!(extraction.notes.iter().any(|note| note.contains("module")));
+        // The broken src is skipped but its siblings still execute — and the
+        // inline module (task: module loading) is collected like any script.
+        assert_eq!(extraction.scripts.len(), 4);
+        assert!(extraction
+            .scripts
+            .iter()
+            .any(|script| script.kind == ScriptKind::Module));
         assert!(extraction
             .notes
             .iter()
@@ -6076,8 +6547,9 @@ mod tests {
                 "inline",
                 "file:///srv/site/a.js",
                 "file:///srv/site/nested/b.js",
+                "file:///srv/site/index.html",
             ],
-            "assembled in document order; the failed fetch yields no script"
+            "assembled in document order (inline module included, its origin is the document URL); the failed fetch yields no script"
         );
         assert_eq!(extraction.scripts[1].code, "JS a.js");
     }
@@ -6090,13 +6562,13 @@ mod tests {
             urls.iter().map(|u| fake_answer(u)).collect()
         });
         // Walk order decides note order, wherever the fetches settled: the
-        // JSON note (before b.js), then the module note, then the gone.js
-        // failure — identical to what the sequential fetcher produced.
-        assert_eq!(extraction.notes.len(), 3, "{:?}", extraction.notes);
+        // JSON note (before b.js), then the gone.js failure — identical to
+        // what the sequential fetcher produced. The module in between is not
+        // a note any more (task: module loading): it is collected and runs.
+        assert_eq!(extraction.notes.len(), 2, "{:?}", extraction.notes);
         assert!(extraction.notes[0].contains("unsupported type"));
-        assert!(extraction.notes[1].contains("module"));
-        assert!(extraction.notes[2].contains("gone.js"));
-        assert!(extraction.notes[2].contains("nope: not found"));
+        assert!(extraction.notes[1].contains("gone.js"));
+        assert!(extraction.notes[1].contains("nope: not found"));
     }
 
     #[test]
@@ -6296,7 +6768,7 @@ mod tests {
             // A misbehaving fetcher answers only the first URL…
             vec![Ok("JS a.js".to_string())]
         });
-        assert_eq!(extraction.scripts.len(), 2, "inline + a.js");
+        assert_eq!(extraction.scripts.len(), 3, "inline + a.js + inline module");
         // …the unanswered ones degrade to notes, exactly like fetch errors.
         assert!(extraction
             .notes
@@ -6877,12 +7349,14 @@ mod tests {
                          document.body.appendChild(d);"#
                     .to_string(),
                 origin: "inline".to_string(),
+            kind: ScriptKind::Classic,
             },
             ScriptSource {
                 code: r#"document.title = document.getElementById("built").textContent.toUpperCase();
                          window.sawDom = true;"#
                     .to_string(),
                 origin: "inline".to_string(),
+            kind: ScriptKind::Classic,
             },
         ];
         let errors = runtime.run_scripts(&scripts, Some(&mut doc));
@@ -7028,12 +7502,14 @@ mod tests {
             ScriptSource {
                 code: "document.body.style = 'background: rgb(255, 0, 0)';".to_string(),
                 origin: "inline".to_string(),
+            kind: ScriptKind::Classic,
             },
             ScriptSource {
                 // Userscripts run in the same realm after the page's own
                 // scripts — exercise the same mutation through that door.
                 code: "document.querySelector('#p1').style.color = 'rgb(0, 0, 255)';".to_string(),
                 origin: "inline".to_string(),
+            kind: ScriptKind::Classic,
             },
         ];
         let errors = runtime.run_scripts(&scripts, Some(&mut doc));
@@ -7205,6 +7681,374 @@ mod tests {
         assert!(
             host.media.commands.is_empty(),
             "media writes on non-media elements must not reach the host"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // `<script type="module">` loading (task: module loading)
+
+    /// An origin for module tests: a path → body table served through the
+    /// exact `ModuleFetch` shape the tab hands the runtime, recording every
+    /// URL fetched so dedup (one instance per specifier) is observable.
+    fn fake_site(pages: &[(&str, &str)]) -> (ModuleFetch, Rc<RefCell<Vec<String>>>) {
+        let site: Rc<HashMap<String, String>> = Rc::new(
+            pages
+                .iter()
+                .map(|(path, body)| (path.to_string(), body.to_string()))
+                .collect(),
+        );
+        let hits: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(Vec::new()));
+        let fetch: ModuleFetch = {
+            let site = Rc::clone(&site);
+            let hits = Rc::clone(&hits);
+            Rc::new(move |url: &Url| {
+                hits.borrow_mut().push(url.as_str().to_string());
+                match site.get(url.path()) {
+                    Some(body) => Ok(body.clone()),
+                    None => Err(format!("404 Not Found: {}", url.path())),
+                }
+            })
+        };
+        (fetch, hits)
+    }
+
+    /// The pure resolution half of the loader (no realm needed): the import
+    /// map's rules decide every specifier — exact keys, prefix keys with the
+    /// remainder carried over, `null` unmappings, `scopes` keyed on the
+    /// referrer — and without a map (or a hit) a relative-URL specifier
+    /// joins the referrer while a **bare** one fails, exactly like a browser.
+    #[test]
+    fn module_specifier_resolution_matrix() {
+        let base = Url::parse("https://m.test/app/main.js").expect("base");
+        let (fetch, _hits) = fake_site(&[]);
+        let loader = UrlModuleLoader::new(base.clone(), fetch);
+        // No map: relative specifiers resolve, bare ones fail outright.
+        assert_eq!(
+            loader
+                .resolve_specifier("./dep.js", &base)
+                .expect("relative"),
+            Url::parse("https://m.test/app/dep.js").expect("url")
+        );
+        assert_eq!(
+            loader
+                .resolve_specifier("/abs/mod.js", &base)
+                .expect("root-relative"),
+            Url::parse("https://m.test/abs/mod.js").expect("url")
+        );
+        assert!(loader.resolve_specifier("react", &base).is_err(), "bare, no map");
+        // A map answers bare specifiers, prefixes carry the remainder, and
+        // `null` unmaps to a resolution failure.
+        let map = ImportMap::parse(
+            r#"{"imports": {
+                "react": "https://esm.sh/react",
+                "lib/": "/v/lib/",
+                "evil": null
+            },
+            "scopes": { "/special/": { "cfg": "/special/cfg.js" } }}"#,
+        )
+        .expect("valid map");
+        loader.set_import_map(Some(map));
+        assert_eq!(
+            loader.resolve_specifier("react", &base).expect("mapped"),
+            Url::parse("https://esm.sh/react").expect("url")
+        );
+        assert_eq!(
+            loader
+                .resolve_specifier("lib/util.js", &base)
+                .expect("prefix"),
+            Url::parse("https://m.test/v/lib/util.js").expect("url")
+        );
+        assert!(loader.resolve_specifier("evil", &base).is_err(), "unmapped null");
+        // `scopes` shadow `imports` for referrers inside the scope prefix —
+        // and only for them.
+        let scoped = Url::parse("https://m.test/special/m.js").expect("scoped url");
+        assert_eq!(
+            loader
+                .resolve_specifier("cfg", &scoped)
+                .expect("scoped bare"),
+            Url::parse("https://m.test/special/cfg.js").expect("url")
+        );
+        assert!(
+            loader.resolve_specifier("cfg", &base).is_err(),
+            "outside the scope the entry does not apply"
+        );
+    }
+
+    /// The whole pipeline on a real realm: an entry module at
+    /// `…/app/main.js` statically imports a relative dep (TWICE — one fetch,
+    /// one instance), a bare specifier answered by the document's import
+    /// map, and reaches the map through a dependency whose OWN relative
+    /// import resolves against the dep's URL, not the document's; the entry
+    /// also reads `import.meta.url`. Classic-script semantics next to it are
+    /// untouched.
+    #[test]
+    fn module_graph_fetches_links_evaluates_and_shares_instances() {
+        let (fetch, hits) = fake_site(&[
+            (
+                "/app/dep.js",
+                "export const x = 7; globalThis.depEvals = (globalThis.depEvals || 0) + 1;",
+            ),
+            (
+                "/v/lib/other.js",
+                "import { s } from '../shared.js'; export const y = s * 2;",
+            ),
+            ("/v/shared.js", "export const s = 5;"),
+        ]);
+        let host = sample_host();
+        let mut runtime = JsRuntime::new_with_modules(
+            Rc::clone(&host),
+            &Url::parse("https://modules.test/app/index.html").expect("doc url"),
+            fetch,
+        );
+        runtime
+            .set_import_map(Some(
+                ImportMap::parse(r#"{"imports": { "lib/": "/v/lib/" }}"#).expect("map"),
+            ));
+        let entry = ScriptSource {
+            code: r#"
+                import { x } from "./dep.js";
+                import * as ns from "./dep.js";
+                import { y } from "lib/other.js";
+                globalThis.result = x + y
+                    + (ns.x === x ? 100 : 0)
+                    + (import.meta.url === "https://modules.test/app/main.js" ? 1000 : 0);
+            "#
+            .to_string(),
+            origin: "https://modules.test/app/main.js".to_string(),
+            kind: ScriptKind::Module,
+        };
+        let errors = runtime.run_scripts(&[entry], None);
+        assert!(errors.is_empty(), "{errors:?}");
+        assert!(
+            runtime.import_map().is_some_and(|map| map.len() == 1),
+            "the document keeps its map for the realm's lifetime"
+        );
+        assert_eq!(
+            runtime.module_loader().map(|loader| loader.len()),
+            Some(4),
+            "entry + three graph modules in the document's module map"
+        );
+        assert_eq!(
+            runtime
+                .eval("globalThis.result")
+                .expect("result")
+                .as_number(),
+            Some(1117.0),
+            "7 + 10 + shared-instance-100 + import.meta.url-1000"
+        );
+        assert_eq!(
+            runtime
+                .eval("globalThis.depEvals")
+                .expect("depEvals")
+                .as_number(),
+            Some(1.0),
+            "two importers, one instance: the dep body ran once"
+        );
+        let mut fetched = hits.borrow().clone();
+        fetched.sort();
+        assert_eq!(
+            fetched,
+            vec![
+                "https://modules.test/app/dep.js".to_string(),
+                "https://modules.test/v/lib/other.js".to_string(),
+                "https://modules.test/v/shared.js".to_string(),
+            ],
+            "each graph module fetched exactly once, bare specifiers through the map, \"../shared.js\" against the DEP's url"
+        );
+    }
+
+    /// A module that cannot load — bare specifier with no map — reports a
+    /// `ScriptError` naming the specifier, and the page KEEPS RUNNING: the
+    /// classic script after it still executes, like every other script error
+    /// in the contract.
+    #[test]
+    fn unresolvable_bare_import_reports_and_the_page_survives() {
+        let (fetch, _hits) = fake_site(&[]);
+        let host = sample_host();
+        let mut runtime = JsRuntime::new_with_modules(
+            Rc::clone(&host),
+            &Url::parse("https://modules.test/page.html").expect("doc url"),
+            fetch,
+        );
+        let scripts = [
+            ScriptSource {
+                code: "import { render } from 'react'; globalThis.never = render;".to_string(),
+                origin: "https://modules.test/page.html".to_string(),
+                kind: ScriptKind::Module,
+            },
+            ScriptSource {
+                code: "globalThis.after = 'ran';".to_string(),
+                origin: "inline".to_string(),
+                kind: ScriptKind::Classic,
+            },
+        ];
+        let errors = runtime.run_scripts(&scripts, None);
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert_eq!(errors[0].origin, "https://modules.test/page.html");
+        assert!(
+            errors[0].message.contains("react"),
+            "the report names the specifier: {:?}",
+            errors[0].message
+        );
+        assert_eq!(
+            runtime
+                .eval("globalThis.after")
+                .expect("after")
+                .as_string()
+                .map(|s| s.to_std_string_escaped()),
+            Some("ran".to_string()),
+            "the next script still runs"
+        );
+    }
+
+    /// A dependency the network refuses (404 from the fetcher) rejects the
+    /// importing module with a message naming the failed URL — and nothing
+    /// is cached, so the failure is honest, once.
+    #[test]
+    fn failed_dependency_fetch_rejects_the_importing_module() {
+        let (fetch, hits) = fake_site(&[("/present.js", "export const here = true;")]);
+        let host = sample_host();
+        let mut runtime = JsRuntime::new_with_modules(
+            Rc::clone(&host),
+            &Url::parse("https://modules.test/page.html").expect("doc url"),
+            fetch,
+        );
+        let scripts = [ScriptSource {
+            code: "import './present.js'; import './missing.js';".to_string(),
+            origin: "https://modules.test/page.html".to_string(),
+            kind: ScriptKind::Module,
+        }];
+        let errors = runtime.run_scripts(&scripts, None);
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert!(
+            errors[0].message.contains("missing.js"),
+            "the report names the failed url: {:?}",
+            errors[0].message
+        );
+        assert!(
+            !hits.borrow().iter().any(|url| url.ends_with("page.html")),
+            "an inline entry module is never re-fetched — it is the page"
+        );
+    }
+
+    /// Cycles: A ⇄ B. The ENTRY module is filed with the loader before its
+    /// imports load, so B's `import from "./a.js"` gets the very instance
+    /// being evaluated — no second fetch, no deadlock — and B (the deepest
+    /// dependency) evaluates before A's body, per spec.
+    #[test]
+    fn module_cycles_resolve_off_the_entry_registration() {
+        let (fetch, hits) = fake_site(&[(
+            "/b.js",
+            "import { fromA } from './a.js'; globalThis.seesA = () => fromA; export const fromB = 2; globalThis.ranB = true;",
+        )]);
+        let host = sample_host();
+        let mut runtime = JsRuntime::new_with_modules(
+            Rc::clone(&host),
+            &Url::parse("https://modules.test/page.html").expect("doc url"),
+            fetch,
+        );
+        let scripts = [ScriptSource {
+            code: "import { fromB } from './b.js'; export const fromA = 1; globalThis.trace = [(globalThis.ranB ? 'b' : 'noB'), 'a', fromB];".to_string(),
+            origin: "https://modules.test/a.js".to_string(),
+            kind: ScriptKind::Module,
+        }];
+        let errors = runtime.run_scripts(&scripts, None);
+        assert!(errors.is_empty(), "{errors:?}");
+        assert_eq!(
+            runtime
+                .eval("JSON.stringify(globalThis.trace)")
+                .expect("trace")
+                .as_string()
+                .map(|s| s.to_std_string_escaped()),
+            Some("[\"b\",\"a\",2]".to_string()),
+            "B evaluated first (post-order), A imported its live binding through the cycle"
+        );
+        assert_eq!(
+            hits.borrow().as_slice(),
+            vec!["https://modules.test/b.js".to_string()],
+            "the cycle fetched B only; A came from the entry registration"
+        );
+    }
+
+    /// Dynamic `import()` — the runtime-side hook: the specifier resolves
+    /// through the import map DURING evaluation (a job the drain runs), the
+    /// body is fetched exactly once, and the namespace arrives.
+    #[test]
+    fn dynamic_import_resolves_through_the_map_at_runtime() {
+        let (fetch, hits) = fake_site(&[
+            ("/v/late.js", "export const v = 42;"),
+            ("/v/once.js", "export const hits = (globalThis.once = (globalThis.once || 0) + 1);"),
+        ]);
+        let host = sample_host();
+        let mut runtime = JsRuntime::new_with_modules(
+            Rc::clone(&host),
+            &Url::parse("https://modules.test/page.html").expect("doc url"),
+            fetch,
+        );
+        runtime
+            .set_import_map(Some(
+                ImportMap::parse(r#"{"imports": { "late": "/v/late.js", "once": "/v/once.js" }}"#)
+                    .expect("map"),
+            ));
+        let scripts = [ScriptSource {
+            code: r#"
+                const ns = await import('late');
+                globalThis.dyn = ns.v;
+                await import('once');
+                await import('once');
+                globalThis.onceFetched = (globalThis.once || 0);
+            "#
+            .to_string(),
+            origin: "https://modules.test/page.html".to_string(),
+            kind: ScriptKind::Module,
+        }];
+        let errors = runtime.run_scripts(&scripts, None);
+        assert!(errors.is_empty(), "{errors:?}");
+        assert_eq!(
+            runtime.eval("globalThis.dyn").expect("dyn").as_number(),
+            Some(42.0),
+            "top-level await + dynamic import through the map"
+        );
+        assert_eq!(
+            runtime
+                .eval("globalThis.onceFetched")
+                .expect("onceFetched")
+                .as_number(),
+            Some(1.0),
+            "two dynamic imports of one specifier: one fetch, one instance"
+        );
+        assert_eq!(hits.borrow().len(), 2, "late.js + once.js: {hits:?}");
+    }
+
+    /// Inline modules resolve their relative imports against the DOCUMENT
+    /// URL (their own URL identity), not the cwd-filesystem loader Boa would
+    /// default to — the same page's module graph runs from the network.
+    #[test]
+    fn inline_module_resolves_against_the_document_url() {
+        let (fetch, hits) = fake_site(&[("/app/dep.js", "export const x = 1;")]);
+        let host = sample_host();
+        let mut runtime = JsRuntime::new_with_modules(
+            Rc::clone(&host),
+            &Url::parse("https://modules.test/app/index.html").expect("doc url"),
+            fetch,
+        );
+        let scripts = [ScriptSource {
+            code: "import { x } from './dep.js'; globalThis.inline = x;".to_string(),
+            origin: "https://modules.test/app/index.html".to_string(),
+            kind: ScriptKind::Module,
+        }];
+        let errors = runtime.run_scripts(&scripts, None);
+        assert!(errors.is_empty(), "{errors:?}");
+        assert_eq!(
+            runtime
+                .eval("globalThis.inline")
+                .expect("inline")
+                .as_number(),
+            Some(1.0)
+        );
+        assert_eq!(
+            hits.borrow().as_slice(),
+            vec!["https://modules.test/app/dep.js".to_string()]
         );
     }
 }
