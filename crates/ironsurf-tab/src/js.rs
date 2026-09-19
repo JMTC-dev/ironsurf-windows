@@ -3585,6 +3585,40 @@ pub fn build_context(host: &HostRef, _timers: &Rc<RefCell<TimerQueue>>) -> Conte
 
     let mut context = Context::default();
 
+    // Full Boa runtime Web API (task: as much JavaScript as possible): every
+    // boa_engine language feature is compiled in (annex-b, bundled-ICU Intl,
+    // Temporal, … — see Cargo.toml), and the whole `boa_runtime` surface lands
+    // on the realm FIRST: WinterTC globals (`atob`/`btoa`, `queueMicrotask`,
+    // `structuredClone`, `TextEncoder`/`TextDecoder`, `AbortController`/
+    // `AbortSignal`, `URL`), a richer `console`, `process`, and `fetch`
+    // (reqwest's blocking client; its promise settles from the job-queue
+    // drain that runs after every script turn). Registering before the glue
+    // below is deliberate: the IronSurf bindings then OVERRIDE the names the
+    // tab must own — `console` (stderr + the per-navigation capture) and the
+    // timers (`setTimeout`/`setInterval`/`clearTimeout`/`clearInterval` → the
+    // tab's poll loop, not the runtime's internal timer channel). Plain
+    // assignments in the (sloppy-mode) prelude replace these bindings cleanly;
+    // everything else (URL, Intl, TextEncoder, AbortController, …) is purely
+    // additive.
+    if let Err(err) = boa_runtime::register(
+        (
+            boa_runtime::extensions::ConsoleExtension::default(),
+            boa_runtime::extensions::ProcessExtension,
+            boa_runtime::extensions::FetchExtension(
+                boa_runtime::fetch::BlockingReqwestFetcher::default(),
+            ),
+        ),
+        None,
+        &mut context,
+    ) {
+        error!("boa_runtime globals failed to install: {err}");
+    }
+    // The tab leaks no environment: `process` stays (pages feature-detect it)
+    // but its env map is emptied before any page code runs.
+    if let Err(err) = context.eval(Source::from_bytes("process.env = {};")) {
+        error!("process.env reset failed: {err}");
+    }
+
     for (name, value) in [
         (native::URL, JsValue::from(JsString::from(url))),
         (native::BODY_TEXT, JsValue::from(JsString::from(body_text))),
@@ -4105,6 +4139,13 @@ impl JsRuntime {
                 }
             }
         }
+        // One microtask drain per script turn (after the whole batch, like a
+        // classic script's job checkpoint): `Promise.then` callbacks and
+        // `boa_runtime` async jobs (fetch) run here, with the live document
+        // still registered.
+        if let Some(err) = self.drain_jobs() {
+            errors.push(err);
+        }
         errors
     }
 
@@ -4141,6 +4182,9 @@ impl JsRuntime {
         let dom_before = self.host.borrow().dom_throws.len();
         let outcome = self.context.eval(Source::from_bytes(code));
         self.host.borrow_mut().userscript = None;
+        // Jobs queued by the userscript run unattributed (page-like turn), and
+        // a job throw becomes the run's report when the script itself was ok.
+        let job_error = self.drain_jobs();
         match outcome {
             // Success is silent on the console feed (attribution is for errors),
             // but never in the log: a script that runs without logging or
@@ -4148,7 +4192,7 @@ impl JsRuntime {
             // (or was not) touched — the run is logged here at debug level.
             Ok(_) => {
                 debug!("userscript {name:?} ran clean ({} bytes)", code.len());
-                None
+                job_error
             }
             Err(err) => {
                 let message = first_line(&err);
@@ -4167,12 +4211,39 @@ impl JsRuntime {
         }
     }
 
+    /// Run Boa's pending **job queue** to empty. Boa 0.22 does NOT drain jobs
+    /// at the end of `eval`, so without this call `Promise.then` /
+    /// `queueMicrotask` callbacks would never run and `boa_runtime` async
+    /// jobs (notably `fetch`) would never settle. One drain per script turn
+    /// (after each batch of page scripts, timer callbacks, event dispatch and
+    /// userscript) gives pages browser-like microtask semantics; a job that
+    /// throws is reported like any script error (origin `"promise"`) and
+    /// never kills the queue.
+    fn drain_jobs(&mut self) -> Option<ScriptError> {
+        let dom_before = self.host.borrow().dom_throws.len();
+        match self.context.run_jobs() {
+            Ok(()) => None,
+            Err(err) => {
+                let message = first_line(&err);
+                let source = self.classify_throw(dom_before, &message);
+                error!("javascript error in queued job: {message}");
+                Some(ScriptError {
+                    origin: "promise".to_string(),
+                    message,
+                    source,
+                })
+            }
+        }
+    }
+
     /// Evaluate one snippet with this runtime's scope active (the same world
     /// page scripts see; used by the binding tests).
     #[cfg(test)]
     pub(crate) fn eval(&mut self, source: &str) -> Result<JsValue, boa_engine::JsError> {
         let _active = self.activate();
-        self.context.eval(Source::from_bytes(source))
+        let outcome = self.context.eval(Source::from_bytes(source));
+        self.drain_jobs();
+        outcome
     }
 
     /// Evaluate one snippet with `doc` registered as the live document
@@ -4185,7 +4256,9 @@ impl JsRuntime {
     ) -> Result<JsValue, boa_engine::JsError> {
         let _active = self.activate();
         let _live_doc = register_live_doc(doc);
-        self.context.eval(Source::from_bytes(source))
+        let outcome = self.context.eval(Source::from_bytes(source));
+        self.drain_jobs();
+        outcome
     }
 
     /// Replay a real user interaction through the page's own event system
@@ -4213,13 +4286,16 @@ impl JsRuntime {
         // document (docId 0) — the glue's wrappers resolve against it.
         let _active = self.activate();
         let _live_doc = register_live_doc(doc);
-        match self.context.eval(Source::from_bytes(&source)) {
+        let prevented = match self.context.eval(Source::from_bytes(&source)) {
             Ok(value) => value.as_boolean().unwrap_or(false),
             Err(err) => {
                 warn!("js {kind} dispatch failed: {err}");
                 false
             }
-        }
+        };
+        // Microtasks the handlers queued run at the end of this event turn.
+        self.drain_jobs();
+        prevented
     }
 
     /// Execute every timer callback due at `now`, in due order. Exceptions
@@ -4262,6 +4338,11 @@ impl JsRuntime {
                     });
                 }
             }
+        }
+        // Timer callbacks form a script turn too — drain their microtasks
+        // (and any fetch jobs) while the live document is still registered.
+        if let Some(err) = self.drain_jobs() {
+            errors.push(err);
         }
         errors
     }
@@ -4679,6 +4760,74 @@ mod tests {
         assert_eq!(
             runtime.eval("setTimeout('not a function', 1)").expect("eval").as_i32(),
             Some(0)
+        );
+    }
+
+    /// The whole `boa_runtime` WinterTC surface plus every boa_engine
+    /// language feature is live in a document realm (task: maximum JS).
+    #[test]
+    fn boa_runtime_web_api_and_all_engine_features_are_present() {
+        let host = sample_host();
+        for expr in [
+            // url feature: a real WHATWG URL.
+            "typeof URL === 'function' && new URL('/x?q=1','https://e.com/').href === 'https://e.com/x?q=1'",
+            // text + base64 + clone (WinterTC).
+            "typeof TextEncoder === 'function' && typeof TextDecoder === 'function'",
+            "atob('aGVsbG8=') === 'hello' && btoa('hello') === 'aGVsbG8='",
+            "structuredClone({a:[1]}).a[0] === 1",
+            // fetch feature: abort primitives + the fetch function itself.
+            "typeof AbortController === 'function' && typeof AbortSignal === 'function'",
+            "typeof fetch === 'function' && typeof queueMicrotask === 'function'",
+            // engine features: bundled-ICU Intl, Temporal, annex-b legacy.
+            "typeof Intl.NumberFormat === 'function' && typeof Temporal === 'object'",
+            "typeof ''.substr === 'function' && typeof ''.trimLeft === 'function'",
+        ] {
+            assert!(
+                eval_snippet(expr, &host).as_boolean() == Some(true),
+                "runtime surface failed: {expr}"
+            );
+        }
+    }
+
+    #[test]
+    fn intl_formats_with_the_bundled_icu_data() {
+        let host = sample_host();
+        // No system ICU data is installed anywhere here — intl_bundled means
+        // the locale data ships in the binary.
+        assert!(
+            eval_snippet("new Intl.NumberFormat('de-DE').format(1234.5) === '1.234,5'", &host)
+                .as_boolean()
+                == Some(true)
+        );
+        assert!(
+            eval_snippet("new Intl.Collator().compare('a', 'b') === -1", &host)
+                .as_boolean()
+                == Some(true)
+        );
+    }
+
+    #[test]
+    fn promise_jobs_drain_at_the_end_of_the_script_turn() {
+        let host = sample_host();
+        let mut runtime = JsRuntime::new(Rc::clone(&host));
+        runtime
+            .eval("var d = false; Promise.resolve().then(function () { d = true; }); queueMicrotask(function () { d = d && 'both'; });")
+            .expect("queue");
+        // boa 0.22 does not drain jobs inside eval — the runtime's turn-end
+        // drain must have run both callbacks.
+        assert_eq!(runtime.eval("d").expect("d").as_string().map(|s| s.to_std_string_escaped()), Some("both".to_string()));
+    }
+
+    #[test]
+    fn process_is_present_but_leaks_no_environment() {
+        let host = sample_host();
+        assert!(
+            eval_snippet(
+                "typeof process === 'object' && Object.keys(process.env).length === 0 && typeof process.cwd === 'function'",
+                &host
+            )
+            .as_boolean()
+                == Some(true)
         );
     }
 

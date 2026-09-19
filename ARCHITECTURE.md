@@ -449,7 +449,11 @@ blitz-paint = "0.3.0-beta.2"      # paint_scene(scene, doc, scale, w, h, x, y)
 blitz-traits = "0.3.0-beta.2"     # net::NetProvider/NetHandler, shell::{Viewport, ColorScheme}
 anyrender = "0.13"                # PaintScene + render_to_buffer
 anyrender_vello_cpu = "0.17"      # VelloCpuImageRenderer — CPU rasterizer, RGBA8 output
-boa_engine = "0.22"               # JavaScript (pure Rust)
+boa_engine = "0.22"   # JavaScript (pure Rust) — ALL language features:
+                      # annex-b, intl_bundled, temporal, float16, xsum, …
+boa_runtime = "0.22"  # the WinterTC Web-API layer: atob/btoa, queueMicrotask,
+                      # structuredClone, TextEncoder/Decoder, AbortController,
+                      # URL, console, process, fetch (features all+process)
 ```
 
 (`stylo 0.20` + `html5ever` + `parley` come in transitively. Reference: `DioxusLabs/blitz`
@@ -589,7 +593,24 @@ and `@import` bodies are not followed.
 After parse & resolve, extract `<script>` elements from the DOM (`document.root_element()`
 walk or `query_selector("script")`), fetch `src=` through our network layer, and execute in
 order in **one** `boa_engine::Context` per tab (per navigation: rebuild context). Bindings
-are a small, DOM-shaped surface:
+are a small, DOM-shaped surface.
+**Full Boa support is switched on** (task: as much JavaScript as possible): every
+`boa_engine` language feature is compiled in — `annex-b` (legacy web compat: `substr`/`trimLeft`,
+legacy escapes/regex quirks), `intl_bundled` (`Intl` with ICU data shipped *in the binary* —
+locale formatting works with no system data), `temporal`, `float16`, `xsum` (+ `deser`,
+`jsvalue-enum`, `native-backtrace`; only wasm/fuzz/debug-only knobs skipped) — and the whole
+**`boa_runtime`** layer registers on every fresh realm before the IronSurf glue:
+`atob`/`btoa`, `queueMicrotask`, `structuredClone`, `TextEncoder`/`TextDecoder`,
+`AbortController`/`AbortSignal`, `URL`, a richer `console`, `process` (its `env` map is
+emptied before page code runs — the tab leaks no environment) and `fetch` (reqwest's
+blocking client; the workspace's reqwest already compiles a rustls crypto provider). The
+IronSurf glue registers over the names the tab must own — `console` (stderr + capture) and
+the timers (the poll loop, not the runtime's internal timer channel) — via its plain
+sloppy-mode assignments. Boa 0.22 does **not** drain its job queue inside `eval`, so the
+runtime drains it once per script turn (`run_jobs` after every script batch, timer batch,
+event dispatch and userscript): `Promise.then`/`queueMicrotask` callbacks now really run,
+and `fetch` promises settle; a throwing job is reported as a script error (origin
+`"promise"`) like any other. The binding surface stays:
 - `window` (eventTarget-ish no-ops), `document.title` get/set (set → `FromTab::TitleChanged`
   and repaint), `document.body.textContent` read-only snapshot,
 - **`window.matchMedia(query)`** returns a MediaQueryList without evaluating media features:

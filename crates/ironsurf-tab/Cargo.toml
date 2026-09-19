@@ -30,7 +30,21 @@ blitz-net = "0.3.0-beta.2"
 blitz-paint = { version = "0.3.0-beta.2", features = ["custom-widget"] }
 blitz-traits = "0.3.0-beta.2"
 # JavaScript (task 8): pure Rust, no mozjs/spidermonkey in the tree.
-boa_engine = "0.22"
+# EVERY boa_engine language feature so as much JS as possible is supported:
+# annex-b (legacy web compat: `substr`/`trimLeft`, legacy octal & escapes,
+# regex quirks), intl_bundled (full `Intl` with self-contained ICU data —
+# no system data needed headless), temporal (the `Temporal` dates/times
+# API), float16 + xsum (f16/sum-numerals literals), experimental +
+# jsvalue-enum + native-backtrace + deser + embedded_lz4 + either (surface
+# and tooling extras). Skipped on purpose: `js`/`trace` (wasm-only),
+# `fuzz` (needs arbitrary), `flowgraph` (debug-only IR).
+boa_engine = { version = "0.22", features = ["annex-b", "intl_bundled", "jsvalue-enum", "native-backtrace", "deser", "either", "embedded_lz4", "experimental"] }
+# boa_runtime: the whole Web-API layer WinterTC-style — `atob`/`btoa`,
+# `queueMicrotask`, `structuredClone`, `TextEncoder`/`TextDecoder`,
+# `AbortController`/`AbortSignal`, `URL`, `console`, `process`, and `fetch`
+# (via reqwest's blocking client; its promises settle from the job-queue
+# drain after every script turn). `all` = fetch + url + reqwest-blocking.
+boa_runtime = { version = "0.22", features = ["all", "process", "annex-b"] }
 anyrender = "0.13"
 anyrender_vello_cpu = "0.17"
 # Geometry/brush types named directly in the paint callback; same versions
