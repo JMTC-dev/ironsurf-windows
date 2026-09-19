@@ -51,6 +51,7 @@ use std::time::{Duration, Instant};
 
 use boa_engine::property::Attribute;
 use boa_engine::{Context, JsNativeError, JsString, JsValue, NativeFunction, Source};
+use blitz_dom::node::{ImageData, SpecialElementData};
 use blitz_dom::{local_name, BaseDocument, LocalName, Node, NodeData, NodeId, Prefix, QualName};
 use blitz_html::HtmlDocument;
 use url::Url;
@@ -1236,6 +1237,10 @@ mod dom_native {
     pub(super) const ATTR_REMOVE: &str = "__ironsurfDomAttrRemove";
     pub(super) const ATTR_COUNT: &str = "__ironsurfDomAttrCount";
     pub(super) const ATTR_AT: &str = "__ironsurfDomAttrAt";
+    // Images: what the engine knows about one element's image bytes, and the
+    // document's own URL resolver (`img.src` must answer an ABSOLUTE url).
+    pub(super) const IMAGE_STATE: &str = "__ironsurfDomImageState";
+    pub(super) const RESOLVE_URL: &str = "__ironsurfDomResolveUrl";
     // Form controls: value / checked (blitz editor + input special data).
     pub(super) const VALUE: &str = "__ironsurfDomValue";
     pub(super) const VALUE_SET: &str = "__ironsurfDomValueSet";
@@ -2196,6 +2201,74 @@ fn register_dom_natives(context: &mut Context) {
                 );
                 JsValue::from(array)
             }
+            None => JsValue::null(),
+        })
+    });
+
+    // -- images (`new Image()`, `img.complete`, `img.naturalWidth`) ----------
+
+    // What the engine knows about one element's image bytes, as
+    // `[loaded, naturalWidth, naturalHeight]`. blitz attaches
+    // `SpecialElementData::Image` to an `<img>` when its fetch settles (or
+    // applies it straight out of the document's image cache), so the triple
+    // answers honestly for the image's *intrinsic* size; every other element
+    // — and an `<img>` whose bytes have not arrived, or failed — reads
+    // `[false, 0, 0]`.
+    native!(dom_native::IMAGE_STATE, 2, |_this, args, context| {
+        let doc = arg_doc(args, 0, context)?;
+        let node = arg_node(args, 1, context)?;
+        let state = with_live_doc(doc, |document| {
+            let element = document.get_node(node_id(node))?.element_data()?;
+            Some(match &element.special_data {
+                SpecialElementData::Image(data) => match &**data {
+                    ImageData::Raster(raster) => {
+                        (true, f64::from(raster.width), f64::from(raster.height))
+                    }
+                    ImageData::Svg(svg) => (
+                        true,
+                        f64::from(svg.intrinsic_width().unwrap_or(0.0).max(0.0)),
+                        f64::from(svg.intrinsic_height().unwrap_or(0.0).max(0.0)),
+                    ),
+                    ImageData::None => (false, 0.0, 0.0),
+                },
+                _ => (false, 0.0, 0.0),
+            })
+        })
+        .flatten()
+        .unwrap_or((false, 0.0, 0.0));
+        let array = boa_engine::object::builtins::JsArray::from_iter(
+            [
+                JsValue::from(state.0),
+                JsValue::new(state.1),
+                JsValue::new(state.2),
+            ],
+            context,
+        );
+        Ok(JsValue::from(array))
+    });
+
+    // The document's own URL resolver. HTML's `reflect, parsing a URL`
+    // rule makes the reflected `src`/`href` getters answer the *absolute*
+    // url, and the tab — never the JS glue — owns the parser: this is
+    // `Url::join` against the live document URL, the same resolver
+    // `Runtime::fetch_media` uses for `<video src>`. `null` = unresolvable
+    // (a base-less document), in which case the glue reports the raw text.
+    native!(dom_native::RESOLVE_URL, 2, |_this, args, context| {
+        let doc = arg_doc(args, 0, context)?;
+        let raw = arg_string(args, 1, context)?;
+        let resolved = with_live_doc(doc, move |document| {
+            if raw.is_empty() {
+                return None;
+            }
+            document
+                .url()
+                .join(&raw)
+                .ok()
+                .map(|url| url.to_string())
+        })
+        .flatten();
+        Ok(match resolved {
+            Some(url) => JsValue::from(JsString::from(url)),
             None => JsValue::null(),
         })
     });
@@ -3790,6 +3863,172 @@ const PRELUDE: &str = r##"
   });
   // Export the interface name (checks like `v instanceof HTMLMediaElement`).
   globalThis.HTMLMediaElement = HTMLMediaElement;
+
+  // ---------------------------------------------------------------------
+  // HTMLImageElement glue + the `Image` constructor
+  //
+  // `new Image()` is the oldest image API on the web and pages reach for it
+  // unconditionally (`var i = new Image(); i.onload = …; i.src = url;`), so
+  // its absence threw `ReferenceError: Image is not defined` out of the whole
+  // script. It creates an `<img>` ELEMENT through exactly the same native as
+  // `document.createElement("img")` and leaves it detached — `isConnected ===
+  // false`, like a real one — and `instanceof HTMLImageElement` holds because
+  // the interface prototype IS the wrapper prototype (in browsers
+  // `Image.prototype === HTMLImageElement.prototype`).
+  //
+  // Two things come with it, both on the wrapper prototype like the media
+  // members above, and both only as honest as the engine can be:
+  //
+  // * Reflected URL attributes. HTML reflects `src`/`href` as URLs: the getter
+  //   answers the url RESOLVED AGAINST THE DOCUMENT URL (only the tab owns a
+  //   URL parser — `__ironsurfDomResolveUrl`), the setter writes the content
+  //   attribute through the same native as `setAttribute`, so a script-built
+  //   `<img>` is fetched by blitz through the tab's own network layer the
+  //   moment it enters the tree (blitz requests `<img src>` on insertion).
+  //   IronSurf has no detached-image preload: `new Image(); i.src = …` on its
+  //   own starts no fetch and never fires `load` — append the image and it
+  //   loads for real (the natural follow-up task).
+  // * The sizing members. `width`/`height` read the content attributes as
+  //   HTML's reflected non-negative integers, falling back — per the IDL — to
+  //   the image's intrinsic size and finally 0; `naturalWidth`/`naturalHeight`/
+  //   `complete`/`currentSrc` read what the engine reported about the bytes.
+  //
+  // Both step aside on tags that have no such IDL member: `div.href = "x"`
+  // stores a string and reads back a string (browsers store an own property),
+  // and neither one navigates.
+  // ---------------------------------------------------------------------
+  var SRC_TAGS = { IMG: 1, INPUT: 1, SCRIPT: 1, IFRAME: 1, AUDIO: 1, VIDEO: 1, SOURCE: 1, TRACK: 1, EMBED: 1 };
+  var HREF_TAGS = { A: 1, AREA: 1, LINK: 1, BASE: 1 };
+  function tagUpper(self) {
+    var name = self.nodeName;
+    return typeof name === "string" ? name.toUpperCase() : "";
+  }
+  function isImg(self) { return tagUpper(self) === "IMG"; }
+  function storeOwn(self, key, value) {
+    // Browsers let a page hang arbitrary data on an element: where there is no
+    // reflected member the accessor steps aside and the value is stored.
+    Object.defineProperty(self, key, {
+      value: value, writable: true, enumerable: true, configurable: true,
+    });
+  }
+  // The reflected-URL getter: "" when the attribute is absent or empty (the
+  // spec default), the ABSOLUTE url otherwise, and the raw text when even the
+  // tab's parser cannot resolve it (a base-less document).
+  function urlAttr(self, key, tags) {
+    if (!tags[tagUpper(self)]) return undefined;
+    var raw = self.getAttribute(key);
+    if (raw === null || raw === undefined) return "";
+    raw = String(raw).trim();
+    if (raw === "") return "";
+    var absolute = host.__ironsurfDomResolveUrl(self.__d, raw);
+    return absolute === null ? raw : String(absolute);
+  }
+  function urlAttrSet(self, key, tags, value) {
+    if (!tags[tagUpper(self)]) {
+      storeOwn(self, key, String(value));
+      return;
+    }
+    self.setAttribute(key, String(value));
+  }
+  protoAccessor("src",
+    function () { return urlAttr(this, "src", SRC_TAGS); },
+    function (value) { urlAttrSet(this, "src", SRC_TAGS, value); });
+  protoAccessor("href",
+    function () { return urlAttr(this, "href", HREF_TAGS); },
+    function (value) { urlAttrSet(this, "href", HREF_TAGS, value); });
+  // Leading non-negative integer (HTML's parsing rules: optional whitespace,
+  // then digits — anything else means the attribute has no value).
+  function nonNegativeInt(raw, fallback) {
+    var text = raw === null || raw === undefined ? "" : String(raw);
+    var match = /^[ \t\r\n\f]*([0-9]+)/.exec(text);
+    return match === null ? fallback : parseInt(match[1], 10);
+  }
+  // `[loaded, naturalWidth, naturalHeight]` from the engine, or null when this
+  // element has no image (never fetched, failed, or not an <img> at all).
+  function imageState(self) {
+    var state = host.__ironsurfDomImageState(self.__d, self.__n);
+    return state && state[0] === true ? state : null;
+  }
+  function intrinsic(self, index) {
+    var state = imageState(self);
+    return state === null ? 0 : Math.round(Number(state[index]));
+  }
+  function sizeAttrSet(self, key, value) {
+    if (!isImg(self)) {
+      storeOwn(self, key, String(value));
+      return;
+    }
+    var n = Number(value);
+    if (!isFinite(n)) n = 0;      // garbage reads as 0 (WebIDL unsigned long)
+    n = Math.floor(n);
+    self.setAttribute(key, String(n < 0 ? 0 : n));
+  }
+  // `width`/`height` on `<img>` are the RENDERED size, which falls back to the
+  // intrinsic size while the element is not laid out (no layout boxes live on
+  // this side of the bridge, so the declared attribute is the best answer for
+  // what the engine would render).
+  protoAccessor("width",
+    function () {
+      if (!isImg(this)) return undefined;
+      var declared = nonNegativeInt(this.getAttribute("width"), -1);
+      return declared >= 0 ? declared : intrinsic(this, 1);
+    },
+    function (value) { sizeAttrSet(this, "width", value); });
+  protoAccessor("height",
+    function () {
+      if (!isImg(this)) return undefined;
+      var declared = nonNegativeInt(this.getAttribute("height"), -1);
+      return declared >= 0 ? declared : intrinsic(this, 2);
+    },
+    function (value) { sizeAttrSet(this, "height", value); });
+  protoAccessor("naturalWidth",
+    function () { return isImg(this) ? intrinsic(this, 1) : undefined; });
+  protoAccessor("naturalHeight",
+    function () { return isImg(this) ? intrinsic(this, 2) : undefined; });
+  protoAccessor("complete",
+    function () {
+      if (!isImg(this)) return undefined;
+      // HTML: `complete` is true when there is no image to wait for at all
+      // (no src, or the empty string), and while the resource is still
+      // travelling it is false. A failed fetch cannot be told apart from a
+      // pending one from this side, so it keeps reading false.
+      var raw = this.getAttribute("src");
+      if (raw === null || String(raw).trim() === "") return true;
+      return imageState(this) !== null;
+    });
+  protoAccessor("currentSrc",
+    function () { return isImg(this) ? urlAttr(this, "src", SRC_TAGS) : undefined; });
+  // `decode()` resolves once the image is decoded; IronSurf decodes as part of
+  // fetching, so a settled image decodes immediately.
+  protoMethod("decode", function () {
+    if (!isImg(this)) return undefined;
+    return Promise.resolve();
+  });
+  // WebIDL `unsigned long` coercion for the factory arguments: garbage and
+  // negatives read as 0, fractions truncate.
+  function unsignedLong(value) {
+    var n = Number(value);
+    if (!isFinite(n)) return 0;
+    n = Math.floor(n);
+    return n < 0 ? 0 : n;
+  }
+  // The interface itself (what `instanceof` consults) and its legacy factory.
+  function HTMLImageElement() {}
+  HTMLImageElement.prototype = NodeProto;
+  // `new Image([width[, height]])`: an <img> element, and the content
+  // attributes are written ONLY when the argument is present — `new Image()`
+  // yields a plain <img> with no width/height at all.
+  function Image(width, height) {
+    var img = document.createElement("img");
+    if (img !== null) {
+      if (width !== undefined) img.setAttribute("width", String(unsignedLong(width)));
+      if (height !== undefined) img.setAttribute("height", String(unsignedLong(height)));
+    }
+    return img;
+  }
+  Image.prototype = NodeProto; // === HTMLImageElement.prototype, like browsers
+  globalThis.HTMLImageElement = HTMLImageElement;
+  globalThis.Image = Image;
 
   function makeConsole(level) {
     return function () {
@@ -6433,6 +6672,149 @@ mod tests {
             document.querySelector("#nope") === null &&
             document.body.getAttribute("nope") === null;
             "##,
+        );
+    }
+
+    /// DOM world at a real `http` URL (reflected URL attributes resolve their
+    /// relatives against the document base) with `page` as its markup, plus
+    /// the host cell so a test can see whether a JS write queued a navigation.
+    fn image_world(page: &str) -> (HostRef, JsRuntime, blitz_html::HtmlDocument) {
+        let host = Rc::new(RefCell::new(HostState::new(
+            "https://example.test/page.html",
+            Some("Bridge"),
+            Some(" body text ".to_string()),
+        )));
+        let runtime = JsRuntime::new(Rc::clone(&host));
+        let mut config = blitz_dom::DocumentConfig::default();
+        config.base_url = Some("https://example.test/page.html".to_string());
+        let doc = blitz_html::HtmlDocument::from_html(page, config);
+        (host, runtime, doc)
+    }
+
+    /// `window.Image` (task: `ReferenceError: Image is not defined`): the
+    /// factory really creates an `<img>` **in the live document** — detached,
+    /// `isConnected` false, with its size arguments written as content
+    /// attributes — and the interface name exists so `instanceof` holds. In
+    /// browsers `Image.prototype === HTMLImageElement.prototype`, so the two
+    /// names share the wrapper prototype here too.
+    #[test]
+    fn image_constructor_creates_a_detached_img_element() {
+        let (_host, mut runtime, mut doc) = image_world(DOM_PAGE);
+        let source = r##"
+            var made = new Image();
+            var sized = new Image(120, 45.9);
+            var junk = new Image("big", -7);
+            var bare = Image();
+            made !== null && made.nodeName === "IMG" && made.nodeType === 1 &&
+            made.isConnected === false && made.parentNode === null &&
+            made.getAttribute("width") === null &&
+            made.getAttribute("height") === null &&
+            sized.getAttribute("width") === "120" &&
+            sized.getAttribute("height") === "45" &&
+            sized.width === 120 && sized.height === 45 &&
+            junk.getAttribute("width") === "0" && junk.getAttribute("height") === "0" &&
+            bare !== null && bare !== made &&
+            typeof Image === "function" && typeof HTMLImageElement === "function" &&
+            made instanceof HTMLImageElement &&
+            Image.prototype === HTMLImageElement.prototype &&
+            // An image with nothing to wait for is complete, with no size.
+            made.complete === true && made.naturalWidth === 0 && made.naturalHeight === 0;
+            "##;
+        assert!(
+            dom_eval(&mut runtime, &mut doc, source).to_boolean(),
+            "Image() must build a real detached <img>"
+        );
+    }
+
+    /// Reflected URL attributes — `img.src = "…"` is THE way a page sets an
+    /// image: the setter writes the content attribute like `setAttribute`, the
+    /// getter answers the url resolved against the **document** url, and a tag
+    /// without the IDL member keeps the browser's own-property semantics
+    /// (`div.href = "x"` stores a string) instead of swallowing the write.
+    /// None of it navigates.
+    #[test]
+    fn reflected_url_attributes_answer_absolute_urls() {
+        let (host, mut runtime, mut doc) = image_world(DOM_PAGE);
+        let source = r##"
+            var img = document.createElement("img");
+            img.src === "" &&
+            (img.src = "/img/logo.png",
+             img.getAttribute("src") === "/img/logo.png" &&
+             img.src === "https://example.test/img/logo.png" &&
+             img.currentSrc === "https://example.test/img/logo.png" &&
+             // Bytes have not arrived (nothing was fetched): still loading.
+             img.complete === false && img.naturalWidth === 0) &&
+            (img.src = "https://cdn.example/a.png", img.src === "https://cdn.example/a.png") &&
+            (img.src = "   ", img.src === "" && img.complete === true) &&
+            (function () {
+                var a = document.createElement("a");
+                document.body.appendChild(a);
+                a.href = "next.html";
+                return a.getAttribute("href") === "next.html" &&
+                    a.href === "https://example.test/next.html";
+            })() &&
+            (function () {
+                var div = document.createElement("div");
+                div.href = "stored";
+                return div.href === "stored" && div.getAttribute("href") === null &&
+                    div.src === undefined && div.width === undefined &&
+                    div.complete === undefined && div.decode() === undefined;
+            })();
+            "##;
+        assert!(
+            dom_eval(&mut runtime, &mut doc, source).to_boolean(),
+            "src/href must reflect as URLs"
+        );
+        assert!(
+            host.borrow().pending_nav.is_none(),
+            "reflecting src/href must never queue a navigation"
+        );
+    }
+
+    /// The image members read what the engine knows about the bytes: no data
+    /// means `complete` false and no intrinsic size, and once blitz has the
+    /// image on the element the members report its real dimensions.
+    #[test]
+    fn image_sizing_members_read_the_engine_data() {
+        let page = r####"<!doctype html>
+<html><head><title>Pic</title></head>
+<body><img id="pic" src="/pic.png"></body></html>"####;
+        let (_host, mut runtime, mut doc) = image_world(page);
+        let pending = r##"
+            var i = document.getElementById("pic");
+            i !== null && i.getAttribute("src") === "/pic.png" &&
+            i.src === "https://example.test/pic.png" &&
+            i.complete === false && i.naturalWidth === 0 && i.width === 0;
+            "##;
+        assert!(
+            dom_eval(&mut runtime, &mut doc, pending).to_boolean(),
+            "an <img> without bytes reads as still loading"
+        );
+        // Hand the element the data blitz attaches when a fetch settles.
+        let id = doc.get_element_by_id("pic").expect("img element");
+        let element = doc
+            .get_node_mut(id)
+            .and_then(|node| node.element_data_mut())
+            .expect("<img> element data");
+        element.special_data = blitz_dom::node::SpecialElementData::Image(Box::new(
+            blitz_dom::node::ImageData::Raster(blitz_dom::node::RasterImageData::new(
+                7,
+                3,
+                Arc::new(vec![0_u8; 7 * 3 * 4]),
+            )),
+        ));
+        let loaded = r##"
+            var i = document.getElementById("pic");
+            i.complete === true &&
+            i.naturalWidth === 7 && i.naturalHeight === 3 &&
+            i.width === 7 && i.height === 3 &&
+            (i.width = 14,
+             i.width === 14 && i.getAttribute("width") === "14") &&
+            typeof i.decode().then === "function";
+            "##;
+        assert!(
+            dom_eval(&mut runtime, &mut doc, loaded).to_boolean(),
+            "loaded image data must read through the members"
         );
     }
 

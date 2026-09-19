@@ -659,6 +659,25 @@ and `fetch` promises settle; a throwing job is reported as a script error (origi
   capitals take no dash); reads re-read the document, writes/deletes go through the same
   `__ironsurfDomAttr*` natives as `setAttribute`, so they restyle and repaint like any attribute
   mutation, and the keys enumerate (`for (k in el.dataset)`).
+- **`window.Image` / `HTMLImageElement` are implemented** (task: `ReferenceError: Image is not defined`):
+  `new Image([width[, height]])` really creates an `<img>` **in the live document** and leaves it detached
+  (`isConnected === false`, like a real one); the size arguments go through WebIDL `unsigned long` coercion
+  (garbage/negatives read `0`, fractions truncate) and an *absent* argument writes no attribute at all.
+  `Image.prototype === HTMLImageElement.prototype` (the node-wrapper prototype), so `instanceof` holds for parsed
+  and script-built images alike. The interface members ride that prototype: `complete`/`naturalWidth`/
+  `naturalHeight`/`currentSrc` read what blitz attached to the element (one new native,
+  `__ironsurfDomImageState` → `[loaded, naturalWidth, naturalHeight]` from `SpecialElementData::Image`),
+  `width`/`height` read the content attributes as HTML's reflected non-negative integers falling back to the
+  intrinsic size, and `decode()` resolves at once. With them, **`src` and `href` became reflected URL
+  attributes** on the tags that carry them (img/input/script/iframe/audio/video/source/track/embed; a/area/link/
+  base): the getter answers the url *resolved against the document url* (`__ironsurfDomResolveUrl` — the same
+  `Url::join` the media fetcher uses), the setter writes the content attribute through the `setAttribute` native,
+  so `img.src = "x.png"` really fetches once the element is in the tree, and `a.href` reads absolute without
+  navigating. A tag with no such IDL member keeps the browser's own-property semantics (`div.href = "x"` stores a
+  string) — the accessors never swallow a page's data. Still TODO: a *detached*-image preload — blitz requests
+  `<img src>` when the element is inserted, so a bare `new Image(); i.src = …` beacon starts no fetch and never
+  fires `load` (append the image and it loads for real, verified by `tests/e2e.rs`:
+  `script_built_image_reads_engine_state`).
 - **`window.localStorage` is a real `Storage`** (task: per-origin DOM storage): `getItem`/
   `setItem`/`removeItem`/`clear`/`key(i)`/`length`, plus the spec's Proxy forms — `localStorage.foo = 1`
   stores, `localStorage.foo` reads, `delete localStorage.foo` removes, `Object.keys` enumerates the

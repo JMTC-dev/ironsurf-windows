@@ -1220,6 +1220,94 @@ fn tab_timer_callback_fires_from_the_poll_loop() {
     exit_cleanly(&mut tab);
 }
 
+/// A REAL 4×4 red PNG (the same fixture body `tests/subresource_pool.rs`
+/// serves), so the image's true dimensions are known and assertable.
+const RED_PNG_4X4: &[u8] = &[
+    0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44,
+    0x52, 0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 0x04, 0x08, 0x02, 0x00, 0x00, 0x00, 0x26,
+    0x93, 0x09, 0x29, 0x00, 0x00, 0x00, 0x10, 0x49, 0x44, 0x41, 0x54, 0x78, 0x9c, 0x63, 0xf8,
+    0xcf, 0xc0, 0x00, 0x47, 0x0c, 0xc4, 0x71, 0x00, 0xae, 0x93, 0x0f, 0xf1, 0xd0, 0x5f, 0x23,
+    0x9e, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82,
+];
+
+/// `new Image()` in a REAL tab (task: `ReferenceError: Image is not defined`).
+/// The page builds an image with the factory, sets `src` through the reflected
+/// URL attribute, and — from a timer, after blitz has really fetched the
+/// fixture PNG sitting next to the page — re-reads both images. So the test
+/// proves the three things the fix promises on the live path: the factory
+/// exists and yields a detached `<img>` (never fetched, reads as still
+/// loading); `src` reflects as an ABSOLUTE url resolved against the document;
+/// and the sizing members report the engine's data for the parsed image
+/// (`naturalWidth` 4 — the PNG's true size), not zeroes.
+/// `IMAGE-FAIL` carries the live readings, so a mismatch is self-describing.
+#[test]
+fn script_built_image_reads_engine_state() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let profile = dir.path().join("profile");
+    std::fs::create_dir_all(&profile).expect("profile dir");
+    // The sandbox lets a file:// page read inside its own profile only, so the
+    // image lives next to the page.
+    std::fs::write(profile.join("pic.png"), RED_PNG_4X4).expect("write png");
+    let fixture = profile.join("index.html");
+    std::fs::write(
+        &fixture,
+        r#"<!doctype html>
+<html>
+  <head><title>Base Title</title></head>
+  <body>
+    <img id="pic" src="pic.png" alt="four by four">
+    <script>
+      var built = new Image(30, 12);
+      built.src = "pic.png";
+      function check() {
+        var live = document.getElementById("pic");
+        return typeof Image === "function" && typeof HTMLImageElement === "function" &&
+          built.nodeName === "IMG" && built.isConnected === false &&
+          built instanceof HTMLImageElement &&
+          built.width === 30 && built.height === 12 &&
+          built.getAttribute("src") === "pic.png" &&
+          built.complete === false && built.naturalWidth === 0 &&
+          live instanceof HTMLImageElement &&
+          live.complete === true &&
+          live.naturalWidth === 4 && live.naturalHeight === 4 &&
+          live.width === 4 && live.height === 4 &&
+          /\/pic\.png$/.test(live.src) && /\/pic\.png$/.test(live.currentSrc);
+      }
+      function detail() {
+        var live = document.getElementById("pic");
+        return [
+          "Image=" + typeof Image + "/" + typeof HTMLImageElement,
+          "built=" + built.nodeName + " " + built.isConnected + " " +
+            built.width + "x" + built.height + " " + built.complete,
+          "live=" + live.complete + " " + live.naturalWidth + "x" + live.naturalHeight +
+            " " + live.width + "x" + live.height,
+          "src=" + live.src + " current=" + live.currentSrc,
+        ].join(" | ");
+      }
+      setTimeout(function () {
+        document.title = check() ? "IMAGE-OK" : "IMAGE-FAIL: " + detail();
+      }, 1500);
+    </script>
+  </body>
+</html>
+"#,
+    )
+    .expect("write fixture");
+
+    let deadline = Instant::now() + DEADLINE;
+    let mut tab = spawn_tab(&fixture, &profile);
+    let mut seen = Vec::new();
+    let title = tab.wait_for(
+        "TitleChanged(\"IMAGE-OK\") from the image checks",
+        |m| matches!(m, FromTab::TitleChanged { title: Some(t) } if t == "IMAGE-OK"),
+        deadline,
+        &mut seen,
+    );
+    assert_eq!(title, FromTab::TitleChanged { title: Some("IMAGE-OK".into()) });
+
+    exit_cleanly(&mut tab);
+}
+
 /// The startpage.com search bar: the page's `<form>` ships ten
 /// `<input type=hidden>` siblings beside the query field inside a flexed
 /// layout. blitz's default UA sheet lacks `input[type=hidden] { display: none }`,
