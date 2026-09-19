@@ -816,6 +816,13 @@ impl ModuleLoader for UrlModuleLoader {
 /// property when the value carries one, the stringified value otherwise.
 fn rejection_message(context: &mut Context, value: &JsValue) -> String {
     if let Some(object) = value.as_object() {
+        // A thrown Error carries a Boa backtrace in `stack` — log it, it is
+        // the only way to locate the throwing statement in a minified bundle.
+        if let Ok(stack) = object.get(js_string!("stack"), context) {
+            if let Some(text) = stack.as_string() {
+                error!("module rejection stack:\n{}", text.to_std_string_escaped());
+            }
+        }
         if let Ok(message) = object.get(js_string!("message"), context) {
             if !message.is_undefined() {
                 if let Ok(text) = message.to_string(context) {
@@ -933,6 +940,12 @@ pub struct HostState {
     /// replace the current entry. Taken by the tab after every JS turn
     /// ([`JsRuntime::take_pending_navigation`]); the last write of a turn wins.
     pub pending_nav: Option<PendingNav>,
+    /// `history.pushState`/`replaceState` asked for a **URL-only** update
+    /// (task: infosec.exchange): the address bar follows, nothing is
+    /// fetched. Taken by the tab after every JS turn
+    /// ([`JsRuntime::take_pending_url`]); the tab resolves the target
+    /// against the document URL and enforces the same-origin rule itself.
+    pub pending_url: Option<String>,
     /// A script changed something that needs a fresh frame.
     pub repaint: bool,
     /// Number of timer/rAF scheduling calls (stats + debug).
@@ -1289,18 +1302,42 @@ fn qual_name_for_tag(tag: &str) -> Result<QualName, &'static str> {
     Ok(QualName::new(None, blitz_dom::ns!(html), LocalName::from(lowered.as_str())))
 }
 
+/// `document.createElementNS` element names: same validation as `createElement`
+/// but the namespace string selects the element's `Namespace` (svg/mathml/
+/// xhtml/html; anything else falls back to HTML like browsers do for unknown
+/// namespaces created from HTML documents).
+fn qual_name_for_ns(tag: &str, ns: &str) -> Result<QualName, &'static str> {
+    let lowered = tag.to_ascii_lowercase();
+    if lowered.is_empty() {
+        return Err("empty tag name");
+    }
+    if !is_valid_dom_name(&lowered) {
+        return Err("invalid tag name");
+    }
+    let namespace = match ns.to_ascii_lowercase().as_str() {
+        "http://www.w3.org/2000/svg" => blitz_dom::ns!(svg),
+        "http://www.w3.org/1998/Math/MathML" => blitz_dom::ns!(mathml),
+        "http://www.w3.org/1999/xhtml" => blitz_dom::ns!(html),
+        _ => blitz_dom::ns!(html),
+    };
+    Ok(QualName::new(None, namespace, LocalName::from(lowered.as_str())))
+}
+
 /// `setAttribute`/`removeAttribute` name rules: like the tag rules but also
 /// rejecting `xmlns` redefinitions and prefix shenanigans (simplified).
-fn qual_name_for_attr(name: &str) -> Result<QualName, &'static str> {
-    if name.is_empty() || name.eq_ignore_ascii_case("xmlns") || !is_valid_dom_name(name) {
-        return Err("invalid attribute name");
+fn qual_name_for_attr(name: &str) -> Result<QualName, String> {
+    // Note: plain `xmlns` IS settable through the DOM API (react-dom does it
+    // for every SVG root); only *prefixed* xmlns redefinition (`xmlns:foo`)
+    // is a namespace error.
+    if name.is_empty() || !is_valid_dom_name(name) {
+        return Err(format!("invalid attribute name {name:?}"));
     }
     let (prefix, local) = match name.split_once(':') {
         Some((prefix, local)) if !prefix.is_empty() && !local.is_empty() => {
             (Some(prefix.to_ascii_lowercase()), local)
         }
         None => (None, name),
-        Some(_) => return Err("invalid attribute name"),
+        Some(_) => return Err(format!("invalid attribute name {name:?}")),
     };
     let local = local.to_ascii_lowercase();
     // Unprefixed HTML attributes are stored in the **empty** namespace: that
@@ -1458,6 +1495,8 @@ mod dom_native {
     pub(super) const BODY: &str = "__ironsurfDomBody";
     pub(super) const NODE_TYPE: &str = "__ironsurfDomNodeType";
     pub(super) const NODE_NAME: &str = "__ironsurfDomNodeName";
+    pub(super) const ELEMENT_NAME: &str = "__ironsurfDomElementName";
+    pub(super) const COMPUTED_VALUE: &str = "__ironsurfDomComputedValue";
     pub(super) const DATA: &str = "__ironsurfDomData";
     pub(super) const SET_DATA: &str = "__ironsurfDomSetData";
     pub(super) const PARENT: &str = "__ironsurfDomParent";
@@ -1472,12 +1511,17 @@ mod dom_native {
     pub(super) const FIRST_ELEMENT_CHILD: &str = "__ironsurfDomFirstElementChild";
     pub(super) const LAST_ELEMENT_CHILD: &str = "__ironsurfDomLastElementChild";
     pub(super) const CREATE_ELEMENT: &str = "__ironsurfDomCreateElement";
+    pub(super) const CREATE_ELEMENT_NS: &str = "__ironsurfDomCreateElementNs";
     pub(super) const CREATE_TEXT: &str = "__ironsurfDomCreateText";
     pub(super) const CREATE_COMMENT: &str = "__ironsurfDomCreateComment";
     pub(super) const GET_BY_ID: &str = "__ironsurfDomGetById";
     pub(super) const LIVE_ITEM: &str = "__ironsurfDomLiveItem";
     pub(super) const LIVE_COUNT: &str = "__ironsurfDomLiveCount";
     pub(super) const QUERY: &str = "__ironsurfDomQuery";
+    pub(super) const QUERY_ALL: &str = "__ironsurfDomQueryAll";
+    pub(super) const MATCHES: &str = "__ironsurfDomMatches";
+    pub(super) const CLOSEST: &str = "__ironsurfDomClosest";
+    pub(super) const PARSE_HTML: &str = "__ironsurfDomParseHtml";
     pub(super) const APPEND_CHILD: &str = "__ironsurfDomAppendChild";
     pub(super) const INSERT_BEFORE: &str = "__ironsurfDomInsertBefore";
     pub(super) const REMOVE_CHILD: &str = "__ironsurfDomRemoveChild";
@@ -1543,7 +1587,24 @@ fn elements_in_tree_order(doc: &BaseDocument) -> Vec<NodeId> {
 
 /// The live membership of a collection (`param` is the lowercased tag name,
 /// class name, or selector — read fresh from the document every time).
-fn live_ids(doc: &BaseDocument, kind: u32, param: &str) -> Vec<NodeId> {
+fn live_ids(doc: &BaseDocument, kind: u32, param: &str, scope: Option<NodeId>) -> Vec<NodeId> {
+    // Spec: element-level collections (getElementsByTagName(s),
+    // getElementsByClassName, querySelectorAll) are SCOPED to the element;
+    // `scope` is that element (`None` = the whole document). blitz-dom's
+    // `query_selector_all_in` walks any subtree — detached ones included,
+    // which is what DOMParser documents need.
+    let in_scope = |selector: &str| -> Vec<NodeId> {
+        match scope {
+            Some(scope) => doc
+                .query_selector_all_in(scope, selector)
+                .map(|ids| ids.to_vec())
+                .unwrap_or_default(),
+            None => doc
+                .query_selector_all(selector)
+                .map(|ids| ids.to_vec())
+                .unwrap_or_default(),
+        }
+    };
     match kind {
         live_kind::TAGS | live_kind::CLASSES => {
             let selector = if kind == live_kind::TAGS {
@@ -1561,16 +1622,124 @@ fn live_ids(doc: &BaseDocument, kind: u32, param: &str) -> Vec<NodeId> {
                     .join(".");
                 format!(".{joined}")
             };
-            doc.query_selector_all(&selector)
-                .map(|ids| ids.to_vec())
-                .unwrap_or_default()
+            in_scope(&selector)
         }
-        live_kind::SELECTOR => doc
-            .query_selector_all(param)
-            .map(|ids| ids.to_vec())
-            .unwrap_or_default(),
-        live_kind::ALL_ELEMENTS => elements_in_tree_order(doc),
+        live_kind::SELECTOR => in_scope(param),
+        live_kind::ALL_ELEMENTS => match scope {
+            Some(_) => in_scope("*"),
+            None => elements_in_tree_order(doc),
+        },
         _ => Vec::new(),
+    }
+}
+
+/// One computed value → its CSS string (stylo's own `ToCss` serializers,
+/// so keywords/lengths/colors come back byte-identical to a stylesheet).
+fn css(value: &impl style_traits::values::ToCss) -> String {
+    style_traits::values::ToCss::to_css_string(value)
+}
+
+/// The properties `getComputedStyle` answers (task: infosec.exchange —
+/// Mastodon's lightbox boots on `direction`, and layout code reads the
+/// sizing/display members next). Everything stylo resolves for the node;
+/// the empty string is the honest "not modelled" answer.
+fn computed_style_value(
+    styles: &style::servo_arc::Arc<style::properties::ComputedValues>,
+    property: &str,
+) -> String {
+    // Every arm reads the generated top-level `clone_<property>` accessor on
+    // `ComputedValues` (stylo routes them to the right style struct itself).
+    match property {
+        "display" => css(&styles.clone_display()),
+        "position" => css(&styles.clone_position()),
+        "direction" => css(&styles.clone_direction()),
+        "visibility" => css(&styles.clone_visibility()),
+        "color" => css(&styles.clone_color()),
+        "background-color" => css(&styles.clone_background_color()),
+        "opacity" => css(&styles.clone_opacity()),
+        "cursor" => css(&styles.clone_cursor()),
+        "box-sizing" => css(&styles.clone_box_sizing()),
+        // The modern split of `white-space` (collapse keyword) — mapped back
+        // onto the legacy CSS keyword the page asked about.
+        "white-space" => match css(&styles.clone_white_space_collapse()).as_str() {
+            "collapse" => "normal".to_string(),
+            other => other.to_string(),
+        },
+        "float" => css(&styles.clone_float()),
+        "clear" => css(&styles.clone_clear()),
+        "overflow-x" => css(&styles.clone_overflow_x()),
+        "overflow-y" => css(&styles.clone_overflow_y()),
+        "z-index" => css(&styles.clone_z_index()),
+        "font-size" => css(&styles.clone_font_size()),
+        "font-weight" => css(&styles.clone_font_weight()),
+        "font-style" => css(&styles.clone_font_style()),
+        "font-family" => css(&styles.clone_font_family()),
+        "line-height" => css(&styles.clone_line_height()),
+        "text-align" => css(&styles.clone_text_align()),
+        "text-transform" => css(&styles.clone_text_transform()),
+        "letter-spacing" => css(&styles.clone_letter_spacing()),
+        "word-spacing" => css(&styles.clone_word_spacing()),
+        "width" => css(&styles.clone_width()),
+        "height" => css(&styles.clone_height()),
+        "min-width" => css(&styles.clone_min_width()),
+        "min-height" => css(&styles.clone_min_height()),
+        "max-width" => css(&styles.clone_max_width()),
+        "max-height" => css(&styles.clone_max_height()),
+        "margin-top" => css(&styles.clone_margin_top()),
+        "margin-right" => css(&styles.clone_margin_right()),
+        "margin-bottom" => css(&styles.clone_margin_bottom()),
+        "margin-left" => css(&styles.clone_margin_left()),
+        "padding-top" => css(&styles.clone_padding_top()),
+        "padding-right" => css(&styles.clone_padding_right()),
+        "padding-bottom" => css(&styles.clone_padding_bottom()),
+        "padding-left" => css(&styles.clone_padding_left()),
+        "top" => css(&styles.clone_top()),
+        "right" => css(&styles.clone_right()),
+        "bottom" => css(&styles.clone_bottom()),
+        "left" => css(&styles.clone_left()),
+        "pointer-events" => css(&styles.clone_pointer_events()),
+        "user-select" => css(&styles.clone_user_select()),
+        _ => String::new(),
+    }
+}
+
+/// `raw` node id → a real query scope: `None` for the whole document (0 /
+/// absent node — the sentinel the JS glue passes) and for nodes the store
+/// has already dropped.
+fn scope_node(raw: u64) -> Option<NodeId> {
+    (raw != NO_NODE).then(|| NodeId::from_u64(raw))
+}
+
+/// `querySelector` with the element-scope rules of the task: a live scope
+/// node restricts the match to its descendants (detached subtrees included
+/// — blitz walks from the scope node itself); anything else stays the
+/// document-wide query.
+fn query_selector_scoped(
+    doc: &BaseDocument,
+    selector: &str,
+    scope: Option<NodeId>,
+) -> Result<Option<NodeId>, ()> {
+    match scope.filter(|scope| doc.get_node(*scope).is_some()) {
+        Some(scope) => doc.query_selector_in(scope, selector).map_err(|_| ()),
+        None => doc.query_selector(selector).map_err(|_| ()),
+    }
+}
+
+/// `querySelectorAll` under the same scope rules.
+fn query_selector_all_scoped(
+    doc: &BaseDocument,
+    selector: &str,
+    scope: Option<NodeId>,
+) -> Result<Vec<NodeId>, ()> {
+    match scope.filter(|scope| doc.get_node(*scope).is_some()) {
+        Some(scope) => doc
+            .query_selector_all_in(scope, selector)
+            .map(|ids| ids.to_vec())
+            .map_err(|_| ()),
+        None => doc
+            .query_selector_all(selector)
+            .map(|ids| ids.to_vec())
+            .map_err(|_| ()),
     }
 }
 
@@ -1738,6 +1907,53 @@ fn register_dom_natives(context: &mut Context) {
         .flatten()
         .unwrap_or(0);
         Ok(JsValue::new(i32::from(kind)))
+    });
+    // `getComputedStyle` engine: the REAL stylo computed values of the live
+    // node (the very `Arc<ComputedValues>` the tab's `settle()` resolved),
+    // serialized per property. Unstyled (never-laid-out) nodes and unknown
+    // properties answer "" — the documented gap, versus pretending.
+    native!(dom_native::COMPUTED_VALUE, 3, |_this, args, context| {
+        let doc = arg_doc(args, 0, context)?;
+        let node = arg_node(args, 1, context)?;
+        let property = arg_string(args, 2, context)?;
+        let out = with_live_doc(doc, |document| {
+            let styles = document
+                .get_node(node_id(node))?
+                .primary_styles()?
+                .clone();
+            Some(computed_style_value(&styles, &property))
+        })
+        .unwrap_or_default()
+        .unwrap_or_default();
+        Ok(JsValue::from(JsString::from(out)))
+    });
+    // `localName`/`tagName` source: the element's RAW local name (case kept
+    // — svg `linearGradient` included) and its namespace, packed as one
+    // `local\u{1}ns` string; non-elements answer "" so both JS getters
+    // report "" like the spec's empty strings for text/comment nodes.
+    native!(dom_native::ELEMENT_NAME, 2, |_this, args, context| {
+        let doc = arg_doc(args, 0, context)?;
+        let node = arg_node(args, 1, context)?;
+        let packed = with_live_doc(doc, |document| {
+            document
+                .get_node(node_id(node))
+                .and_then(|node| node.element_data())
+                .map(|element| {
+                    // One `local\u{1}h|f` string: the raw local name plus an
+                    // HTML/foreign namespace bit (`tagName` uppercases HTML
+                    // elements only, the SVG DOM keeps names as-written).
+                    let mut packed = element.name.local.to_string();
+                    packed.push('\u{1}');
+                    packed.push(if element.name.ns == blitz_dom::ns!(html) {
+                        'h'
+                    } else {
+                        'f'
+                    });
+                    packed
+                })
+        })
+        .unwrap_or_default();
+        Ok(JsValue::from(JsString::from(packed.unwrap_or_default())))
     });
     native!(dom_native::NODE_NAME, 2, |_this, args, context| {
         let doc = arg_doc(args, 0, context)?;
@@ -1937,6 +2153,19 @@ fn register_dom_natives(context: &mut Context) {
             .unwrap_or(NO_NODE);
         Ok(JsValue::new(raw as f64))
     });
+    native!(dom_native::CREATE_ELEMENT_NS, 3, |_this, args, context| {
+        let doc = arg_doc(args, 0, context)?;
+        let ns = arg_string(args, 1, context)?;
+        let tag = arg_string(args, 2, context)?;
+        let name = qual_name_for_ns(&tag, &ns)
+            .map_err(|reason| {
+                JsNativeError::range().with_message(format!("InvalidCharacterError: {reason}"))
+            })
+            .map_err(boa_engine::JsError::from_native)?;
+        let raw = with_mut(doc, move |mutator| node_raw(mutator.create_element(name, Vec::new())))
+            .unwrap_or(NO_NODE);
+        Ok(JsValue::new(raw as f64))
+    });
     native!(dom_native::CREATE_TEXT, 2, |_this, args, context| {
         let doc = arg_doc(args, 0, context)?;
         let text = arg_string(args, 1, context)?;
@@ -1976,9 +2205,12 @@ fn register_dom_natives(context: &mut Context) {
             // querySelectorAll with an unparsable selector must raise
             // SyntaxError (task contract), so propagate the parse error.
             let count = with_live_doc(doc, |document| {
-                document.query_selector_all(&param).map(|ids| ids.len()).map_err(|_| {
-                    JsNativeError::syntax().with_message(format!("SyntaxError: invalid selector {param:?}"))
-                })
+                query_selector_all_scoped(document, &param, scope_node(raw))
+                    .map(|ids| ids.len())
+                    .map_err(|_| {
+                        JsNativeError::syntax()
+                            .with_message(format!("SyntaxError: invalid selector {param:?}"))
+                    })
             });
             match count {
                 None => return Err(throw_no_doc()),
@@ -1986,7 +2218,10 @@ fn register_dom_natives(context: &mut Context) {
                 Some(Ok(count)) => count,
             }
         } else {
-            with_live_doc(doc, |document| live_ids(document, kind, &param).len()).unwrap_or(0)
+            with_live_doc(doc, |document| {
+                live_ids(document, kind, &param, scope_node(raw)).len()
+            })
+            .unwrap_or(0)
         };
         Ok(JsValue::new(count as f64))
     });
@@ -2006,7 +2241,7 @@ fn register_dom_natives(context: &mut Context) {
             .flatten()
         } else {
             with_live_doc(doc, |document| {
-                let ids = live_ids(document, kind, &param);
+                let ids = live_ids(document, kind, &param, scope_node(raw));
                 usize::try_from(index)
                     .ok()
                     .and_then(|index| ids.get(index).copied())
@@ -2015,14 +2250,18 @@ fn register_dom_natives(context: &mut Context) {
         };
         Ok(JsValue::new(raw_item.map_or(NO_NODE, node_raw) as f64))
     });
-    native!(dom_native::QUERY, 2, |_this, args, context| {
+    native!(dom_native::QUERY, 3, |_this, args, context| {
         let doc = arg_doc(args, 0, context)?;
         let selector = arg_string(args, 1, context)?;
+        // Optional SCOPE node (task: real DOMParser): restrict the match to
+        // its descendants — and follow detached subtrees, which is exactly
+        // what a `DOMParser.parseFromString` document is. Absent/0 (or a
+        // vanished node) keeps the document-wide query.
+        let raw = arg_node(args, 2, context)?;
         // An unparsable selector raises SyntaxError (task contract); a
         // valid-but-empty match is just null at the JS layer.
         let outcome = with_live_doc(doc, |document| {
-            document
-                .query_selector(&selector)
+            query_selector_scoped(document, &selector, scope_node(raw))
                 .map(|found| found.map_or(NO_NODE, node_raw))
                 .map_err(|_| {
                     JsNativeError::syntax()
@@ -2034,6 +2273,87 @@ fn register_dom_natives(context: &mut Context) {
             Some(Err(err)) => Err(boa_engine::JsError::from_native(err)),
             Some(Ok(raw)) => Ok(JsValue::new(raw as f64)),
         }
+    });
+    native!(dom_native::QUERY_ALL, 3, |_this, args, context| {
+        let doc = arg_doc(args, 0, context)?;
+        let selector = arg_string(args, 1, context)?;
+        let raw = arg_node(args, 2, context)?;
+        // One-shot snapshot list (a static NodeList): the live-list proxies
+        // keep their document scope; a detached subtree gets the snapshot
+        // shape the spec itself hands back for `parseFromString` documents.
+        let outcome = with_live_doc(doc, |document| {
+            query_selector_all_scoped(document, &selector, scope_node(raw)).map_err(|_| {
+                JsNativeError::syntax()
+                    .with_message(format!("SyntaxError: invalid selector {selector:?}"))
+            })
+        });
+        match outcome {
+            None => Err(throw_no_doc()),
+            Some(Err(err)) => Err(boa_engine::JsError::from_native(err)),
+            Some(Ok(ids)) => {
+                let array = boa_engine::object::builtins::JsArray::from_iter(
+                    ids.into_iter().map(|id| JsValue::new(node_raw(id) as f64)),
+                    context,
+                );
+                Ok(JsValue::from(array))
+            }
+        }
+    });
+    native!(dom_native::MATCHES, 3, |_this, args, context| {
+        let doc = arg_doc(args, 0, context)?;
+        let node = arg_node(args, 1, context)?;
+        let selector = arg_string(args, 2, context)?;
+        let outcome = with_live_doc(doc, |document| {
+            document.matches_selector(node_id(node), &selector).map_err(|_| {
+                JsNativeError::syntax()
+                    .with_message(format!("SyntaxError: invalid selector {selector:?}"))
+            })
+        });
+        match outcome {
+            None => Err(throw_no_doc()),
+            Some(Err(err)) => Err(boa_engine::JsError::from_native(err)),
+            Some(Ok(matches)) => Ok(JsValue::new(matches)),
+        }
+    });
+    native!(dom_native::CLOSEST, 3, |_this, args, context| {
+        let doc = arg_doc(args, 0, context)?;
+        let node = arg_node(args, 1, context)?;
+        let selector = arg_string(args, 2, context)?;
+        let outcome = with_live_doc(doc, |document| {
+            document.closest(node_id(node), &selector).map_err(|_| {
+                JsNativeError::syntax()
+                    .with_message(format!("SyntaxError: invalid selector {selector:?}"))
+            })
+        });
+        match outcome {
+            None => Err(throw_no_doc()),
+            Some(Err(err)) => Err(boa_engine::JsError::from_native(err)),
+            Some(Ok(found)) => Ok(JsValue::new(found.map_or(NO_NODE, node_raw) as f64)),
+        }
+    });
+    // DOMParser's engine (task: real DOMParser): a REAL detached `<html>`
+    // element in the live document's node store, its subtree built by the
+    // very same html5ever parser (`parse_inner_html_into_mutator`) that
+    // serves `innerHTML=`. The nodes are genuine blitz nodes — every DOM
+    // native works on them, subtree-scoped — they are simply never inserted
+    // (no layout, no paint, no resource fetches), like a browser's inert
+    // `parseFromString` document.
+    native!(dom_native::PARSE_HTML, 2, |_this, args, context| {
+        let doc = arg_doc(args, 0, context)?;
+        let html = arg_string(args, 1, context)?;
+        let name = qual_name_for_tag("html")
+            .expect("the literal 'html' is a valid tag name");
+        let raw = with_mut(doc, move |mutator| {
+            let host = mutator.create_element(name, Vec::new());
+            blitz_html::DocumentHtmlParser::parse_inner_html_into_mutator(
+                mutator,
+                host,
+                &html,
+            );
+            node_raw(host)
+        })
+        .unwrap_or(NO_NODE);
+        Ok(JsValue::new(raw as f64))
     });
     native!(dom_native::APPEND_CHILD, 3, |_this, args, context| {
         let doc = arg_doc(args, 0, context)?;
@@ -2601,6 +2921,14 @@ fn register_dom_natives(context: &mut Context) {
                 .element_data_mut()
                 .ok_or_else(|| JsNativeError::typ().with_message("not an element"))?;
             if checkbox_state(element).is_none() {
+                // Spec: every input has a checkedness; only checkbox/radio
+                // expose it meaningfully. React hands `checked={false}` to
+                // plain text inputs on controlled forms, and the old hard
+                // TypeError killed mastodon's whole search column behind an
+                // error boundary. Non-inputs simply have no checked IDL.
+                if input_type(element).is_some() {
+                    return Ok(());
+                }
                 return Err(JsNativeError::typ()
                     .with_message("checked is only valid on checkbox/radio inputs"));
             }
@@ -2759,6 +3087,7 @@ mod native {
     pub(super) const TITLE_SET: &str = "__ironsurfTitleSet";
     pub(super) const CONSOLE: &str = "__ironsurfConsole";
     pub(super) const NAVIGATE: &str = "__ironsurfNavigate";
+    pub(super) const SET_URL: &str = "__ironsurfSetUrl";
     pub(super) const SET_TIMEOUT: &str = "__ironsurfSetTimeout";
     pub(super) const SET_INTERVAL: &str = "__ironsurfSetInterval";
     pub(super) const RAF: &str = "__ironsurfRaf";
@@ -2923,7 +3252,11 @@ const PRELUDE: &str = r##"
   }
   function makeEvent(type, target, init) {
     init = init || {};
-    var ev = {
+    // Real `Event` instances: every event a page receives satisfies
+    // `ev instanceof Event` (function declarations hoist, so the Event
+    // class defined further down is available here).
+    var ev = Object.create(Event.prototype);
+    Object.assign(ev, {
       type: type,
       target: target,
       currentTarget: target,
@@ -2955,7 +3288,7 @@ const PRELUDE: &str = r##"
         ev._stop = true;
         ev._stopImmediate = true;
       },
-    };
+    });
     return ev;
   }
   // The propagation path: target → … → <html> → document → window.
@@ -3300,8 +3633,8 @@ const PRELUDE: &str = r##"
             return pairs[Symbol.iterator]();
           };
         if (key === "forEach")
-          return function (fn) {
-            for (var i = 0, n = count(); i < n; i++) fn(item(i), i, view);
+          return function (fn, thisArg) {
+            for (var i = 0, n = count(); i < n; i++) fn.call(thisArg, item(i), i, view);
           };
         if (typeof key === "symbol") {
           // Iterating the live list yields snapshots; mutations in the
@@ -3433,6 +3766,24 @@ const PRELUDE: &str = r##"
 
   protoGet("nodeType", function () { return host.__ironsurfDomNodeType(this.__d, this.__n); });
   protoGet("nodeName", function () { return host.__ironsurfDomNodeName(this.__d, this.__n); });
+  // `localName`/`tagName` (spec): the raw local name, and the HTML-element
+  // uppercase / foreign-element-as-is rule for `tagName`. Non-elements get
+  // "" from both, which is exactly what a browser hands back.
+  function elementNameParts(node) {
+    var raw = host.__ironsurfDomElementName(node.__d, node.__n);
+    var cut = raw.indexOf("\u0001");
+    if (cut < 0) return null; // not an element
+    return { local: raw.slice(0, cut), ns: raw.slice(cut + 1) };
+  }
+  protoGet("localName", function () {
+    var parts = elementNameParts(this);
+    return parts === null ? "" : parts.local;
+  });
+  protoGet("tagName", function () {
+    var parts = elementNameParts(this);
+    if (parts === null) return "";
+    return parts.ns === "h" ? parts.local.toUpperCase() : parts.local;
+  });
   protoAccessor(
     "nodeValue",
     function () { return host.__ironsurfDomData(this.__d, this.__n); },
@@ -3761,6 +4112,87 @@ const PRELUDE: &str = r##"
     function (v) { host.__ironsurfDomAttrSet(this.__d, this.__n, "class", String(v)); }
   );
 
+  // DOMTokenList over the `class` attribute. Mastodon toggles layout classes
+  // on <body> (`document.body.classList.toggle(...)`) on every mount, and the
+  // missing accessor read as "cannot convert undefined to object". Each
+  // access returns a fresh snapshot array (indices + length for free) whose
+  // mutators re-read the attribute, so repeated toggles compose correctly.
+  var domTokenListMethods = {
+    item: function (index) {
+      var c = tokenClasses(this.__tokenOwner);
+      var i = Number(index);
+      if (!isFinite(i) || i < 0) return null;
+      return c[i] === undefined ? null : c[i];
+    },
+    contains: function (token) {
+      return tokenClasses(this.__tokenOwner).indexOf(String(token)) !== -1;
+    },
+    add: function () {
+      var node = this.__tokenOwner;
+      var c = tokenClasses(node);
+      for (var i = 0; i < arguments.length; i++) {
+        var t = String(arguments[i]);
+        if (c.indexOf(t) === -1) c.push(t);
+      }
+      host.__ironsurfDomAttrSet(node.__d, node.__n, "class", c.join(" "));
+    },
+    remove: function () {
+      var node = this.__tokenOwner;
+      var c = tokenClasses(node);
+      for (var i = 0; i < arguments.length; i++) {
+        var t = String(arguments[i]);
+        var at = c.indexOf(t);
+        if (at !== -1) c.splice(at, 1);
+      }
+      host.__ironsurfDomAttrSet(node.__d, node.__n, "class", c.join(" "));
+    },
+    toggle: function (token, force) {
+      var node = this.__tokenOwner;
+      var s = String(token);
+      var c = tokenClasses(node);
+      var has = c.indexOf(s) !== -1;
+      var want = force === undefined || force === null ? !has : !!force;
+      if (want && !has) c.push(s);
+      if (!want && has) c.splice(c.indexOf(s), 1);
+      host.__ironsurfDomAttrSet(node.__d, node.__n, "class", c.join(" "));
+      return want;
+    },
+    replace: function (token, newToken) {
+      var node = this.__tokenOwner;
+      var c = tokenClasses(node);
+      var at = c.indexOf(String(token));
+      if (at === -1) return false;
+      c[at] = String(newToken);
+      host.__ironsurfDomAttrSet(node.__d, node.__n, "class", c.join(" "));
+      return true;
+    },
+    forEach: function (fn, thisArg) {
+      var c = tokenClasses(this.__tokenOwner);
+      for (var i = 0; i < c.length; i++) fn.call(thisArg, c[i], i, this);
+    },
+    toString: function () {
+      return tokenClasses(this.__tokenOwner).join(" ");
+    },
+  };
+  function tokenClasses(node) {
+    var v = host.__ironsurfDomAttr(node.__d, node.__n, "class");
+    if (v === null || v === undefined || v === "") return [];
+    return String(v).trim().split(/\s+/);
+  }
+  protoAccessor("classList", function () {
+    var list = tokenClasses(this);
+    Object.defineProperty(list, "__tokenOwner", { value: this, enumerable: false });
+    Object.keys(domTokenListMethods).forEach(function (m) {
+      Object.defineProperty(list, m, {
+        value: domTokenListMethods[m],
+        enumerable: false,
+        configurable: true,
+        writable: true,
+      });
+    });
+    return list;
+  });
+
   protoMethod("getAttribute", function (name) {
     return host.__ironsurfDomAttr(this.__d, this.__n, String(name));
   });
@@ -3773,13 +4205,63 @@ const PRELUDE: &str = r##"
   protoMethod("hasAttribute", function (name) {
     return host.__ironsurfDomAttr(this.__d, this.__n, String(name)) !== null;
   });
-  // Element-level queries: document-wide match (scoping is a known gap).
+  // Element-level queries are SCOPED to the element (spec) — the native
+  // walks THIS node's subtree, detached ones included, so `querySelector`
+  // works on the real DOM a `DOMParser.parseFromString` returned too.
   protoMethod("querySelector", function (selector) {
-    return wrapNode(this.__d, host.__ironsurfDomQuery(this.__d, String(selector)));
+    return wrapNode(this.__d, host.__ironsurfDomQuery(this.__d, String(selector), this.__n));
   });
   protoMethod("querySelectorAll", function (selector) {
-    host.__ironsurfDomQuery(this.__d, String(selector));
-    return makeList(this.__d, 3, 0, String(selector));
+    // Browsers validate at call time: run the scoped query once so an
+    // unparsable selector raises SyntaxError, then hand back the live list.
+    host.__ironsurfDomQuery(this.__d, String(selector), this.__n);
+    return makeList(this.__d, 3, this.__n, String(selector));
+  });
+  protoMethod("matches", function (selector) {
+    return host.__ironsurfDomMatches(this.__d, this.__n, String(selector));
+  });
+  protoMethod("closest", function (selector) {
+    return wrapNode(this.__d, host.__ironsurfDomClosest(this.__d, this.__n, String(selector)));
+  });
+  // contains/getRootNode/compareDocumentPosition (task: infosec.exchange):
+  // the `inert` polyfill Mastodon ships walks focusability through exactly
+  // this trio; their absence threw inside a dynamic import and killed the
+  // module graph. Pure JS parent walks — no engine journal needed.
+  protoMethod("contains", function (other) {
+    var p = other;
+    var guard = 0;
+    while (p && guard++ < 8192) {
+      if (p === this) return true;
+      p = p.parentNode;
+    }
+    return false;
+  });
+  protoMethod("getRootNode", function () {
+    var p = this;
+    var guard = 0;
+    while (p.parentNode && guard++ < 8192) p = p.parentNode;
+    return p;
+  });
+  protoMethod("compareDocumentPosition", function (other) {
+    if (other === null || other === undefined) {
+      throw new TypeError("compareDocumentPosition requires a node");
+    }
+    if (other === this) return 0;
+    // CONTAINS(4)|PRECEDING(16) === 20 what browsers report for ancestors.
+    var p = other.parentNode;
+    var guard = 0;
+    while (p && guard++ < 8192) {
+      if (p === this) return 20;
+      p = p.parentNode;
+    }
+    p = this.parentNode;
+    guard = 0;
+    while (p && guard++ < 8192) {
+      if (p === other) return 34; // CONTAINED_BY(32)|PRECEDING(2)
+      p = p.parentNode;
+    }
+    // No ancestor relation the page can act on: report disconnected.
+    return 9;
   });
   protoMethod("addEventListener", function (type, fn, options) {
     addListener(this, String(type), fn, options);
@@ -3803,11 +4285,11 @@ const PRELUDE: &str = r##"
   // getElementsByClassName on any element (live, like the document one).
   protoMethod("getElementsByClassName", function (name) {
     // Not scoped to descendants in this bridge — document-wide live list.
-    return makeList(this.__d, 2, 0, String(name));
+    return makeList(this.__d, 2, this.__n, String(name));
   });
   protoMethod("getElementsByTagName", function (name) {
     var tag = String(name).toLowerCase();
-    return makeList(this.__d, tag === "*" ? 4 : 1, 0, tag);
+    return makeList(this.__d, tag === "*" ? 4 : 1, this.__n, tag);
   });
 
   // DocumentFragment: no blitz node (blitz has no fragment kind), so the
@@ -3923,6 +4405,11 @@ const PRELUDE: &str = r##"
     readyState: "complete",
     visibilityState: "visible",
     hidden: false,
+    // This tab always holds focus in IronSurf's single-window model, and no
+    // script can take it back, so the honest answer is `true`.
+    hasFocus: function () {
+      return true;
+    },
     get documentElement() {
       if (!host.__ironsurfDomHasDoc()) return null;
       return wrapNode(0, host.__ironsurfDomHtml(0));
@@ -3982,6 +4469,13 @@ const PRELUDE: &str = r##"
     createElement: function (tag) {
       // Invalid names raise InvalidCharacterError from the native.
       return wrapNode(0, host.__ironsurfDomCreateElement(0, String(tag)));
+    },
+    createElementNS: function (ns, tag) {
+      // React-dom creates every <svg>/<math> through this single entry
+      // (mastodon's landing renders SVG icons before anything else, and the
+      // missing method took the whole tree down behind an error boundary).
+      // The namespace lands on the blitz element's QualName namespace.
+      return wrapNode(0, host.__ironsurfDomCreateElementNs(0, String(ns), String(tag)));
     },
     createTextNode: function (text) {
       return wrapNode(0, host.__ironsurfDomCreateText(0, String(text)));
@@ -4289,8 +4783,26 @@ const PRELUDE: &str = r##"
 
   function makeConsole(level) {
     return function () {
-      // Array.prototype.join applies JavaScript's ToString to every argument.
-      host.__ironsurfConsole(level, Array.prototype.join.call(arguments, " "));
+      // ToString per argument, except Errors: those print with their stack,
+      // which is the difference between "console.error(err) logged nothing
+      // useful" and a debuggable page console (Mastodon's error boundary
+      // re-logs every render throw this way).
+      var parts = [];
+      for (var i = 0; i < arguments.length; i++) {
+        var a = arguments[i];
+        if (a instanceof Error && typeof a.stack === "string" && a.stack !== "") {
+          parts.push(String(a.name) + ": " + String(a.message) + "\n" + a.stack);
+        } else if (typeof a === "symbol") {
+          parts.push(String(a));
+        } else {
+          try {
+            parts.push(String(a));
+          } catch (ignored) {
+            parts.push("[unprintable]");
+          }
+        }
+      }
+      host.__ironsurfConsole(level, parts.join(" "));
     };
   }
 
@@ -4441,6 +4953,1960 @@ const PRELUDE: &str = r##"
     return new Proxy(api, handlers);
   })();
   host.localStorage = localStorage;
+
+  // ---------------------------------------------------------------------
+  // URLSearchParams (task: infosec.exchange / Mastodon). The whole WHATWG
+  // surface over a live pair list: the four constructor inits (string,
+  // iterable of pairs, record, another URLSearchParams), append/get/getAll/
+  // has/set/delete/sort/keys/values/entries/forEach/size and the stringifier
+  // (application/x-www-form-urlencoded: alphanumeric + `*-._` stay literal,
+  // space becomes `+`). Iteration results are one-shot iterators in spec
+  // shape ({ done, value }). Boa has no `URLSearchParams` in `boa_runtime`
+  // (only `URL`), and Mastodon's polyfill bundle dies at construction time
+  // without it, which leaves the whole SPA on its <noscript> fallback.
+  // ---------------------------------------------------------------------
+  function formEncodeComponent(s) {
+    return encodeURIComponent(String(s))
+      .replace(/'/g, "%27")
+      .replace(/!/g, "%21")
+      .replace(/\(/g, "%28")
+      .replace(/\)/g, "%29")
+      .replace(/~/g, "%7E")
+      .replace(/\*/g, "%2A")
+      .replace(/\+/g, "%2B")
+      .replace(/%20/g, "+");
+  }
+  function formDecodeComponent(s) {
+    var text = String(s).replace(/\+/g, " ");
+    try {
+      return decodeURIComponent(text);
+    } catch (err) {
+      return text; // a malformed % escape stays literal (spec)
+    }
+  }
+  function URLSearchParams(init) {
+    var pairs = [];
+    Object.defineProperty(this, "__pairs", { value: pairs });
+    if (init === undefined || init === null) return;
+    if (typeof init === "string") {
+      parseInto(pairs, init);
+      return;
+    }
+    if (init instanceof URLSearchParams) {
+      init.forEach(function (v, k) { pairs.push([k, v]); });
+      return;
+    }
+    if (typeof init[Symbol.iterator] === "function") {
+      var it = init[Symbol.iterator]();
+      for (;;) {
+        var step = it.next();
+        if (step.done) break;
+        var pair = step.value;
+        if (typeof pair[Symbol.iterator] !== "function") {
+          throw new TypeError("Expected a two-item iterable as init pair");
+        }
+        var parts = Array.from(pair);
+        if (parts.length !== 2) {
+          throw new TypeError("Expected a two-item iterable as init pair");
+        }
+        pairs.push([String(parts[0]), String(parts[1])]);
+      }
+      return;
+    }
+    if (typeof init === "object") {
+      Object.keys(init).forEach(function (k) {
+        pairs.push([String(k), String(init[k])]);
+      });
+    }
+  }
+  function parseInto(pairs, query) {
+    var text = String(query);
+    if (text.charAt(0) === "?") text = text.slice(1);
+    if (text === "") return;
+    text.split("&").forEach(function (chunk) {
+      if (chunk === "") return;
+      var eq = chunk.indexOf("=");
+      if (eq < 0) pairs.push([formDecodeComponent(chunk), ""]);
+      else pairs.push([formDecodeComponent(chunk.slice(0, eq)), formDecodeComponent(chunk.slice(eq + 1))]);
+    });
+  }
+  function makeListIterator(pairs, kind) {
+    var index = 0;
+    var iterator = {
+      next: function () {
+        if (index >= pairs.length) {
+          index = pairs.length;
+          return { done: true, value: undefined };
+        }
+        var pair = pairs[index++];
+        return {
+          done: false,
+          value: kind === "key" ? pair[0] : kind === "value" ? pair[1] : [pair[0], pair[1]],
+        };
+      },
+    };
+    iterator[Symbol.iterator] = function () { return iterator; };
+    return iterator;
+  }
+  URLSearchParams.prototype = {
+    constructor: URLSearchParams,
+    append: function (name, value) {
+      this.__pairs.push([String(name), String(value)]);
+    },
+    get: function (name) {
+      name = String(name);
+      for (var i = 0; i < this.__pairs.length; i++) {
+        if (this.__pairs[i][0] === name) return this.__pairs[i][1];
+      }
+      return null;
+    },
+    getAll: function (name) {
+      name = String(name);
+      var out = [];
+      for (var i = 0; i < this.__pairs.length; i++) {
+        if (this.__pairs[i][0] === name) out.push(this.__pairs[i][1]);
+      }
+      return out;
+    },
+    has: function (name, value) {
+      name = String(name);
+      var byValue = value !== undefined;
+      for (var i = 0; i < this.__pairs.length; i++) {
+        if (this.__pairs[i][0] !== name) continue;
+        if (!byValue || this.__pairs[i][1] === String(value)) return true;
+      }
+      return false;
+    },
+    set: function (name, value) {
+      name = String(name);
+      value = String(value);
+      for (var i = 0; i < this.__pairs.length; i++) {
+        if (this.__pairs[i][0] === name) {
+          this.__pairs[i][1] = value;
+          while (this.__pairs.length > i + 1) {
+            var found = -1;
+            for (var j = i + 1; j < this.__pairs.length; j++) {
+              if (this.__pairs[j][0] === name) { found = j; break; }
+            }
+            if (found < 0) break;
+            this.__pairs.splice(found, 1);
+          }
+          return;
+        }
+      }
+      this.__pairs.push([name, value]);
+    },
+    delete: function (name, value) {
+      name = String(name);
+      var byValue = value !== undefined;
+      for (var i = this.__pairs.length - 1; i >= 0; i--) {
+        var pair = this.__pairs[i];
+        if (pair[0] === name && (!byValue || pair[1] === String(value))) {
+          this.__pairs.splice(i, 1);
+        }
+      }
+    },
+    sort: function () {
+      // Stable sort by name (spec: SortParameters by ascending code units).
+      var indexed = this.__pairs.map(function (pair, i) { return [pair, i]; });
+      indexed.sort(function (a, b) {
+        if (a[0][0] < b[0][0]) return -1;
+        if (a[0][0] > b[0][0]) return 1;
+        return a[1] - b[1];
+      });
+      this.__pairs.splice(0, this.__pairs.length);
+      indexed.forEach(function (entry) { this.__pairs.push(entry[0]); }, this);
+    },
+    replace: function (init) {
+      var fresh = new URLSearchParams(init);
+      this.__pairs.splice(0, this.__pairs.length);
+      fresh.__pairs.forEach(function (pair) { this.__pairs.push(pair); }, this);
+    },
+    forEach: function (cb, thisArg) {
+      // Snapshot: the callback may mutate the live list (spec iterates a copy).
+      this.__pairs.slice().forEach(function (pair) {
+        cb.call(thisArg, pair[1], pair[0], this);
+      }, this);
+    },
+    keys: function () { return makeListIterator(this.__pairs, "key"); },
+    values: function () { return makeListIterator(this.__pairs, "value"); },
+    entries: function () { return makeListIterator(this.__pairs, "entry"); },
+    toString: function () {
+      return this.__pairs
+        .map(function (pair) { return formEncodeComponent(pair[0]) + "=" + formEncodeComponent(pair[1]); })
+        .join("&");
+    },
+    get size() {
+      return this.__pairs.length;
+    },
+  };
+  URLSearchParams.prototype[Symbol.iterator] = URLSearchParams.prototype.entries;
+  host.URLSearchParams = URLSearchParams;
+
+  // ---------------------------------------------------------------------
+  // Event / CustomEvent / EventTarget (task: infosec.exchange). `Event`
+  // was a plain object made by makeEvent() — pages that `new Event(...)`,
+  // `class X extends Event`, or feature-check `Event.prototype` died with
+  // "Event is not defined" (Mastodon's common chunk does, at module scope,
+  // which kills the whole boot chain). These classes read/write exactly
+  // the properties the dispatcher above uses (`_stop`, `defaultPrevented`
+  // included), so a real `new Event(...)` flows through the same capture/
+  // bubble machinery as the synthetic ones. makeEvent() now produces
+  // instances of Event.prototype, so `ev instanceof Event` holds for
+  // every event the page ever sees.
+  // ---------------------------------------------------------------------
+  function Event(type, init) {
+    if (type === undefined || type === null) {
+      throw new TypeError("Failed to construct 'Event': 1 argument required");
+    }
+    type = String(type);
+    if (type === "") {
+      throw new TypeError("Failed to construct 'Event': The type provided is an empty String");
+    }
+    init = init || {};
+    this.type = type;
+    this.bubbles = !!init.bubbles;
+    this.cancelable = !!init.cancelable;
+    this.composed = !!init.composed;
+    this.defaultPrevented = false;
+    this.eventPhase = 0; // NONE until dispatched
+    this.isTrusted = false;
+    this.target = null;
+    this.currentTarget = null;
+    this.timeStamp = Date.now();
+  }
+  Event.NONE = 0;
+  Event.CAPTURING_PHASE = 1;
+  Event.AT_TARGET = 2;
+  Event.BUBBLING_PHASE = 3;
+  Event.prototype.constructor = Event;
+  Event.prototype.preventDefault = function () {
+    if (this.cancelable) this.defaultPrevented = true;
+  };
+  Event.prototype.stopPropagation = function () {
+    this._stop = true;
+  };
+  Event.prototype.stopImmediatePropagation = function () {
+    this._stop = true;
+    this._stopImmediate = true;
+  };
+  Event.prototype.composedPath = function () {
+    return this.__composedPath || [];
+  };
+  function CustomEvent(type, init) {
+    Event.call(this, type, init);
+    init = init || {};
+    this.detail = init.detail === undefined ? null : init.detail;
+  }
+  CustomEvent.prototype = Object.create(Event.prototype);
+  CustomEvent.prototype.constructor = CustomEvent;
+  function EventTarget() {}
+  EventTarget.prototype.addEventListener = function (type, fn, options) {
+    addListener(this, String(type), fn, options);
+  };
+  EventTarget.prototype.removeEventListener = function (type, fn, options) {
+    removeListener(this, String(type), fn, options);
+  };
+  EventTarget.prototype.dispatchEvent = function (ev) {
+    if (!ev || typeof ev.type !== "string") {
+      throw new TypeError("parameter 1 is not of type 'Event'");
+    }
+    var target = this === EventTarget.prototype ? host : this;
+    ev.target = target;
+    ev.currentTarget = target;
+    if (target.__n) {
+      firePath(eventPath(target), ev); // DOM node: real capture/bubble
+    } else {
+      ev.eventPhase = 2;
+      visitNode(target, ev, "target"); // standalone target: own listeners only
+    }
+    return !ev.defaultPrevented;
+  };
+  host.Event = Event;
+  host.CustomEvent = CustomEvent;
+  host.EventTarget = EventTarget;
+
+  // ---------------------------------------------------------------------
+  // DOMException (task: infosec.exchange). Missing entirely — and core-js
+  // (every modern bundle's polyfill layer) resolves `getBuiltIn
+  // ('DOMException')` to undefined, then aborts the WHOLE polyfill module
+  // on `wrapper.prototype = undefined.prototype` with Boa's "cannot convert
+  // 'null' or 'undefined' to object". Spec shape: extends Error, the
+  // (message, { name } | name) constructor forms, the legacy `code` digit,
+  // the INDEX_SIZE_ERR… constants on both the constructor and the
+  // prototype, and no own `stack` (matching browsers for the feature probe
+  // core-js uses here).
+  // ---------------------------------------------------------------------
+  var DOM_EXCEPTION_CODES = {
+    IndexSizeError: 1, HierarchyRequestError: 3, WrongDocumentError: 4,
+    InvalidCharacterError: 5, NoModificationAllowedError: 7, NotFoundError: 8,
+    NotSupportedError: 9, InvalidStateError: 11, SyntaxError: 12,
+    InvalidModificationError: 13, NamespaceError: 14, InvalidAccessError: 15,
+    TypeMismatchError: 17, SecurityError: 18, NetworkError: 19, AbortError: 20,
+    URLMismatchError: 21, QuotaExceededError: 22, TimeoutError: 23,
+    InvalidNodeTypeError: 24, DataCloneError: 25,
+  };
+  function DOMException(message, options) {
+    var text = message === undefined ? "" : String(message);
+    // The dictionary form and the legacy name-string form agree here.
+    var exceptionName = "Error";
+    if (typeof options === "string") exceptionName = options;
+    else if (options && typeof options === "object" && options.name !== undefined)
+      exceptionName = String(options.name);
+    this.message = text;
+    this.name = exceptionName;
+    this.code = DOM_EXCEPTION_CODES[exceptionName] || 0;
+  }
+  DOMException.prototype = Object.create(Error.prototype);
+  DOMException.prototype.constructor = DOMException;
+  (function () {
+    var legacy = {
+      INDEX_SIZE_ERR: 1, DOMSTRING_SIZE_ERR: 2, HIERARCHY_REQUEST_ERR: 3,
+      WRONG_DOCUMENT_ERR: 4, INVALID_CHARACTER_ERR: 5, NO_DATA_ALLOWED_ERR: 6,
+      NO_MODIFICATION_ALLOWED_ERR: 7, NOT_FOUND_ERR: 8, NOT_SUPPORTED_ERR: 9,
+      INUSE_ATTRIBUTE_ERR: 10, INVALID_STATE_ERR: 11, SYNTAX_ERR: 12,
+      INVALID_MODIFICATION_ERR: 13, NAMESPACE_ERR: 14, INVALID_ACCESS_ERR: 15,
+      VALIDATION_ERR: 16, TYPE_MISMATCH_ERR: 17, SECURITY_ERR: 18,
+      NETWORK_ERR: 19, ABORT_ERR: 20, URL_MISMATCH_ERR: 21,
+      QUOTA_EXCEEDED_ERR: 22, TIMEOUT_ERR: 23, INVALID_NODE_TYPE_ERR: 24,
+      DATA_CLONE_ERR: 25,
+    };
+    Object.keys(legacy).forEach(function (key) {
+      DOMException[key] = legacy[key];
+      DOMException.prototype[key] = legacy[key];
+    });
+  })();
+  host.DOMException = DOMException;
+
+  // ---------------------------------------------------------------------
+  // DOMParser (task: real DOMParser). `parseFromString` hands back a REAL
+  // DOM built by the engine's own html5ever parser: the `__ironsurfDomParseHtml`
+  // native creates a detached `<html>` element in the document's node store
+  // and parses the markup into it, so every node is a genuine blitz node —
+  // textContent, queries (scoped, so they reach detached subtrees),
+  // attributes, mutation — it is simply never inserted: no style, no layout,
+  // no paint, no resource fetches. Exactly the inert document a browser
+  // gives back. The Document wrapper mirrors the spec surface over that
+  // element (documentElement/head/body/…, with the creation methods
+  // delegating to the live document like adoption would).
+  // ---------------------------------------------------------------------
+  var DOMParserDocumentProto = {
+    get documentElement() { return this.__root; },
+    get head() { return this.__root.querySelector("head"); },
+    get body() { return this.__root.querySelector("body"); },
+    set body(node) { throw new Error("setting document.body is not supported"); },
+    get title() {
+      var titleNode = this.querySelector("title");
+      return titleNode ? titleNode.textContent : "";
+    },
+    get textContent() { return this.__root.textContent; },
+    get innerHTML() { return this.__root.innerHTML; },
+    get childNodes() { return this.__root.childNodes; },
+    get firstChild() { return this.__root.firstChild; },
+    get lastChild() { return this.__root.lastChild; },
+    get doctype() { return null; },
+    get documentURI() { return "about:blank"; },
+    get URL() { return "about:blank"; },
+    get defaultView() { return null; },
+    querySelector: function (selector) {
+      return wrapNode(0, host.__ironsurfDomQuery(0, String(selector), this.__root.__n));
+    },
+    querySelectorAll: function (selector) {
+      host.__ironsurfDomQuery(0, String(selector), this.__root.__n); // validate
+      return makeList(0, 3, this.__root.__n, String(selector));
+    },
+    getElementById: function (id) {
+      // The document-wide id lookup cannot see a detached tree, so walk it.
+      var wanted = String(id);
+      var all = this.__root.querySelectorAll("*");
+      for (var i = 0; i < all.length; i++) {
+        var candidate = all[i];
+        if (candidate.getAttribute && candidate.getAttribute("id") === wanted) return candidate;
+      }
+      return null;
+    },
+    getElementsByTagName: function (tag) {
+      var name = String(tag).toLowerCase();
+      return this.__root.querySelectorAll(name === "*" ? "*" : name);
+    },
+    getElementsByClassName: function (names) {
+      var joined = String(names).trim().split(/\s+/).join(".");
+      if (joined === "") return [];
+      return this.__root.querySelectorAll("." + joined);
+    },
+    createElement: function (tag) { return document.createElement(tag); },
+    createElementNS: function (ns, tag) { return document.createElementNS(ns, tag); },
+    createTextNode: function (text) { return document.createTextNode(text); },
+    createComment: function (text) { return document.createComment(text); },
+    createDocumentFragment: function () { return document.createDocumentFragment(); },
+    adoptNode: function (node) { return node; },
+    importNode: function (node) { return node; },
+  };
+  function DOMParser() {}
+  DOMParser.prototype.parseFromString = function (source, mimeType) {
+    var type = String(mimeType === undefined ? "" : mimeType)
+      .toLowerCase()
+      .split(";")[0]
+      .trim();
+    // The spec's supported types; all of them parse through the HTML parser
+    // here (blitz has no separate XML/image pipeline to hand out — XHTML and
+    // SVG markup survives it element-for-element, which is what matters).
+    var supported =
+      type === "text/html" ||
+      type === "application/xhtml+xml" ||
+      type === "image/svg+xml" ||
+      type === "text/xml" ||
+      type === "application/xml";
+    if (!supported) {
+      throw new TypeError("DOMParser.parseFromString: unsupported mime type " + type);
+    }
+    var markup = source === undefined ? "" : String(source);
+    var root = wrapNode(0, host.__ironsurfDomParseHtml(0, markup));
+    var parsed = Object.create(DOMParserDocumentProto);
+    Object.defineProperty(parsed, "__root", { value: root });
+    return parsed;
+  };
+  host.DOMParser = DOMParser;
+
+  // ---------------------------------------------------------------------
+  // MutationObserver (task: infosec.exchange). Mastodon's boot chain died
+  // at `new MutationObserver(...)` ("MutationObserver is not defined") and
+  // the page console reported it caught — the app never rendered past the
+  // <noscript> shell. This is a REAL observer for every mutation the page
+  // itself performs: the childList/attribute/characterData records are
+  // emitted by the DOM methods below (appendChild, setAttribute, the
+  // textContent/innerHTML setters, …), delivered as microtasks in spec
+  // batches, with subtree matching through the live parent chain. Changes
+  // blitz makes on its own (user typing into a focused field) are the
+  // documented gap — no engine change journal exists to observe.
+  // ---------------------------------------------------------------------
+  var moObservers = []; // {callback, target, options}
+  var moRecords = null; // this microtask's records (null = none queued)
+  var moScheduled = false;
+  function moIsAncestor(maybeAncestor, node) {
+    var seen = 0;
+    var parent = node.parentNode;
+    while (parent && seen++ < 4096) {
+      if (parent === maybeAncestor) return true;
+      parent = parent.parentNode;
+    }
+    return false;
+  }
+  function moInterested(observer, record) {
+    var options = observer.options;
+    // Observing the DOCUMENT (what every app actually does) means every
+    // element of this page is inside it — the wrapper tree has no node id
+    // for the document, so the containment is decided by definition.
+    if (observer.isDocument && record.target && record.target !== host) {
+      // fall through to the type/filter checks below with containment met
+    } else if (record.target !== observer.target) {
+      if (!options.subtree || !moIsAncestor(observer.target, record.target)) return false;
+    }
+    if (record.type === "childList" && !options.childList) return false;
+    if (record.type === "attributes" && !options.attributes) return false;
+    if (record.type === "characterData" && !options.characterData) return false;
+    if (record.type === "attributes" && options.attributeFilter && record.target) {
+      var wanted = false;
+      for (var i = 0; i < options.attributeFilter.length; i++) {
+        if (String(options.attributeFilter[i]) === record.attributeName) {
+          wanted = true;
+          break;
+        }
+      }
+      if (!wanted) return false;
+    }
+    return true;
+  }
+  function moEmit(record) {
+    if (moObservers.length === 0) return;
+    var relevant = false;
+    for (var i = 0; i < moObservers.length; i++) {
+      if (moInterested(moObservers[i], record)) {
+        relevant = true;
+        break;
+      }
+    }
+    if (!relevant) return;
+    if (!moRecords) moRecords = [];
+    moRecords.push(record);
+    if (moScheduled) return;
+    moScheduled = true;
+    queueMicrotask(function () {
+      moScheduled = false;
+      var batch = moRecords;
+      moRecords = null;
+      if (!batch) return;
+      // Snapshot the observer list: a callback may observe/disconnect more.
+      var observers = moObservers.slice();
+      for (var o = 0; o < observers.length; o++) {
+        var observer = observers[o];
+        var forThis = batch.filter(function (record) {
+          return moInterested(observer, record);
+        });
+        if (forThis.length === 0) continue;
+        try {
+          observer.callback(forThis, observer);
+        } catch (err) {
+          reportError("MutationObserver callback: " + err);
+        }
+      }
+    });
+  }
+  function MutationObserver(callback) {
+    if (typeof callback !== "function") {
+      throw new TypeError("Failed to construct 'MutationObserver': parameter 1 is not of type 'Function'.");
+    }
+    this.__callback = callback;
+  }
+  MutationObserver.prototype.observe = function (target, options) {
+    if ((!target || target.__n === undefined) && target !== document) {
+      throw new TypeError("Failed to execute 'observe': parameter 1 is not of type 'Node'.");
+    }
+    var opts = options || {};
+    if (!opts.childList && !opts.attributes && !opts.characterData) {
+      throw new TypeError("Failed to execute 'observe': The options object must set at least one of 'attributes', 'characterData', or 'childList' to true.");
+    }
+    // Spec: re-observing the same target replaces the previous registration.
+    for (var i = 0; i < moObservers.length; i++) {
+      if (moObservers[i].callback === this.__callback && moObservers[i].target === target) {
+        moObservers[i].options = opts;
+        return;
+      }
+    }
+    moObservers.push({
+      callback: this.__callback,
+      target: target,
+      options: opts,
+      isDocument: target === document,
+    });
+  };
+  MutationObserver.prototype.disconnect = function () {
+    var callback = this.__callback;
+    moObservers = moObservers.filter(function (entry) {
+      return entry.callback !== callback;
+    });
+  };
+  MutationObserver.prototype.takeRecords = function () {
+    if (!moRecords) return [];
+    var callback = this.__callback;
+    var mine = [];
+    var rest = [];
+    for (var i = 0; i < moRecords.length; i++) {
+      var entry = { observer: null, record: moRecords[i] };
+      var interest = false;
+      for (var o = 0; o < moObservers.length; o++) {
+        if (moObservers[o].callback === callback && moInterested(moObservers[o], moRecords[i])) {
+          interest = true;
+          break;
+        }
+      }
+      (interest ? mine : rest).push(moRecords[i]);
+    }
+    moRecords = rest;
+    return mine;
+  };
+  // The mutation methods emit records (wrap-and-emit keeps every existing
+  // behaviour — the wrapper runs the original first, then reports).
+  // `before` may capture a pre-mutation snapshot passed on to `after`.
+  function moWrap(name, emit) {
+    var original = NodeProto[name];
+    if (typeof original !== "function") return;
+    NodeProto[name] = function () {
+      var args = Array.prototype.slice.call(arguments);
+      var snapshot = emit.before ? emit.before.apply(this, args) : undefined;
+      var result = original.apply(this, args);
+      emit.after.call(this, result, args, snapshot);
+      return result;
+    };
+  }
+  moWrap("appendChild", {
+    after: function (result, args) {
+      moEmit({ type: "childList", target: this, addedNodes: [args[0]], removedNodes: [] });
+    },
+  });
+  moWrap("insertBefore", {
+    after: function (result, args) {
+      moEmit({ type: "childList", target: this, addedNodes: [args[0]], removedNodes: [] });
+    },
+  });
+  moWrap("removeChild", {
+    after: function (result, args) {
+      moEmit({ type: "childList", target: this, addedNodes: [], removedNodes: [args[0]] });
+    },
+  });
+  moWrap("replaceChild", {
+    after: function (result, args) {
+      moEmit({ type: "childList", target: this, addedNodes: [args[0]], removedNodes: [args[1]] });
+    },
+  });
+  moWrap("remove", {
+    before: function () {
+      return this.parentNode;
+    },
+    after: function (result, args, parent) {
+      if (parent) moEmit({ type: "childList", target: parent, addedNodes: [], removedNodes: [this] });
+    },
+  });
+  moWrap("setAttribute", {
+    before: function (name) {
+      return this.getAttribute(name); // null = the attribute is new
+    },
+    after: function (result, args, oldValue) {
+      moEmit({
+        type: "attributes",
+        target: this,
+        attributeName: String(args[0]),
+        oldValue: oldValue === null || oldValue === undefined ? "" : oldValue,
+      });
+    },
+  });
+  moWrap("removeAttribute", {
+    before: function (name) {
+      return this.getAttribute(name);
+    },
+    after: function (result, args, oldValue) {
+      if (oldValue !== null && oldValue !== undefined) {
+        moEmit({ type: "attributes", target: this, attributeName: String(args[0]), oldValue: oldValue });
+      }
+    },
+  });
+  // The text setters: characterData on text nodes, childList on elements
+  // (replacing an element's children — the diff is not reconstructed here,
+  // the record still fires like a browser's).
+  ["textContent", "innerHTML"].forEach(function (name) {
+    var accessor = Object.getOwnPropertyDescriptor(NodeProto, name);
+    if (!accessor || typeof accessor.set !== "function") return;
+    Object.defineProperty(NodeProto, name, {
+      configurable: accessor.configurable,
+      enumerable: accessor.enumerable,
+      get: accessor.get,
+      set: function (value) {
+        var isText = this.nodeType === 3;
+        var oldValue = isText ? this.nodeValue : undefined;
+        accessor.set.call(this, value);
+        if (isText) {
+          moEmit({ type: "characterData", target: this, oldValue: oldValue === null ? "" : oldValue });
+        } else {
+          moEmit({ type: "childList", target: this, addedNodes: [], removedNodes: [] });
+        }
+      },
+    });
+  });
+  host.MutationObserver = MutationObserver;
+
+  // ---------------------------------------------------------------------
+  // MessageChannel / MessagePort (task: infosec.exchange). react-dom's
+  // scheduler feature-detects `MessageChannel` and dies at `new
+  // MessageChannel()` without it ("not a callable function" deep inside
+  // the reconciler — the app never painted). Ports are real in the ways
+  // this browser can honour: postMessage delivers the *other* port a
+  // `message` event as a fresh task (0 ms host timer — like the browser's
+  // task queue, never re-entrant into the poster), onmessage plus
+  // addEventListener listeners all fire, close() stops delivery, and data
+  // passes by reference (one thread, one heap — the honest version of
+  // structured clone here). `start()` is accepted; delivery never waits
+  // on it.
+  // ---------------------------------------------------------------------
+  function MessagePort() {
+    this.__other = null;
+    this.__closed = false;
+    this.onmessage = null;
+  }
+  MessagePort.prototype.postMessage = function (data) {
+    var other = this.__other;
+    if (!other || other.__closed) return;
+    var messageEvent = {
+      type: "message",
+      data: data,
+      source: this,
+      origin: urlParts(host.__ironsurfUrl).protocol + (urlParts(host.__ironsurfUrl).host ? "//" + urlParts(host.__ironsurfUrl).host : ""),
+      lastEventId: "",
+      ports: [],
+    };
+    host.__ironsurfSetTimeout(function () {
+      if (other.__closed) return;
+      if (typeof other.onmessage === "function") {
+        try {
+          other.onmessage.call(other, messageEvent);
+        } catch (err) {
+          reportError("MessagePort onmessage: " + err);
+        }
+      }
+      var list = listenerList(other, "message", false);
+      if (list) {
+        var pending = list.slice();
+        for (var i = 0; i < pending.length; i++) callListener(pending[i], messageEvent, other);
+      }
+    }, 0);
+  };
+  MessagePort.prototype.start = function () {
+    // Delivery is task-based from the first postMessage; nothing to arm.
+  };
+  MessagePort.prototype.close = function () {
+    this.__closed = true;
+  };
+  MessagePort.prototype.addEventListener = function (type, fn, options) {
+    addListener(this, String(type), fn, options);
+  };
+  MessagePort.prototype.removeEventListener = function (type, fn, options) {
+    removeListener(this, String(type), fn, options);
+  };
+  function MessageChannel() {
+    var port1 = new MessagePort();
+    var port2 = new MessagePort();
+    port1.__other = port2;
+    port2.__other = port1;
+    this.port1 = port1;
+    this.port2 = port2;
+  }
+  host.MessageChannel = MessageChannel;
+  host.MessagePort = MessagePort;
+
+  // ---------------------------------------------------------------------
+  // getComputedStyle (task: infosec.exchange). Mastodon's lightbox module
+  // boots with `getComputedStyle(document.body).direction !== "rtl"` — no
+  // function, no boot. Each read goes through the `__ironsurfDomComputedValue`
+  // native, which answers the REAL stylo computed value of the live,
+  // settled node; unmodelled properties (and never-laid-out detached nodes)
+  // read as "" like an unset custom property. Pseudo-element arguments are
+  // accepted and read from the element itself (no pseudo resolution here).
+  // ---------------------------------------------------------------------
+  function cssPropName(name) {
+    var text = String(name);
+    if (/^(webkit|moz|ms|o)[A-Z]/.test(text)) {
+      return "-" + text.replace(/([A-Z])/g, "-$1").toLowerCase();
+    }
+    return text.replace(/([A-Z])/g, "-$1").toLowerCase();
+  }
+  host.getComputedStyle = function (element, pseudoElement) {
+    void pseudoElement; // no pseudo tree to resolve against — see header
+    var node = element && element.__n ? element : document.documentElement;
+    var read = function (name) {
+      var property = cssPropName(name);
+      if (property.indexOf("-") === 0) return ""; // vendor prefix: not modelled
+      return host.__ironsurfDomComputedValue(node.__d, node.__n, property);
+    };
+    var base = {
+      getPropertyValue: read,
+      getPropertyPriority: function () {
+        return "";
+      },
+      setProperty: noop,
+      removeProperty: function () {
+        return "";
+      },
+      item: function () {
+        return "";
+      },
+      length: 0,
+      parentRule: null,
+      type: "",
+    };
+    return new Proxy(base, {
+      get: function (target, key) {
+        if (typeof key === "symbol" || Object.prototype.hasOwnProperty.call(target, key)) {
+          return target[key];
+        }
+        return read(key);
+      },
+      set: function (target, key, value) {
+        // Setting a computed style writes the INLINE style (spec) — through
+        // the live `style` surface when the node has one.
+        if (node.style && typeof key === "string") {
+          node.style[key] = value;
+        }
+        return true;
+      },
+      has: function (target, key) {
+        return key in target || (typeof key === "string" && read(key) !== "");
+      },
+    });
+  };
+
+  // ---------------------------------------------------------------------
+  // history (task: infosec.exchange). react-router's browser history does
+  // `window.history.length` as its FIRST statement — a missing `history`
+  // aborted the whole router module ("cannot convert 'null' or 'undefined'
+  // to object"), and Mastodon stayed on its <noscript> fallback. The URL
+  // stack here mirrors what the page pushed: pushState/replaceState are
+  // REAL address-bar updates (the `__ironsurfSetUrl` native, resolve +
+  // same-origin enforced tab-side) that fetch nothing; back/forward/go
+  // cannot rewind page state here, so they stay inert (the SHELL's back
+  // button walks the tab's real document history, untouched by this).
+  // ---------------------------------------------------------------------
+  var historyStack = [{ url: host.__ironsurfUrl, state: null }];
+  var historyTop = 0;
+  function historyOrigin(urlText) {
+    var parts = urlParts(urlText);
+    return parts.protocol + "|" + parts.host;
+  }
+  function writeHistoryEntry(data, urlArg, replace) {
+    var state = data === undefined ? null : data;
+    var currentUrl = host.__ironsurfUrl;
+    var nextUrl = currentUrl;
+    if (urlArg !== undefined && urlArg !== null && String(urlArg) !== "") {
+      var resolved = String(urlArg);
+      try {
+        var absolute = host.__ironsurfDomResolveUrl(0, resolved);
+        if (absolute) resolved = absolute;
+      } catch (err) {
+        throw new DOMException("pushState: bad url argument", "SyntaxError");
+      }
+      if (historyOrigin(resolved) !== historyOrigin(currentUrl)) {
+        // Spec: a cross-origin pushState/replaceState is a SecurityError.
+        throw new DOMException("pushState: cross-origin url", "SecurityError");
+      }
+      nextUrl = resolved;
+    }
+    var entry = { url: nextUrl, state: state };
+    if (replace) {
+      historyStack[historyTop] = entry;
+    } else {
+      historyStack.splice(historyTop + 1, historyStack.length, entry);
+      historyTop = historyStack.length - 1;
+    }
+    if (nextUrl !== currentUrl) {
+      // URL-only: the tab re-points the address bar, fetches nothing.
+      host.__ironsurfSetUrl(nextUrl);
+    }
+  }
+  var history = {
+    scrollRestoration: "auto",
+    get length() {
+      return historyStack.length;
+    },
+    get state() {
+      var entry = historyStack[historyTop];
+      return entry ? entry.state : null;
+    },
+    go: noop,
+    back: noop,
+    forward: noop,
+    pushState: function (data, title, url) {
+      writeHistoryEntry(data, url, false);
+    },
+    replaceState: function (data, title, url) {
+      writeHistoryEntry(data, url, true);
+    },
+  };
+  host.history = history;
+
+  // `process.nextTick` (task: infosec.exchange). boa_runtime ships a `process`
+  // object whose `Object.prototype.toString` tag is literally `[object process]`
+  // — so core-js's *environment detector* (toRawType(process)==="process")
+  // concludes it is running under Node, and its `setImmediate` polyfill then
+  // routes every flush through `process.nextTick(...)`, which does not exist:
+  // the first microtask after boot dies with "not a callable function" and
+  // Mastodon never hydrates. Give the Node-flavoured object the one method its
+  // tag promises; semantics per spec (runs before the next microtask checkpoint,
+  // extra args forwarded, returns a thenable-ish TickInfo we keep plain).
+  if (typeof process === "object" && process) {
+    if (typeof process.nextTick !== "function") {
+      Object.defineProperty(process, "nextTick", {
+        value: function (callback) {
+          if (typeof callback !== "function") {
+            throw new TypeError("callback must be a function");
+          }
+          var args = Array.prototype.slice.call(arguments, 1);
+          // Node semantics: an exception thrown by a nextTick callback is an
+          // uncaught exception, not a rejected promise. Swallow-and-log keeps
+          // the error visible (console) instead of vanishing into an
+          // unhandledrejection event our realm does not fire — React's
+          // scheduler flushes route through here, and silent commit failures
+          // are agony to debug otherwise.
+          Promise.resolve().then(function () {
+            callback.apply(null, args);
+          }).catch(function (err) {
+            try {
+              console.error(err && err.stack ? String(err.stack) : err);
+            } catch (ignored) {
+              // nothing else to do
+            }
+          });
+        },
+        writable: true,
+        configurable: true,
+      });
+    }
+    // Feature-detects like `process.on("unhandledRejection", ...)` are common
+    // in app boot code that trusts the `[object process]` tag; make them inert
+    // instead of fatal.
+    if (typeof process.on !== "function") {
+      process.on = function () {
+        return process;
+      };
+    }
+    if (typeof process.off !== "function") {
+      process.off = process.on;
+    }
+    if (typeof process.once !== "function") {
+      process.once = process.on;
+    }
+    if (typeof process.removeAllListeners !== "function") {
+      process.removeAllListeners = function () {
+        return process;
+      };
+    }
+    if (!process.versions) {
+      process.versions = {};
+    }
+  }
+
+  // IndexedDB (task: infosec.exchange). Mastodon's emoji localCache opens a
+  // real Indexed database (`idb` on npm wraps raw `indexedDB.open`, requests
+  // resolved from `success`/`error` events, transactions from `complete`), and
+  // the boot chain `await`s it before creating the React root: without IDB the
+  // app hangs silently between the `time` chunk import and `createRoot` — zero
+  // errors, zero render. This is a small but *real* IndexedDB: object stores,
+  // keyPaths (string/array), autoIncrement, indexes (unique + multiEntry),
+  // IDBKeyRange queries, cursors, and auto-committing transactions, kept
+  // in-memory (mastodon refetches on every cold start anyway). Requests fire
+  // their events in creation order on microtasks, which is all the `idb`
+  // wrapper relies on; iteration is a sorted full scan (slow-but-correct).
+  // Canonical string key for Map-based storage: equal keys ⇒ equal strings,
+  // distinct typed keys ⇒ distinct strings (type prefixes prevent "1" vs 1).
+  function idbKeyString(key) {
+    if (typeof key === "number") return "N:" + key;
+    if (typeof key === "string") return "S:" + JSON.stringify(key);
+    if (Array.isArray(key)) {
+      var parts = ["A:"];
+      for (var i = 0; i < key.length; i++) parts.push(idbKeyString(key[i]));
+      return parts.join("\u0001");
+    }
+    if (key instanceof Date) return "T:" + key.getTime();
+    return "U:" + String(key);
+  }
+  function idbCmp(a, b) {
+    function rank(v) {
+      if (typeof v === "number") return isNaN(v) ? 9 : 0;
+      if (typeof v === "string") return 1;
+      if (Array.isArray(v)) return 2;
+      return 3;
+    }
+    var ra = rank(a), rb = rank(b);
+    if (ra !== rb) return ra < rb ? -1 : 1;
+    if (ra === 0) return a === b ? 0 : a < b ? -1 : 1;
+    if (ra === 1) return a === b ? 0 : a < b ? -1 : 1;
+    if (ra === 2) {
+      var n = Math.min(a.length, b.length);
+      for (var i = 0; i < n; i++) {
+        var c = idbCmp(a[i], b[i]);
+        if (c !== 0) return c;
+      }
+      return a.length === b.length ? 0 : a.length < b.length ? -1 : 1;
+    }
+    return 0;
+  }
+  function IDBKeyRange(lower, upper, lowerOpen, upperOpen) {
+    this.lower = lower;
+    this.upper = upper;
+    this.lowerOpen = !!lowerOpen;
+    this.upperOpen = !!upperOpen;
+  }
+  IDBKeyRange.bound = function (lower, upper, lo, up) {
+    return new IDBKeyRange(lower, upper, lo, up);
+  };
+  IDBKeyRange.lowerBound = function (lower, lo) {
+    return new IDBKeyRange(lower, undefined, lo, false);
+  };
+  IDBKeyRange.upperBound = function (upper, up) {
+    return new IDBKeyRange(undefined, upper, false, up);
+  };
+  IDBKeyRange.only = function (value) {
+    return new IDBKeyRange(value, value, false, false);
+  };
+  IDBKeyRange.prototype.includes = function (key) {
+    if (key === undefined || key === null) return false;
+    if (this.lower !== undefined) {
+      var c = idbCmp(key, this.lower);
+      if (c < 0 || (c === 0 && this.lowerOpen)) return false;
+    }
+    if (this.upper !== undefined) {
+      var c2 = idbCmp(key, this.upper);
+      if (c2 > 0 || (c2 === 0 && this.upperOpen)) return false;
+    }
+    return true;
+  };
+  IDBKeyRange.prototype.intersects = function (other) {
+    if (this.lower !== undefined && other.upper !== undefined && idbCmp(this.lower, other.upper) > 0) return false;
+    if (other.lower !== undefined && this.upper !== undefined && idbCmp(other.lower, this.upper) > 0) return false;
+    return true;
+  };
+  function idbWrapEvent(type, extra) {
+    var ev = new Event(type);
+    if (extra) for (var k in extra) ev[k] = extra[k];
+    return ev;
+  }
+  class IDBRequest extends EventTarget {
+    constructor() {
+      super();
+      this.result = null;
+      this.error = null;
+      this.source = null;
+      this.transaction = null;
+      this.readyState = "pending";
+    }
+  }
+  class IDBOpenDBRequest extends IDBRequest {
+    constructor() {
+      super();
+      this.oldVersion = 0;
+      this.newVersion = 0;
+    }
+  }
+  class IDBTransaction extends EventTarget {
+    constructor(db, storeNames, mode) {
+      super();
+      this.db = db;
+      this._names = storeNames.slice();
+      this.mode = mode;
+      this.error = null;
+      this.aborted = false;
+      this._pending = 0;
+      this._completeFired = false;
+      var self = this;
+      this._names.forEach(function (name, i) {
+        self[i] = name;
+      });
+      this.length = this._names.length;
+      queueMicrotask(function () {
+        self._maybeComplete();
+      });
+    }
+    get objectStoreNames() {
+      var names = this._names.slice();
+      names.contains = function (n) {
+        return names.indexOf(n) !== -1;
+      };
+      return names;
+    }
+    objectStore(name) {
+      // versionchange transactions may touch stores the upgrade itself just
+      // created, so they are not pinned to the name list captured at open.
+      if (this.mode !== "versionchange" && this._names.indexOf(name) === -1) {
+        throw new DOMException("object store not in transaction", "NotFoundError");
+      }
+      var store = this.db.__stores.get(name);
+      if (!store) throw new DOMException("object store gone", "NotFoundError");
+      // One IDBObjectStore facade per (tx, store): idb keys its wrapper cache
+      // by the raw object, and `tx.store` must be the first store's object.
+      this.__facades ||= {};
+      if (!this.__facades[name]) {
+        var facade = Object.create(IDBObjectStore.prototype);
+        Object.assign(facade, store);
+        facade.__tx = this;
+        this.__facades[name] = facade;
+      }
+      return this.__facades[name];
+    }
+    _start(op, source) {
+      if (this.aborted) throw new DOMException("transaction aborted", "AbortError");
+      var req = new IDBRequest();
+      req.transaction = this;
+      req.source = source || null;
+      this._pending++;
+      var self = this;
+      queueMicrotask(function () {
+        if (self.aborted) {
+          req.error = new DOMException("transaction aborted", "AbortError");
+          req.readyState = "done";
+          req.dispatchEvent(idbWrapEvent("error"));
+        } else {
+          try {
+            req.result = op();
+            req.readyState = "done";
+            req.dispatchEvent(idbWrapEvent("success"));
+          } catch (err) {
+            req.error = err instanceof DOMException ? err : new DOMException(String(err && err.message));
+            req.readyState = "done";
+            self.error = req.error;
+            req.dispatchEvent(idbWrapEvent("error"));
+          }
+        }
+        self._pending--;
+        queueMicrotask(function () {
+          self._maybeComplete();
+        });
+      });
+      return req;
+    }
+    _maybeComplete() {
+      if (this.aborted || this._pending > 0 || this._completeFired) return;
+      this._completeFired = true;
+      this.dispatchEvent(idbWrapEvent("complete"));
+    }
+    abort() {
+      if (this._completeFired) return;
+      this.aborted = true;
+      this.error = new DOMException("transaction aborted", "AbortError");
+      this.dispatchEvent(idbWrapEvent("abort"));
+    }
+  }
+  class IDBIndex {
+    constructor(store, name, keyPath, options) {
+      this.name = name;
+      this.keyPath = keyPath;
+      this.multiEntry = !!(options && options.multiEntry);
+      this.unique = !!(options && options.unique);
+      this.__store = store;
+      var self = this;
+      this.__keys = function (entry) {
+        return indexKeys(entry[1], self.keyPath, self.multiEntry);
+      };
+    }
+    __tx() {
+      var tx = this.__store.__tx;
+      if (!tx) throw new DOMException("index used outside a transaction", "InvalidStateError");
+      return tx;
+    }
+    getAll(query) {
+      var self = this;
+      var tx = this.__tx();
+      var req = tx._start(function () {
+        return self.__match(query).map(function (hit) {
+          return hit[1][1];
+        });
+      }, this);
+      return req;
+    }
+    getAllKeys(query) {
+      var self = this;
+      var tx = this.__tx();
+      return tx._start(function () {
+        return self.__match(query).map(function (hit) {
+          return hit[1][0];
+        });
+      }, this);
+    }
+    get(query) {
+      var self = this;
+      var tx = this.__tx();
+      return tx._start(function () {
+        var hits = self.__match(query);
+        return hits.length ? hits[0][1][1] : undefined;
+      }, this);
+    }
+    getKey(query) {
+      var self = this;
+      var tx = this.__tx();
+      return tx._start(function () {
+        var hits = self.__match(query);
+        return hits.length ? hits[0][1][0] : undefined;
+      }, this);
+    }
+    count(query) {
+      var self = this;
+      var tx = this.__tx();
+      return tx._start(function () {
+        return self.__match(query).length;
+      }, this);
+    }
+    openCursor(query, direction) {
+      var self = this;
+      var tx = this.__tx();
+      var box = { _rows: null, _i: 0 };
+      var req = tx._start(function () {
+        box._rows = self.__match(query);
+        box._i = 0;
+        return cursorValue(box, tx, false);
+      }, this);
+      req.__box = box;
+      return req;
+    }
+    __match(query) {
+      var self = this;
+      var rows = this.__store.__rows();
+      var hits = [];
+      rows.forEach(function (row) {
+        self.__keys(row).forEach(function (k) {
+          if (query === undefined || query === null || (query instanceof IDBKeyRange && query.includes(k)) || (!(query instanceof IDBKeyRange) && idbCmp(k, query) === 0)) {
+            hits.push([k, row]);
+          }
+        });
+      });
+      hits.sort(function (a, b) {
+        return idbCmp(a[0], b[0]) || idbCmp(a[1][0], b[1][0]);
+      });
+      return hits;
+    }
+  }
+  function indexKeys(value, keyPath, multiEntry) {
+    var raw;
+    if (Array.isArray(keyPath)) {
+      raw = keyPath.map(function (part) {
+        return value ? value[part] : undefined;
+      });
+      if (raw.some(function (p) { return p === undefined || p === null; })) return [];
+      return [raw];
+    }
+    raw = value ? value[keyPath] : undefined;
+    if (raw === undefined || raw === null) return [];
+    if (multiEntry) {
+      if (!Array.isArray(raw)) raw = [raw];
+      return raw.filter(function (k) { return k !== undefined && k !== null; });
+    }
+    return [raw];
+  }
+  // Index definitions and store shapes are mirrored into `record.storeDefs`
+  // so a later `indexedDB.open` (a reload in the same tab) sees the schema
+  // even though the data itself is in-memory and discarded per realm only in
+  // spirit — stores survive here for cheap re-imports.
+  function idbWirePersist(store, record) {
+    store.__persist = function () {
+      var defs = {};
+      Object.keys(store.__indexDefs).forEach(function (n) {
+        var ix = store.__indexDefs[n];
+        defs[n] = { keyPath: ix.keyPath, multiEntry: ix.multiEntry, unique: ix.unique };
+      });
+      record.storeDefs[store.name] = {
+        keyPath: store.keyPath,
+        autoIncrement: store.autoIncrement,
+        indexes: defs,
+      };
+    };
+  }
+  function idbHydrate(record) {
+    record.stores.forEach(function (store, name) {
+      var def = record.storeDefs[name];
+      if (!def) return;
+      Object.keys(def.indexes || {}).forEach(function (iname) {
+        if (store.__indexDefs[iname]) return;
+        var d = def.indexes[iname];
+        store.__indexDefs[iname] = new IDBIndex(store, iname, d.keyPath, {
+          multiEntry: d.multiEntry,
+          unique: d.unique,
+        });
+      });
+      idbWirePersist(store, record);
+    });
+  }
+  class IDBObjectStore {
+    constructor(name, keyPath, autoIncrement) {
+      this.name = name;
+      this.keyPath = keyPath;
+      this.autoIncrement = !!autoIncrement;
+      // Map<canonical key string, [key, value]>: O(1) put/get/delete. Reads
+      // that must report IDB order re-sort from the map (n log n) — the
+      // bulk-import path (Mastodon: thousands of emoji rows) stays linear.
+      this.__entries = new Map();
+      this.__nextAuto = 1;
+      this.__indexDefs = {};
+      this.__tx = null;
+    }
+    get indexNames() {
+      var names = Object.keys(this.__indexDefs);
+      names.contains = function (n) {
+        return names.indexOf(n) !== -1;
+      };
+      return names;
+    }
+    createIndex(name, keyPath, options) {
+      var idx = new IDBIndex(this, name, keyPath, options);
+      this.__indexDefs[name] = idx;
+      if (this.__persist) this.__persist();
+      return idx;
+    }
+    deleteIndex(name) {
+      delete this.__indexDefs[name];
+      if (this.__persist) this.__persist();
+    }
+    index(name) {
+      if (!this.__indexDefs[name]) {
+        throw new DOMException("no such index", "NotFoundError");
+      }
+      return this.__indexDefs[name];
+    }
+    __keyFor(value, key) {
+      if (key !== undefined && key !== null) return key;
+      if (typeof this.keyPath === "string" && value && value[this.keyPath] !== undefined) return value[this.keyPath];
+      if (Array.isArray(this.keyPath)) {
+        var parts = this.keyPath.map(function (p) { return value ? value[p] : undefined; });
+        if (parts.every(function (p) { return p !== undefined; })) return parts;
+      }
+      return undefined;
+    }
+    __rows() {
+      var rows = [];
+      this.__entries.forEach(function (entry) {
+        rows.push(entry);
+      });
+      rows.sort(function (a, b) { return idbCmp(a[0], b[0]); });
+      return rows;
+    }
+    __write(k, value) {
+      this.__entries.set(idbKeyString(k), [k, value]);
+      if (typeof k === "number" && k >= this.__nextAuto) this.__nextAuto = k + 1;
+    }
+    __allocKey() {
+      var k = this.__nextAuto;
+      this.__nextAuto = k + 1;
+      return k;
+    }
+    put(value, key) {
+      var self = this;
+      var tx = this.__tx;
+      return tx._start(function () {
+        var k = self.__keyFor(value, key);
+        if (k === undefined) {
+          if (self.autoIncrement) k = self.__allocKey();
+          else throw new DOMException("missing key for put", "DataError");
+        }
+        self.__write(k, value);
+        return k;
+      }, this);
+    }
+    add(value, key) {
+      var self = this;
+      var tx = this.__tx;
+      return tx._start(function () {
+        var k = self.__keyFor(value, key);
+        if (k === undefined) {
+          if (self.autoIncrement) k = self.__allocKey();
+          else throw new DOMException("missing key for add", "DataError");
+        }
+        if (self.__entries.has(idbKeyString(k))) {
+          throw new DOMException("key already present", "ConstraintError");
+        }
+        self.__write(k, value);
+        return k;
+      }, this);
+    }
+    get(key) {
+      var self = this;
+      var tx = this.__tx;
+      return tx._start(function () {
+        if (key instanceof IDBKeyRange) {
+          var rows = self.__match(key);
+          return rows.length ? rows[0][1] : undefined;
+        }
+        var hit = self.__entries.get(idbKeyString(key));
+        return hit ? hit[1] : undefined;
+      }, this);
+    }
+    getAll(query, limit) {
+      var self = this;
+      var tx = this.__tx;
+      return tx._start(function () {
+        var rows = self.__match(query);
+        if (limit !== undefined) rows = rows.slice(0, limit);
+        return rows.map(function (row) { return row[1]; });
+      }, this);
+    }
+    getAllKeys(query, limit) {
+      var self = this;
+      var tx = this.__tx;
+      return tx._start(function () {
+        var rows = self.__match(query);
+        if (limit !== undefined) rows = rows.slice(0, limit);
+        return rows.map(function (row) { return row[0]; });
+      }, this);
+    }
+    getKey(query) {
+      var self = this;
+      var tx = this.__tx;
+      return tx._start(function () {
+        var rows = self.__match(query);
+        return rows.length ? rows[0][0] : undefined;
+      }, this);
+    }
+    count(query) {
+      var self = this;
+      var tx = this.__tx;
+      return tx._start(function () {
+        if (query === undefined || query === null) return self.__entries.size;
+        return self.__match(query).length;
+      }, this);
+    }
+    delete(key) {
+      var self = this;
+      var tx = this.__tx;
+      return tx._start(function () {
+        if (key instanceof IDBKeyRange) {
+          var doomed = [];
+          self.__entries.forEach(function (entry, mapKey) {
+            if (key.includes(entry[0])) doomed.push(mapKey);
+          });
+          doomed.forEach(function (mapKey) {
+            self.__entries.delete(mapKey);
+          });
+        } else {
+          self.__entries.delete(idbKeyString(key));
+        }
+        return undefined;
+      }, this);
+    }
+    clear() {
+      var self = this;
+      var tx = this.__tx;
+      return tx._start(function () {
+        self.__entries.clear();
+        return undefined;
+      }, this);
+    }
+    openCursor(query, direction) {
+      var self = this;
+      var tx = this.__tx;
+      var box = { _rows: null, _i: 0 };
+      var req = tx._start(function () {
+        box._rows = self.__match(query);
+        box._i = 0;
+        return cursorValue(box, tx, false);
+      }, this);
+      req.__box = box;
+      return req;
+    }
+    openKeyCursor(query, direction) {
+      var self = this;
+      var tx = this.__tx;
+      var box = { _rows: null, _i: 0 };
+      var req = tx._start(function () {
+        box._rows = self.__match(query);
+        box._i = 0;
+        return cursorValue(box, tx, true);
+      }, this);
+      req.__box = box;
+      return req;
+    }
+    __match(query) {
+      var rows;
+      if (query === undefined || query === null) {
+        rows = this.__rows();
+      } else {
+        rows = [];
+        var self = this;
+        this.__entries.forEach(function (row) {
+          if (query instanceof IDBKeyRange) {
+            if (query.includes(row[0])) rows.push(row);
+          } else if (idbCmp(row[0], query) === 0) {
+            rows.push(row);
+          }
+        });
+        rows.sort(function (a, b) { return idbCmp(a[0], b[0]); });
+      }
+      return rows;
+    }
+  }
+  // Shared cursor machinery: `box` holds the sorted hit list; continue() on
+  // the SAME cursor object advances the shared index (spec behaviour).
+  function cursorValue(box, tx, keyOnly) {
+    if (!box._rows || box._i >= box._rows.length) return null;
+    var hit = box._rows[box._i];
+    if (!box.__cursor) {
+      var cur = new IDBCursor();
+      cur.__box = box;
+      cur.__tx = tx;
+      cur.__keyOnly = keyOnly;
+      box.__cursor = cur;
+    }
+    var c = box.__cursor;
+    c.key = hit[0];
+    c.primaryKey = hit[1][0];
+    c.value = hit[1][1];
+    return c;
+  }
+  class IDBCursor extends EventTarget {
+    constructor() {
+      super();
+      this.key = undefined;
+      this.primaryKey = undefined;
+      this.value = undefined;
+    }
+    continue(key) {
+      var box = this.__box;
+      if (key !== undefined && key !== null) {
+        // skip ahead to first row at/after key
+        while (box._i < box._rows.length && idbCmp(box._rows[box._i][0], key) < 0) box._i++;
+      } else {
+        box._i++;
+      }
+      var self = this;
+      return this.__tx._start(function () {
+        return cursorValue(box, self.__tx, self.__keyOnly);
+      }, null);
+    }
+    advance(count) {
+      var box = this.__box;
+      box._i += count;
+      var self = this;
+      return this.__tx._start(function () {
+        return cursorValue(box, self.__tx, self.__keyOnly);
+      }, null);
+    }
+    delete() {
+      var box = this.__box;
+      var pk = this.primaryKey;
+      var self = this;
+      return this.__tx._start(function () {
+        var store = self.__storeObj();
+        if (store) {
+          store.__entries = store.__entries.filter(function (row) {
+            return idbCmp(row[0], pk) !== 0;
+          });
+        }
+        return undefined;
+      }, null);
+    }
+    __storeObj() {
+      return null;
+    }
+  }
+  class IDBCursorWithValue extends IDBCursor {}
+  class IDBDatabase extends EventTarget {
+    constructor(record) {
+      super();
+      this.__record = record;
+      this.name = record.name;
+      this.__stores = record.stores;
+    }
+    get version() {
+      return this.__record.version;
+    }
+    get objectStoreNames() {
+      var names = Array.from(this.__stores.keys());
+      names.contains = function (n) {
+        return names.indexOf(n) !== -1;
+      };
+      names.item = function (i) {
+        return names[i];
+      };
+      return names;
+    }
+    createObjectStore(name, options) {
+      if (this.__stores.has(name)) {
+        throw new DOMException("object store exists", "ConstraintError");
+      }
+      var store = new IDBObjectStore(name, (options && options.keyPath) || null, !!(options && options.autoIncrement));
+      this.__stores.set(name, store);
+      idbWirePersist(store, this.__record);
+      store.__persist();
+      return store;
+    }
+    deleteObjectStore(name) {
+      this.__stores.delete(name);
+      delete this.__record.storeDefs[name];
+    }
+    transaction(storeNames, mode) {
+      var names = Array.isArray(storeNames) ? storeNames.slice() : [storeNames];
+      var m = mode || "readonly";
+      var self = this;
+      names.forEach(function (n) {
+        if (!self.__stores.has(n)) {
+          throw new DOMException("no such object store: " + n, "NotFoundError");
+        }
+      });
+      return new IDBTransaction(self, names, m);
+    }
+    close() {
+      this.__record.open = false;
+      this.dispatchEvent(idbWrapEvent("close"));
+    }
+  }
+  var idbDatabases = {};
+  class IDBFactory extends EventTarget {
+    open(name, version) {
+      var req = new IDBOpenDBRequest();
+      var record = idbDatabases[name];
+      if (!record) {
+        record = idbDatabases[name] = {
+          name: name,
+          version: 0,
+          stores: new Map(),
+          storeDefs: {},
+        };
+      }
+      var want = version === undefined ? Math.max(record.version, 1) : version;
+      var db = new IDBDatabase(record);
+      req.result = db;
+      req.transaction = null;
+      req.oldVersion = record.version;
+      req.newVersion = want;
+      var self = this;
+      queueMicrotask(function () {
+        if (record.version > want) {
+          req.error = new DOMException("version decrease", "VersionError");
+          req.dispatchEvent(idbWrapEvent("error"));
+          return;
+        }
+        idbHydrate(record);
+        if (record.version < want) {
+          var tx = new IDBTransaction(db, Array.from(record.stores.keys()), "versionchange");
+          tx.db = db;
+          req.transaction = tx;
+          req.oldVersion = record.version;
+          req.newVersion = want;
+          var ev = idbWrapEvent("upgradeneeded", {
+            oldVersion: record.version,
+            newVersion: want,
+          });
+          req.result = db;
+          req.dispatchEvent(ev);
+          record.version = want;
+        }
+        req.readyState = "done";
+        req.dispatchEvent(idbWrapEvent("success"));
+      });
+      return req;
+    }
+    deleteDatabase(name) {
+      var req = new IDBOpenDBRequest();
+      var record = idbDatabases[name];
+      req.oldVersion = record ? record.version : 0;
+      req.newVersion = null;
+      var self = this;
+      queueMicrotask(function () {
+        if (idbDatabases[name]) {
+          idbDatabases[name] = { name: name, version: 0, stores: new Map(), storeDefs: {} };
+        }
+        req.readyState = "done";
+        req.dispatchEvent(idbWrapEvent("success"));
+      });
+      return req;
+    }
+    databases() {
+      return Promise.resolve(
+        Object.keys(idbDatabases).map(function (n) {
+          return { name: n, version: idbDatabases[n].version };
+        })
+      );
+    }
+  }
+  host.IDBKeyRange = IDBKeyRange;
+  host.IDBRequest = IDBRequest;
+  host.IDBOpenDBRequest = IDBOpenDBRequest;
+  host.IDBTransaction = IDBTransaction;
+  host.IDBObjectStore = IDBObjectStore;
+  host.IDBIndex = IDBIndex;
+  host.IDBCursor = IDBCursor;
+  host.IDBCursorWithValue = IDBCursorWithValue;
+  host.IDBDatabase = IDBDatabase;
+  host.IDBFactory = IDBFactory;
+  host.indexedDB = new IDBFactory();
+
+  // `reportError` (WHATWG): several of our listener-error paths report through
+  // it; boa_runtime has no such global, so a listener throw previously died
+  // with "reportError is not defined", masking the real error.
+  if (typeof host.reportError !== "function") {
+    host.reportError = function (e) {
+      try {
+        console.error(e);
+      } catch (ignored) {
+        // nothing else to do
+      }
+    };
+  }
+
+  // fetch() accepts our `URL` objects (task: infosec.exchange). boa_runtime's
+  // FetchExtension type-checks the resource with `instanceof` against *its*
+  // URL class, but the realm's global `URL` is the tab's own native — so
+  // `fetch(new URL(x), {headers})` (how Mastodon's API layer calls it) died
+  // with "Resource must be a URL or Request object", silently rejecting the
+  // custom-emoji request that gates the React render. Unwrap URL-likes to
+  // their href; Request objects go through untouched.
+  if (typeof host.fetch === "function") {
+    var rawFetch = host.fetch;
+    host.fetch = function (resource, init) {
+      try {
+        if (
+          resource !== null &&
+          resource !== undefined &&
+          typeof resource !== "string" &&
+          !(typeof host.Request === "function" && resource instanceof host.Request)
+        ) {
+          var href =
+            typeof resource.href === "string" && resource.href
+              ? resource.href
+              : typeof resource.url === "string" && resource.url
+                ? resource.url
+                : null;
+          if (href !== null) resource = href;
+        }
+      } catch (ignored) {
+        // fall through with the original argument
+      }
+      return rawFetch.call(host, resource, init);
+    };
+  }
+
+  // Element interface classes (task: infosec.exchange). react-dom's commit
+  // phase does `activeElement instanceof window.HTMLIFrameElement` (and a
+  // dozen sibling checks); the realm had none of the HTML* constructors, so
+  // the check threw "right-hand side of 'instanceof' should be an object" —
+  // inside a scheduler flush, i.e. swallowed by the nextTick promise, i.e.
+  // React died with zero console output. Our wrappers all share one
+  // prototype, so the classes use `Symbol.hasInstance` to test the wrapper's
+  // live nodeType/tagName: instanceof answers what the node actually is,
+  // without a per-tag prototype forest under the bridge.
+  function defineDomClass(name, predicate) {
+    var C = function () {
+      throw new TypeError("Illegal constructor");
+    };
+    Object.defineProperty(C, "name", { value: name, configurable: true });
+    // Bind the interface prototype to the shared bridge prototype: pages and
+    // polyfills read/write `Element.prototype.matches`, `HTMLElement.prototype
+    // .inert`, etc., and the *same* object must answer for our wrappers (all
+    // wrappers share NodeProto) — so the interface prototypes ARE NodeProto.
+    // instanceof stays accurate through the Symbol.hasInstance predicate.
+    if (name !== "Window" && name !== "Document") {
+      Object.defineProperty(C, "prototype", { value: NodeProto, writable: false });
+    }
+    Object.defineProperty(C, Symbol.hasInstance, {
+      value: function (x) {
+        try {
+          return !!predicate(x);
+        } catch (ignored) {
+          return false;
+        }
+      },
+      configurable: true,
+    });
+    host[name] = C;
+    return C;
+  }
+  function domNodeType(x) {
+    if (x === null || x === undefined || typeof x !== "object") return 0;
+    if (x === document || (x.documentElement !== undefined && x.defaultView !== undefined && x.__root === undefined)) return 9;
+    if (typeof x.nodeType === "number") return x.nodeType;
+    return 0;
+  }
+  function domTagName(x) {
+    try {
+      return x && typeof x.tagName === "string" ? x.tagName.toUpperCase() : "";
+    } catch (ignored) {
+      return "";
+    }
+  }
+  var isElementNode = function (x) {
+    return domNodeType(x) === 1;
+  };
+  var NodeInterface = defineDomClass("Node", function (x) {
+    return domNodeType(x) !== 0 || x === document;
+  });
+  [
+    ["ELEMENT_NODE", 1],
+    ["ATTRIBUTE_NODE", 2],
+    ["TEXT_NODE", 3],
+    ["CDATA_SECTION_NODE", 4],
+    ["ENTITY_REFERENCE_NODE", 5],
+    ["ENTITY_NODE", 6],
+    ["PROCESSING_INSTRUCTION_NODE", 7],
+    ["COMMENT_NODE", 8],
+    ["DOCUMENT_NODE", 9],
+    ["DOCUMENT_TYPE_NODE", 10],
+    ["DOCUMENT_FRAGMENT_NODE", 11],
+    ["NOTATION_NODE", 12],
+    ["DOCUMENT_POSITION_DISCONNECTED", 1],
+    ["DOCUMENT_POSITION_PRECEDING", 2],
+    ["DOCUMENT_POSITION_FOLLOWING", 4],
+    ["DOCUMENT_POSITION_IMPLEMENTATION_SPECIFIC", 8],
+    ["DOCUMENT_POSITION_CONTAINS", 16],
+    ["DOCUMENT_POSITION_CONTAINED_BY", 32],
+  ].forEach(function (pair) {
+    Object.defineProperty(NodeInterface, pair[0], { value: pair[1] });
+  });
+  defineDomClass("Element", isElementNode);
+  defineDomClass("HTMLElement", isElementNode);
+  defineDomClass("Document", function (x) {
+    return x === document || (domNodeType(x) === 9 ? true : false);
+  });
+  defineDomClass("Window", function (x) {
+    return x === host;
+  });
+  defineDomClass("Text", function (x) {
+    return domNodeType(x) === 3;
+  });
+  defineDomClass("Comment", function (x) {
+    return domNodeType(x) === 8;
+  });
+  defineDomClass("DocumentFragment", function (x) {
+    return domNodeType(x) === 11;
+  });
+  var htmlTagClasses = [
+    ["IFRAME", "HTMLIFrameElement"],
+    ["DIV", "HTMLDivElement"],
+    ["SPAN", "HTMLSpanElement"],
+    ["A", "HTMLAnchorElement"],
+    ["IMG", "HTMLImageElement"],
+    ["P", "HTMLParagraphElement"],
+    ["UL", "HTMLUListElement"],
+    ["OL", "HTMLOListElement"],
+    ["LI", "HTMLLIElement"],
+    ["INPUT", "HTMLInputElement"],
+    ["TEXTAREA", "HTMLTextAreaElement"],
+    ["BUTTON", "HTMLButtonElement"],
+    ["SELECT", "HTMLSelectElement"],
+    ["OPTION", "HTMLOptionElement"],
+    ["OPTGROUP", "HTMLOptGroupElement"],
+    ["FORM", "HTMLFormElement"],
+    ["LABEL", "HTMLLabelElement"],
+    ["FIELDSET", "HTMLFieldSetElement"],
+    ["LEGEND", "HTMLLegendElement"],
+    ["TABLE", "HTMLTableElement"],
+    ["THEAD", "HTMLTableSectionElement"],
+    ["TBODY", "HTMLTableSectionElement"],
+    ["TFOOT", "HTMLTableSectionElement"],
+    ["TR", "HTMLTableRowElement"],
+    ["TD", "HTMLTableCellElement"],
+    ["TH", "HTMLTableHeaderCellElement"],
+    ["CANVAS", "HTMLCanvasElement"],
+    ["VIDEO", "HTMLVideoElement"],
+    ["AUDIO", "HTMLAudioElement"],
+    ["SOURCE", "HTMLSourceElement"],
+    ["TRACK", "HTMLTrackElement"],
+    ["PICTURE", "HTMLPictureElement"],
+    ["BODY", "HTMLBodyElement"],
+    ["HEAD", "HTMLHeadElement"],
+    ["HTML", "HTMLHtmlElement"],
+    ["TITLE", "HTMLTitleElement"],
+    ["META", "HTMLMetaElement"],
+    ["LINK", "HTMLLinkElement"],
+    ["SCRIPT", "HTMLScriptElement"],
+    ["STYLE", "HTMLStyleElement"],
+    ["NOSCRIPT", "HTMLNoScriptElement"],
+    ["TEMPLATE", "HTMLTemplateElement"],
+    ["DIALOG", "HTMLDialogElement"],
+    ["DETAILS", "HTMLDetailsElement"],
+    ["SUMMARY", "HTMLSummaryElement"],
+    ["PRE", "HTMLPreElement"],
+    ["CODE", "HTMLCodeElement"],
+    ["B", "HTMLBRElement"],
+    ["STRONG", "HTMLStrongElement"],
+    ["EM", "HTMLEmElement"],
+    ["U", "HTMLUElement"],
+    ["I", "HTMLIElement"],
+    ["H1", "HTMLHeadingElement"],
+    ["H2", "HTMLHeadingElement"],
+    ["H3", "HTMLHeadingElement"],
+    ["H4", "HTMLHeadingElement"],
+    ["H5", "HTMLHeadingElement"],
+    ["H6", "HTMLHeadingElement"],
+    ["HEADER", "HTMLElement"],
+    ["FOOTER", "HTMLElement"],
+    ["NAV", "HTMLElement"],
+    ["MAIN", "HTMLElement"],
+    ["SECTION", "HTMLElement"],
+    ["ARTICLE", "HTMLElement"],
+    ["ASIDE", "HTMLElement"],
+    ["FIGURE", "HTMLElement"],
+    ["FIGCAPTION", "HTMLElement"],
+    ["BLOCKQUOTE", "HTMLElement"],
+    ["SMALL", "HTMLElement"],
+    ["BR", "HTMLBreakElement"],
+    ["HR", "HTMLHRElement"],
+    ["DL", "HTMLDListElement"],
+    ["DT", "HTMLDTElement"],
+    ["DD", "HTMLDDElement"],
+    ["CAPTION", "HTMLElement"],
+    ["COL", "HTMLElement"],
+    ["COLGROUP", "HTMLElement"],
+    ["OBJECT", "HTMLObjectElement"],
+    ["PARAM", "HTMLParamElement"],
+    ["EMBED", "HTMLEmbedElement"],
+    ["AREA", "HTMLAreaElement"],
+    ["MAP", "HTMLMapElement"],
+    ["BASE", "HTMLBaseElement"],
+    ["PROGRESS", "HTMLProgressElement"],
+    ["METER", "HTMLMeterElement"],
+    ["DATA", "HTMLDataElement"],
+    ["TIME", "HTMLTimeElement"],
+    ["OUTPUT", "HTMLOutputElement"],
+    ["RUBY", "HTMLElement"],
+    ["RB", "HTMLElement"],
+    ["RTC", "HTMLElement"],
+    ["RP", "HTMLElement"],
+    ["RT", "HTMLElement"],
+    ["BDO", "HTMLElement"],
+    ["BDI", "HTMLElement"],
+    ["WBR", "HTMLElement"],
+    ["ABBR", "HTMLElement"],
+    ["CITE", "HTMLElement"],
+    ["DFN", "HTMLElement"],
+    ["KBD", "HTMLElement"],
+    ["SAMP", "HTMLElement"],
+    ["VAR", "HTMLElement"],
+    ["SUB", "HTMLElement"],
+    ["SUP", "HTMLElement"],
+    ["INS", "HTMLElement"],
+    ["DEL", "HTMLElement"],
+    ["Q", "HTMLElement"],
+    ["MARK", "HTMLElement"],
+    ["PICTURE", "HTMLPictureElement"],
+    ["PICTURE", "HTMLPictureElement"],
+  ];
+  var svgTagClasses = {
+    SVG: "SVGSVGElement",
+    PATH: "SVGPathElement",
+    CIRCLE: "SVGCircleElement",
+    RECT: "SVGRectElement",
+    LINE: "SVGLineElement",
+    POLYLINE: "SVGPolylineElement",
+    POLYGON: "SVGPolygonElement",
+    ELLIPSE: "SVGEllipseElement",
+    G: "SVGGElement",
+    DEFS: "SVGDefsElement",
+    USE: "SVGUseElement",
+    SYMBOL: "SVGSymbolElement",
+    TEXT: "SVGTextElement",
+    TSPAN: "SVGTSpanElement",
+    IMAGE: "SVGImageElement",
+    LINEARGRADIENT: "SVGLinearGradientElement",
+    RADIALGRADIENT: "SVGRadialGradientElement",
+    STOP: "SVGStopElement",
+    CLIPPATH: "SVGClipPathElement",
+    MASK: "SVGMaskElement",
+    FILTER: "SVGFilterElement",
+    FEGAUSSIANBLUR: "SVGFEGaussianBlurElement",
+    FEDROPLIGHTING: "SVGFEDropShadowElement",
+    TITLE: "SVGTitleElement",
+    CIRCLE: "SVGCircleElement",
+  };
+  // cname -> set of tags that satisfy `instanceof <cname>` (HEADINGS, table
+  // sections and the generic HTMLElement share one class across tags, so we
+  // group first and register exactly one constructor per interface name).
+  var htmlTagsByClass = Object.create(null);
+  for (var hci = 0; hci < htmlTagClasses.length; hci++) {
+    var cname = htmlTagClasses[hci][1];
+    if (cname === "HTMLElement") continue;
+    (htmlTagsByClass[cname] || (htmlTagsByClass[cname] = [])).push(htmlTagClasses[hci][0]);
+  }
+  Object.keys(svgTagClasses).forEach(function (tag) {
+    var cname = svgTagClasses[tag];
+    (htmlTagsByClass[cname] || (htmlTagsByClass[cname] = [])).push(tag);
+  });
+  Object.keys(htmlTagsByClass).forEach(function (cname) {
+    if (host[cname]) return; // e.g. HTMLMediaElement already real
+    var tags = {};
+    htmlTagsByClass[cname].forEach(function (t) {
+      tags[t] = true;
+    });
+    defineDomClass(cname, function (x) {
+      return isElementNode(x) && tags[domTagName(x)] === true;
+    });
+  });
+  // SVGSVGElement/SVGElement base: any lowercase-tagged node with an SVG-ish
+  // namespace tag — cheap proxy: tagName in the svg map, or the node answers
+  // ownerSVGElement-style checks (we simply treat tags not in the HTML table
+  // and not common HTML as SVG when the tag is in svgTagClasses values).
+  if (!host.SVGElement) {
+    defineDomClass("SVGElement", function (x) {
+      if (!isElementNode(x)) return false;
+      var tag = domTagName(x);
+      for (var key in svgTagClasses) {
+        if (svgTagClasses[key] === undefined) continue;
+        if (tag === key) return true;
+      }
+      return false;
+    });
+  }
+  // document.activeElement: focus tracking does not exist (one focused
+  // surface, the page), so the active element is the body, spec default.
+  if (document && document.activeElement === undefined) {
+    Object.defineProperty(document, "activeElement", {
+      get: function () {
+        return document.body || document.documentElement;
+      },
+      configurable: true,
+    });
+  }
 
   // `document`/`console` as globals (and thus as `window.document`/etc, since
   // window IS the global object).
@@ -4655,6 +7121,30 @@ fn build_context_with_modules(
         }),
     ) {
         error!("js binding `location` failed to install: {err}");
+    }
+    // `history.pushState`/`replaceState` (task: infosec.exchange): a URL-only
+    // change — the tab re-points the address bar (`UrlChanged`) without any
+    // fetch; resolution + the same-origin guard live on the Rust side of this
+    // native (see `Tab::follow_pending_js_url`), never in page code.
+    if let Err(err) = context.register_global_builtin_callable(
+        JsString::from(native::SET_URL),
+        1,
+        NativeFunction::from_copy_closure(|_this, args, context| {
+            let target = args
+                .first()
+                .cloned()
+                .unwrap_or(JsValue::undefined())
+                .to_string(context)?
+                .to_std_string_escaped();
+            if !target.is_empty() {
+                with_host(|host| {
+                    host.pending_url = Some(target);
+                });
+            }
+            Ok(JsValue::undefined())
+        }),
+    ) {
+        error!("js binding `history` failed to install: {err}");
     }
     // window.alert/confirm/prompt (task: JS dialogs): every argument is
     // coerced first (a page's own `valueOf`/`toString` could re-enter JS),
@@ -5117,6 +7607,19 @@ impl JsRuntime {
         self.host.borrow_mut().pending_nav.take()
     }
 
+    /// Take the URL-only address-bar change `history.pushState`/`replaceState`
+    /// queued during this JS turn (see the `SET_URL` native). The tab applies
+    /// it — resolve, same-origin, `UrlChanged` — never refetching.
+    pub fn take_pending_url(&self) -> Option<String> {
+        self.host.borrow_mut().pending_url.take()
+    }
+
+    /// Re-point the realm's `location.href` after an applied pushState: the
+    /// address bar and what page scripts read must agree.
+    pub fn set_url(&self, url: &str) {
+        self.host.borrow_mut().url = url.to_string();
+    }
+
     /// Evaluate a `javascript:` URL's program in this document's world (the
     /// same realm page scripts live in, with `doc` as the live document).
     /// Ok(`Some(text)`) when the completion value is a string to render as a
@@ -5222,6 +7725,10 @@ impl JsRuntime {
                 Ok(_) => {}
                 Err(err) => {
                     let message = first_line(&err);
+                    let backtrace = format!("{err:?}");
+                    if !backtrace.trim().is_empty() {
+                        error!("javascript error backtrace:\n{backtrace}");
+                    }
                     let source = self.classify_throw(dom_before, &message);
                     error!("javascript error in {origin}: {message}", origin = script.origin);
                     errors.push(ScriptError {
@@ -5318,6 +7825,10 @@ impl JsRuntime {
                         // settled alongside, report the rejection itself;
                         // this is the fallback reading.
                         let message = first_line(&err);
+                        let backtrace = format!("{err:?}");
+                        if !backtrace.trim().is_empty() {
+                            error!("module job backtrace:\n{backtrace}");
+                        }
                         outcome = Some(Err(if message.is_empty() {
                             "module graph failed".to_string()
                         } else {

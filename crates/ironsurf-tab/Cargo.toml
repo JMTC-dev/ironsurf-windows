@@ -71,6 +71,9 @@ atomic_refcell = "0.1"
 # `cssparser`/`selectors` are the same locked versions providing the reporter
 # trait's argument types — zero extra compilation.
 style = { version = "0.20.0", package = "stylo" }
+# `getComputedStyle` serializes stylo computed values with the very `ToCss`
+# trait they implement (already locked and compiled by the engine graph).
+style_traits = { version = "0.20.0", package = "stylo_traits" }
 cssparser = "0.37"
 selectors = "0.40"
 

@@ -3821,6 +3821,7 @@ dependencies = [
  "selectors",
  "serde_json",
  "stylo",
+ "stylo_traits",
  "tempfile",
  "url",
  "vp9dec",

@@ -547,6 +547,10 @@ pub struct Tab {
     history: Vec<Url>,
     history_index: usize,
     last_url: Option<String>,
+    /// `history.pushState`/`replaceState` re-pointed the address bar past
+    /// the document's own URL (task: infosec.exchange); wins over
+    /// `doc.url()` in `check_meta` until the NEXT real navigation.
+    url_override: Option<String>,
     last_title: Option<Option<String>>,
     /// `document.title` as last assigned by page JavaScript (task 8). Wins over
     /// the `ShellProvider`/`<title>` node sources while the document is live.
@@ -937,6 +941,7 @@ impl Tab {
             history_index: 0,
             last_title: None,
             last_url: None,
+            url_override: None,
             js_title: None,
             js_status: None,
             js: None,
@@ -1106,6 +1111,9 @@ impl Tab {
             "navigate \"{raw}\" ({history:?}{})",
             if post.is_some() { ", form POST" } else { "" }
         );
+        // A real navigation owns the URL again: any pushState address-bar
+        // override from the outgoing document dies with it.
+        self.url_override = None;
         // `javascript:` is never fetched: the text after the scheme is a
         // program for the current page's JS world (address bar, `<a href>`,
         // or a page's own `location.href = "javascript:…"`). Checked on the
@@ -2190,7 +2198,11 @@ impl Tab {
     /// flushed through the `ShellProvider` hook (which JS/DOM mutations
     /// update), falling back to polling the `<title>` node.
     fn check_meta(&mut self) {
-        let mut current_url = self.doc.as_ref().map(|doc| doc.url().as_str().to_owned());
+        // A pushState'd address bar wins over the (unchanged) document URL.
+        let mut current_url = self.url_override.clone();
+        if current_url.is_none() {
+            current_url = self.doc.as_ref().map(|doc| doc.url().as_str().to_owned());
+        }
         if current_url.is_none() {
             // Before the first successful load the tab still reports the
             // URL it is trying to show (stable contract for the shell).
@@ -3346,9 +3358,57 @@ impl Tab {
             }
             return true;
         }
-        // 3. The page's own navigation request (`location.href=`/`assign`/
+        // 3. `history.pushState`/`replaceState` (task: infosec.exchange): a
+        //    URL-only change — address bar follows, document stays put.
+        if self.follow_pending_js_url() {
+            return true;
+        }
+        // 4. The page's own navigation request (`location.href=`/`assign`/
         //    `replace`/`reload` from scripts, timers, or event handlers).
         self.follow_pending_js_nav()
+    }
+
+    /// Apply the URL-only address-bar change `history.pushState`/`replaceState`
+    /// queued during the last JS turn: resolve against the live document URL,
+    /// enforce the SAME-ORIGIN rule tab-side (never trusting the page's JS),
+    /// then let `check_meta` ship the `UrlChanged`. The document is not
+    /// refetched and engine history is untouched — spec-wise the page did not
+    /// navigate, it only relabelled where it is.
+    fn follow_pending_js_url(&mut self) -> bool {
+        let Some(target) = self
+            .js
+            .as_ref()
+            .and_then(|runtime| runtime.take_pending_url())
+        else {
+            return false;
+        };
+        let base = self
+            .doc
+            .as_ref()
+            .map(|doc| doc.url().clone())
+            .or_else(|| self.history.get(self.history_index).cloned());
+        let resolved = match base.as_ref().and_then(|base| base.join(&target).ok()) {
+            Some(url) => url,
+            None => {
+                warn!("js url update to {target:?} did not resolve");
+                return true;
+            }
+        };
+        let crosses_origin = base
+            .as_ref()
+            .is_some_and(|base| base.origin() != resolved.origin());
+        if crosses_origin {
+            warn!("js url update to {resolved} crosses the document origin; ignored");
+            return true;
+        }
+        debug!("history.pushState → {resolved} (url-only, no fetch)");
+        self.url_override = Some(resolved.as_str().to_owned());
+        // `location.href` and the address bar must agree from here on.
+        if let Some(runtime) = self.js.as_ref() {
+            runtime.set_url(resolved.as_str());
+        }
+        self.check_meta();
+        true
     }
 
     /// Act on a submission the form layer resolved: POST only goes to the

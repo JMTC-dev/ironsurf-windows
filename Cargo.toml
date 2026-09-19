@@ -16,3 +16,9 @@ url = "2"
 
 [profile.release]
 debug = false
+
+# `vp9dec` (the VP7/8/9 bitstream decoder behind the tab's video path) crashes
+# rustc at opt-level=3 (SIGSEGV in the LLVM pipeline on this box); keep it at
+# opt-level=1 in release builds — bitstream decoding is not hot enough for -O3.
+[profile.release.package.vp9dec]
+opt-level = 1
