@@ -661,7 +661,38 @@ sloppy-mode assignments. Boa 0.22 does **not** drain its job queue inside `eval`
 runtime drains it once per script turn (`run_jobs` after every script batch, timer batch,
 event dispatch and userscript): `Promise.then`/`queueMicrotask` callbacks now really run,
 and `fetch` promises settle; a throwing job is reported as a script error (origin
-`"promise"`) like any other. The binding surface stays:
+`"promise"`) like any other.
+**The DOM/Web surface grew a full Mastodon boot chain** (task: make https://infosec.exchange
+render — it showed only the `<noscript>` shell): PRELUDE gains `URLSearchParams` (full WHATWG
+form), `Event`/`CustomEvent`/`EventTarget` (dispatched events are real `instanceof Event`),
+`DOMException` (spec-shaped, deliberately **no own `stack`** so core-js's probe installs its
+wrapper over ours), an **in-memory IndexedDB** (stores, key ranges, multiEntry/compound
+indexes, cursors, versionchange upgrades — Mastodon's `initializeEmoji()` gates `createRoot()
+.render()` behind the `idb` wrapper's instanceof + request/tx event contract), `MessageChannel`/
+`MessagePort`, microtask-delivered `MutationObserver`, `DOMParser.parseFromString` (real HTML5
+fragment parsing through `parse_inner_html_into_mutator` + scoped `querySelector`/`matches`/
+`closest` so the parsed tree is queryable), `window.history` (`pushState`/`replaceState` are
+URL-only: they update the address bar via `pending_url` → `url_override` → `FromTab::UrlChanged`
+— the engine's session history is untouched, same-origin is enforced tab-side), `getComputedStyle`
+(a Proxy reading stylo `ComputedValues::clone_<property>()` accessors), `reportError`,
+`document.hasFocus`, `crypto`-adjacent odds, and `document.createElementNS` (new native
+`__ironsurfDomCreateElementNs` builds the `QualName` with a real svg/mathml `Namespace` —
+react-dom creates **every `<svg>`** through it and mastodon's landing leads with SVG icons).
+All HTML*/SVG*/`Node`/`Element`/`Document` interface classes exist with `Symbol.hasInstance`
+predicates keyed on node type + local tag name (react-dom's `x instanceof HTMLIFrameElement`
+checks decide event paths, and must not lie), while `Element.prototype` **is** the shared
+wrapper prototype — polyfills that read `Element.prototype.matches` or install accessors on
+`HTMLElement.prototype.inert` land on real wrappers. `window.fetch` unwraps same-realm
+URL-likes to `href` before handing to boa_runtime's fetcher (it rejects unknown URL objects).
+The `checked` setter is a silent no-op on non-checkbox inputs (react hands `checked={false}`
+to text inputs; a hard TypeError previously killed mastodon's search column behind an error
+boundary), bare `xmlns` is settable (react-dom stamps it on every SVG root), `classList` is a
+snapshot DOMTokenList over the `class` attribute, and both `console.error(err)` and module
+rejections print error **stacks** — the single most valuable debug affordance added this round.
+Honest gaps: SVG content paints as empty boxes (structure exists, rendering doesn't), timers
+still drive nothing off `document.visibilityState`, and unhead/helmet's deferred-init timer
+still throws once (`createContext` undefined there — a module-cycle quirk, page survives).
+The binding surface stays:
 - `window` (eventTarget-ish no-ops), `document.title` get/set (set → `FromTab::TitleChanged`
   and repaint), `document.body.textContent` read-only snapshot,
 - **`window.matchMedia(query)`** returns a MediaQueryList without evaluating media features:
