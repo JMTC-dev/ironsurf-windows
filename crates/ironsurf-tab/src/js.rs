@@ -3486,6 +3486,20 @@ const PRELUDE: &str = r##"
     },
     get protocol() { return urlParts(host.__ironsurfUrl).protocol; },
     get host() { return urlParts(host.__ironsurfUrl).host; },
+    // `location.origin`: the tuple origin serialised (scheme://host:port).
+    // Mastodon's emoji-data loader does `new URL(path, location.origin)` —
+    // with `origin` absent the base is undefined and WHATWG parsing throws
+    // "relative URL without a base" out of the fetch. Documents whose scheme
+    // has no serialisable origin (about:, data:, file:, …) answer the spec's
+    // opaque "null" (a string), which also makes `new URL(x, "null")` fail
+    // loudly rather than resolve against garbage.
+    get origin() {
+      var p = urlParts(host.__ironsurfUrl);
+      if ((p.protocol === "http:" || p.protocol === "https:") && p.host) {
+        return p.protocol + "//" + p.host;
+      }
+      return p.host ? p.protocol + "//" + p.host : "null";
+    },
     get hostname() { return urlParts(host.__ironsurfUrl).hostname; },
     get pathname() { return urlParts(host.__ironsurfUrl).pathname; },
     get search() { return urlParts(host.__ironsurfUrl).search; },
@@ -4860,8 +4874,15 @@ const PRELUDE: &str = r##"
     var state = imageState(self);
     return state === null ? 0 : Math.round(Number(state[index]));
   }
+  // <canvas> width/height: content attributes (unsigned longs), falling back
+  // to the HTML defaults when the attribute is absent or garbage.
+  function canvasSize(self, key, fallback) {
+    var declared = nonNegativeInt(self.getAttribute(key), -1);
+    return declared >= 0 ? declared : fallback;
+  }
+  function isCanvasTag(self) { return tagUpper(self) === "CANVAS"; }
   function sizeAttrSet(self, key, value) {
-    if (!isImg(self)) {
+    if (!isImg(self) && !isCanvasTag(self)) {
       storeOwn(self, key, String(value));
       return;
     }
@@ -4876,6 +4897,8 @@ const PRELUDE: &str = r##"
   // what the engine would render).
   protoAccessor("width",
     function () {
+      // <canvas> reflects width/height with the HTML defaults 300×150.
+      if (isCanvasTag(this)) return canvasSize(this, "width", 300);
       if (!isImg(this)) return undefined;
       var declared = nonNegativeInt(this.getAttribute("width"), -1);
       return declared >= 0 ? declared : intrinsic(this, 1);
@@ -4883,6 +4906,7 @@ const PRELUDE: &str = r##"
     function (value) { sizeAttrSet(this, "width", value); });
   protoAccessor("height",
     function () {
+      if (isCanvasTag(this)) return canvasSize(this, "height", 150);
       if (!isImg(this)) return undefined;
       var declared = nonNegativeInt(this.getAttribute("height"), -1);
       return declared >= 0 ? declared : intrinsic(this, 2);
@@ -4936,6 +4960,107 @@ const PRELUDE: &str = r##"
   Image.prototype = NodeProto; // === HTMLImageElement.prototype, like browsers
   globalThis.HTMLImageElement = HTMLImageElement;
   globalThis.Image = Image;
+
+  // ---------------------------------------------------------------------
+  // HTMLCanvasElement glue + an honest transparent-black 2D context
+  // (task: infosec.exchange without console errors).
+  //
+  // Mastodon renders every custom-emoji blur placeholder through a real
+  // <canvas>: the decode itself is pure JS (fine in boa), but the paint path
+  // is `canvas.getContext("2d").putImageData(createImageData(w,h), 0, 0)` —
+  // with no getContext on the element the CALL threw "not a callable
+  // function", the app caught it and logged `Blurhash decoding failure` at
+  // console.error on every image-bearing timeline item.
+  //
+  // There is no GPU and no rasteriser on this side of the bridge, so the
+  // context is spec-shaped but draws nothing: state members are plain
+  // properties, drawing methods are no-ops, getImageData answers transparent
+  // black — exactly what a canvas nobody painted on reads back, so the
+  // surface never lies about pixels that were never composited. Blurhash's
+  // `createImageData(...).data.set(pixels); putImageData(imgData, 0, 0)`
+  // completes silently instead of erroring; the placeholder stays blank.
+  // `webgl`/`webgl2` answer null (no GPU, like a browser with it disabled);
+  // `bitmaprenderer` answers null too (ImageBitmap is not implemented).
+  // toDataURL/toBlob are deliberately absent: rendering a PNG of our own is
+  // the honest follow-up, and a fake bytes-free data URL would lie.
+  // ---------------------------------------------------------------------
+  function canvasImageData(width, height) {
+    var w = unsignedLong(width);
+    var h = unsignedLong(height);
+    return { width: w, height: h, data: new Uint8ClampedArray(w * h * 4), colorSpace: "srgb" };
+  }
+  function canvasContext2D() {
+    var noop = function () {};
+    return {
+      // canvas back-reference is written by getContext (the element wrapper).
+      canvas: null,
+      fillStyle: "#000000", strokeStyle: "#000000",
+      globalAlpha: 1, globalCompositeOperation: "source-over",
+      lineWidth: 1, lineCap: "butt", lineJoin: "miter", miterLimit: 10,
+      shadowBlur: 0, shadowColor: "rgba(0, 0, 0, 0)", shadowOffsetX: 0, shadowOffsetY: 0,
+      font: "10px sans-serif", textAlign: "start", textBaseline: "alphabetic",
+      direction: "inherit", imageSmoothingEnabled: true, imageSmoothingQuality: "low",
+      filter: "none",
+      save: noop, restore: noop,
+      scale: noop, rotate: noop, translate: noop, transform: noop,
+      setTransform: noop, resetTransform: noop,
+      beginPath: noop, closePath: noop, moveTo: noop, lineTo: noop,
+      bezierCurveTo: noop, quadraticCurveTo: noop, arc: noop, arcTo: noop,
+      ellipse: noop, rect: noop, roundRect: noop,
+      fill: noop, stroke: noop, clip: noop,
+      fillRect: noop, strokeRect: noop, clearRect: noop,
+      fillText: noop, strokeText: noop,
+      setLineDash: noop, getLineDash: function () { return []; },
+      drawImage: noop, drawFocusIfNeeded: noop,
+      isPointInPath: function () { return false; },
+      isPointInStroke: function () { return false; },
+      measureText: function (text) {
+        // No font engine here: every box reads zero-width.
+        return {
+          width: 0, actualBoundingBoxLeft: 0, actualBoundingBoxRight: 0,
+          actualBoundingBoxAscent: 0, actualBoundingBoxDescent: 0,
+          fontBoundingBoxAscent: 0, fontBoundingBoxDescent: 0,
+          emHeightAscent: 0, emHeightDescent: 0, alphabeticBaseline: 0,
+          hangingBaseline: 0, ideographicBaseline: 0,
+          text: text === undefined ? "" : String(text),
+        };
+      },
+      createLinearGradient: function () { return { addColorStop: noop }; },
+      createRadialGradient: function () { return { addColorStop: noop }; },
+      createConicGradient: function () { return { addColorStop: noop }; },
+      createPattern: function () { return null; },
+      createImageData: function (a, b) {
+        // The spec allows createImageData(imageData) or (w, h).
+        if (a !== null && typeof a === "object" && typeof a.width === "number") {
+          return canvasImageData(a.width, a.height);
+        }
+        return canvasImageData(a, b);
+      },
+      getImageData: function (sx, sy, sw, sh) {
+        // Nothing has ever been composited into this context, so reading any
+        // rect back answers transparent black — which is what the fresh
+        // all-zero buffer is.
+        return canvasImageData(sw, sh);
+      },
+      putImageData: noop,
+    };
+  }
+  protoMethod("getContext", function (type) {
+    if (!isCanvasTag(this)) return undefined;
+    var kind = String(type === undefined ? "" : type).toLowerCase();
+    if (kind !== "2d") return null; // no webgl (no GPU), no bitmaprenderer
+    var ctx = canvasContext2D();
+    ctx.canvas = this;
+    return ctx;
+  });
+  protoMethod("getContextAttributes", function () {
+    if (!isCanvasTag(this)) return undefined;
+    return {
+      alpha: true, depth: false, stencil: false, antialias: false,
+      desynchronized: false, willReadFrequently: false, colorSpace: "srgb",
+      pixelFormat: "RGBA8",
+    };
+  });
 
   function makeConsole(level) {
     return function () {
@@ -11071,6 +11196,131 @@ globalThis[which + "Self"] = String((function(){ return (() => this === undefine
             probe("cSelf"),
             "false",
             "classic/sloppy: .call(undefined) rebinds to globalThis, untouched by the fix"
+        );
+    }
+    /// `location.origin` (task: infosec.exchange emoji-data loader).
+    /// Mastodon's chunk does `new URL(path, location.origin)`; with `origin`
+    /// absent the base is undefined and WHATWG parsing throws "relative URL
+    /// without a base" out of the fetch. The getter must serialise the tuple
+    /// origin (keeping explicit ports — origins do NOT fold default ports)
+    /// and answer the string "null" for schemes with no serialisable origin.
+    #[test]
+    fn location_origin_serialises_the_document_origin() {
+        let host = sample_host(); // https://example.test/page.html
+        assert_eq!(
+            eval_snippet("location.origin", &host)
+                .as_string()
+                .map(|s| s.to_std_string_escaped()),
+            Some("https://example.test".to_string())
+        );
+        // `new URL(path, location.origin)` — the exact Mastodon call shape —
+        // resolves instead of throwing.
+        assert_eq!(
+            eval_snippet(
+                r#"new URL("/system/emoji_data/en.json", location.origin).href === "https://example.test/system/emoji_data/en.json""#,
+                &host
+            )
+            .as_boolean(),
+            Some(true)
+        );
+        // Explicit ports are part of the origin.
+        host.borrow_mut().url = "http://127.0.0.1:8765/a?b=1#c".into();
+        assert_eq!(
+            eval_snippet("location.origin", &host)
+                .as_string()
+                .map(|s| s.to_std_string_escaped()),
+            Some("http://127.0.0.1:8765".to_string())
+        );
+        // Documents without a tuple origin read the opaque string "null"…
+        host.borrow_mut().url = "about:blank".into();
+        assert_eq!(
+            eval_snippet("location.origin", &host)
+                .as_string()
+                .map(|s| s.to_std_string_escaped()),
+            Some("null".to_string())
+        );
+        // …which fails loudly as a URL base instead of resolving anywhere.
+        assert_eq!(
+            eval_snippet(
+                r#"(function () { try { new URL("/x", location.origin); return false; } catch (e) { return true; } })()"#,
+                &host
+            )
+            .as_boolean(),
+            Some(true)
+        );
+    }
+
+    /// Canvas 2D glue (task: infosec.exchange blurhash placeholders). The
+    /// decode is pure JS; the paint path is
+    /// `getContext("2d").putImageData(createImageData(w,h), 0, 0)` — it must
+    /// complete silently, with a real Uint8ClampedArray buffer, and every
+    /// reading must stay honest (nothing painted ⇒ transparent black).
+    #[test]
+    fn canvas_answers_a_transparent_black_2d_context() {
+        let (_host, mut runtime, mut doc) = image_world(DOM_PAGE);
+        // The exact blurhash shape that logged `Blurhash decoding failure`.
+        let source = r##"
+            var el = document.createElement("canvas");
+            el.width = 4; el.height = 2;
+            var ctx = el.getContext("2d");
+            var img = ctx.createImageData(4, 2);
+            img.data.set(new Uint8ClampedArray(4 * 2 * 4).fill(7));
+            ctx.putImageData(img, 0, 0);
+            ctx.canvas === el
+                && img.width === 4 && img.height === 2
+                && img.data.length === 32
+                && img.data[3] === 7
+                && el.width === 4 && el.height === 2;
+        "##;
+        assert!(
+            dom_eval(&mut runtime, &mut doc, source).to_boolean(),
+            "the blurhash paint path must complete silently"
+        );
+        // width/height reflect the content attributes with HTML defaults.
+        let source = r##"
+            var el = document.createElement("canvas");
+            if (el.width !== 300 || el.height !== 150) false;
+            (el.width === 300 && el.height === 150) &&
+            (el.setAttribute("width", "64"), el.width === 64) &&
+            (el.height = 32, el.getAttribute("height") === "32");
+        "##;
+        assert!(
+            dom_eval(&mut runtime, &mut doc, source).to_boolean(),
+            "canvas width/height must reflect the attributes (defaults 300x150)"
+        );
+        // No GPU, no rasteriser: webgl/bitmaprenderer answer null like a
+        // browser with them disabled; non-canvas elements have no context.
+        let source = r##"
+            var el = document.createElement("canvas");
+            var div = document.createElement("div");
+            el.getContext("webgl") === null
+                && el.getContext("webgl2") === null
+                && el.getContext("bitmaprenderer") === null
+                && el.getContext("nonsense") === null
+                && div.getContext("2d") === undefined;
+        "##;
+        assert!(
+            dom_eval(&mut runtime, &mut doc, source).to_boolean(),
+            "non-2d contexts must read null; elements without canvas have none"
+        );
+        // getImageData on a never-painted context is transparent black, and
+        // the drawing surface is all no-ops with plain state properties.
+        let source = r##"
+            var ctx = document.createElement("canvas").getContext("2d");
+            ctx.fillStyle = "#ff0000";
+            ctx.imageSmoothingQuality = "high";
+            ctx.fillRect(0, 0, 10, 10);
+            ctx.save(); ctx.translate(3, 3); ctx.restore();
+            var d = ctx.getImageData(0, 0, 2, 2);
+            d.width === 2 && d.height === 2 && d.data.length === 16
+                && d.data.every(function (b) { return b === 0; })
+                && ctx.fillStyle === "#ff0000"
+                && ctx.getLineDash().length === 0
+                && ctx.measureText("x").width === 0;
+        "##;
+        assert!(
+            dom_eval(&mut runtime, &mut doc, source).to_boolean(),
+            "a never-painted context reads transparent black with plain state"
         );
     }
 }

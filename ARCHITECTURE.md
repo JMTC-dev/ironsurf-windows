@@ -738,6 +738,23 @@ The binding surface stays:
   `<img src>` when the element is inserted, so a bare `new Image(); i.src = …` beacon starts no fetch and never
   fires `load` (append the image and it loads for real, verified by `tests/e2e.rs`:
   `script_built_image_reads_engine_state`).
+- **`location.origin` serialises the document's origin** (task: infosec.exchange's emoji-data loader did
+  `new URL(path, location.origin)`; with `origin` absent the base was undefined and WHATWG parsing threw
+  "relative URL without a base"). It is the *serialized tuple* origin `scheme://host:port` — explicit ports
+  are kept (origins do not fold default ports, unlike the localStorage area key above) — and documents with
+  no tuple origin (`about:`, `data:`, `file:`…) answer the spec's opaque string `"null"`, which makes such a
+  base fail loudly instead of silently resolving against nothing.
+- **Canvas is a paint surface, honestly empty** (task: Mastodon paints every custom-emoji blur placeholder
+  through `canvas.getContext("2d").putImageData(createImageData(w,h),0,0)` — no getContext meant the *call*
+  itself threw into the app's catch and logged `Blurhash decoding failure`; the decode is pure JS). `getContext`
+  lives on the element prototype: `"2d"` answers a context, `"webgl"`/`"webgl2"`/`"bitmaprenderer"`/unknown
+  answer `null` like a browser with them disabled, and non-canvas elements answer `undefined`. The 2D context
+  keeps state as plain own properties, every drawing call is a silent no-op (there is no rasteriser and no GPU
+  here), `createImageData`/`getImageData` return real `Uint8ClampedArray`-backed ImageData, and reads answer
+  the fresh all-zero buffer — **nothing painted ⇒ nothing readable back**, never fake pixels.
+  `width`/`height` are canvas-reflected content attributes with the HTML 300×150 defaults (extending the img
+  accessors above, so `canvas.width = canvas.width` round-trips). `toDataURL`/`toBlob`/`OffscreenCanvas` are
+  deliberately *absent*: encoding bytes we never rendered would lie, and their callers (upload paths) feature-detect.
 - **`window.localStorage` is a real `Storage`** (task: per-origin DOM storage): `getItem`/
   `setItem`/`removeItem`/`clear`/`key(i)`/`length`, plus the spec's Proxy forms — `localStorage.foo = 1`
   stores, `localStorage.foo` reads, `delete localStorage.foo` removes, `Object.keys` enumerates the
