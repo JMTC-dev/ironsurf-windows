@@ -2,6 +2,17 @@
 resolver = "2"
 members = ["crates/*"]
 
+# IronSurf: `boa_ast` is forked into `thirdparty/boa/boa_ast` (vendored 0.22.0 + fix).
+# Upstream boa_ast 0.22.0 `Scope::escape_this_in_enclosing_function_scope` stops at the
+# first enclosing function scope when escaping `this` — even when that scope belongs to
+# an arrow function, which has no `this` binding. `this` reached through 2+ nested arrows
+# therefore never escaped to the real `this`-binding function, its function environment
+# was never pushed, and the `This` opcode fell through to undefined/globalThis (the
+# react-spring `Cannot convert undefined or null to object` crash; see
+# thirdparty/boa/PATCH.md). Upstream main is still unfixed as of 2026-08.
+[patch.crates-io]
+boa_ast = { path = "thirdparty/boa/boa_ast" }
+
 [workspace.dependencies]
 # GPU acceleration: `backend-linuxkms-noseat` compiles Slint's LinuxKMS backend
 # (DRM/KMS + EGL/GBM via glutin + FemtoVG) so the shell can render on a bare

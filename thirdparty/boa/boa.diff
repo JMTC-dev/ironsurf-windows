@@ -1,0 +1,125 @@
+# Diff of thirdparty/boa/boa_ast vs pristine boa_ast 0.22.0 (crates.io registry source).
+# Generated: 2026-09-20; regenerate per PATCH.md. Excludes the added fork test file.
+Only in a/registry/boa_ast-0.22.0: .cargo_vcs_info.json
+Only in a/registry/boa_ast-0.22.0: Cargo.lock
+diff -ru '--exclude=escape_this_nested_arrows.rs' a/registry/boa_ast-0.22.0/Cargo.toml thirdparty/boa/boa_ast/Cargo.toml
+--- a/registry/boa_ast-0.22.0/Cargo.toml	2006-07-24 01:21:28.000000000 +0000
++++ thirdparty/boa/boa_ast/Cargo.toml	2026-09-20 04:17:12.668195829 +0000
+@@ -62,6 +62,12 @@
+ name = "scope"
+ path = "tests/scope.rs"
+ 
++# IronSurf fork: regression test for the `escape_this_in_enclosing_function_scope`
++# fix (see ../PATCH.md); upstream publishes with `autotests = false`.
++[[test]]
++name = "escape_this_nested_arrows"
++path = "tests/escape_this_nested_arrows.rs"
++
+ [dependencies.arbitrary]
+ version = "1"
+ features = ["derive"]
+diff -ru '--exclude=escape_this_nested_arrows.rs' a/registry/boa_ast-0.22.0/src/scope.rs thirdparty/boa/boa_ast/src/scope.rs
+--- a/registry/boa_ast-0.22.0/src/scope.rs	2006-07-24 01:21:28.000000000 +0000
++++ thirdparty/boa/boa_ast/src/scope.rs	2026-09-20 03:28:49.726998053 +0000
+@@ -105,6 +105,11 @@
+     function: bool,
+     // Has the `this` been accessed/escaped outside the function environment boundary.
+     this_escaped: Cell<bool>,
++    // IronSurf fork: does this function scope belong to an *arrow* function? Arrow
++    // functions have no `this` binding of their own (see
++    // `escape_this_in_enclosing_function_scope`). Set once by the scope analyzer via
++    // `set_arrow`; irrelevant for non-function scopes.
++    arrow: Cell<bool>,
+ 
+     context: Rc<ScopeContext>,
+ }
+@@ -121,6 +126,7 @@
+                 bindings: RefCell::default(),
+                 function: true,
+                 this_escaped: Cell::new(false),
++                arrow: Cell::new(false),
+                 context: Rc::default(),
+             }),
+         }
+@@ -136,6 +142,7 @@
+                 bindings: RefCell::default(),
+                 function,
+                 this_escaped: Cell::new(false),
++                arrow: Cell::new(false),
+                 context: parent.inner.context.clone(),
+                 outer: Some(parent),
+             }),
+@@ -255,6 +262,19 @@
+         self.inner.function
+     }
+ 
++    /// Marks this (function) scope as belonging to an arrow function, which has no
++    /// `this` binding of its own.
++    pub fn set_arrow(&self) {
++        self.inner.arrow.set(true);
++    }
++
++    /// Check if this scope belongs to an arrow function (and therefore cannot hold a
++    /// `this` binding).
++    #[must_use]
++    pub fn is_arrow(&self) -> bool {
++        self.inner.arrow.get()
++    }
++
+     /// Check if the scope is a global scope.
+     #[must_use]
+     pub fn is_global(&self) -> bool {
+@@ -356,14 +376,34 @@
+     }
+ 
+     /// Escape enclosing function environment's `this`.
++    ///
++    /// IronSurf fork bugfix (vs upstream boa_ast 0.22.0 / boa-devs boa):
++    /// upstream stops at the *first* enclosing function scope after crossing a
++    /// function boundary. Arrow functions have no `this` binding of their own, so
++    /// when `this` is reached through 2+ nested arrows (the common
++    /// `.map(e => () => this.x)` pattern inside a method), upstream marked the
++    /// *outer arrow's* scope instead of the nearest enclosing real function. The
++    /// `this` never escaped to the method's function scope, its
++    /// `requires_function_scope` stayed false, the method's function environment
++    /// (the one holding the initialized `this`) was never pushed at runtime, and
++    /// the `This` opcode fell through to the module/global environment — handing
++    /// back `undefined`/`globalThis` where the receiver belongs (the
++    /// react-spring `Cannot convert undefined or null to object` crash).
++    /// Keep walking through arrow-function scopes until the nearest scope that can
++    /// actually bind `this`.
+     pub fn escape_this_in_enclosing_function_scope(&self) {
+         let mut current = self;
+         let mut crossed_function_border = false;
+ 
+         loop {
+             if crossed_function_border && current.is_function() {
+-                current.inner.this_escaped.set(true);
+-                return;
++                // An arrow-function scope has no `this` binding, so the escape must
++                // continue outward through it (upstream stopped here and lost the
++                // binding).
++                if !current.is_arrow() {
++                    current.inner.this_escaped.set(true);
++                    return;
++                }
+             }
+             if let Some(outer) = &current.inner.outer {
+                 if current.is_function() {
+diff -ru '--exclude=escape_this_nested_arrows.rs' a/registry/boa_ast-0.22.0/src/scope_analyzer.rs thirdparty/boa/boa_ast/src/scope_analyzer.rs
+--- a/registry/boa_ast-0.22.0/src/scope_analyzer.rs	2006-07-24 01:21:28.000000000 +0000
++++ thirdparty/boa/boa_ast/src/scope_analyzer.rs	2026-09-20 03:29:15.619251364 +0000
+@@ -1891,6 +1891,13 @@
+         requires_function_scope: false,
+     };
+ 
++    // IronSurf fork: record that this function scope belongs to an arrow function, which
++    // has no `this` binding of its own — see
++    // `Scope::escape_this_in_enclosing_function_scope`.
++    if arrow {
++        scopes.function_scope.set_arrow();
++    }
++
+     // 1. Let calleeContext be the running execution context.
+     // 2. Let code be func.[[ECMAScriptCode]].
+     // 3. Let strict be func.[[Strict]].

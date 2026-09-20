@@ -1,7 +1,10 @@
-//! Root-cause fixture: the `TypeError: cannot convert 'null' or 'undefined'
-//! to object` that https://infosec.exchange/explore (Mastodon/Glitch) throws
-//! from `packs/chevron_right-D7sFWRVh.js:1:11396` inside react-spring's rAF
-//! frame loop (task #69).
+//! Regression fixture for the boa 0.22 nested-arrow `this` engine bug — FIXED
+//! in the vendored fork (`thirdparty/boa/boa_ast`, see
+//! `thirdparty/boa/PATCH.md`), originally root-caused on
+//! https://infosec.exchange/explore (Mastodon/Glitch), where
+//! `packs/chevron_right-D7sFWRVh.js:1:11396` threw `TypeError: cannot convert
+//! 'null' or 'undefined' to object` inside react-spring's rAF frame loop
+//! (task #69).
 //!
 //! MINIMAL, SELF-CONTAINED localhost reproduction: a hand-condensed port of
 //! @react-spring/core's FluidValue observer machinery (`addObserver`/
@@ -14,22 +17,18 @@
 //!   -> observerAdded(n){ n==1 && each(this.inputs, ins => each(ins, v => isFluid(v) && addObserver(v, this))) }
 //! ```
 //!
-//! runs the pack's `rt`/`observerAdded` chain verbatim. boa 0.22 evaluates
-//! `this` inside the DOUBLY-NESTED arrow as `undefined` in module code (one
-//! arrow level is fine; the identical classic script is fine — see the pure-
-//! boa unit `boa_0_22_bug_this_is_undefined_through_nested_arrows_in_modules`
-//! in `src/js.rs`), so `undefined` lands in the spring's
-//! `Symbol(FluidValue.observers)` Set and the next change flush —
-//! `flushObservers(spring)` ≙ the pack's `et` inside the frame loop — throws
-//! the production TypeError out of `Set::forEach`.
+//! runs the pack's `rt`/`observerAdded` chain verbatim. Upstream boa_ast
+//! 0.22.0 evaluated `this` inside the DOUBLY-NESTED arrow as `undefined` in
+//! module code (`globalThis` in classic scripts), so `undefined` landed in
+//! the spring's `Symbol(FluidValue.observers)` Set and the next change flush
+//! — `flushObservers(spring)` ≙ the pack's `et` inside the frame loop —
+//! threw out of `Set::forEach`. With the fork fix the observer registered is
+//! the real `InterpolateFn` and the flush succeeds.
 //!
-//! Headless (no `$DISPLAY`, localhost only). Run the reproduction (currently
-//! pinned by `#[ignore]` — it must flip to the healthy assertion once the
-//! engine bug is fixed):
-//!
-//! ```text
-//! cargo test -p ironsurf-tab --test react_spring_observer_this -- --ignored --nocapture
-//! ```
+//! Headless (no `$DISPLAY`, localhost only). Both tests run in the default
+//! suite: `spring_observer_registration_survives_the_frame_flush` asserts
+//! the healthy title, `fixture_page_reports_no_console_errors` asserts the
+//! page logs no `console [error]` line to the tab's stderr.
 
 use std::io::{Read, Write};
 use std::net::TcpListener;
@@ -234,13 +233,14 @@ fn spawn_tab(url: &str, profile_dir: &std::path::Path) -> (TabChild, std::path::
     )
 }
 
-/// CURRENT-BOA BUG PIN (passes today): the ES-module react-spring port
-/// registers an `undefined` observer and the flush throws the production
-/// message. When the engine bug is fixed THIS test flips — invert it
-/// alongside `boa_0_22_bug_this_is_undefined_through_nested_arrows_in_modules`
-/// (src/js.rs) and un-ignore the health test below.
+/// FIXED-ENGINE REGRESSION (was the current-boa bug pin, inverted on fix):
+/// the ES-module react-spring port must register the REAL `InterpolateFn`
+/// observer (not `undefined`), the frame flush must not throw, and the page
+/// must log NO `console [error]` line to the tab's stderr — the production
+/// signature was `TypeError: cannot convert 'null' or 'undefined' to object`
+/// out of `Set::forEach` (see `thirdparty/boa/PATCH.md`).
 #[test]
-fn boa_bug_repro_undefined_observer_throws_the_production_typeerror() {
+fn fixture_page_reports_no_console_errors() {
     let port = spawn_local_http();
     let dir = tempfile::tempdir().expect("tempdir");
     let (mut tab, stderr_path) = spawn_tab(
@@ -248,36 +248,25 @@ fn boa_bug_repro_undefined_observer_throws_the_production_typeerror() {
         dir.path(),
     );
     let titles = tab.wait_any_title();
-    let stderr_text = {
-        // Let the console line reach the stderr log, then read it.
-        let deadline = Instant::now() + DEADLINE;
-        let mut text = String::new();
-        loop {
-            text = std::fs::read_to_string(&stderr_path).unwrap_or_default();
-            if text.contains("cannot convert") || Instant::now() >= deadline {
-                break;
-            }
-            tab.pump();
-            thread::sleep(Duration::from_millis(100));
-        }
-        text
-    };
+    // Give any (hypothetical) console line a moment to reach the stderr log.
+    thread::sleep(Duration::from_millis(500));
+    let stderr_text = std::fs::read_to_string(&stderr_path).unwrap_or_default();
     let final_title = titles.last().cloned().unwrap_or_default();
     assert_eq!(
-        final_title, "THROW:TypeError",
-        "fixture title must report the throw (stderr: {stderr_text})"
+        final_title, "SPRING-OK",
+        "fixture title must report the healthy flush (stderr: {stderr_text})"
     );
     assert!(
-        stderr_text.contains("TypeError: cannot convert 'null' or 'undefined' to object"),
-        "stderr must carry the exact production TypeError (titles: {titles:?})"
+        !stderr_text.contains("console [error]")
+            && !stderr_text.contains("cannot convert"),
+        "stderr must be free of js console errors (titles: {titles:?}; stderr: {stderr_text})"
     );
     let _ = tab.child.kill();
 }
 
-/// THE HEALTHY ASSERTION (currently fails on boa 0.22 — task #69's fix flips
-/// the pair). Run with `-- --ignored`.
+/// THE HEALTHY ASSERTION (un-ignored on fix — used to be the reproduction
+/// pinned for task #69).
 #[test]
-#[ignore = "boa 0.22 bug: `this` is undefined through >=2 nested arrows in module code, so react-spring registers an undefined observer (see module docs)"]
 fn spring_observer_registration_survives_the_frame_flush() {
     let port = spawn_local_http();
     let dir = tempfile::tempdir().expect("tempdir");

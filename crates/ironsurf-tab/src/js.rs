@@ -10564,22 +10564,27 @@ mod tests {
     }
 
     // ---------------------------------------------------------------------
-    // boa 0.22 ENGINE BUG (root-caused on infosec.exchange/explore, task #69)
+    // boa 0.22 ENGINE BUG — FIXED in the vendored fork (thirdparty/boa,
+    // see thirdparty/boa/PATCH.md; root-caused on infosec.exchange/explore,
+    // task #69). Regression tests for the fixed `this` semantics.
     // ---------------------------------------------------------------------
 
-    /// Pure boa 0.22 (fresh default realm, NO glue): in code compiled as an
-    /// **ES module**, a class method's `this` is lost (`undefined`) when it is
-    /// reached through TWO OR MORE nested nested arrow functions, while one
-    /// arrow level keeps it and the identical code evaluated as a CLASSIC
-    /// script keeps it at any depth. Live consequence: @react-spring/core's
+    /// Fresh-default-realm (NO glue) regression test for the forked boa_ast
+    /// fix: a class method's `this` must survive **any depth of nested arrow
+    /// functions**, in both module and classic-script compilation. Before the
+    /// fork fix, upstream boa_ast 0.22 lost `this` (undefined in modules,
+    /// globalThis in scripts) through >=2 nested arrows: the scope analyzer's
+    /// `escape_this_in_enclosing_function_scope` stopped at the outer arrow's
+    /// function scope — which cannot bind `this` — so the method's function
+    /// environment (the `this` holder) was never pushed. Live consequence
+    /// back then: @react-spring/core's
     /// `observerAdded(e){e==1&&N(this.inputs,e=>N(e,e=>z(e)&&rt(e,this)))}`
-    /// registers `undefined` into a spring's FluidValue-observers Set, and the
-    /// next rAF advance throws `TypeError: cannot convert 'null' or
-    /// 'undefined' to object` out of `Set::forEach`. This test pins the WRONG
-    /// (buggy) behaviour so the fix task sees it flip; see
-    /// `tests/react_spring_observer_this.rs` for the end-to-end fixture.
+    /// registered `undefined` into a spring's FluidValue-observers Set and the
+    /// next rAF advance threw `TypeError: cannot convert 'null' or 'undefined'
+    /// to object` out of `Set::forEach`. See also
+    /// `tests/react_spring_observer_this.rs` (end-to-end fixture).
     #[test]
-    fn boa_0_22_bug_this_is_undefined_through_nested_arrows_in_modules() {
+    fn this_survives_nested_arrows_in_modules_and_scripts() {
         // Same body evaluated two ways: as a module and as a classic script.
         let body = r#"
 class C {
@@ -10595,9 +10600,25 @@ class C {
       });
     });
   }
+  three(){
+    [0].forEach(a => [0].forEach(b => [0].forEach(c => {
+      globalThis[which + "Three"] = String(this instanceof C);
+    })));
+  }
+  identity(){
+    const o = {};
+    [0].forEach(e => [0].forEach(v => {
+      globalThis[which + "Identity"] = String(this === o);
+    }));
+    return o;
+  }
 }
-new C().one();
-new C().two();
+const c = new C();
+c.one();
+c.two();
+c.three();
+c.identity();
+globalThis[which + "Self"] = String((function(){ return (() => this === undefined)(); }).call(undefined));
 "#;
         let mut context = Context::default();
 
@@ -10639,8 +10660,33 @@ new C().two();
         assert_eq!(probe("mOne"), "object", "module, one arrow level");
         assert_eq!(
             probe("mTwo"),
-            "undefined",
-            "boa 0.22 BUG: `this` is undefined through >=2 nested arrows in module code"
+            "object",
+            "fork fix: `this` survives two nested arrows in module code"
+        );
+        assert_eq!(
+            probe("mThree"),
+            "true",
+            "fork fix: `this` keeps receiver identity three arrows deep"
+        );
+        assert_eq!(
+            probe("cThree"),
+            "true",
+            "classic script: receiver identity three arrows deep"
+        );
+        assert_eq!(
+            probe("mIdentity"),
+            "false",
+            "`this` is the receiver, never a sibling object"
+        );
+        assert_eq!(
+            probe("mSelf"),
+            "true",
+            "non-escaping `this` in a plain (strict) function is untouched"
+        );
+        assert_eq!(
+            probe("cSelf"),
+            "false",
+            "classic/sloppy: .call(undefined) rebinds to globalThis, untouched by the fix"
         );
     }
 }

@@ -692,6 +692,17 @@ rejections print error **stacks** — the single most valuable debug affordance 
 Honest gaps: SVG content paints as empty boxes (structure exists, rendering doesn't), timers
 still drive nothing off `document.visibilityState`, and unhead/helmet's deferred-init timer
 still throws once (`createContext` undefined there — a module-cycle quirk, page survives).
+**`boa_ast` is forked** (task: the explore-page react-spring `TypeError: cannot convert
+'null' or 'undefined' to object`): upstream `Scope::escape_this_in_enclosing_function_scope`
+stops escaping `this` at the first enclosing function scope — even an arrow's, which cannot
+bind `this` — so any `this` reached through **2+ nested arrows** lost its binding: the real
+`this`-binding function never got `requires_function_scope`, its function environment was
+never pushed, and the `This` opcode fell through to `undefined` (modules) / `globalThis`
+(scripts). Vendored as `thirdparty/boa/boa_ast` (stock 0.22.0 + a two-hunk fix: function
+scopes record arrow-ness; the escape walk keeps going through arrow scopes) and wired in
+via `[patch.crates-io]` in the root `Cargo.toml` — the fix is tracked in git, not applied
+to registry checkouts; see `thirdparty/boa/PATCH.md` (upstream `main` is still unfixed).
+Live effect: chevron_right's rAF frame flush no longer throws on infosec.exchange/explore.
 The binding surface stays:
 - `window` (eventTarget-ish no-ops), `document.title` get/set (set → `FromTab::TitleChanged`
   and repaint), `document.body.textContent` read-only snapshot,
