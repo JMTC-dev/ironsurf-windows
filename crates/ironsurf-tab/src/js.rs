@@ -10562,6 +10562,87 @@ mod tests {
             vec!["https://modules.test/app/dep.js".to_string()]
         );
     }
+
+    // ---------------------------------------------------------------------
+    // boa 0.22 ENGINE BUG (root-caused on infosec.exchange/explore, task #69)
+    // ---------------------------------------------------------------------
+
+    /// Pure boa 0.22 (fresh default realm, NO glue): in code compiled as an
+    /// **ES module**, a class method's `this` is lost (`undefined`) when it is
+    /// reached through TWO OR MORE nested nested arrow functions, while one
+    /// arrow level keeps it and the identical code evaluated as a CLASSIC
+    /// script keeps it at any depth. Live consequence: @react-spring/core's
+    /// `observerAdded(e){e==1&&N(this.inputs,e=>N(e,e=>z(e)&&rt(e,this)))}`
+    /// registers `undefined` into a spring's FluidValue-observers Set, and the
+    /// next rAF advance throws `TypeError: cannot convert 'null' or
+    /// 'undefined' to object` out of `Set::forEach`. This test pins the WRONG
+    /// (buggy) behaviour so the fix task sees it flip; see
+    /// `tests/react_spring_observer_this.rs` for the end-to-end fixture.
+    #[test]
+    fn boa_0_22_bug_this_is_undefined_through_nested_arrows_in_modules() {
+        // Same body evaluated two ways: as a module and as a classic script.
+        let body = r#"
+class C {
+  one(){
+    [0].forEach(e => {
+      globalThis[which + "One"] = typeof this;
+    });
+  }
+  two(){
+    [0].forEach(e => {
+      [0].forEach(v => {
+        globalThis[which + "Two"] = typeof this;
+      });
+    });
+  }
+}
+new C().one();
+new C().two();
+"#;
+        let mut context = Context::default();
+
+        // As an ES MODULE (what a `<script type=module>` body becomes).
+        context
+            .global_object()
+            .set(js_string!("which"), JsValue::from(js_string!("m")), false, &mut context)
+            .expect("global write");
+        let module = Module::parse(
+            Source::from_bytes(body.as_bytes()),
+            None,
+            &mut context,
+        )
+        .expect("module parses");
+        let promise = module.load_link_evaluate(&mut context);
+        context.run_jobs().expect("module jobs run");
+        assert!(matches!(promise.state(), PromiseState::Fulfilled(_)));
+
+        // As a CLASSIC SCRIPT (identical source text).
+        context
+            .global_object()
+            .set(js_string!("which"), JsValue::from(js_string!("c")), false, &mut context)
+            .expect("global write");
+        context
+            .eval(Source::from_bytes(body.as_bytes()))
+            .expect("classic evals");
+
+        let mut probe = |name: &str| -> String {
+            context
+                .global_object()
+                .get(js_string!(name), &mut context)
+                .expect("global read")
+                .as_string()
+                .map(|s| s.to_std_string_escaped())
+                .unwrap_or_default()
+        };
+        assert_eq!(probe("cOne"), "object", "classic script, one arrow level");
+        assert_eq!(probe("cTwo"), "object", "classic script, two arrow levels");
+        assert_eq!(probe("mOne"), "object", "module, one arrow level");
+        assert_eq!(
+            probe("mTwo"),
+            "undefined",
+            "boa 0.22 BUG: `this` is undefined through >=2 nested arrows in module code"
+        );
+    }
 }
 
 
@@ -10885,4 +10966,5 @@ mod local_storage_tests {
             "localStorage is durable on disk, per origin"
         );
     }
+
 }
