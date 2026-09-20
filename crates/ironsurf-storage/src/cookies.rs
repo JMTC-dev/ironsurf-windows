@@ -13,8 +13,9 @@
 //!   single-label (undotted) domains can never widen scope;
 //! - path matching is RFC6265 section 5.1.4 verbatim (`/foo` matches `/foo`
 //!   and `/foo/bar` but not `/foobar`; `/foo/` never matches bare `/foo`);
-//! - `HttpOnly` is captured and persisted (never exposed to scripts — the JS
-//!   layer has no cookie access at all) but still sent normally over HTTP;
+//! - `HttpOnly` is captured and persisted (never exposed to scripts — the
+//!   `document_cookie` view omits such cookies entirely) but still sent
+//!   normally over HTTP;
 //! - expired cookies are pruned on load, on access, and on `set` replacement
 //!   (a `Set-Cookie` whose `Expires` is already past deletes the cookie it
 //!   would have replaced, exactly like a `Max-Age<=0`);
@@ -37,7 +38,7 @@ pub struct Cookie {
 }
 
 #[derive(Default)]
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct CookieJar {
     path: Option<PathBuf>,
     cookies: Vec<Cookie>,
@@ -195,7 +196,27 @@ impl CookieJar {
 
     /// `Cookie:` header value ("a=1; b=2") for `request_url`, or `None` if
     /// no cookie applies. Expired cookies are pruned during the scan.
+    /// Includes `HttpOnly` cookies — this is the wire view.
     pub fn cookie_header(&self, request_url: &url::Url, now_unix: i64) -> Option<String> {
+        self.cookie_string(request_url, now_unix, false)
+    }
+
+    /// The `document.cookie` getter view: the same matching rules as
+    /// [`Self::cookie_header`] but **`HttpOnly` cookies never appear** —
+    /// that attribute exists precisely to hide a cookie from scripts while
+    /// it keeps riding on HTTP requests. Answers `""` (not `None`) when
+    /// nothing visible applies, which is what browsers hand scripts.
+    pub fn document_cookie(&self, request_url: &url::Url, now_unix: i64) -> String {
+        self.cookie_string(request_url, now_unix, true)
+            .unwrap_or_default()
+    }
+
+    fn cookie_string(
+        &self,
+        request_url: &url::Url,
+        now_unix: i64,
+        skip_http_only: bool,
+    ) -> Option<String> {
         // Interior mutability is not worth it here: prune via a const-safe
         // scan and rely on callers mutating through &mut elsewhere.
         let is_https = request_url.scheme() == "https";
@@ -206,6 +227,7 @@ impl CookieJar {
             .iter()
             .filter(|c| c.expires_unix.map(|e| e > now_unix).unwrap_or(true))
             .filter(|c| !(c.secure && !is_https))
+            .filter(|c| !(skip_http_only && c.http_only))
             .filter(|c| domain_match(&host, &c.domain))
             .filter(|c| path_match(&req_path, &c.path))
             .collect();

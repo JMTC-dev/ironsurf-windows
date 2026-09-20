@@ -372,7 +372,8 @@ pub struct Cookie { pub name: String, pub value: String, pub domain: String,
                     pub expires_unix: Option<i64> }
 impl CookieJar {
     pub fn set_from_set_cookie(&mut self, request_url: &url::Url, header_value: &str, now_unix: i64);
-    pub fn cookie_header(&self, request_url: &url::Url, now_unix: i64) -> Option<String>; // "a=1; b=2"
+    pub fn cookie_header(&self, request_url: &url::Url, now_unix: i64) -> Option<String>; // "a=1; b=2" (wire view, incl. HttpOnly)
+    pub fn document_cookie(&self, request_url: &url::Url, now_unix: i64) -> String; // script view: same matching, HttpOnly hidden, "" when nothing visible
     pub fn save(&self) -> Result<(), StoreError>;
     pub fn clear(&mut self);
     pub fn cookies(&self) -> &[Cookie];
@@ -388,8 +389,9 @@ impl CookieJar {
 //    request host or with a single-label value it rejects the cookie
 //  - path prefix match per RFC6265 §5.1.4 verbatim (/foo matches /foo and
 //    /foo/bar, never /foobar; /foo/ never matches bare /foo)
-//  - HttpOnly is captured/persisted (scripts never see cookies at all) and
-//    is still sent normally over HTTP
+//  - HttpOnly is captured/persisted and still sent normally over HTTP, but
+//    it is NEVER in the `document_cookie` (script) view — that attribute
+//    exists precisely to hide a cookie from scripts while it keeps riding
 //  - expired cookies are dropped on load/access; an already-expired
 //    Set-Cookie (or Max-Age<=0, or a malformed Max-Age) deletes the cookie
 //    it names instead of storing it
@@ -749,7 +751,36 @@ The binding surface stays:
   storage is per container *and* per origin (two tabs of one container on different origins never
   read each other's data; a tab restart keeps its areas; the sandbox hides them from other
   containers).
-  `console.log/info/warn/error` → tab stderr + `FromTab::StatusText` **and** a
+- **`document.cookie` reads and writes the container's live cookie jar** (task: the axios XSRF
+  read — Mastodon's request layer did `document.cookie.match(…)`, read `undefined`, and died
+  with boa's `TypeError: cannot convert 'null' or 'undefined' to object`). Both directions funnel
+  through ONE native (`__ironsurfCookies(op, value)`), and all rules live on the Rust side: the
+  document URL is re-parsed from the host state on *every* call (never cached), only `http`/`https`
+  documents have cookies at all, and reads answer `CookieJar::document_cookie` — the jar's
+  **script-visible view**: the identical domain/path/Secure/expiry matching the wire `Cookie:`
+  header uses (longer paths first), with `HttpOnly` entries hidden. Writes ride the jar's RFC6265
+  `Set-Cookie` parser (so `Path`/`Domain`/`Expires`/`Max-Age` all behave like the network path,
+  including delete-by-expiry), after the native strips any `HttpOnly` attribute — scripts can
+  never mint one. Cookieless documents (opaque origin, bare tests, the headless harness) read
+  `""` and silently drop writes — **never `undefined`**, which is what made axios die. The tab
+  hands the JS host the very `Arc<Mutex<CookieJar>>` the network provider captures `Set-Cookie`
+  into, so a server cookie is script-readable the moment the response lands and a script-set
+  cookie rides out on the very next request (`tests/cookies.rs` pins both halves: the exact page
+  title never contains the HttpOnly value, the server-side `Cookie:` header always does).
+- **`fetch`/`Request` accept what real pages hand them** (task: infosec.exchange's API layer —
+  Mastodon's axios builds `Object.assign(Object.create(null), N, {signal: O, …, body: data})`,
+  a null-prototype init whose nullable members are present-but-null). Two glue steps, in PRELUDE:
+  a present-null `signal`/`body` normalises to `undefined` through a shallow copy (boa's `TryFromJs`
+  demuxes only `undefined`; a present `null` died as "cannot convert value to a Object" for the
+  signal and "body is not a supported type" for the body — every Mastodon API request carried
+  `signal: null`); and a string resource is resolved against the DOCUMENT base like browsers —
+  Mastodon's same-origin `/api/v2/…` style survived as an authority-less URI into reqwest, whose
+  build failure surfaced as the http crate's Display, literally `builder error`, an opaque rejection
+  no one could debug. `null`/`undefined` resources are NOT absolutized (they must reject TypeError,
+  not silently GET the base URL — pinned), the caller's init is never mutated, and the `Request`
+  wrapper returns the raw instance keeping `instanceof` semantics (`tests/fetch_init.rs` pins the
+  full axios-shaped init end-to-end against a live local server, incl. the relative-path case).
+- `console.log/info/warn/error` → tab stderr + `FromTab::StatusText` **and** a
   `FromTab::ConsoleLog { source: "js", level, message }` per line (all four levels, page order).
 - **`window.alert`/`confirm`/`prompt` are implemented as real synchronous modals**: the native
   emits `FromTab::DialogRequest` and **blocks the calling script in place** — pumping stdin

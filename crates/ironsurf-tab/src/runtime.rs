@@ -1635,6 +1635,12 @@ impl Tab {
         // handle (task: per-origin DOM storage); the per-origin rule is
         // enforced natively against the host URL set just above.
         host.borrow_mut().local_storage = Some(Arc::clone(&self.local_storage));
+        // `document.cookie` reaches the container jar through this handle
+        // (task: the axios XSRF read): the SAME `Arc` the provider captures
+        // `Set-Cookie` into, so scripts read the cookies the wire rides on
+        // (minus HttpOnly, enforced in the native) and cookies scripts set
+        // go out on the next request — one jar, both directions.
+        host.borrow_mut().cookies = Some(Arc::clone(&self.jar));
         debug!(
             "running {} script(s) for {url}; skipped: {:?}",
             extraction.scripts.len(),

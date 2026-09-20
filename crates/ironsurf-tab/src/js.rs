@@ -983,6 +983,14 @@ pub struct HostState {
     /// access. `None` behaves exactly like an opaque origin: the surface
     /// exists but every access is denied (bare JS tests without a store).
     pub local_storage: Option<SharedLocalStorage>,
+    /// The container's **cookie jar** cell (task: `document.cookie`).
+    /// The very `Arc` the tab's fetchers write `Set-Cookie` into, handed to
+    /// the bindings so `document.cookie` reads and writes the live jar:
+    /// reads answer the script-visible view for the CURRENT document URL
+    /// (jar matching, HttpOnly hidden), writes ride the RFC6265 parser on
+    /// the Rust side. `None` (bare JS tests, the headless harness) behaves
+    /// like a cookieless document: reads return `""`, writes are ignored.
+    pub cookies: Option<SharedCookieJar>,
 }
 
 impl HostState {
@@ -1026,6 +1034,14 @@ pub type HostRef = Rc<RefCell<HostState>>;
 /// through an origin re-resolved from the CURRENT document URL, so the
 /// per-origin security rule is enforced on the Rust side of the native.
 pub type SharedLocalStorage = Arc<std::sync::Mutex<ironsurf_storage::LocalStorage>>;
+
+/// The tab's container cookie jar (task: `document.cookie`): the SAME
+/// `Arc<Mutex<CookieJar>>` the network layer captures `Set-Cookie` into
+/// ([`crate::netmod`]/the BlitzNet provider own it), borrowed by the JS
+/// bindings so scripts see — and extend — exactly the cookies the wire
+/// rides on. All matching rules live in `ironsurf_storage::CookieJar`;
+/// the bindings only ever re-resolve the document URL at call time.
+pub type SharedCookieJar = Arc<std::sync::Mutex<ironsurf_storage::CookieJar>>;
 
 /// One scheduled timer. Callbacks are `JsValue`s from the owning [`JsRuntime`]'s
 /// realm (boa 0.22 keeps GC objects alive while a `JsValue` handle exists, so
@@ -3096,6 +3112,7 @@ mod native {
     pub(super) const MEDIA_CMD: &str = "__ironsurfMediaCmd";
     pub(super) const DIALOG: &str = "__ironsurfDialog";
     pub(super) const STORAGE: &str = "__ironsurfStorage";
+    pub(super) const COOKIES: &str = "__ironsurfCookies";
 }
 
 /// One-shot delay used for `requestAnimationFrame` (~60 Hz; the tab has no
@@ -4513,6 +4530,20 @@ const PRELUDE: &str = r##"
     },
     set title(value) {
       host.__ironsurfTitleSet(String(value));
+    },
+    // document.cookie (task: the axios XSRF read): both directions funnel
+    // through the ONE cookies native. Reads answer the container jar's
+    // script-visible view for THIS document URL (same domain/path/Secure
+    // matching the wire "Cookie:" header uses, HttpOnly entries hidden);
+    // writes ride the jar's RFC6265 parser, with the native stripping any
+    // HttpOnly attribute a page tries to set. Cookieless documents (opaque
+    // origin, no jar) read "" and silently drop writes — never `undefined`,
+    // which is exactly what made axios die.
+    get cookie() {
+      return String(host.__ironsurfCookies("get", null));
+    },
+    set cookie(value) {
+      host.__ironsurfCookies("set", String(value));
     },
     get URL() {
       return host.__ironsurfUrl;
@@ -6602,6 +6633,61 @@ const PRELUDE: &str = r##"
   // with "Resource must be a URL or Request object", silently rejecting the
   // custom-emoji request that gates the React render. Unwrap URL-likes to
   // their href; Request objects go through untouched.
+  // …and a RequestInit whose NULLABLE members are present-but-null is the
+  // spec's way of saying "no value": `signal: null` = no signal, `body:
+  // null` = no body. boa_runtime 0.22 converts its init with `TryFromJs`,
+  // whose `Option<T>` demuxes only `undefined` — a PRESENT `null` falls
+  // into the conversion arm, and `fetch(url, {signal: null})` dies as
+  // `TypeError: cannot convert value to a Object` while `body: null` dies
+  // as `Request constructor: body is not a supported type`. Both are what
+  // Mastodon's axios sends: its fetch adapter builds `Object.assign(
+  // Object.create(null), N, {signal: O, method, headers, body: data, …})`,
+  // so a GET arrives with `signal: null`-shaped members and a null data.
+  // Present-but-null therefore normalises to undefined through a shallow
+  // copy — the caller's object is never mutated, and any non-null member
+  // rides through untouched.
+  // A string resource is resolved against the DOCUMENT base like browsers
+  // (Request and fetch share this step). The engine chain is otherwise
+  // honest to the string it is handed, and a path-relative "/api/v2/…"
+  // (Mastodon's same-origin API style) survives into reqwest as a URI with
+  // no authority — where `Request::builder().build()` fails with the http
+  // crate's Display, literally "builder error", surfaced to the page as an
+  // opaque rejection no one can debug. Absolutizing here means relative
+  // requests reach the wire as real URLs.
+  function absolutizeUrlLike(input) {
+    try {
+      if (typeof input === "string") {
+        return new URL(input, host.location.href).href;
+      }
+    } catch (ignored) {
+      // an unparseable base or input rides through as-is
+    }
+    return input;
+  }
+  var NULLABLE_INIT_MEMBERS = ["signal", "body"];
+  function normalizeNullInit(init) {
+    try {
+      if (init !== null && typeof init === "object") {
+        var copy = null;
+        for (var i = 0; i < NULLABLE_INIT_MEMBERS.length; i++) {
+          var key = NULLABLE_INIT_MEMBERS[i];
+          if (init[key] === null) {
+            if (copy === null) {
+              copy = {};
+              Object.keys(init).forEach(function (k) {
+                copy[k] = init[k];
+              });
+            }
+            copy[key] = undefined;
+          }
+        }
+        if (copy !== null) return copy;
+      }
+    } catch (ignored) {
+      // fall through with the original argument
+    }
+    return init;
+  }
   if (typeof host.fetch === "function") {
     var rawFetch = host.fetch;
     host.fetch = function (resource, init) {
@@ -6623,8 +6709,28 @@ const PRELUDE: &str = r##"
       } catch (ignored) {
         // fall through with the original argument
       }
-      return rawFetch.call(host, resource, init);
+      return rawFetch.call(host, absolutizeUrlLike(resource), normalizeNullInit(init));
     };
+  }
+  // The `Request` constructor takes the same RequestInit through the same
+  // converter, so it gets the same normalisation. The wrapper returns the
+  // RAW instance (so `instanceof` answers off the original class) and
+  // forwards the prototype + `hasInstance` test, keeping the class-shaped
+  // surface browsers expose.
+  if (typeof host.Request === "function") {
+    var RawRequest = host.Request;
+    var RequestGlue = function (input, init) {
+      return new RawRequest(absolutizeUrlLike(input), normalizeNullInit(init));
+    };
+    RequestGlue.prototype = RawRequest.prototype;
+    Object.defineProperty(RequestGlue, "name", { value: "Request", configurable: true });
+    Object.defineProperty(RequestGlue, Symbol.hasInstance, {
+      value: function (x) {
+        return x instanceof RawRequest;
+      },
+      configurable: true,
+    });
+    host.Request = RequestGlue;
   }
 
   // Element interface classes (task: infosec.exchange). react-dom's commit
@@ -7320,6 +7426,111 @@ fn build_context_with_modules(
         }),
     ) {
         error!("js binding `localStorage` failed to install: {err}");
+    }
+    // document.cookie (task: the axios XSRF read — Mastodon's request layer
+    // did `document.cookie.match(...)`, read `undefined`, and died with boa's
+    // "cannot convert 'null' or 'undefined' to object"). ONE native funnels
+    // both directions, and all rules live HERE, not in JavaScript: the
+    // document URL is re-parsed from the host on EVERY call (never cached),
+    // only http/https documents have cookies at all, reads answer the jar's
+    // script-visible view (domain/path/Secure/expiry matching identical to
+    // the wire `Cookie:` header, `HttpOnly` entries hidden), and writes are
+    // fed through the jar's RFC6265 `Set-Cookie` parser — after the native
+    // strips any `HttpOnly` attribute, since scripts can never set one.
+    // No jar / no http(s) URL ⇒ reads answer "" and writes no-op (the
+    // spec's behaviour for opaque origins, and the honest answer offline).
+    if let Err(err) = context.register_global_builtin_callable(
+        JsString::from(native::COOKIES),
+        2,
+        NativeFunction::from_copy_closure(|_this, args, context| {
+            let op = args
+                .first()
+                .cloned()
+                .unwrap_or(JsValue::undefined())
+                .to_string(context)?
+                .to_std_string_escaped();
+            // Coercion runs before the host is touched (the rule every
+            // native follows).
+            let raw = arg_opt_string(args.get(1), context)?;
+            let (jar, url) = with_host(|host| (host.cookies.clone(), host.url.clone()))
+                .unwrap_or((None, String::new()));
+            let document_url = Url::parse(&url).ok().filter(|u| {
+                matches!(u.scheme(), "http" | "https") && u.host_str().is_some()
+            });
+            match op.as_str() {
+                "get" => {
+                    let text = match (&jar, document_url.as_ref()) {
+                        (Some(jar), Some(document_url)) => {
+                            let jar = jar
+                                .lock()
+                                .unwrap_or_else(|poisoned| poisoned.into_inner());
+                            jar.document_cookie(document_url, crate::netmod::now_unix())
+                        }
+                        _ => String::new(),
+                    };
+                    Ok(JsValue::from(JsString::from(text)))
+                }
+                "set" => {
+                    let Some(raw) = raw.filter(|raw| !raw.is_empty()) else {
+                        return Ok(JsValue::from(false));
+                    };
+                    // A cookie set from a script is NEVER HttpOnly: strip
+                    // the attribute before the jar sees it (RFC 6265 §5.3
+                    // reserves it for the `Set-Cookie` path only).
+                    let mut parts = raw.splitn(2, ';');
+                    let name_value = parts.next().unwrap_or("");
+                    let kept: Vec<String> = parts
+                        .next()
+                        .unwrap_or("")
+                        .split(';')
+                        .filter(|attr| {
+                            let key = attr
+                                .trim()
+                                .to_ascii_lowercase()
+                                .split('=')
+                                .next()
+                                .unwrap_or("")
+                                .to_string();
+                            key != "httponly"
+                        })
+                        .map(|attr| attr.to_string())
+                        .collect();
+                    let header = if kept.is_empty() {
+                        name_value.to_string()
+                    } else {
+                        format!("{name_value};{}", kept.join(";"))
+                    };
+                    match (&jar, document_url.as_ref()) {
+                        (Some(jar), Some(document_url)) => {
+                            let mut jar = jar
+                                .lock()
+                                .unwrap_or_else(|poisoned| poisoned.into_inner());
+                            jar.set_from_set_cookie(document_url, &header, crate::netmod::now_unix());
+                            if let Err(err) = jar.save() {
+                                // The live jar updated; only persistence
+                                // failed — the cookie still rides and reads.
+                                warn!("cookie persist failed for {url}: {err}");
+                            }
+                            Ok(JsValue::from(true))
+                        }
+                        _ => Ok(JsValue::from(false)),
+                    }
+                }
+                // Non-throwing probe (tests, diagnostics): what a GET would
+                // answer for, or whether a jar exists at all.
+                "url" => Ok(JsValue::from(JsString::from(
+                    document_url
+                        .as_ref()
+                        .map(|u| u.to_string())
+                        .unwrap_or_default(),
+                ))),
+                "has-jar" => Ok(JsValue::from(jar.is_some())),
+                // Unknown ops are inert (only our prelude calls this native).
+                _ => Ok(JsValue::undefined()),
+            }
+        }),
+    ) {
+        error!("js binding `cookies` failed to install: {err}");
     }
 
     // Timers: real queue entries the tab's poll loop executes. A non-callable
@@ -11013,4 +11224,248 @@ mod local_storage_tests {
         );
     }
 
+}
+
+#[cfg(test)]
+mod document_cookie_tests {
+    use super::*;
+
+    fn jar_cell() -> SharedCookieJar {
+        Arc::new(std::sync::Mutex::new(ironsurf_storage::CookieJar::new()))
+    }
+
+    fn host_for(url: &str, jar: Option<SharedCookieJar>) -> HostRef {
+        let mut state = HostState::new(url, None, None);
+        state.cookies = jar;
+        Rc::new(RefCell::new(state))
+    }
+
+    /// Evaluate a snippet in a fresh per-document world (prelude + natives).
+    fn eval_in(host: &HostRef, source: &str) -> JsValue {
+        let mut runtime = JsRuntime::new(Rc::clone(host));
+        runtime.eval(source).expect("snippet should evaluate")
+    }
+
+    fn eval_str(host: &HostRef, source: &str) -> String {
+        eval_in(host, source)
+            .as_string()
+            .map(|s| s.to_std_string_escaped())
+            .unwrap_or_default()
+    }
+
+    /// The regression pin for the axios XSRF crash (the Mastodon console
+    /// `TypeError: cannot convert 'null' or 'undefined' to object at read`):
+    /// `document.cookie` answers a STRING — possibly empty — on every
+    /// document, jar or no jar, so axios's `document.cookie.match(...)`
+    /// parses and answers `null` instead of throwing.
+    #[test]
+    fn cookie_getter_is_always_a_string_never_undefined() {
+        for url in ["about:blank", "data:text/html,x", "file:///x/y.html", "https://site.test/"] {
+            let host = host_for(url, None);
+            assert_eq!(
+                eval_str(&host, "typeof document.cookie"),
+                "string",
+                "{url}: document.cookie must be a string"
+            );
+            assert_eq!(eval_str(&host, "document.cookie"), "", "{url}: cookieless reads empty");
+        }
+        // The exact axios XSRF shape, live off a cookieless document.
+        let host = host_for("https://site.test/", None);
+        let answer = eval_in(
+            &host,
+            r#"(function () {
+                var m = document.cookie.match(/(?:^|;\s*)(XSRF-TOKEN)=([^;]*)/);
+                return m ? decodeURIComponent(m[2]) : "none";
+            })()"#,
+        );
+        assert_eq!(answer.as_string().map(|s| s.to_std_string_escaped()), Some("none".into()));
+    }
+
+    /// Both directions ride the jar: server-set cookies appear in the
+    /// getter (HttpOnly ones NEVER do, while they still go out on the wire),
+    /// page-set cookies land in the jar, a page's `HttpOnly` attribute is
+    /// stripped (scripts cannot mint one), and longer paths sort first.
+    #[test]
+    fn cookie_writes_and_reads_ride_the_container_jar() {
+        let jar = jar_cell();
+        let url = "https://forum.example.test/thread/42";
+        let host = host_for(url, Some(Arc::clone(&jar)));
+        // Seed the jar the way a server response would.
+        jar.lock().unwrap().set_from_set_cookie(
+            &Url::parse(url).unwrap(),
+            "session=SECRET; Path=/; HttpOnly",
+            crate::netmod::now_unix(),
+        );
+        jar.lock().unwrap().set_from_set_cookie(
+            &Url::parse(url).unwrap(),
+            "prefs=light; Path=/",
+            crate::netmod::now_unix(),
+        );
+        assert_eq!(
+            eval_str(&host, "document.cookie"),
+            "prefs=light",
+            "HttpOnly stays off the script view"
+        );
+        // Page writes: a default-path cookie and one path-scoped with an
+        // attempted HttpOnly flag.
+        eval_in(
+            &host,
+            r#"
+            document.cookie = "draft=d1";
+            document.cookie = "note=n; HttpOnly; Path=/thread";
+            "#,
+        );
+        assert_eq!(
+            eval_str(&host, "document.cookie"),
+            "draft=d1; note=n; prefs=light",
+            "RFC6265 longer-path-first order, page cookies visible"
+        );
+        let wire = jar
+            .lock()
+            .unwrap()
+            .cookie_header(&Url::parse(url).unwrap(), crate::netmod::now_unix());
+        assert_eq!(
+            wire.as_deref(),
+            Some("draft=d1; note=n; session=SECRET; prefs=light"),
+            "the wire rides everything, including the script-set cookies"
+        );
+        {
+            let jar = jar.lock().unwrap();
+            let note = jar
+                .cookies()
+                .iter()
+                .find(|c| c.name == "note")
+                .expect("note landed in the jar");
+            assert!(!note.http_only, "a page's HttpOnly attribute must be stripped");
+        }
+        // Path scoping: from another path on the same host only the
+        // root-path cookies remain visible.
+        let elsewhere = host_for("https://forum.example.test/other", Some(Arc::clone(&jar)));
+        assert_eq!(eval_str(&elsewhere, "document.cookie"), "prefs=light");
+        // Deletion the browser way: an expired Max-Age removes the cookie.
+        eval_in(&host, r#"document.cookie = "draft=x; Max-Age=0";"#);
+        assert_eq!(
+            eval_str(&host, "document.cookie"),
+            "note=n; prefs=light",
+            "Max-Age=0 deletes (name+path must match)"
+        );
+    }
+
+    /// An expired `Expires=` write deletes like browsers; a second jar (a
+    /// different container) shares nothing, and writes on a cookieless
+    /// document are silently dropped rather than throwing.
+    #[test]
+    fn expiry_deletes_and_cookieless_documents_drop_writes() {
+        let jar = jar_cell();
+        let host = host_for("https://shop.example.test/cart", Some(Arc::clone(&jar)));
+        eval_in(&host, r#"document.cookie = "cart=9; Expires=Wed, 09 Jun 2021 10:18:14 GMT";"#);
+        assert_eq!(eval_str(&host, "document.cookie"), "");
+        let other = host_for("https://shop.example.test/cart", None);
+        assert_eq!(
+            eval_str(&other, r#"(function(){ document.cookie = "x=1"; return document.cookie; })()"#),
+            "",
+            "no jar: writes are inert, reads stay empty"
+        );
+    }
+
+
+}
+
+#[cfg(test)]
+mod request_init_tests {
+    use super::*;
+
+    fn host() -> HostRef {
+        Rc::new(RefCell::new(HostState::new(
+            "https://example.test/page.html",
+            None,
+            None,
+        )))
+    }
+
+    /// Evaluate a snippet in a fresh per-document world (prelude + natives,
+    /// including boa_runtime's fetch/Request layer).
+    fn eval(host: &HostRef, source: &str) -> JsValue {
+        let mut runtime = JsRuntime::new(Rc::clone(host));
+        runtime.eval(source).expect("snippet should evaluate")
+    }
+
+    fn eval_true(host: &HostRef, source: &str) -> bool {
+        eval(host, source).as_boolean().unwrap_or(false)
+    }
+
+    /// A RequestInit with NULLABLE members present-as-null (`{signal: null}`,
+    /// `{body: null}`) is the spec's own way of saying "no signal" / "no
+    /// body", but boa_runtime 0.22 converts init through `TryFromJs`, whose
+    /// `Option<T>` demuxes only `undefined` — a present `null` fell into the
+    /// conversion arm and died as `TypeError: cannot convert value to a
+    /// Object` (signal) or "Request constructor: body is not a supported
+    /// type" (body). This is the path Mastodon's axios fetch adapter walks:
+    /// every request is `new Request(url, Object.assign(Object.create(null),
+    /// N, {signal: O, method, headers, body: data, duplex, credentials}))`,
+    /// so a GET arrives with null-prototype init and null-ish signal/data.
+    /// The prelude normalises present-but-null `signal`/`body` to undefined
+    /// through a shallow copy before the raw converter sees them. (Asserts
+    /// are behavioural: boa_runtime 0.22 exposes NO `.method`/`.body`/
+    /// `.signal` getters on Request, so echo checks happen response-side in
+    /// the real-tab `fetch_init` e2e instead of on the instance here.)
+    #[test]
+    fn request_init_normalises_null_signal_and_body() {
+        let host = host();
+        // The bare shape: null signal AND null body construct, not throw.
+        assert!(
+            eval_true(
+                &host,
+                r#"(function () {
+                    var r = new Request("https://example.test/api", { signal: null, body: null });
+                    return typeof r === "object" && r !== null;
+                })()"#
+            ),
+            "null signal/body must read as no-signal/no-body, not throw"
+        );
+        // axios's EXACT shape: null-prototype init, null-prototype headers,
+        // null signal + body, unknown members (duplex, credentials)
+        // tolerated — and the caller's object left untouched (the copy is a
+        // copy, never a mutation).
+        assert!(
+            eval_true(
+                &host,
+                r#"(function () {
+                    var h = Object.assign(Object.create(null), { Accept: "application/json, text/plain, */*" });
+                    var P = Object.assign(Object.create(null), {
+                        signal: null, method: "GET", headers: h, body: null,
+                        duplex: "half", credentials: "same-origin",
+                    });
+                    var r = new Request("https://example.test/api2", P);
+                    return r !== null && P.signal === null && P.body === null;
+                })()"#
+            ),
+            "the axios-shaped init must construct and stay untouched"
+        );
+        // Class surface intact through the wrapper.
+        assert!(
+            eval_true(
+                &host,
+                r#"(function () {
+                    var r = new Request("https://example.test/api3", { signal: null });
+                    return Request.name === "Request"
+                        && r instanceof Request
+                        && Request.prototype.isPrototypeOf(r);
+                })()"#
+            ),
+            "the Request wrapper keeps the class-shaped surface browsers expose"
+        );
+        // A REAL AbortSignal still flows into the constructor untouched.
+        assert!(
+            eval_true(
+                &host,
+                r#"(function () {
+                    var c = new AbortController();
+                    new Request("https://example.test/api4", { signal: c.signal });
+                    return true;
+                })()"#
+            ),
+            "a non-null signal must survive the normalisation"
+        );
+    }
 }

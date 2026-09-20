@@ -325,3 +325,40 @@ fn jar_persists_per_container_file() {
     jar.save().unwrap();
     assert!(ca.cookie_jar().cookies().is_empty());
 }
+
+// --- the `document.cookie` view (task: scripts see the jar, minus HttpOnly) --
+
+#[test]
+fn document_cookie_view_hides_httponly_but_keeps_the_wire_view() {
+    let mut jar = jar_with("secret=1; Path=/; HttpOnly", "https://example.com/");
+    jar.set_from_set_cookie(&url("https://example.com/"), "public=2; Path=/", T);
+
+    // The wire still rides both cookies...
+    assert_eq!(
+        jar.cookie_header(&url("https://example.com/"), T).as_deref(),
+        Some("secret=1; public=2")
+    );
+    // ...scripts see only the non-HttpOnly one.
+    assert_eq!(
+        jar.document_cookie(&url("https://example.com/"), T),
+        "public=2"
+    );
+}
+
+#[test]
+fn document_cookie_matches_path_secure_and_expiry_like_the_wire() {
+    let mut jar = CookieJar::new();
+    jar.set_from_set_cookie(&url("https://example.com/app/"), "in_app=1; Path=/app", T);
+    jar.set_from_set_cookie(&url("https://example.com/"), "root=2; Path=/; Secure", T);
+    jar.set_from_set_cookie(&url("https://example.com/"), "gone=3; Path=/; Max-Age=-1", T);
+
+    // /app sees the path-scoped cookie plus the root one (longer path first).
+    assert_eq!(
+        jar.document_cookie(&url("https://example.com/app/page"), T),
+        "in_app=1; root=2"
+    );
+    // The Secure cookie is invisible over http — to scripts exactly as on the wire.
+    assert_eq!(jar.document_cookie(&url("http://example.com/app/x"), T), "in_app=1");
+    // Nothing visible answers "" (browsers hand scripts empty strings, not null).
+    assert_eq!(jar.document_cookie(&url("https://other.test/"), T), "");
+}
