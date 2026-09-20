@@ -2725,17 +2725,24 @@ fn register_dom_natives(context: &mut Context) {
             if mutator.doc.get_node(node_id(node)).is_none() {
                 return Err(JsNativeError::typ().with_message("NotFoundError: node is gone"));
             }
-            // Remove the stored attribute whose local name matches (the
-            // parser stores full QualNames pages cannot spell).
+            // Remove the stored attribute whose name matches: either the
+            // bare local name (the parser stores full QualNames pages
+            // cannot spell) or the `prefix:local` serialization react-dom
+            // passes to removeAttributeNS for SVG `xlink:href`.
             let existing = mutator
                 .doc
                 .get_node(node_id(node))
                 .and_then(|node| node.element_data())
                 .and_then(|element| {
-                    element
-                        .attrs
-                        .iter()
-                        .find(|attr| str::eq_ignore_ascii_case(&attr.name.local, name.as_str()))
+                    element.attrs.iter().find(|attr| {
+                        attr.name.prefix.as_ref().map_or_else(
+                            || str::eq_ignore_ascii_case(&attr.name.local, name.as_str()),
+                            |prefix| {
+                                format!("{prefix}:{}", attr.name.local).eq_ignore_ascii_case(name.as_str())
+                                    || str::eq_ignore_ascii_case(&attr.name.local, name.as_str())
+                            },
+                        )
+                    })
                 })
                 .map(|attr| attr.name.clone());
             if let Some(qual_name) = existing {
@@ -3719,7 +3726,22 @@ const PRELUDE: &str = r##"
             return idx < 0 || idx >= host.__ironsurfDomAttrCount(d, n) ? null : attrAt(idx);
           };
         if (key === "getNamedItem") return function (name) { return named(name); };
-        if (typeof key === "symbol") return undefined;
+        if (typeof key === "symbol") {
+          // NamedNodeMap is iterable (wetsuit's sanitizer runs
+          // `for (let attr of el.attributes)`); yields {name, value} snapshots.
+          if (key === Symbol.iterator)
+            return function () {
+              var arr = [];
+              var count = host.__ironsurfDomAttrCount(d, n);
+              for (var i = 0; i < count; i++) {
+                var a = attrAt(i);
+                if (a !== null) arr.push(a);
+              }
+              return arr[Symbol.iterator]();
+            };
+          if (key === Symbol.toStringTag) return "NamedNodeMap";
+          return undefined;
+        }
         var v = host.__ironsurfDomAttr(d, n, String(key));
         if (v !== null) return v; // attrs.class === "…" (string, like browsers)
         var i = toIndex(key);
@@ -3856,9 +3878,26 @@ const PRELUDE: &str = r##"
   );
   protoAccessor(
     "innerHTML",
-    function () { return host.__ironsurfDomSerialize(this.__d, this.__n, false); },
-    function (v) { host.__ironsurfDomSetInner(this.__d, this.__n, String(v)); }
+    function () {
+      if (isTemplateElement(this)) return templateContents(this).innerHTML;
+      return host.__ironsurfDomSerialize(this.__d, this.__n, false);
+    },
+    function (v) {
+      if (isTemplateElement(this)) { setTemplateContents(this, String(v)); return; }
+      host.__ironsurfDomSetInner(this.__d, this.__n, String(v));
+    }
   );
+  // HTMLTemplateElement.content — the inert DocumentFragment behind a
+  // <template>. wetsuit (mstdn.social's status composer) sanitizes HTML
+  // through `document.createElement("template"); t.innerHTML = html;
+  // walk(t.content)`, and without `content` the very first status render
+  // died reading `nodeType` of `undefined`. Contents live realm-side (blitz
+  // has no template content model): the fragment is a JS list of real,
+  // detached nodes, exactly like createDocumentFragment's.
+  protoGet("content", function () {
+    if (isTemplateElement(this)) return templateContents(this);
+    return undefined;
+  });
   protoGet("outerHTML", function () { return host.__ironsurfDomSerialize(this.__d, this.__n, true); });
 
   // ---------------------------------------------------------------------
@@ -4222,6 +4261,32 @@ const PRELUDE: &str = r##"
   protoMethod("hasAttribute", function (name) {
     return host.__ironsurfDomAttr(this.__d, this.__n, String(name)) !== null;
   });
+  // Element.getAttributeNames() — unhead's render loop (on every Mastodon
+  // page view) adopts orphaned tag elements with
+  // `for (let name of el.getAttributeNames())`, and the missing method
+  // threw "not a callable function" out of the provider's scheduler.
+  // The *NS variants: react-dom reaches for setAttributeNS the moment it
+  // patches an SVG `href`/`xlink:href` (Mastodon's icon <use> elements),
+  // and the missing method aborted the whole commit phase. Blitz stores
+  // attribute names verbatim, so the qualified name IS the storage key.
+  protoMethod("setAttributeNS", function (ns, name, value) {
+    host.__ironsurfDomAttrSet(this.__d, this.__n, String(name), String(value));
+  });
+  protoMethod("getAttributeNS", function (ns, name) {
+    return host.__ironsurfDomAttr(this.__d, this.__n, String(name));
+  });
+  protoMethod("removeAttributeNS", function (ns, name) {
+    host.__ironsurfDomAttrRemove(this.__d, this.__n, String(name));
+  });
+  protoMethod("getAttributeNames", function () {
+    var out = [];
+    var count = host.__ironsurfDomAttrCount(this.__d, this.__n);
+    for (var i = 0; i < count; i++) {
+      var pair = host.__ironsurfDomAttrAt(this.__d, this.__n, i);
+      if (pair !== null) out.push(pair[0]);
+    }
+    return out;
+  });
   // Element-level queries are SCOPED to the element (spec) — the native
   // walks THIS node's subtree, detached ones included, so `querySelector`
   // works on the real DOM a `DOMParser.parseFromString` returned too.
@@ -4326,9 +4391,28 @@ const PRELUDE: &str = r##"
       var kids = this.__frag;
       var view = { length: kids.length, item: function (i) { return kids[i] === undefined ? null : kids[i]; } };
       for (var i = 0; i < kids.length; i++) view[String(i)] = kids[i];
+      view[Symbol.iterator] = function () { return kids.slice()[Symbol.iterator](); };
       return view;
     },
     hasChildNodes: function () { return this.__frag.length > 0; },
+    firstChild: function () {
+      var k = this.__frag[0];
+      return k === undefined ? null : k;
+    },
+    lastChild: function () {
+      var k = this.__frag[this.__frag.length - 1];
+      return k === undefined ? null : k;
+    },
+    firstElementChild: function () {
+      for (var i = 0; i < this.__frag.length; i++)
+        if (this.__frag[i].nodeType === 1) return this.__frag[i];
+      return null;
+    },
+    lastElementChild: function () {
+      for (var i = this.__frag.length - 1; i >= 0; i--)
+        if (this.__frag[i].nodeType === 1) return this.__frag[i];
+      return null;
+    },
     appendChild: function (child) {
       unwrapChild(child);
       if (child.__frag) {
@@ -4374,6 +4458,10 @@ const PRELUDE: &str = r##"
     Object.defineProperty(frag, "nodeName", { value: "#document-fragment" });
     Object.defineProperty(frag, "childNodes", { get: fragOverrides.childNodes });
     Object.defineProperty(frag, "hasChildNodes", { value: fragOverrides.hasChildNodes });
+    Object.defineProperty(frag, "firstChild", { get: fragOverrides.firstChild });
+    Object.defineProperty(frag, "lastChild", { get: fragOverrides.lastChild });
+    Object.defineProperty(frag, "firstElementChild", { get: fragOverrides.firstElementChild });
+    Object.defineProperty(frag, "lastElementChild", { get: fragOverrides.lastElementChild });
     Object.defineProperty(frag, "appendChild", { value: fragOverrides.appendChild, writable: true });
     Object.defineProperty(frag, "insertBefore", { value: fragOverrides.insertBefore, writable: true });
     Object.defineProperty(frag, "removeChild", { value: fragOverrides.removeChild, writable: true });
@@ -4393,6 +4481,43 @@ const PRELUDE: &str = r##"
       set: function () { throw new Error("innerHTML is not supported on DocumentFragment"); },
     });
     return frag;
+  }
+
+  // Template contents, keyed by "docId:nodeId" (wrappers are cached per
+  // node, but the fragment must survive wrapper re-creations too). First
+  // access adopts any children already under the element — markup parsed
+  // with a <template> in it lands its children inside the element, and the
+  // spec moves them into the content fragment at parse time.
+  var templateFragCache = Object.create(null);
+  function isTemplateElement(node) {
+    return !!node.__n && node.tagName === "TEMPLATE";
+  }
+  function templateContents(el) {
+    var key = el.__d + ":" + el.__n;
+    var frag = templateFragCache[key];
+    if (frag !== undefined) return frag;
+    frag = fragPatch(makeFragment());
+    var kids = el.childNodes;
+    var moved = [];
+    for (var i = 0; i < kids.length; i++) moved.push(kids[i]);
+    for (var j = 0; j < moved.length; j++) frag.appendChild(moved[j]);
+    templateFragCache[key] = frag;
+    return frag;
+  }
+  // innerHTML= on a template parses the markup (blitz parses under any node,
+  // attached or not) then MOVES the fresh children out of the scratch
+  // container into the inert fragment — same parse, none of the nodes
+  // rendered.
+  function setTemplateContents(el, html) {
+    var frag = templateContents(el);
+    frag.__frag.length = 0;
+    if (html === "") return;
+    var scratch = document.createElement("div");
+    host.__ironsurfDomSetInner(el.__d, scratch.__n, html);
+    var kids = scratch.childNodes;
+    var moved = [];
+    for (var i = 0; i < kids.length; i++) moved.push(kids[i]);
+    for (var j = 0; j < moved.length; j++) frag.appendChild(moved[j]);
   }
 
   // The document object. When the tab registers a live blitz document the
@@ -8246,6 +8371,10 @@ impl JsRuntime {
                 if let Err(err) = callback.call(&JsValue::undefined(), &args, &mut self.context) {
                     let message = first_line(&err);
                     let source = self.classify_throw(dom_before, &message);
+                    let backtrace = format!("{err:?}");
+                    if !backtrace.trim().is_empty() {
+                        error!("javascript error in timer callback backtrace:\n{backtrace}");
+                    }
                     error!("javascript error in timer callback: {message}");
                     errors.push(ScriptError {
                         origin: "timer".to_string(),
@@ -9727,6 +9856,50 @@ mod tests {
             expected && b.textContent === "bold" && wrap.children.length === 2;
             "#,
         );
+    }
+
+    #[test]
+    fn dom_template_content_is_an_inert_fragment() {
+        // wetsuit (mstdn.social's status composer) sanitizes through
+        // template.content; mstdn.social live proved the whole composer
+        // tree dies without it.
+        dom_true(
+            r#"
+            var t = document.createElement("template");
+            t.innerHTML = '<p class="a">hi &amp; <b>b</b></p><img src="https://example.com/x.png" width="50">';
+            var frag = t.content;
+            var moved = frag.childNodes.length === 2 && frag.firstChild.tagName === "P"
+              && frag.firstChild.textContent === "hi & b"
+              && t.childNodes.length === 0 && frag.nodeType === 11;
+            var seen = 0; for (var n of frag.childNodes) seen += n.nodeType;
+            var inert = document.querySelector("p.a") === null;
+            var again = t.innerHTML === '<p class="a">hi &amp; <b>b</b></p><img src="https://example.com/x.png" width="50">';
+            moved && inert && seen === 2 && again && t.content === frag;
+            "#,
+        );
+    }
+
+    #[test]
+    fn dom_attribute_names_iterable_and_ns() {
+        // unhead's render loop (getAttributeNames) and react-dom's SVG href
+        // patching (setAttributeNS) — both proved live on mstdn.social.
+        let (mut runtime, mut doc) = dom_world();
+        let value = dom_eval(&mut runtime, &mut doc, r##"
+            var d = document.createElement("div");
+            d.setAttribute("id", "gn");
+            d.setAttribute("class", "k");
+            var pairs = []; for (var a of d.attributes) pairs.push(a.name + "=" + a.value);
+            var names = d.getAttributeNames();
+            var okNames = names.length === 2 && names.indexOf("id") >= 0 && names.indexOf("class") >= 0;
+            var okPairs = pairs.length === 2 && pairs.indexOf("id=gn") >= 0 && pairs.indexOf("class=k") >= 0;
+            d.setAttributeNS("http://www.w3.org/1999/xlink", "xlink:href", "#icon");
+            var okNs = d.getAttributeNS(null, "xlink:href") === "#icon" && d.getAttribute("xlink:href") === "#icon";
+            d.removeAttributeNS(null, "xlink:href");
+            var empty = document.createElement("span");
+            okNames && okPairs && okNs && d.getAttribute("xlink:href") === null && d.getAttributeNames().length === 2 && empty.getAttributeNames().length === 0;
+            "##,
+        );
+        assert!(value.to_boolean(), "getAttributeNames/*NS*/ + NamedNodeMap iteration");
     }
 
     #[test]
