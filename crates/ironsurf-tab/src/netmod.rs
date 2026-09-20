@@ -1314,6 +1314,119 @@ pub fn plain_http_fetch_report(
     })
 }
 
+/// The answer an `XMLHttpRequest.send` gets back: everything the page reads
+/// off the finished request (`headers` with lowercased names, `body` as
+/// lossy UTF-8 — the shape the glue hands back as a JSON envelope).
+pub struct XhrReply {
+    pub status: u16,
+    pub status_text: String,
+    pub final_url: String,
+    pub headers: Vec<(String, String)>,
+    pub body: String,
+}
+
+/// One `XMLHttpRequest` exchange (task: infosec.exchange posts): ANY method,
+/// the page's own request headers, an optional body — on the shared worker's
+/// auto-redirect client. The container jar rides along exactly like a
+/// browser's: the jar's `Cookie` header is sent for the URL, `Set-Cookie`
+/// responses are captured into the jar (the page's own `Cookie` header is
+/// ignored — the jar owns that header), and one [`NetEvent`] per finished or
+/// failed request feeds the DevTools network panel. The cache is
+/// deliberately NOT consulted: an API body replayed stale from the document
+/// cache would lie to the app (browsers may use the HTTP cache here, but the
+/// response the page gets is always the truth). https/http only; any other
+/// scheme is an error the page sees as a network failure.
+pub fn xhr_fetch_report<J>(
+    method: &str,
+    url: &Url,
+    headers: &[(String, String)],
+    body: Option<&[u8]>,
+    jar: &mut J,
+    now: i64,
+    user_agent: &SharedUserAgent,
+    report: NetReport,
+) -> Result<XhrReply, String>
+where
+    J: JarAccess + ?Sized,
+{
+    if !is_http_scheme(url) {
+        return Err(format!("xhr: unsupported scheme for {url}"));
+    }
+    let verb = method.to_ascii_uppercase();
+    let user_agent = read_user_agent(user_agent);
+    let started = std::time::Instant::now();
+    let parsed_method = reqwest::Method::from_bytes(verb.as_bytes())
+        .map_err(|_| format!("xhr: bad method {method:?}"))?;
+    let mut req = shared_worker()
+        .client()
+        .request(parsed_method, url.as_str())
+        .header("User-Agent", user_agent);
+    for (name, value) in headers {
+        if name.eq_ignore_ascii_case("cookie") || name.eq_ignore_ascii_case("user-agent") {
+            continue; // the jar owns Cookie, the UA cell owns User-Agent
+        }
+        req = req.header(name.as_str(), value.as_str());
+    }
+    if let Some(cookie) = jar.cookie_header_at(url, now) {
+        req = req.header(reqwest::header::COOKIE, cookie);
+    }
+    if let Some(body) = body {
+        req = req.body(body.to_vec());
+    }
+    let response = req.send().map_err(|e| {
+        let message = format!("fetch {url}: {e}");
+        warn!("xhr {verb} {url} failed: {e}");
+        if let Some(report) = report {
+            report(net_failed(&verb, url, elapsed_ms(started), message.clone()));
+        }
+        message
+    })?;
+    let status = response.status().as_u16();
+    // reqwest exposes no reason phrase (HTTP/2 has none either); the IANA
+    // canonical reason is what browsers synthesise for HTTP/2 responses.
+    let status_text = response
+        .status()
+        .canonical_reason()
+        .unwrap_or("")
+        .to_owned();
+    let final_url = response.url().clone();
+    let headers = collect_headers(response.headers());
+    let set_cookies: Vec<String> = response
+        .headers()
+        .get_all(reqwest::header::SET_COOKIE)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .map(str::to_owned)
+        .collect();
+    let bytes = response.bytes().map_err(|e| {
+        let message = format!("body {final_url}: {e}");
+        if let Some(report) = report {
+            report(net_failed(&verb, &final_url, elapsed_ms(started), message.clone()));
+        }
+        message
+    })?;
+    if !set_cookies.is_empty() {
+        jar.capture_set_cookies_at(&final_url, set_cookies, now);
+    }
+    debug!("xhr {verb} {final_url} -> {status} ({} B)", bytes.len());
+    if let Some(report) = report {
+        report(net_ok(
+            &verb,
+            &final_url,
+            status,
+            bytes.len() as u64,
+            elapsed_ms(started),
+        ));
+    }
+    Ok(XhrReply {
+        status,
+        status_text,
+        final_url: final_url.to_string(),
+        headers,
+        body: String::from_utf8_lossy(&bytes).into_owned(),
+    })
+}
+
 /// Cookie-jar work a managed fetch needs, in three shapes: the jar itself
 /// (a caller that already owns one — tests, the media worker's private jar),
 /// a [`MutexGuard`] the caller holds, and a [`Mutex`] **shared** with other

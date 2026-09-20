@@ -663,6 +663,61 @@ pub fn extract_scripts_batch(
 /// archive sink as the rest of the page.
 pub type ModuleFetch = Rc<dyn Fn(&Url) -> Result<String, String>>;
 
+/// The tab's `XMLHttpRequest` handle (task: infosec.exchange posts): one
+/// blocking request of any method with the page's own request headers and an
+/// optional string body, answered with status/headers/body — the tab's own
+/// jar, UA cell, and DevTools queue behind it
+/// ([`crate::netmod::xhr_fetch_report`]). Handed to the JS host the same way
+/// [`ModuleFetch`] is; the bindings call it from inside `send()` and deliver
+/// the result through the spec's event sequence.
+pub struct XhrFetch {
+    call: Rc<
+        dyn Fn(
+            &str,                                // method
+            &str,                                // absolute URL
+            &[(String, String)],                 // request headers
+            Option<&str>,                        // string body (none = no body)
+        ) -> Result<crate::netmod::XhrReply, String>,
+    >,
+}
+
+// `Clone` clones the `Rc` (one closure, many handles — the same cheap share
+// an `Rc<dyn Fn>` alias would give); a hand-written `Debug` because the
+// debug-printed `HostState` holds one next to the other shared cells and a
+// `dyn Fn` has no `Debug` of its own.
+impl Clone for XhrFetch {
+    fn clone(&self) -> Self {
+        Self {
+            call: Rc::clone(&self.call),
+        }
+    }
+}
+
+impl std::fmt::Debug for XhrFetch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("XhrFetch(<tab network closure>)")
+    }
+}
+
+impl XhrFetch {
+    #[must_use]
+    pub fn new(call: Rc<dyn Fn(&str, &str, &[(String, String)], Option<&str>) -> Result<crate::netmod::XhrReply, String>>) -> Self {
+        Self { call }
+    }
+}
+
+impl std::ops::Deref for XhrFetch {
+    type Target = dyn Fn(
+        &str,
+        &str,
+        &[(String, String)],
+        Option<&str>,
+    ) -> Result<crate::netmod::XhrReply, String>;
+    fn deref(&self) -> &Self::Target {
+        &*self.call
+    }
+}
+
 /// The document's ES-module loader (task: `<script type="module">` loading):
 /// resolves every specifier through the document's [`ImportMap`] when it has
 /// one (read at resolution time — the map is installed before the first
@@ -983,6 +1038,13 @@ pub struct HostState {
     /// access. `None` behaves exactly like an opaque origin: the surface
     /// exists but every access is denied (bare JS tests without a store).
     pub local_storage: Option<SharedLocalStorage>,
+    /// The tab's **XHR network handle** (task: infosec.exchange posts):
+    /// `XMLHttpRequest.send` runs the request through it — the tab's own
+    /// jar/cache-free reporting path — so page XHRs ride the same client,
+    /// User-Agent cell, and cookie jar as every other tab fetch. `None`
+    /// (bare JS tests, no tab attached) makes every `send()` complete with
+    /// a network error, exactly like a browser whose network is dead.
+    pub xhr: Option<XhrFetch>,
     /// The container's **cookie jar** cell (task: `document.cookie`).
     /// The very `Arc` the tab's fetchers write `Set-Cookie` into, handed to
     /// the bindings so `document.cookie` reads and writes the live jar:
@@ -3120,6 +3182,31 @@ mod native {
     pub(super) const DIALOG: &str = "__ironsurfDialog";
     pub(super) const STORAGE: &str = "__ironsurfStorage";
     pub(super) const COOKIES: &str = "__ironsurfCookies";
+    pub(super) const XHR: &str = "__ironsurfXhr";
+    pub(super) const RANDOM_BYTES: &str = "__ironsurfRandomBytes";
+    pub(super) const RANDOM_UUID: &str = "__ironsurfRandomUUID";
+}
+
+/// Process-wide random source for `crypto.getRandomValues`/`randomUUID`
+/// (task: infosec.exchange posts): a splitmix64 seeded from the clock.
+/// Pages spend this on ids (Mastodon stamps request ids with `randomUUID`),
+/// not keys — and nothing here is a security boundary.
+fn next_random_u64() -> u64 {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::LazyLock;
+    use std::time::{SystemTime, UNIX_EPOCH};
+    static STATE: LazyLock<AtomicU64> = LazyLock::new(|| {
+        AtomicU64::new(
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_nanos() as u64)
+                .unwrap_or(0x5DEECE_66D),
+        )
+    });
+    let mut z = STATE.fetch_add(0x9E37_79B9_7F4A_7C15, Ordering::Relaxed);
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^ (z >> 31)
 }
 
 /// One-shot delay used for `requestAnimationFrame` (~60 Hz; the tab has no
@@ -6863,6 +6950,38 @@ const PRELUDE: &str = r##"
   host.IDBFactory = IDBFactory;
   host.indexedDB = new IDBFactory();
 
+  // crypto (task: infosec.exchange posts): Mastodon's request layer calls
+  // `crypto.randomUUID()` during boot — with NO `crypto` global every
+  // `crypto.x` reference throws a ReferenceError and the saga graph stalls
+  // before a single trending request is issued (the column stays
+  // "Loading…" forever). Just getRandomValues/randomUUID, nothing subtle:
+  // feature detection via `crypto.subtle === undefined` keeps working.
+  host.crypto = {
+    getRandomValues: function (target) {
+      var u8 = null;
+      try {
+        if (typeof ArrayBuffer !== "undefined" && target instanceof ArrayBuffer) {
+          u8 = new Uint8Array(target);
+        } else if (target && target.buffer !== undefined && target.buffer !== null) {
+          u8 = new Uint8Array(target.buffer, target.byteOffset || 0, target.byteLength || 0);
+        }
+      } catch (e) {
+        u8 = null;
+      }
+      if (!u8) {
+        throw new TypeError("getRandomValues requires a typed array");
+      }
+      var bytes = host.__ironsurfRandomBytes(u8.length);
+      for (var i = 0; i < u8.length; i++) {
+        u8[i] = bytes.charCodeAt(i);
+      }
+      return target;
+    },
+    randomUUID: function () {
+      return host.__ironsurfRandomUUID();
+    },
+  };
+
   // `reportError` (WHATWG): several of our listener-error paths report through
   // it; boa_runtime has no such global, so a listener throw previously died
   // with "reportError is not defined", masking the real error.
@@ -6982,6 +7101,213 @@ const PRELUDE: &str = r##"
     });
     host.Request = RequestGlue;
   }
+
+  // ---------------------------------------------------------------------
+  // XMLHttpRequest (task: infosec.exchange posts). Mastodon's entire API
+  // layer is axios, and axios selects its XHR adapter whenever
+  // `typeof XMLHttpRequest === "function"` — without the constructor no
+  // `/api/` request is EVER issued, and the timeline stayed empty with zero
+  // console output (the rejection is swallowed inside the app's own chain).
+  // This is the spec surface with ONE honest simplification: `send()` is
+  // BLOCKING (the engine is single-threaded and even the fetch glue settles
+  // on the tab's blocking client), so the whole event sequence —
+  // readystatechange(2), readystatechange(3), load, readystatechange(4),
+  // loadend (or error, readystatechange(4), loadend on a network failure) —
+  // fires inside `send()` instead of across task turns. Every library in
+  // existence (axios included) assigns its handlers BEFORE calling `send()`,
+  // so nothing observes the compression. Binary `responseType`s
+  // (arraybuffer/blob) answer an empty `response` — the envelope is text;
+  // `responseText` always carries the (lossy-UTF-8) body, which is exactly
+  // what axios reads for the default/`text`/`json` types.
+  // ---------------------------------------------------------------------
+  function XhrUpload() {}
+  XhrUpload.prototype.addEventListener = function (type, fn) {
+    addListener(this, String(type), fn, false);
+  };
+  XhrUpload.prototype.removeEventListener = function (type, fn) {
+    removeListener(this, String(type), fn, false);
+  };
+  function fireXhrEvent(xhr, type) {
+    // The standalone-EventTarget path of the dispatcher: own registered
+    // listeners, then the `on<type>` property, errors reported per listener.
+    var ev = makeEvent(type, xhr);
+    ev.currentTarget = xhr;
+    visitNode(xhr, ev, "target");
+  }
+  function XMLHttpRequest() {
+    this._method = "GET";
+    this._url = "";
+    this._headers = []; // [[name, value]] in set order
+    this._open = false;
+    this.readyState = 0; // UNSENT
+    this.status = 0;
+    this.statusText = "";
+    this.response = "";
+    this.responseText = "";
+    this.responseURL = "";
+    this.responseXML = null;
+    this.responseType = "";
+    this.timeout = 0;
+    this.withCredentials = false;
+    this.upload = new XhrUpload();
+    this.onload = null;
+    this.onerror = null;
+    this.ontimeout = null;
+    this.onabort = null;
+    this.onloadstart = null;
+    this.onprogress = null;
+    this.onloadend = null;
+    this.onreadystatechange = null;
+  }
+  XMLHttpRequest.UNSENT = 0;
+  XMLHttpRequest.OPENED = 1;
+  XMLHttpRequest.HEADERS_RECEIVED = 2;
+  XMLHttpRequest.LOADING = 3;
+  XMLHttpRequest.DONE = 4;
+  XMLHttpRequest.prototype.UNSENT = 0;
+  XMLHttpRequest.prototype.OPENED = 1;
+  XMLHttpRequest.prototype.HEADERS_RECEIVED = 2;
+  XMLHttpRequest.prototype.LOADING = 3;
+  XMLHttpRequest.prototype.DONE = 4;
+  XMLHttpRequest.prototype.addEventListener = function (type, fn) {
+    addListener(this, String(type), fn, false);
+  };
+  XMLHttpRequest.prototype.removeEventListener = function (type, fn) {
+    removeListener(this, String(type), fn, false);
+  };
+  XMLHttpRequest.prototype.open = function (method, url) {
+    // A relative target resolves against the document URL, like the spec's
+    // entry-settings-object base; an unparseable pair throws like the spec.
+    var resolved;
+    try {
+      resolved = new URL(String(url), host.location.href).href;
+    } catch (err) {
+      throw new TypeError("Failed to execute 'open' on 'XMLHttpRequest': invalid URL");
+    }
+    this._method = String(method).toUpperCase();
+    this._url = resolved;
+    this._headers = [];
+    this._open = true;
+    this.readyState = 1; // OPENED
+    fireXhrEvent(this, "readystatechange");
+  };
+  XMLHttpRequest.prototype.setRequestHeader = function (name, value) {
+    if (!this._open || this.readyState === 0) {
+      throw new TypeError("Failed to execute 'setRequestHeader' on 'XMLHttpRequest': object is not initialized");
+    }
+    name = String(name);
+    value = String(value);
+    for (var i = 0; i < this._headers.length; i++) {
+      if (this._headers[i][0].toLowerCase() === name.toLowerCase()) {
+        // The spec COMBINES same-name headers with ", ".
+        this._headers[i][1] += ", " + value;
+        return;
+      }
+    }
+    this._headers.push([name, value]);
+  };
+  XMLHttpRequest.prototype.getAllResponseHeaders = function () {
+    var list = this._responseHeaders || [];
+    var names = [];
+    var byName = {};
+    for (var i = 0; i < list.length; i++) {
+      var name = String(list[i][0]).toLowerCase();
+      // Forbidden response headers: never visible to a page.
+      if (name === "set-cookie" || name === "set-cookie2") continue;
+      if (!Object.prototype.hasOwnProperty.call(byName, name)) {
+        byName[name] = [];
+        names.push(name);
+      }
+      byName[name].push(list[i][1]);
+    }
+    names.sort(); // lexicographical order, per spec
+    var out = "";
+    for (var j = 0; j < names.length; j++) {
+      out += names[j] + ": " + byName[names[j]].join(", ") + "\r\n";
+    }
+    return out;
+  };
+  XMLHttpRequest.prototype.getResponseHeader = function (name) {
+    name = String(name).toLowerCase();
+    if (name === "set-cookie" || name === "set-cookie2") return null;
+    var list = this._responseHeaders || [];
+    var values = null;
+    for (var i = 0; i < list.length; i++) {
+      if (String(list[i][0]).toLowerCase() === name) {
+        if (values === null) values = [];
+        values.push(list[i][1]);
+      }
+    }
+    return values === null ? null : values.join(", ");
+  };
+  XMLHttpRequest.prototype.overrideMimeType = function (mime) {
+    this._overriddenMimeType = String(mime);
+  };
+  XMLHttpRequest.prototype.abort = function () {
+    // send() is synchronous here: by the time a page can call abort there
+    // is nothing in flight any more. The flag is kept for shape only.
+    this._aborted = true;
+  };
+  XMLHttpRequest.prototype.send = function (body) {
+    if (!this._open) {
+      throw new TypeError(
+        "Failed to execute 'send' on 'XMLHttpRequest': XMLHttpRequest still initialized. Call 'open' first."
+      );
+    }
+    var envelope = null;
+    try {
+      envelope = JSON.parse(
+        host.__ironsurfXhr(
+          this._method,
+          this._url,
+          JSON.stringify(this._headers),
+          body === undefined || body === null ? null : String(body)
+        )
+      );
+    } catch (err) {
+      // A thrown native IS the network error: the page sees status 0 and the
+      // `error` event, exactly like a dead network in a browser.
+      envelope = null;
+    }
+    if (envelope === null || typeof envelope !== "object" || envelope === null) {
+      this._responseHeaders = [];
+      this.status = 0;
+      this.statusText = "";
+      this.responseText = "";
+      this.response = this.responseType === "" || this.responseType === "text" ? "" : null;
+      this.responseURL = "";
+      this.readyState = 4;
+      fireXhrEvent(this, "error");
+      fireXhrEvent(this, "readystatechange");
+      fireXhrEvent(this, "loadend");
+      return;
+    }
+    this._responseHeaders = envelope.headers || [];
+    this.status = envelope.status | 0;
+    this.statusText = String(envelope.statusText || "");
+    this.responseText = String(envelope.body || "");
+    this.responseURL = String(envelope.url || this._url);
+    if (this.responseType === "json") {
+      try {
+        this.response = JSON.parse(this.responseText);
+      } catch (err) {
+        this.response = null; // parse failure reads as null, per the spec
+      }
+    } else if (this.responseType === "" || this.responseType === "text") {
+      this.response = this.responseText;
+    } else {
+      this.response = null; // arraybuffer/blob/document: no channel
+    }
+    this.readyState = 2; // HEADERS_RECEIVED
+    fireXhrEvent(this, "readystatechange");
+    this.readyState = 3; // LOADING (the whole body is already here)
+    fireXhrEvent(this, "readystatechange");
+    this.readyState = 4; // DONE
+    fireXhrEvent(this, "load");
+    fireXhrEvent(this, "readystatechange");
+    fireXhrEvent(this, "loadend");
+  };
+  host.XMLHttpRequest = XMLHttpRequest;
 
   // Element interface classes (task: infosec.exchange). react-dom's commit
   // phase does `activeElement instanceof window.HTMLIFrameElement` (and a
@@ -7781,6 +8107,117 @@ fn build_context_with_modules(
         }),
     ) {
         error!("js binding `cookies` failed to install: {err}");
+    }
+
+    // `XMLHttpRequest` send (task: infosec.exchange posts): every argument is
+    // coerced first (the page's own `toString` could re-enter JS), the host's
+    // handle is cloned out BEFORE the request runs — no host borrow is held
+    // across the blocking exchange (the dialog native's rule). The reply
+    // rides back as a JSON envelope `{status,statusText,url,headers,body}`;
+    // a transport failure is a THROWN error message the glue turns into the
+    // spec's `error` event. The tab has no network without a live host, so
+    // bare realms get the same thrown "no network" every send answers there.
+    if let Err(err) = context.register_global_builtin_callable(
+        JsString::from(native::XHR),
+        4,
+        NativeFunction::from_copy_closure(|_this, args, context| {
+            let method = args
+                .first()
+                .cloned()
+                .unwrap_or(JsValue::undefined())
+                .to_string(context)?
+                .to_std_string_escaped();
+            let url = args
+                .get(1)
+                .cloned()
+                .unwrap_or(JsValue::undefined())
+                .to_string(context)?
+                .to_std_string_escaped();
+            let headers_json = arg_opt_string(args.get(2), context)?.unwrap_or_default();
+            // A null/undefined body means NO body; anything else is the
+            // string the page handed `send()` (FormData/Blob/ArrayBuffer
+            // bodies stay out of this glue — the envelope is text).
+            let body = match args.get(3) {
+                Some(value) if !value.is_undefined() && !value.is_null() => Some(
+                    value
+                        .to_string(context)?
+                        .to_std_string_escaped(),
+                ),
+                _ => None,
+            };
+            let fetcher = with_host(|host| host.xhr.clone()).flatten();
+            let Some(fetcher) = fetcher else {
+                return Err(JsNativeError::typ()
+                    .with_message("XMLHttpRequest: no network host attached")
+                    .into());
+            };
+            let parsed: Vec<(String, String)> = serde_json::from_str(&headers_json)
+                .unwrap_or_default();
+            let reply = fetcher(&method, url.as_str(), &parsed, body.as_deref())
+                .map_err(|msg| JsNativeError::typ().with_message(msg))?;
+            let envelope = serde_json::json!({
+                "status": reply.status,
+                "statusText": reply.status_text,
+                "url": reply.final_url,
+                "headers": reply.headers,
+                "body": reply.body,
+            });
+            let text = serde_json::to_string(&envelope)
+                .map_err(|err| JsNativeError::typ().with_message(format!("xhr: {err}")))?;
+            Ok(JsValue::from(JsString::from(text)))
+        }),
+    ) {
+        error!("js binding `xhr` failed to install: {err}");
+    }
+
+    // `crypto.getRandomValues`'s byte source (see `next_random_u64`). The
+    // answer is one char per byte (codes ≤ 0xFF, always valid UTF-16) so the
+    // glue reads it back with `charCodeAt` — no JSON parse per call.
+    if let Err(err) = context.register_global_builtin_callable(
+        JsString::from(native::RANDOM_BYTES),
+        1,
+        NativeFunction::from_copy_closure(|_this, args, context| {
+            let len = args
+                .first()
+                .cloned()
+                .unwrap_or(JsValue::undefined())
+                .to_u32(context)? as usize;
+            let len = len.min(65_536);
+            let mut codes = Vec::with_capacity(len);
+            for _ in 0..len {
+                codes.push((next_random_u64() & 0xFF) as u16);
+            }
+            Ok(JsValue::from(JsString::from(String::from_utf16_lossy(&codes))))
+        }),
+    ) {
+        error!("js binding `randomBytes` failed to install: {err}");
+    }
+
+    // `crypto.randomUUID`: a v4 UUID — 16 random bytes with the version and
+    // variant nibbles set per spec.
+    if let Err(err) = context.register_global_builtin_callable(
+        JsString::from(native::RANDOM_UUID),
+        0,
+        NativeFunction::from_copy_closure(|_this, _args, _context| {
+            let mut b = [0u8; 16];
+            for (i, slot) in b.iter_mut().enumerate() {
+                *slot = ((next_random_u64() >> (8 * (i % 8))) & 0xFF) as u8;
+            }
+            b[6] = (b[6] & 0x0F) | 0x40;
+            b[8] = (b[8] & 0x3F) | 0x80;
+            let hex = b.iter().map(|x| format!("{x:02x}")).collect::<String>();
+            let uuid = format!(
+                "{}-{}-{}-{}-{}",
+                &hex[0..8],
+                &hex[8..12],
+                &hex[12..16],
+                &hex[16..20],
+                &hex[20..32]
+            );
+            Ok(JsValue::from(JsString::from(uuid)))
+        }),
+    ) {
+        error!("js binding `randomUUID` failed to install: {err}");
     }
 
     // Timers: real queue entries the tab's poll loop executes. A non-callable

@@ -1641,6 +1641,35 @@ impl Tab {
         // (minus HttpOnly, enforced in the native) and cookies scripts set
         // go out on the next request — one jar, both directions.
         host.borrow_mut().cookies = Some(Arc::clone(&self.jar));
+        // `XMLHttpRequest.send` runs on THIS network stack (task:
+        // infosec.exchange posts): Mastodon's axios picks its XHR adapter
+        // whenever the constructor exists, and without it not one `/api/`
+        // request is ever issued — an empty timeline in zero console output.
+        // Same client, same jar, same UA cell, same DevTools queue as every
+        // other tab fetch (the cache stays out: an API body must never be
+        // replayed stale to the page).
+        let xhr_fetch = {
+            let jar = Arc::clone(&self.jar);
+            let net_events = Arc::clone(&self.net_events);
+            let user_agent = Arc::clone(&self.user_agent);
+            js::XhrFetch::new(Rc::new(move |method, url, headers, body| {
+                let parsed = url::Url::parse(url).map_err(|err| err.to_string())?;
+                let events = Arc::clone(&net_events);
+                let jar_ref = Arc::clone(&jar);
+                let mut jar_access: &std::sync::Mutex<_> = &jar_ref;
+                netmod::xhr_fetch_report(
+                    method,
+                    &parsed,
+                    headers,
+                    body.map(str::as_bytes),
+                    &mut jar_access,
+                    netmod::now_unix(),
+                    &user_agent,
+                    Some(&|event| events.lock().expect("net events mutex").push(event)),
+                )
+            }))
+        };
+        host.borrow_mut().xhr = Some(xhr_fetch);
         debug!(
             "running {} script(s) for {url}; skipped: {:?}",
             extraction.scripts.len(),
