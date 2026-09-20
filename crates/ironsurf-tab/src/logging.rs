@@ -29,6 +29,14 @@
 //!   [`css_content_type_warning`], called by the tab's `BlitzNetProvider` on
 //!   every settled `.css` response).
 //!
+//! Vendor-prefixed **unknown property names** are deliberately NOT reported
+//! (see [`silently_dropped_unknown_property`]): every engine drops
+//! `-webkit-…`/`-ms-…`-style names with no console output, and page code
+//! writes them intentionally (Mastodon's progress bar stamps five transition
+//! prefixes per style-attribute update — reporting them floods the console
+//! with errors that mean nothing). Value errors on REAL properties
+//! (`color: bogus`) still report.
+//!
 //! Known honest gaps: `<link rel=stylesheet>` *content* is fetched by blitz
 //! and never appears as DOM text, so its parse errors are not visible to the
 //! seam (its failures and wrong content types are); `@import` bodies are not
@@ -129,6 +137,15 @@ impl ParseErrorReporter for CollectingReporter {
         location: cssparser::SourceLocation,
         error: ContextualParseError,
     ) {
+        // An unrecognised property name every engine drops silently is not a
+        // console error (see [`silently_dropped_unknown_property`]).
+        if let ContextualParseError::UnsupportedPropertyDeclaration(decl, _, _) = &error {
+            if let Some(name) = declaration_name(decl) {
+                if silently_dropped_unknown_property(&name) {
+                    return;
+                }
+            }
+        }
         let mut entries = self.entries.lock().expect("css reporter mutex");
         // Bounded: the parse can surface hundreds of errors on a hostile
         // sheet; the first ones describe the problem well enough.
@@ -137,6 +154,78 @@ impl ParseErrorReporter for CollectingReporter {
         }
     }
 }
+
+/// The property name of a declaration slice (`"color: red !important"` →
+/// `"color"`), lowercased; `None` when the slice isn't `name: value` shaped.
+fn declaration_name(decl: &str) -> Option<String> {
+    let (name, _) = decl.split_once(':')?;
+    let name = name.trim().to_ascii_lowercase();
+    (!name.is_empty()).then_some(name)
+}
+
+/// `true` when no browser logs this unknown property name: dashed idents
+/// (`-webkit-transition`, `-ms-filter`, `_zoom`, … — the leading dash IS the
+/// "everywhere-invalid, ignore me" convention), legacy unprefixed spellings
+/// of `-ms-*` names (`ms-transition`, from old IE-era code that survived into
+/// production inline styles), and their `-ms-` forms once Internet
+/// Explorer's required hyphen was standardised away. Stylo itself already
+/// silences the first family (`is_non_mozilla_vendor_identifier`); the other
+/// two reach the reporter, and a real console stays quiet about all three —
+/// only the VALUE of a genuine property (`color: bogus`) is worth a page
+/// error.
+fn silently_dropped_unknown_property(name: &str) -> bool {
+    name.starts_with('-')
+        || name.starts_with('_')
+        || (name.starts_with("ms-") && KNOWN_MS_ALIASES.contains(&name))
+}
+
+/// Standard properties `ms-x` stands in for (the `-ms-` vendor form of every
+/// one of these is or was a real engine property).
+const KNOWN_MS_ALIASES: &[&str] = &[
+    "ms-animation",
+    "ms-animation-delay",
+    "ms-animation-direction",
+    "ms-animation-duration",
+    "ms-animation-fill-mode",
+    "ms-animation-iteration-count",
+    "ms-animation-name",
+    "ms-animation-play-state",
+    "ms-animation-timing-function",
+    "ms-appearance",
+    "ms-backface-visibility",
+    "ms-background-size",
+    "ms-border-bottom-left-radius",
+    "ms-border-bottom-right-radius",
+    "ms-border-top-left-radius",
+    "ms-border-top-right-radius",
+    "ms-box-shadow",
+    "ms-box-sizing",
+    "ms-column-count",
+    "ms-filter",
+    "ms-flex",
+    "ms-flex-align",
+    "ms-flex-direction",
+    "ms-flex-item-align",
+    "ms-flex-order",
+    "ms-flex-pack",
+    "ms-flex-wrap",
+    "ms-hyphens",
+    "ms-interpolation-mode",
+    "ms-linear-gradient",
+    "ms-order",
+    "ms-perspective",
+    "ms-perspective-origin",
+    "ms-radial-gradient",
+    "ms-transform",
+    "ms-transform-origin",
+    "ms-transform-style",
+    "ms-transition",
+    "ms-transition-delay",
+    "ms-transition-duration",
+    "ms-transition-property",
+    "ms-transition-timing-function",
+    "ms-user-select",
+];
 
 /// Re-parse `css` as an author stylesheet through Stylo's real error-reporting
 /// path (the one blitz switches off) and return the console messages for the
@@ -367,6 +456,45 @@ mod tests {
         let mut fresh = CssScanState::new();
         let entries = scan_css(&good, &base, &mut fresh);
         assert!(entries.is_empty(), "valid CSS must not warn: {entries:?}");
+    }
+
+    /// The Mastodon progress-bar case (live infosec.exchange console flood):
+    /// legacy/vendor unknown NAMES are dropped silently by every engine and
+    /// must produce no console entries — while genuine property VALUE errors
+    /// still report.
+    #[test]
+    fn vendor_prefixed_unknown_properties_are_silent() {
+        let base = Url::parse("about:blank").expect("about:blank");
+        let doc = blitz_html::HtmlDocument::from_html(
+            "<!doctype html><html><head>\
+             <style>a { -ms-transition: width 200ms; -webkit-box-shadow: 0 0 1px red; \
+                        _zoom: 1; ms-filter: progid:dx; ms-transition: width 200ms linear 0s }</style>\
+             </head><body><div style=\"will-change: width, opacity; \
+             transition: width 200ms linear 0s; ms-transition: width 200ms linear 0s; \
+             -webkit-transition: width 200ms linear 0s; -moz-transition: width 200ms linear 0s; \
+             -o-transition: width 200ms linear 0s; width: 100%; opacity: 1\">x</div>\
+             <p style=\"color: bogus\">y</p></body></html>",
+            blitz_dom::DocumentConfig::default(),
+        );
+        let mut state = CssScanState::new();
+        let entries = scan_css(&doc, &base, &mut state);
+        assert!(
+            entries
+                .iter()
+                .all(|e| !e.message.contains("transition") && !e.message.contains("filter")),
+            "vendor/legacy names must be silent: {entries:?}"
+        );
+        assert!(
+            entries.iter().any(|e| e.message.contains("color")),
+            "a real property's bad value still reports: {entries:?}"
+        );
+        // Pure vendor noise ⇒ zero entries.
+        let quiet = blitz_html::HtmlDocument::from_html(
+            "<!doctype html><html><body><div style=\"-ms-transition: all 1s; ms-transition: all 1s; -webkit-user-select: none\">x</div></body></html>",
+            blitz_dom::DocumentConfig::default(),
+        );
+        let mut fresh = CssScanState::new();
+        assert!(scan_css(&quiet, &base, &mut fresh).is_empty());
     }
 
     #[test]
