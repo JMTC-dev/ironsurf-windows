@@ -447,3 +447,139 @@ fn matchmedia_reveal_script_unhides_the_page_it_gates() {
         "the reveal must paint the 200x120 box (~24 000 px), found {content}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// SVG viewBox regression (Mastodon timeline buried under black blobs).
+//
+// Script-built SVG — which is how React renders every icon — goes through this
+// crate's DOM bridge, and the bridge used to store *every* attribute name
+// lower-cased. In the HTML namespace that is the spec; in foreign content it is
+// a corruption: `viewBox` → `viewbox`, so `usvg` never sees a viewBox, falls
+// back to a 24-unit viewport, and a glyph authored on a 960-unit grid paints
+// ~40x oversized (a 24px icon became a 720x560 black fill covering the column).
+// The fixture mounts the same glyph twice — parsed from markup (html5ever
+// adjusts the case itself) and built by `createElementNS` + `setAttribute` —
+// and reports the live attribute-name list in its title.
+const SVG_FIXTURE: &str = r#"<!doctype html>
+<html>
+  <head>
+    <title>before</title>
+    <style>body { margin: 0; background: #ffffff; color: #000000 } svg { display: block }</style>
+  </head>
+  <body>
+    <svg id="a" viewBox="0 -960 960 960" width="24" height="24"><path d="M784-120 532-372q-30 24-69 38t-83 14q-109 0-184.5-75.5T120-580q0-109 75.5-184.5T380-840q109 0 184.5 75.5T640-580q0 44-14 83t-38 69l252 252-56 56Z"/></svg>
+    <div id="report">pending</div>
+    <script>
+      var SVG_NS = "http://www.w3.org/2000/svg";
+      var s = document.createElementNS(SVG_NS, "svg");
+      s.setAttribute("viewBox", "0 -960 960 960");
+      s.setAttribute("width", "24");
+      s.setAttribute("height", "24");
+      var p = document.createElementNS(SVG_NS, "path");
+      p.setAttribute("d", "M784-120 532-372q-30 24-69 38t-83 14q-109 0-184.5-75.5T120-580q0-109 75.5-184.5T380-840q109 0 184.5 75.5T640-580q0 44-14 83t-38 69l252 252-56 56Z");
+      s.appendChild(p);
+      document.body.appendChild(s);
+
+      var names = s.getAttributeNames().join(",");
+      // HTML elements must keep lower-casing, or this fix over-corrects.
+      var div = document.createElement("div");
+      div.setAttribute("viewBox", "x");
+      var grad = document.createElementNS(SVG_NS, "linearGradient");
+      document.title =
+        (names.indexOf("viewBox") >= 0 &&
+         s.getAttribute("viewBox") === "0 -960 960 960" &&
+         div.getAttributeNames()[0] === "viewbox" &&
+         grad.localName === "linearGradient")
+          ? "ok"
+          : "broken:" + names;
+    </script>
+  </body>
+</html>
+"#;
+
+/// `box=(0,4)-(24,28)` → `(0.0, 4.0, 24.0, 28.0)`.
+fn paint_box(line: &str) -> Option<(f32, f32, f32, f32)> {
+    let (_, rest) = line.split_once("box=(")?;
+    let (lo, hi) = rest.split_once(")-(")?;
+    let hi = hi.split_once(')')?.0;
+    let nums: Vec<f32> = lo
+        .split(',')
+        .chain(hi.split(','))
+        .filter_map(|n| n.trim().parse().ok())
+        .collect();
+    let [x0, y0, x1, y1] = <[f32; 4]>::try_from(nums).ok()?;
+    Some((x0, y0, x1, y1))
+}
+
+/// The brush of a recorded fill (`brush=rgba(0,0,0,1)`).
+fn paint_is_black(line: &str) -> bool {
+    let Some((_, rest)) = line.split_once("brush=rgba(") else {
+        return false;
+    };
+    let mut parts = rest.split(',').map(|c| c.trim().parse::<f32>().unwrap_or(1.0));
+    let (r, g, b, a) = (parts.next().unwrap(), parts.next().unwrap(), parts.next().unwrap(), parts.next().unwrap_or(1.0));
+    // A clear brush is vger's placeholder for a glyph run, not a painted shape.
+    a > 0.05 && r < 0.05 && g < 0.05 && b < 0.05
+}
+
+#[test]
+fn svg_viewbox_case_survives_setattribute_and_icons_paint_their_size() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let fixture = dir.path().join("svg.html");
+    fs::write(&fixture, SVG_FIXTURE).expect("write fixture");
+    let body_out = dir.path().join("body.html");
+    let output = Command::new(env!("CARGO_BIN_EXE_ironsurf-tab"))
+        .env("IRONSURF_FILL_MIN_AREA", "1") // also report the 24px icon fills
+        .arg("--headless")
+        .arg("--url")
+        .arg(url::Url::from_file_path(&fixture).expect("file url").as_str())
+        .args([
+            "--wait",
+            "150",
+            "--size",
+            "200x120",
+            "--dump-paint-detail",
+            "--body-out",
+            body_out.to_str().unwrap(),
+        ])
+        .output()
+        .expect("spawn ironsurf-tab --headless");
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    assert!(
+        output.status.success(),
+        "exit {:?}\nstderr:\n{stderr}",
+        output.status.code()
+    );
+    // The page's own verdict on the live DOM: `viewBox` kept its case on the
+    // script-built svg, `getAttribute` finds it, HTML still lower-cases, and
+    // `createElementNS(svgNS, "linearGradient")` kept its name.
+    assert!(stderr.contains("HEADLESS title=ok"), "stderr:\n{stderr}");
+
+    // Both icons serialize with the real attribute name.
+    let body = fs::read_to_string(&body_out).expect("body-out");
+    assert_eq!(
+        body.matches("viewBox=\"0 -960 960 960\"").count(),
+        2,
+        "both the parsed and the script-built icon must keep viewBox:\n{body}"
+    );
+
+    // The paint oracle: an icon fill may not be bigger than its box. Before the
+    // fix this line reported a ~720x560 black fill on a 200x120 page.
+    let mut icons = 0;
+    for line in stderr.lines().filter(|l| l.starts_with("FILLDETAIL idx")) {
+        let Some((x0, y0, x1, y1)) = paint_box(line) else { continue };
+        let (w, h) = (x1 - x0, y1 - y0);
+        if paint_is_black(line) {
+            assert!(
+                w <= 40.0 && h <= 40.0,
+                "a black fill painted {w:.0}x{h:.0} at ({x0:.0},{y0:.0}) — an SVG \
+                 glyph painted outside its 24px box:\n{line}"
+            );
+            icons += 1;
+        }
+    }
+    assert!(
+        icons >= 2,
+        "expected the two 24px icon glyphs to paint, saw {icons} black fills:\n{stderr}"
+    );
+}

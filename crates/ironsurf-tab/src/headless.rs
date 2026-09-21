@@ -84,6 +84,10 @@ pub struct HeadlessArgs {
     /// histogram, so a laid-out-but-invisible subtree can be told apart from a
     /// paint-culling bug.
     pub dump_paint: bool,
+    /// `--dump-paint-detail`: for every large fill record its untransformed
+    /// path, its transform and the enclosing clip stack — the fingerprint that
+    /// tells a mis-scaled vector (SVG/path) fill from an oversized CSS box.
+    pub dump_paint_detail: bool,
     /// `--hit X,Y` (repeatable): print the element chain under each point.
     pub hits: Vec<(f32, f32)>,
 }
@@ -100,6 +104,7 @@ impl HeadlessArgs {
         let mut dump_inputs = false;
         let mut dump_layout = false;
         let mut dump_paint = false;
+        let mut dump_paint_detail = false;
         let mut hits = Vec::new();
         let mut saw_url = false;
 
@@ -140,6 +145,7 @@ impl HeadlessArgs {
                 "--dump-inputs" => dump_inputs = true,
                 "--dump-layout" => dump_layout = true,
                 "--dump-paint" => dump_paint = true,
+                "--dump-paint-detail" => dump_paint_detail = true,
                 "--hit" => {
                     let v = value("hit")?;
                     let (x, y) = v
@@ -198,6 +204,7 @@ impl HeadlessArgs {
             dump_inputs,
             dump_layout,
             dump_paint,
+            dump_paint_detail,
             hits,
             width: size.0.max(1),
             height: size.1.max(1),
@@ -279,6 +286,11 @@ pub fn run(args: &[String]) -> Result<(), Box<dyn Error>> {
     if args.dump_paint {
         if let Some(doc) = tab.document_mut() {
             dump_paint_scene(doc, args.width, args.height);
+        }
+    }
+    if args.dump_paint_detail {
+        if let Some(doc) = tab.document_mut() {
+            dump_paint_detail(doc, args.width, args.height);
         }
     }
     for (x, y) in args.hits.clone() {
@@ -641,6 +653,141 @@ fn dump_paint_scene(doc: &mut blitz_html::HtmlDocument, width: u32, height: u32)
         "PAINT commands={} glyph_runs={glyphs} glyph_runs_in_column_top={glyphs_in_articles} fills={fills} strokes={strokes} layers={clips}",
         scene.commands.len()
     );
+}
+
+/// Paint the settled document into a recording `Scene` and describe every
+/// *large* fill command (`--dump-paint-detail`): the untransformed path, the
+/// transform applied to it and the enclosing clip stack. A huge black blob is
+/// thereby fingerprinted — a mis-scaled vector fill says “24-unit path times a
+/// 30× transform”, an oversized CSS box says “a 720×560 rect at an offset”.
+fn dump_paint_detail(doc: &mut blitz_html::HtmlDocument, width: u32, height: u32) {
+    use anyrender::recording::RenderCommand;
+    use kurbo::Shape as _;
+
+    let mut scene = anyrender::recording::Scene::new();
+    blitz_paint::paint_scene(&mut scene, doc, 1.0, width, height, 0, 0);
+
+    let brush_text = |brush: &anyrender::Paint| -> String {
+        match brush {
+            anyrender::Paint::Solid(c) => format!(
+                "rgba({},{},{},{})",
+                c.components[0], c.components[1], c.components[2], c.components[3]
+            ),
+            anyrender::Paint::Gradient(_) => "gradient".to_string(),
+            anyrender::Paint::Image(_) => "image".to_string(),
+            other => format!("{other:?}"),
+        }
+    };
+
+    let mut stack: Vec<(char, kurbo::Rect)> = Vec::new();
+    let mut shown = 0usize;
+    let mut centers: Vec<(f64, f64)> = Vec::new();
+    for (index, cmd) in scene.commands.iter().enumerate() {
+        match cmd {
+            RenderCommand::PushClipLayer(clip) => {
+                stack.push((
+                    'C',
+                    clip.transform
+                        .transform_rect_bbox(clip.clip.bounding_box()),
+                ));
+            }
+            RenderCommand::PushLayer(layer) => {
+                stack.push((
+                    'L',
+                    layer
+                        .transform
+                        .transform_rect_bbox(layer.clip.bounding_box()),
+                ));
+            }
+            RenderCommand::PopLayer => {
+                stack.pop();
+            }
+            RenderCommand::Fill(fill) => {
+                let bb = fill.transform.transform_rect_bbox(fill.shape.bounding_box());
+                // Threshold is overridable so the same dump can be used on a
+                // small fixture (`IRONSURF_FILL_MIN_AREA=0`).
+                let min_area: f64 = std::env::var("IRONSURF_FILL_MIN_AREA")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(5000.0);
+                if (bb.x1 - bb.x0) * (bb.y1 - bb.y0) < min_area {
+                    continue;
+                }
+                if shown >= 64 {
+                    continue;
+                }
+                shown += 1;
+                centers.push(((bb.x0 + bb.x1) / 2.0, (bb.y0 + bb.y1) / 2.0));
+                let raw = fill.shape.bounding_box();
+                let segs: Vec<String> = fill
+                    .shape
+                    .elements()
+                    .iter()
+                    .map(|el| format!("{el:?}"))
+                    .collect();
+                let [a, b, c, d, e, f] = fill.transform.as_coeffs();
+                let clips: Vec<String> = stack
+                    .iter()
+                    .rev()
+                    .take(3)
+                    .map(|(kind, r)| {
+                        format!("{kind}({:.0},{:.0})-({:.0},{:.0})", r.x0, r.y0, r.x1, r.y1)
+                    })
+                    .collect();
+                eprintln!(
+                    "FILLDETAIL idx={index} box=({:.0},{:.0})-({:.0},{:.0}) raw=({:.1},{:.1})-({:.1},{:.1}) segs={} brush={} xf=[{a:.2} {b:.2} {c:.2} {d:.2} {e:.1} {f:.1}] fill={:?} clips=[{}] path=[{}]",
+                    bb.x0,
+                    bb.y0,
+                    bb.x1,
+                    bb.y1,
+                    raw.x0,
+                    raw.y0,
+                    raw.x1,
+                    raw.y1,
+                    fill.shape.elements().len(),
+                    brush_text(&fill.brush),
+                    fill.fill,
+                    clips.join(" "),
+                    segs.join(" ")
+                );
+            }
+            _ => {}
+        }
+    }
+    eprintln!("FILLDETAIL shown={shown}/big_fills commands={}", scene.commands.len());
+    // The other half of the fingerprint: what DOM element actually sits under
+    // the middle of each large fill (points outside the viewport are clamped).
+    for (x, y) in centers {
+        let x = x.clamp(1.0, f64::from(width) - 2.0) as f32;
+        let y = y.clamp(1.0, f64::from(height) - 2.0) as f32;
+        let Some(start) = doc.element_from_point(x, y) else {
+            eprintln!("FILLDETAIPHIT {x},{y}: <nothing>");
+            continue;
+        };
+        let mut names = Vec::new();
+        let mut cur = Some(start);
+        while let Some(id) = cur {
+            let Some(node) = doc.get_node(id) else { break };
+            if let Some(el) = node.element_data() {
+                names.push(format!(
+                    "{}{}",
+                    el.name.local,
+                    match el.id.as_ref().map(|a| &**a) {
+                        Some(i) => format!("#{i}"),
+                        None => match el.attr(blitz_dom::local_name!("class")) {
+                            Some(c) if !c.is_empty() => format!(
+                                ".{}",
+                                c.split_whitespace().next().unwrap_or("")
+                            ),
+                            _ => String::new(),
+                        },
+                    }
+                ));
+            }
+            cur = node.parent;
+        }
+        eprintln!("FILLDETAIPHIT {x},{y}: {}", names.join(" < "));
+    }
 }
 
 /// Print every element whose layout box is bigger than 500x500 (or is an

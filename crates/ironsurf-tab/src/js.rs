@@ -62,7 +62,9 @@ use boa_engine::{
     Trace,
 };
 use blitz_dom::node::{ImageData, SpecialElementData};
-use blitz_dom::{local_name, BaseDocument, LocalName, Node, NodeData, NodeId, Prefix, QualName};
+use blitz_dom::{
+    local_name, BaseDocument, LocalName, Namespace, Node, NodeData, NodeId, Prefix, QualName,
+};
 use blitz_html::HtmlDocument;
 use url::Url;
 
@@ -1594,12 +1596,160 @@ fn qual_name_for_ns(tag: &str, ns: &str) -> Result<QualName, &'static str> {
         "http://www.w3.org/1999/xhtml" => blitz_dom::ns!(html),
         _ => blitz_dom::ns!(html),
     };
-    Ok(QualName::new(None, namespace, LocalName::from(lowered.as_str())))
+    // Same case rule as attributes: `createElementNS(svgNS, "linearGradient")`
+    // has to land a `linearGradient`, not a `lineargradient` nothing renders.
+    let local = if namespace == blitz_dom::ns!(svg) {
+        adjust_foreign_name(SVG_ELEMENT_ADJUSTMENTS, tag)
+            .unwrap_or(tag)
+            .to_string()
+    } else {
+        lowered
+    };
+    Ok(QualName::new(None, namespace, LocalName::from(local.as_str())))
 }
+
+/// Look up a lower-cased foreign name in one of the adjustment tables below,
+/// answering the canonical camelCase spelling (`viewbox` → `viewBox`).
+fn adjust_foreign_name(
+    table: &'static [(&'static str, &'static str)],
+    name: &str,
+) -> Option<&'static str> {
+    table
+        .iter()
+        .find(|(lower, _)| str::eq_ignore_ascii_case(lower, name))
+        .map(|(_, canonical)| *canonical)
+}
+
+/// HTML's "adjust MathML/SVG attributes" renames: the lower-cased spelling a
+/// markup parser produces → the camelCase name the foreign vocabulary defines.
+/// Case is **significant** outside the HTML namespace — `viewbox` is not
+/// `viewBox` — and an `<svg>` root whose `viewBox` has been lower-cased
+/// silently loses its coordinate system: `usvg` then falls back to a 24-unit
+/// viewport, so a glyph authored on a 960-unit grid (Mastodon's whole icon
+/// set) paints ~40× oversized and buries the column under black blobs.
+/// html5ever applies this table while parsing; the DOM spec's attribute-name
+/// adjustment step makes `setAttribute` owe callers the same fixup.
+const SVG_ATTRIBUTE_ADJUSTMENTS: &[(&str, &str)] = &[
+    ("attributename", "attributeName"),
+    ("attributetype", "attributeType"),
+    ("basefrequency", "baseFrequency"),
+    ("baseprofile", "baseProfile"),
+    ("calcmode", "calcMode"),
+    ("clippathmode", "clipPathMode"),
+    ("clippathunits", "clipPathUnits"),
+    ("contentscripttype", "contentScriptType"),
+    ("contentstyletype", "contentStyleType"),
+    ("definitionurl", "definitionURL"),
+    ("diffuselightingconstant", "diffuseConstant"),
+    ("edgemode", "edgeMode"),
+    ("externalresourcesrequired", "externalResourcesRequired"),
+    ("filterres", "filterRes"),
+    ("filterunits", "filterUnits"),
+    ("glyphref", "glyphRef"),
+    ("gradienttransform", "gradientTransform"),
+    ("gradientunits", "gradientUnits"),
+    ("kernelmatrix", "kernelMatrix"),
+    ("kernelunitlength", "kernelUnitLength"),
+    ("keypoints", "keyPoints"),
+    ("keysplines", "keySplines"),
+    ("keytimes", "keyTimes"),
+    ("lengthadjust", "lengthAdjust"),
+    ("limitingconeangle", "limitingConeAngle"),
+    ("markerheight", "markerHeight"),
+    ("markerwidth", "markerWidth"),
+    ("maskcontentunits", "maskContentUnits"),
+    ("maskunits", "maskUnits"),
+    ("numoctaves", "numOctaves"),
+    ("pathlength", "pathLength"),
+    ("patterncontentunits", "patternContentUnits"),
+    ("patterntransform", "patternTransform"),
+    ("patternunits", "patternUnits"),
+    ("pointsatx", "pointsAtX"),
+    ("pointsaty", "pointsAtY"),
+    ("pointsatz", "pointsAtZ"),
+    ("preservealpha", "preserveAlpha"),
+    ("preserveaspectratio", "preserveAspectRatio"),
+    ("primitiveunits", "primitiveUnits"),
+    ("refx", "refX"),
+    ("refy", "refY"),
+    ("repeatcount", "repeatCount"),
+    ("repeatdur", "repeatDur"),
+    ("requiredextensions", "requiredExtensions"),
+    ("requiredfeatures", "requiredFeatures"),
+    ("specularconstant", "specularConstant"),
+    ("specularexponent", "specularExponent"),
+    ("spreadmethod", "spreadMethod"),
+    ("startoffset", "startOffset"),
+    ("stddeviation", "stdDeviation"),
+    ("stitchtiles", "stitchTiles"),
+    ("surfacescale", "surfaceScale"),
+    ("systemlanguage", "systemLanguage"),
+    ("tablevalues", "tableValues"),
+    ("targetx", "targetX"),
+    ("targety", "targetY"),
+    ("textlength", "textLength"),
+    ("viewbox", "viewBox"),
+    ("viewtarget", "viewTarget"),
+    ("xchannelselector", "xChannelSelector"),
+    ("ychannelselector", "yChannelSelector"),
+    ("zoomandpan", "zoomAndPan"),
+];
+
+/// The MathML spelling of the same step (`definitionurl` is the one name whose
+/// case the vocabulary capitalises).
+const MATHML_ATTRIBUTE_ADJUSTMENTS: &[(&str, &str)] =
+    &[("definitionurl", "definitionURL")];
+
+/// HTML's "adjust MathML/SVG tags" renames for element names created through
+/// `document.createElementNS` — `linearGradient`, `clipPath` and the filter
+/// primitives are camelCase in SVG and are matched case-sensitively.
+const SVG_ELEMENT_ADJUSTMENTS: &[(&str, &str)] = &[
+    ("animatemotion", "animateMotion"),
+    ("animatetransform", "animateTransform"),
+    ("clippath", "clipPath"),
+    ("feblend", "feBlend"),
+    ("fecolormatrix", "feColorMatrix"),
+    ("fecomponenttransfer", "feComponentTransfer"),
+    ("fecomposite", "feComposite"),
+    ("feconvolvematrix", "feConvolveMatrix"),
+    ("fediffuselighting", "feDiffuseLighting"),
+    ("fedisplacementmap", "feDisplacementMap"),
+    ("fedistantlight", "feDistantLight"),
+    ("fedroplightshadow", "feDropShadow"),
+    ("feflood", "feFlood"),
+    ("fefunca", "feFuncA"),
+    ("fefuncb", "feFuncB"),
+    ("fefuncg", "feFuncG"),
+    ("fefuncr", "feFuncR"),
+    ("fegaussianblur", "feGaussianBlur"),
+    ("feimage", "feImage"),
+    ("femerge", "feMerge"),
+    ("femergenode", "feMergeNode"),
+    ("femorphology", "feMorphology"),
+    ("feoffset", "feOffset"),
+    ("fepointlight", "fePointLight"),
+    ("fespecularlighting", "feSpecularLighting"),
+    ("fespotlight", "feSpotLight"),
+    ("fetile", "feTile"),
+    ("feturbulence", "feTurbulence"),
+    ("foreignobject", "foreignObject"),
+    ("glyphref", "glyphRef"),
+    ("lineargradient", "linearGradient"),
+    ("meshgradient", "meshGradient"),
+    ("meshpatch", "meshPatch"),
+    ("radialgradient", "radialGradient"),
+    ("textpath", "textPath"),
+];
 
 /// `setAttribute`/`removeAttribute` name rules: like the tag rules but also
 /// rejecting `xmlns` redefinitions and prefix shenanigans (simplified).
-fn qual_name_for_attr(name: &str) -> Result<QualName, String> {
+///
+/// `element_ns` is the target element's namespace: HTML elements store
+/// lower-cased names like the spec's `setAttribute` step says, but foreign
+/// (SVG/MathML) elements keep the case the caller used — with the adjustment
+/// table above applied to the lower-cased spelling — since `usvg`/stylo look
+/// those names up case-sensitively.
+fn qual_name_for_attr(name: &str, element_ns: &Namespace) -> Result<QualName, String> {
     // Note: plain `xmlns` IS settable through the DOM API (react-dom does it
     // for every SVG root); only *prefixed* xmlns redefinition (`xmlns:foo`)
     // is a namespace error.
@@ -1613,7 +1763,19 @@ fn qual_name_for_attr(name: &str) -> Result<QualName, String> {
         None => (None, name),
         Some(_) => return Err(format!("invalid attribute name {name:?}")),
     };
-    let local = local.to_ascii_lowercase();
+    let adjustments = if *element_ns == blitz_dom::ns!(svg) {
+        Some(SVG_ATTRIBUTE_ADJUSTMENTS)
+    } else if *element_ns == blitz_dom::ns!(mathml) {
+        Some(MATHML_ATTRIBUTE_ADJUSTMENTS)
+    } else {
+        None
+    };
+    let local = match adjustments {
+        // Foreign content: the camelCase spelling when the table knows one,
+        // otherwise the name exactly as the caller wrote it.
+        Some(table) => adjust_foreign_name(table, local).unwrap_or(local).to_string(),
+        None => local.to_ascii_lowercase(),
+    };
     // Unprefixed HTML attributes are stored in the **empty** namespace: that
     // is how html5ever's tokenizer builds them (`QualName::new(None, ns!(),
     // name)`) and blitz's `Attributes::set/remove` compare the full QualName.
@@ -3081,7 +3243,19 @@ fn register_dom_natives(context: &mut Context) {
         let node = arg_node(args, 1, context)?;
         let name = arg_string(args, 2, context)?;
         let value = arg_string(args, 3, context)?;
-        let name = qual_name_for_attr(&name)
+        // Whose namespace is this? HTML elements lower-case attribute names,
+        // foreign (SVG/MathML) ones must not — react-dom sets every icon's
+        // `viewBox` through here, and a lower-cased `viewbox` throws away the
+        // glyph's whole coordinate system.
+        let element_ns = with_live_doc(doc, |document| {
+            document
+                .get_node(node_id(node))
+                .and_then(|node| node.element_data())
+                .map(|element| element.name.ns.clone())
+        })
+        .flatten()
+        .unwrap_or_else(|| blitz_dom::ns!());
+        let name = qual_name_for_attr(&name, &element_ns)
             .map_err(|reason| {
                 JsNativeError::range().with_message(format!("InvalidCharacterError: {reason}"))
             })
@@ -3291,7 +3465,8 @@ fn register_dom_natives(context: &mut Context) {
             if mutator.doc.get_node(node_id(node)).is_none() {
                 return Err(JsNativeError::typ().with_message("NotFoundError: node is gone"));
             }
-            let name = qual_name_for_attr("value").expect("valid attr name");
+            let name = qual_name_for_attr("value", &blitz_dom::ns!(html))
+                .expect("valid attr name");
             mutator.set_attribute(node_id(node), name, &value);
             Ok(())
         });
@@ -3340,7 +3515,8 @@ fn register_dom_natives(context: &mut Context) {
             // Keeps the special data AND the ElementState::CHECKED bit (so
             // `:checked` style matching follows) in sync (element.rs).
             element.set_checkbox_input_checked(checked);
-            let name = qual_name_for_attr("checked").expect("valid attr name");
+            let name = qual_name_for_attr("checked", &blitz_dom::ns!(html))
+                .expect("valid attr name");
             if checked {
                 mutator.set_attribute(node_id(node), name, "");
             } else {
@@ -13763,5 +13939,81 @@ mod boa_site_scratch {
                 Err(e) => println!("{name}: FULL\n{e}"),
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod foreign_name_case {
+    use super::*;
+
+    fn html() -> Namespace {
+        blitz_dom::ns!(html)
+    }
+    fn svg() -> Namespace {
+        blitz_dom::ns!(svg)
+    }
+
+    /// Foreign content keeps attribute-name case: the SVG DOM, stylo and
+    /// `usvg` all look `viewBox`/`gradientUnits`/`refX` up case-sensitively, so
+    /// a lower-cased `viewbox` drops the icon's coordinate system (Mastodon's
+    /// 960-unit glyph grid then paints ~40x oversized, black, over the feed).
+    #[test]
+    fn svg_attributes_keep_their_case() {
+        for name in ["viewBox", "gradientUnits", "refX", "preserveAspectRatio", "d"] {
+            let qual = qual_name_for_attr(name, &svg()).expect("valid");
+            assert_eq!(&*qual.local.to_string(), name, "{name} lost its case");
+        }
+        // The parser's lower-cased spelling maps to the canonical name too.
+        assert_eq!(
+            &*qual_name_for_attr("viewbox", &svg()).unwrap().local.to_string(),
+            "viewBox"
+        );
+    }
+
+    /// HTML keeps the spec's lower-casing, so this is not a blanket change.
+    #[test]
+    fn html_attributes_stay_lower_case() {
+        assert_eq!(
+            &*qual_name_for_attr("viewBox", &html()).unwrap().local.to_string(),
+            "viewbox"
+        );
+        assert_eq!(
+            &*qual_name_for_attr("sTYle", &html()).unwrap().local.to_string(),
+            "style"
+        );
+    }
+
+    /// Prefixed names (`xlink:href` on svg `<use>`) land in their namespace
+    /// whatever the element's namespace is.
+    #[test]
+    fn prefixed_svg_attributes_keep_their_namespace() {
+        let qual = qual_name_for_attr("xlink:href", &svg()).unwrap();
+        assert_eq!(qual.ns, blitz_dom::ns!(xlink));
+        assert_eq!(&*qual.local.to_string(), "href");
+    }
+
+    /// camelCase SVG elements (`linearGradient`, `clipPath`, the filter
+    /// primitives) survive `createElementNS` with their real names.
+    #[test]
+    fn svg_element_names_keep_their_case() {
+        for tag in ["svg", "path", "linearGradient", "clipPath", "feGaussianBlur"] {
+            let qual = qual_name_for_ns(tag, "http://www.w3.org/2000/svg").expect("valid");
+            assert_eq!(&*qual.local.to_string(), tag, "{tag} lost its case");
+        }
+        assert_eq!(
+            &*qual_name_for_ns("lineargradient", "http://www.w3.org/2000/svg")
+                .unwrap()
+                .local
+                .to_string(),
+            "linearGradient"
+        );
+        // HTML still lower-cases.
+        assert_eq!(
+            &*qual_name_for_ns("DiV", "http://www.w3.org/1999/xhtml")
+                .unwrap()
+                .local
+                .to_string(),
+            "div"
+        );
     }
 }

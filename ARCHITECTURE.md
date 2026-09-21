@@ -700,9 +700,23 @@ to text inputs; a hard TypeError previously killed mastodon's search column behi
 boundary), bare `xmlns` is settable (react-dom stamps it on every SVG root), `classList` is a
 snapshot DOMTokenList over the `class` attribute, and both `console.error(err)` and module
 rejections print error **stacks** — the single most valuable debug affordance added this round.
-Honest gaps: SVG content paints as empty boxes (structure exists, rendering doesn't), timers
-still drive nothing off `document.visibilityState`, and unhead/helmet's deferred-init timer
-still throws once (`createContext` undefined there — a module-cycle quirk, page survives).
+**Foreign content keeps name case** (task: black blobs over the first Mastodon posts). HTML
+lower-cases names; SVG/MathML must not. `usvg`, stylo and the SVG DOM look up `viewBox`,
+`gradientUnits`, `preserveAspectRatio`, `linearGradient`/`clipPath`/`feGaussianBlur`
+case-sensitively, and an `<svg>` root carrying a lower-cased `viewbox` silently loses its
+coordinate system: `usvg` falls back to a 24-unit viewport, so a glyph authored on a 960-unit
+grid (Mastodon's whole icon set) paints ~40× oversized — a 24 px icon became a 720x560 black
+fill over the timeline. So `qual_name_for_attr(name, element_ns)`/`qual_name_for_ns` lowercase
+**only inside the HTML namespace** and otherwise apply html5ever's "adjust MathML/SVG
+attributes/tags" renames (`viewbox`→`viewBox`, `lineargradient`→`linearGradient`) — the same
+table the markup parser already runs, since the DOM spec's name-adjustment step owes
+`setAttribute` the fixup too. Reads stay case-insensitive the way browsers made them
+(`getAttribute("viewBox")` finds a stored `viewbox` and vice versa). Pinned by the
+`js::foreign_name_case` units and
+`tests/headless.rs::svg_viewbox_case_survives_setattribute_and_icons_paint_their_size`, which
+asserts on the *recorded paint*: every black fill ≤40 px, not a column-wide blob. Honest gaps:
+timers still drive nothing off `document.visibilityState`, and unhead/helmet's deferred-init
+timer still throws once (`createContext` undefined there — a module-cycle quirk, page survives).
 **Lazy route chunks actually mount** (task: infosec.exchange/explore posts render): three
 pieces close the Vite/React-lazy chain. (1) `rel` is a **reflected** string attribute on
 `<link>`/`<a>`/`<area>`/`<form>` (with `as`/`crossOrigin` on `<link>`) — blitz's
@@ -720,9 +734,11 @@ Mastodon's link-card builds an anchor and reads `.hostname`, and an absent membe
 whole status render. Finally, `Tab.anim_clock` feeds `BaseDocument::resolve`'s
 `current_time_for_animations` (was a constant `0.`): Mastodon's `.status{animation:…fade}`
 (`0%{opacity:0}`) was frozen at its start keyframe, so a column full of fetched statuses
-painted blank. Known remaining: an oversized SVG/path fill still paints over the first posts
-(recorded fill bboxes ~720x560 clipped to the column) — a blitz paint bug, separate from the
-fetch/render path.
+painted blank. The oversized SVG fill that used to paint over the first posts (~720x560 bboxes
+clipped to the column) was **our** bridge corrupting `viewBox`, not a blitz paint bug — see the
+name-case invariant above; the `--dump-paint-detail` headless flag (bbox/brush/fill-rule/clips of
+every recorded fill, `IRONSURF_FILL_MIN_AREA` sets the floor, default 1500 px²) is what located
+it and is what the regression test asserts through.
 **`boa_ast` is forked** (task: the explore-page react-spring `TypeError: cannot convert
 'null' or 'undefined' to object`): upstream `Scope::escape_this_in_enclosing_function_scope`
 stops escaping `this` at the first enclosing function scope — even an arrow's, which cannot
