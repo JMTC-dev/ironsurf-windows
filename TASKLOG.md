@@ -88,3 +88,10 @@
   till the next event, so the session is tracked in Rust, not slint. tests/new_tab_url_bar.rs (own binary — IRONSURF_DATA_DIR
   is process-global): token bump, keystroke replaces, announce cannot clobber, Esc restores, page click drops the draft; shell
   65u + every suite green; :2.0 real app — Ctrl-T then typing logs exactly `address bar: "example.com"`; ARCH §focus routing.
+## #49 infosec.exchange render stall root-caised: initial-state JSON has no local_settings (fresh-profile parity) and
+  the app fills it from localStorage mastodon-settings; document-start userscript seeds it and the Redux Record lands
+  intact (size=20, rm=no). Live-feed/saga/XHR end-to-end confirmed (timelines/public 200, 80KB, trends items in store).
+  Sole blocker now: one uncaught TypeError at HandledLink (collection_preview_card :2:6210 = the useAppSelector call —
+  Boa reports failing ops at the enclosing call column, pinned in js.rs typeerror_message_taxonomy tests) aborts the
+  whole React render pass; react-redux context spy (fx11) chasing which member is null. Also landed: IntersectionObserver,
+  focus()/click()/event constructors, viewport constants — fx6 boot is console-clean.

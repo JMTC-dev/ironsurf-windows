@@ -1714,6 +1714,33 @@ impl Tab {
             );
             runtime.set_import_map(Some(map));
         }
+        // `@run-at document-start` userscripts (Tampermonkey directive, task:
+        // infosec.exchange forensics): scripts whose source carries the
+        // directive run BEFORE any page script, so they can wrap realm
+        // singletons (timers, XHR, fetch) before the page captures them.
+        // The directive lives in the code itself — the wire format is
+        // unchanged. Scripts without the directive keep running after the
+        // page's own scripts, as before.
+        let start_scripts: Vec<(String, String)> = self
+            .userscripts
+            .iter()
+            .filter(|s| s.enabled && Self::runs_at_start(&s.code))
+            .filter(|s| {
+                userscripts_for_url(std::slice::from_ref(s), url.as_str())
+                    .iter()
+                    .any(|m| m.id == s.id)
+            })
+            .map(|s| (s.name.clone(), s.code.clone()))
+            .collect();
+        if !start_scripts.is_empty() {
+            debug!(
+                "running {} document-start userscript(s) for {url}",
+                start_scripts.len()
+            );
+            for (name, code) in &start_scripts {
+                runtime.run_userscript(name, code, self.doc.as_mut());
+            }
+        }
         // The live document is registered for the duration of the run, so
         // page JS can read and mutate the real DOM (docId 0).
         let errors = runtime.run_scripts(&extraction.scripts, self.doc.as_mut());
@@ -1735,6 +1762,21 @@ impl Tab {
         self.run_userscripts(url);
     }
 
+    /// True when a userscript's source declares the Tampermonkey directive
+    /// `@run-at document-start` (checked over the leading comment block only —
+    /// the same window managers scan). Everything else runs at document end.
+    fn runs_at_start(code: &str) -> bool {
+        code.lines()
+            .take_while(|line| {
+                let t = line.trim_start();
+                t.starts_with("//") || t.starts_with("*") || t.is_empty()
+            })
+            .any(|line| {
+                let t = line.to_ascii_lowercase();
+                t.contains("@run-at") && (t.contains("document-start") || t.contains("document_start"))
+            })
+    }
+
     /// Run the userscripts that apply to this document (task: userscripts).
     ///
     /// Called at the end of every `run_scripts`, i.e. once per loaded document
@@ -1753,6 +1795,9 @@ impl Tab {
         }
         let matching: Vec<(String, String)> = userscripts_for_url(&self.userscripts, url.as_str())
             .into_iter()
+            // document-start scripts already ran before the page's own
+            // scripts; running them twice would double-wrap patched globals.
+            .filter(|script| !Self::runs_at_start(&script.code))
             .map(|script| (script.name.clone(), script.code.clone()))
             .collect();
         if matching.is_empty() {

@@ -733,6 +733,40 @@ impl std::ops::Deref for XhrFetch {
 /// synchronously (the tab's blocking client, like every other tab fetch) and
 /// hands out an already-ready future, so a whole import graph settles within
 /// one job-queue drain.
+/// Forensic debug tool — inert unless `IRONSURF_CHUNK_DEBUG` is set in the
+/// environment. A handful of exact-match rewrites that make vendored library
+/// code report internal state through `console.log`. The needles are pinned to
+/// one minified build (react-redux v9 inside `detect-it.esm-*.js`): the
+/// `useSelector` body reads `{store, subscription}` off the context value and
+/// the app's abort site was a null member there; these probes log the context
+/// object's shape from both the Provider and the subscriber side so a null can
+/// be attributed. Identity transform for every other chunk.
+fn debug_chunk_transform(body: String) -> String {
+    if std::env::var("IRONSURF_CHUNK_DEBUG").is_err() {
+        return body;
+    }
+    let mut out = body;
+    const SUB_HOOK: (&str, &str) = (
+        "=t();A.useRef(!0);let s=A.useCallback",
+        "=t();try{console.log(\"[HOOK] keys=\"+Object.keys(t()).join(\",\")+\" sub=\"+typeof a+\" store=\"+typeof i+\" gs=\"+typeof o+\" @\"+(new Error(\"h\")).stack.replace(/\\n/g,\"|\"))}catch(he){console.log(\"[HOOKF] \"+he)}A.useRef(!0);let s=A.useCallback",
+    );
+    const PROV_HOOK: (&str, &str) = (
+        "let s=n||Hr;return A.createElement(s.Provider,{value:a},t)",
+        "let s=n||Hr;try{console.log(\"[PROV] ctxkeys=\"+(s?Object.keys(s).join(\",\"):\"?\")+\" store=\"+(a?typeof a.store:\"?\")+\" sub=\"+(a?typeof a.subscription:\"?\")+\" valkeys=\"+(a?Object.keys(a).join(\",\"):\"?\"))}catch(he){console.log(\"[PROVF] \"+he)}return A.createElement(s.Provider,{value:a},t)",
+    );
+    const P_ENTRY: (&str, &str) = (
+        "P=({href:e,text:t,prevText:n,hashtagAccountId:r,mention:i,collectionId:a,className:o,children:s,...c})=>{let l=_(",
+        "P=({href:e,text:t,prevText:n,hashtagAccountId:r,mention:i,collectionId:a,className:o,children:s,...c})=>{console.log(\"[PENTRY] href=\"+String(e)+\" text=\"+String(t).slice(0,40)+\" stack=\"+String((new Error(\"pe\")).stack).replace(/\\n/g,\"|\").slice(0,900));let l=_(",
+    );
+    for (needle, repl) in [SUB_HOOK, PROV_HOOK, P_ENTRY] {
+        if out.contains(needle) {
+            out = out.replace(needle, repl);
+            eprintln!("[chunk-debug] instrumented one site");
+        }
+    }
+    out
+}
+
 pub struct UrlModuleLoader {
     /// The document URL: referrer for loads with no module/script path of
     /// their own — dynamic `import()` from a classic script or a `javascript:`
@@ -841,6 +875,7 @@ impl ModuleLoader for UrlModuleLoader {
                 return std::future::ready(Err(JsNativeError::typ().with_message(message).into()));
             }
         };
+        let body = debug_chunk_transform(body);
         let path = PathBuf::from(resolved.as_str());
         let mut context = context.borrow_mut();
         let parsed = Module::parse(
@@ -3339,6 +3374,8 @@ const PRELUDE: &str = r##"
   }
   // Non-bubbling event types (focus/blur fire on the target only).
   var NO_BUBBLE = { focus: 1, blur: 1, focusin_nonbubbling: 1, scroll: 1, load: 1 };
+  // The element `focus()` last named (see the `focus()` glue).
+  var __focusedElement = null;
   // Inline `on<type>="..."` attribute handlers, compiled per (node,type);
   // recompiled only when the attribute text changes.
   var inlineCache = Object.create(null); // targetId → type → {src, fn}
@@ -3604,10 +3641,16 @@ const PRELUDE: &str = r##"
   host.name = "";
   host.closed = false;
   host.devicePixelRatio = 1;
-  host.innerWidth = 0;
-  host.innerHeight = 0;
-  host.outerWidth = 0;
-  host.outerHeight = 0;
+  // Viewport constants (task: infosec.exchange). These were 0 — and every
+  // measuring widget (carousels, lazy-render gates, `matchMedia` fallbacks)
+  // behaves pathologically on a 0×0 viewport: the landing carousel's raf loop
+  // never settles its measurement. They now default to the engine's own
+  // default window (DEFAULT_SIZE, 1024×768 CSS px); a live resize is not yet
+  // propagated into the realm (TODO: push ToTab::Resize through here too).
+  host.innerWidth = 1024;
+  host.innerHeight = 768;
+  host.outerWidth = 1024;
+  host.outerHeight = 768;
   host.location = location;
 
   // ---------------------------------------------------------------------
@@ -3971,6 +4014,22 @@ const PRELUDE: &str = r##"
   protoGet("attributes", function () { return makeAttrMap(this.__d, this.__n); });
   protoAccessor(
     "textContent",
+    function () {
+      var v = host.__ironsurfDomText(this.__d, this.__n);
+      return v === null ? "" : v;
+    },
+    function (v) { host.__ironsurfDomTextSet(this.__d, this.__n, String(v)); }
+  );
+  // HTMLElement.innerText — spec'd as textContent with rendered-line
+  // formatting; with no layout engine the textContent value IS the honest
+  // approximation. Glitch-timeline link cards build their prop as
+  // `text: el.innerText` (collection_preview_card), and a missing member
+  // there propagated undefined into `text.startsWith("#")` — the one
+  // uncaught TypeError that aborted the whole first render pass on
+  // infosec.exchange (Boa reports property reads of undefined as "cannot
+  // convert 'null' or 'undefined' to object").
+  protoAccessor(
+    "innerText",
     function () {
       var v = host.__ironsurfDomText(this.__d, this.__n);
       return v === null ? "" : v;
@@ -4465,6 +4524,53 @@ const PRELUDE: &str = r##"
     firePath(eventPath(this), event);
     return !event.defaultPrevented;
   });
+  // `HTMLElement.prototype.click` — real activation semantics: dispatch a
+  // bubbling click through the capture/bubble path, then honour the default
+  // action the page did not prevent (an `<a href>` navigates, same host hook
+  // `location.href` assignment uses). Without this, `el.click()` — how every
+  // SPA test-drive and cookie-banner dismissal works — is a missing property
+  // (task: infosec.exchange).
+  protoMethod("click", function () {
+    var ev = makeEvent("click", this, { detail: 0 });
+    firePath(eventPath(this), ev);
+    if (ev.defaultPrevented) return;
+    var tag = String(this.tagName || "").toUpperCase();
+    if (tag === "A") {
+      var href = this.getAttribute ? this.getAttribute("href") : null;
+      if (href !== null && href !== "" && !/^javascript:/i.test(String(href))) {
+        try {
+          var target = new URL(String(href), host.location.href).href;
+          host.__ironsurfNavigate(target, false);
+        } catch (err) {
+          /* unresolvable href: no default action, like the spec */
+        }
+      }
+    }
+  });
+  // `focus()`/`blur()` — the trends hero's callback ref runs
+  // `el.focus({ preventScroll: true })` on every mount; `focus` was not a
+  // property of our elements, so the scheduled timer task threw
+  // "not a callable function" straight through the column (task:
+  // infosec.exchange). One focused surface, so this tracks a single element
+  // and exposes it as `document.activeElement` (body when nothing is focused,
+  // spec default). `preventScroll` is accepted but inert: this engine has no
+  // JS-visible scroll model for script to move.
+  protoMethod("focus", function (_options) {
+    if (__focusedElement === this) return;
+    __focusedElement = this;
+    firePath(eventPath(this), makeEvent("focus", this));
+  });
+  protoMethod("blur", function () {
+    if (__focusedElement !== this) return;
+    __focusedElement = null;
+    firePath(eventPath(this), makeEvent("blur", this));
+  });
+  // Scroll requests are accepted and inert: layout exists, but the realm has
+  // no scroll-position model to move (and callers only care that it does not
+  // throw).
+  protoMethod("scrollIntoView", function (_arg) {});
+  protoMethod("scroll", function (_arg) {});
+  protoMethod("scrollTo", function (_arg) {});
   // getElementsByClassName on any element (live, like the document one).
   protoMethod("getElementsByClassName", function (name) {
     // Not scoped to descendants in this bridge — document-wide live list.
@@ -5594,6 +5700,80 @@ const PRELUDE: &str = r##"
   host.CustomEvent = CustomEvent;
   host.EventTarget = EventTarget;
 
+  // UIEvent / MouseEvent / KeyboardEvent constructors (task: infosec.exchange
+  // explore tabs). Page code — and every "drive the page from JS" pattern —
+  // builds real interaction events; without these constructors `new
+  // MouseEvent(...)` is a ReferenceError and synthetic activation dies
+  // before it reaches the app's listeners. Instances are genuine `Event`
+  // objects (same makeEvent base, so propagation internals match) with the
+  // init dictionary layered on top.
+  function eventWith(proto, type, init) {
+    var base = makeEvent(String(type), null, init);
+    var ev = Object.create(proto);
+    Object.keys(base).forEach(function (k) { ev[k] = base[k]; });
+    ev.target = null;
+    ev.currentTarget = null;
+    return ev;
+  }
+  function UIEvent(type, init) {
+    var ev = eventWith(UIEvent.prototype, type, init || {});
+    ev.detail = (init && typeof init.detail === "number") ? init.detail : 0;
+    ev.view = (init && init.view) || host;
+    return ev;
+  }
+  UIEvent.prototype = Object.create(Event.prototype);
+  UIEvent.prototype.constructor = UIEvent;
+  function MouseEvent(type, init) {
+    init = init || {};
+    var ev = eventWith(MouseEvent.prototype, type, init);
+    ev.detail = typeof init.detail === "number" ? init.detail : 0;
+    ev.view = init.view || host;
+    ev.screenX = init.screenX || 0;
+    ev.screenY = init.screenY || 0;
+    ev.clientX = init.clientX || 0;
+    ev.clientY = init.clientY || 0;
+    ev.ctrlKey = !!init.ctrlKey;
+    ev.shiftKey = !!init.shiftKey;
+    ev.altKey = !!init.altKey;
+    ev.metaKey = !!init.metaKey;
+    ev.button = init.button || 0;
+    ev.buttons = init.buttons || 0;
+    ev.relatedTarget = init.relatedTarget || null;
+    ev.which = ev.button;
+    return ev;
+  }
+  MouseEvent.prototype = Object.create(UIEvent.prototype);
+  MouseEvent.prototype.constructor = MouseEvent;
+  function KeyboardEvent(type, init) {
+    init = init || {};
+    var ev = eventWith(KeyboardEvent.prototype, type, init);
+    ev.detail = typeof init.detail === "number" ? init.detail : 0;
+    ev.view = init.view || host;
+    ev.key = init.key === undefined ? "" : String(init.key);
+    ev.code = init.code === undefined ? "" : String(init.code);
+    ev.location = init.location || 0;
+    ev.repeat = !!init.repeat;
+    ev.isComposing = !!init.isComposing;
+    ev.ctrlKey = !!init.ctrlKey;
+    ev.shiftKey = !!init.shiftKey;
+    ev.altKey = !!init.altKey;
+    ev.metaKey = !!init.metaKey;
+    ev.getModifierState = function (name) {
+      name = String(name).toLowerCase();
+      if (name === "control") return ev.ctrlKey;
+      if (name === "shift") return ev.shiftKey;
+      if (name === "alt") return ev.altKey;
+      if (name === "meta") return ev.metaKey;
+      return false;
+    };
+    return ev;
+  }
+  KeyboardEvent.prototype = Object.create(UIEvent.prototype);
+  KeyboardEvent.prototype.constructor = KeyboardEvent;
+  host.UIEvent = UIEvent;
+  host.MouseEvent = MouseEvent;
+  host.KeyboardEvent = KeyboardEvent;
+
   // ---------------------------------------------------------------------
   // DOMException (task: infosec.exchange). Missing entirely — and core-js
   // (every modern bundle's polyfill layer) resolves `getBuiltIn
@@ -6029,6 +6209,80 @@ const PRELUDE: &str = r##"
   }
   host.MessageChannel = MessageChannel;
   host.MessagePort = MessagePort;
+
+  // ---------------------------------------------------------------------
+  // IntersectionObserver (task: infosec.exchange). Without this the Mastodon
+  // `scrollable_list` component throws `ReferenceError:
+  // IntersectionObserver is not defined` mid-render the moment a timeline
+  // mounts — the statuses are fetched (200, 97 KB) but the column dies into
+  // its error boundary and nothing paints. This engine exposes no layout
+  // geometry to JS at all (`getBoundingClientRect`/`clientHeight` are not
+  // bridged, `innerHeight` is a constant), so an honest intersection test is
+  // impossible; the simplification here is OPTIMISTIC VIEWPORT: every
+  // observed target is reported exactly once, as fully intersecting, on the
+  // next task — the exact record shape sentinel-driven "load more"/lazy-mount
+  // code consumes, once per `observe()` like the spec's initial delivery.
+  // A real browser would re-report on scroll; that feedback loop is absent,
+  // so nothing here can re-trigger the app in a loop. `unobserve` /
+  // `disconnect` stop pending and future records; `takeRecords` drains the
+  // (always empty, post-delivery) queue.
+  // ---------------------------------------------------------------------
+  function ioRect() {
+    return { x: 0, y: 0, top: 0, left: 0, right: 0, bottom: 0, width: 0, height: 0 };
+  }
+  function IntersectionObserver(callback, options) {
+    if (typeof callback !== "function") {
+      throw new TypeError("Failed to construct 'IntersectionObserver': callback required");
+    }
+    options = options || {};
+    this.root = options.root || null;
+    this.rootMargin = String(options.rootMargin || "0px");
+    this.threshold = options.threshold === undefined ? 0 : options.threshold;
+    this.__callback = callback;
+    this.__pending = [];
+    this.__dead = false;
+  }
+  IntersectionObserver.prototype.observe = function (target) {
+    if (this.__dead || !target) return;
+    for (var i = 0; i < this.__pending.length; i++) {
+      if (this.__pending[i] === target) return; // already queued, like the spec
+    }
+    this.__pending.push(target);
+    var self = this;
+    host.__ironsurfSetTimeout(function () {
+      if (self.__dead) return;
+      var idx = self.__pending.indexOf(target);
+      if (idx < 0) return; // unobserved before delivery: no record
+      self.__pending.splice(idx, 1);
+      var entry = {
+        target: target,
+        isIntersecting: true,
+        intersectingTime: 0,
+        intersectionRatio: 1,
+        boundingClientRect: ioRect(),
+        intersectionRect: ioRect(),
+        rootBounds: ioRect(),
+        time: Date.now(),
+      };
+      try {
+        self.__callback([entry], self);
+      } catch (err) {
+        reportError("IntersectionObserver callback: " + err);
+      }
+    }, 0);
+  };
+  IntersectionObserver.prototype.unobserve = function (target) {
+    var idx = this.__pending.indexOf(target);
+    if (idx >= 0) this.__pending.splice(idx, 1);
+  };
+  IntersectionObserver.prototype.disconnect = function () {
+    this.__pending = [];
+    this.__dead = true;
+  };
+  IntersectionObserver.prototype.takeRecords = function () {
+    return []; // records deliver on task; nothing ever queues behind
+  };
+  host.IntersectionObserver = IntersectionObserver;
 
   // ---------------------------------------------------------------------
   // getComputedStyle (task: infosec.exchange). Mastodon's lightbox module
@@ -7579,12 +7833,12 @@ const PRELUDE: &str = r##"
       return false;
     });
   }
-  // document.activeElement: focus tracking does not exist (one focused
-  // surface, the page), so the active element is the body, spec default.
+  // document.activeElement: the element `focus()` last named, else the body
+  // (spec default). One focused surface — see the `focus()` glue above.
   if (document && document.activeElement === undefined) {
     Object.defineProperty(document, "activeElement", {
       get: function () {
-        return document.body || document.documentElement;
+        return __focusedElement || document.body || document.documentElement;
       },
       configurable: true,
     });
@@ -8683,6 +8937,8 @@ impl JsRuntime {
                 ))
             }
         };
+        let code = debug_chunk_transform(code.to_string());
+        let code = code.as_str();
         let path = PathBuf::from(url);
         let module = match Module::parse(
             Source::from_bytes(code.as_bytes()).with_path(&path),
@@ -9241,6 +9497,29 @@ mod tests {
                 target: "https://example.test/page.html".to_string(),
                 replace: true,
             })
+        );
+    }
+
+    #[test]
+    fn inner_text_mirrors_text_content() {
+        // HTMLElement.innerText (infosec.exchange: the link-card text prop in
+        // collection_preview_card is `text: el.innerText`; a missing member
+        // propagated undefined into `text.startsWith("#")` and aborted the
+        // whole first render pass — Boa reads a property of undefined as
+        // "cannot convert 'null' or 'undefined' to object"). No layout engine
+        // exists, so the spec's rendered-line formatting collapses to the
+        // textContent value.
+        dom_true(
+            r##"
+            var d = document.createElement("div");
+            d.innerHTML = "a<b>bc</b>";
+            var read = d.innerText === "abc";
+            d.innerText = "z &amp;y";
+            var written = d.textContent.indexOf("z") === 0 && d.children.length === 0;
+            var span = document.querySelector("span");
+            var viaSpan = span ? span.innerText.length > 0 : true;
+            read && written && viaSpan;
+            "##,
         );
     }
 
@@ -12327,5 +12606,92 @@ mod request_init_tests {
             ),
             "a non-null signal must survive the normalisation"
         );
+    }
+}
+
+#[cfg(test)]
+mod typeerror_message_taxonomy {
+    use super::*;
+
+    fn eval_err(src: &str) -> String {
+        let host = Rc::new(RefCell::new(HostState::new("https://example.test/p.html", None, None)));
+        let mut runtime = JsRuntime::new(Rc::clone(&host));
+        match runtime.eval(src) {
+            Ok(_) => String::new(),
+            Err(e) => format!("{e}").lines().next().unwrap_or_default().to_owned(),
+        }
+    }
+
+    /// The taxonomy of Boa's TypeErrors, pinned because the infosec.exchange
+    /// console forensics turn on it: a failed MEMBER ACCESS on null/undefined
+    /// reports "cannot convert 'null' or 'undefined' to object" (`to_object`),
+    /// while a failed DESTRUCTURING reports "Cannot destructure 'null' value".
+    /// A React component rendering into the first reports the former from the
+    /// member reads inside its first hook (e.g. a selector reading a key off a
+    /// MISSING preloaded-state slice); seeing the destructure wording instead
+    /// means the null sat in a binding site, not an access site. A call on a
+    /// non-object reports "not a callable function".
+    /// When the failing access sits INSIDE a function body, Boa reports the
+    /// access column within that frame, and the frame carries the function
+    /// name — used to localize the infosec `at P (:2:6210)` crash.
+    #[test]
+    fn failure_inside_function_reports_inner_column() {
+        let err = eval_err("function P({ text: t }) { return t.startsWith(`#`); } P({})");
+        println!("inside-fn err: {err}");
+        assert!(err.starts_with("TypeError: cannot convert"), "{err}");
+        let line2 = err.lines().nth(1).unwrap_or_default();
+        assert!(line2.contains("at P"), "{err}");
+    }
+
+    #[test]
+    fn access_destructure_and_call_have_distinct_messages() {
+        assert_eq!(
+            eval_err("var a=null; a.addNestedSub"),
+            "TypeError: cannot convert 'null' or 'undefined' to object (unknown at :1:15)"
+        );
+        assert_eq!(
+            eval_err("var b=undefined; b.deep.here"),
+
+            "TypeError: cannot convert 'null' or 'undefined' to object (unknown at :1:20)"
+        );
+        assert_eq!(
+            eval_err("function P({a:e,b:t}){return 1} P.call(undefined, null)"),
+            "TypeError: Cannot destructure 'null' value (unknown at :1:39)"
+        );
+        assert_eq!(
+            eval_err("const P=({a:e,b:t,...c})=>1; P.call(undefined, null)"),
+            "TypeError: Cannot destructure 'null' value (unknown at :1:36)"
+        );
+        assert_eq!(eval_err("var t=null; t()"), "TypeError: not a callable function (unknown at :1:14)");
+        // Rest-args do NOT shield the binding failure: apply([undefined]) still dies.
+        let rest = eval_err("const f=({a})=>1; Reflect.apply(f, undefined, [undefined, {}])");
+        assert!(
+            rest.starts_with("TypeError: Cannot destructure 'undefined' value"),
+            "rest-args do not shield the binding failure: {rest}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod boa_site_scratch {
+    use super::*;
+
+    #[test]
+    #[ignore = "scratch: where boa locates null-arg destructuring failures"]
+    fn boa_null_arg_site() {
+        for (name, code) in [
+            ("arrow-param-null", "const P=({a,b=1,c})=>a; P(null);"),
+            ("fn-param-null", "function Q({a}){return a} Q(undefined);"),
+            ("arrow-rest-prop-null", "const R=({a, ...c})=>String(a)+typeof c; R(null);"),
+            ("arrow-rest-prop-ok", "const S=({a=2, ...c})=>String(a)+typeof c; S({});"),
+            ("arrow-defaults-null", "const T=({a=1,b=2})=>a+b; T(null);"),
+        ] {
+            let host = Rc::new(RefCell::new(HostState::new("https://example.test/p.html", None, None)));
+            let mut runtime = JsRuntime::new(Rc::clone(&host));
+            match runtime.eval(code) {
+                Ok(_) => println!("{name}: no error"),
+                Err(e) => println!("{name}: FULL\n{e}"),
+            }
+        }
     }
 }
