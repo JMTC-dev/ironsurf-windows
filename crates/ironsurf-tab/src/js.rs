@@ -1978,6 +1978,16 @@ mod dom_native {
     // document's own URL resolver (`img.src` must answer an ABSOLUTE url).
     pub(super) const IMAGE_STATE: &str = "__ironsurfDomImageState";
     pub(super) const RESOLVE_URL: &str = "__ironsurfDomResolveUrl";
+    // Form submissions from script (`document.forms`, `form.elements`,
+    // `requestSubmit()` — task: reddit's PoW shell). `FORM_IDS` answers the
+    // document's `<form>` elements in tree order, `FORM_CONTROLS` the listed
+    // controls one form owns, and `FORM_SUBMIT` resolves one form's
+    // submission ([url, method] — the tab's own form-entry-list algorithm,
+    // so JS-built hidden inputs with a script-set `value` submit exactly
+    // like a click-submitted one).
+    pub(super) const FORM_IDS: &str = "__ironsurfFormIds";
+    pub(super) const FORM_CONTROLS: &str = "__ironsurfFormControlIds";
+    pub(super) const FORM_SUBMIT: &str = "__ironsurfFormSubmit";
     // Form controls: value / checked (blitz editor + input special data).
     pub(super) const VALUE: &str = "__ironsurfDomValue";
     pub(super) const VALUE_SET: &str = "__ironsurfDomValueSet";
@@ -3431,6 +3441,105 @@ fn register_dom_natives(context: &mut Context) {
 
     // -- form controls ("<input>"/"<button>" work) ----------------------------
 
+    // -- forms from script (task: reddit's PoW shell) -----------------------
+    // Reddit gates every first navigation behind a tiny JS proof-of-work
+    // shell: one inline script doubles a token and calls
+    // `form.requestSubmit()` on a GET form, and ONLY the answered request is
+    // served the real subreddit. `document.forms` / `form.elements` /
+    // `requestSubmit()` are therefore load-bearing, and they read the LIVE
+    // document (script-appended hidden inputs and script-set `value`s
+    // included) through the very same entry-list the click path uses.
+    native!(dom_native::FORM_IDS, 1, |_this, args, context| {
+        let doc = arg_doc(args, 0, context)?;
+        let ids = with_live_doc(doc, |document| {
+            let mut forms = Vec::new();
+            for id in elements_in_tree_order(document) {
+                if document
+                    .get_node(id)
+                    .and_then(|node| node.element_data())
+                    .is_some_and(|el| el.name.local == *local_name!("form"))
+                {
+                    forms.push(id);
+                }
+            }
+            forms
+        })
+        .unwrap_or_default();
+        let array = boa_engine::object::builtins::JsArray::from_iter(
+            ids.into_iter().map(|id| JsValue::new(node_raw(id) as f64)),
+            context,
+        );
+        Ok(JsValue::from(array))
+    });
+    native!(dom_native::FORM_CONTROLS, 2, |_this, args, context| {
+        let doc = arg_doc(args, 0, context)?;
+        let raw = arg_node(args, 1, context)?;
+        // HTML's listed elements (the ones `form.elements` exposes). The
+        // ownership check (`owner_form`) is the same one the entry list
+        // uses, so an appended control shows up and a removed one drops out.
+        let is_listed = |document: &BaseDocument, id: NodeId| {
+            document
+                .get_node(id)
+                .and_then(|node| node.element_data())
+                .is_some_and(|el| {
+                    el.name.local == *local_name!("button")
+                        || el.name.local == *local_name!("fieldset")
+                        || el.name.local == *local_name!("input")
+                        || el.name.local == *local_name!("select")
+                        || el.name.local == *local_name!("textarea")
+                        || (el.name.local == *local_name!("img")
+                            && el.attr(local_name!("name")).is_some())
+                })
+        };
+        let ids = with_live_doc(doc, |document| {
+            let form = node_id(raw);
+            let mut controls = Vec::new();
+            for id in elements_in_tree_order(document) {
+                if crate::forms::owner_form(document, id) == Some(form)
+                    && is_listed(document, id)
+                {
+                    controls.push(id);
+                }
+            }
+            controls
+        })
+        .unwrap_or_default();
+        let array = boa_engine::object::builtins::JsArray::from_iter(
+            ids.into_iter().map(|id| JsValue::new(node_raw(id) as f64)),
+            context,
+        );
+        Ok(JsValue::from(array))
+    });
+    // One form submission, resolved the forms-side way (`build_submission`):
+    // answers `[url, "get"|"post"]` — the glue dispatches GET through the
+    // standard JS navigation queue and leaves POST to a `submit()` method
+    // only (the JS navigation hook carries no body). `null` = no form/no
+    // live document, which the glue reports as a no-op like a browser's
+    // disconnected-form behaviour.
+    native!(dom_native::FORM_SUBMIT, 2, |_this, args, context| {
+        let doc = arg_doc(args, 0, context)?;
+        let raw = arg_node(args, 1, context)?;
+        let submission = with_live_doc(doc, |document| {
+            crate::forms::build_submission(document, node_id(raw), None).ok()
+        })
+        .flatten();
+        let Some(sub) = submission else {
+            return Ok(JsValue::null());
+        };
+        let method = match sub.method {
+            crate::forms::FormMethod::Get => "get",
+            crate::forms::FormMethod::Post => "post",
+        };
+        let array = boa_engine::object::builtins::JsArray::from_iter(
+            [
+                JsValue::from(JsString::from(sub.url.to_string())),
+                JsValue::from(JsString::from(method)),
+            ],
+            context,
+        );
+        Ok(JsValue::from(array))
+    });
+
     native!(dom_native::VALUE, 2, |_this, args, context| {
         let doc = arg_doc(args, 0, context)?;
         let node = arg_node(args, 1, context)?;
@@ -4118,6 +4227,11 @@ const PRELUDE: &str = r##"
     get search() { return urlParts(host.__ironsurfUrl).search; },
     get hash() { return urlParts(host.__ironsurfUrl).hash; },
   };
+  // `document.location` IS `window.location` (same readonly attribute in the
+  // HTML spec). Reddit's PoW shell reads `document.location.search` from its
+  // submit handler; with the alias missing the read threw out of the handler
+  // (harmless there, fatal elsewhere).
+  var documentLocation = location;
 
 
   // Like browsers, the global object *is* `window`: window.window === window,
@@ -4241,6 +4355,28 @@ const PRELUDE: &str = r##"
     getEntriesByName: function () { return []; },
     getEntriesByType: function () { return []; },
   };
+  // `PerformanceObserver` (task: reddit): the observation surface only. A
+  // real observer FIRES its callback as matching performance entries land;
+  // this engine has no performance-entry timeline, so there is genuinely
+  // nothing to observe — the constructor records the callback and
+  // `observe()` never fires it (the honest equivalent of a browser where no
+  // entry of the requested type is ever produced), which keeps the whole
+  // telemetry pattern (`new PerformanceObserver(cb); obs.observe({type});`)
+  // alive instead of a ReferenceError killing the bundle. Feature probe
+  // contract: `supportedEntryTypes` is [] (no types produced).
+  function PerformanceObserver(callback) {
+    if (typeof callback !== "function") {
+      throw new TypeError("PerformanceObserver callback must be a function");
+    }
+    this.__callback = callback;
+  }
+  PerformanceObserver.prototype.observe = function () {};
+  PerformanceObserver.prototype.disconnect = function () {};
+  PerformanceObserver.prototype.takeRecords = function () { return []; };
+  PerformanceObserver.supportedEntryTypes = [];
+  PerformanceObserver.prototype.constructor = PerformanceObserver;
+  host.PerformanceObserver = PerformanceObserver;
+  globalThis.PerformanceObserver = PerformanceObserver;
   // `isSecureContext`: true for https and the loopback origins browsers treat
   // as potentially trustworthy. Clipboard/service-worker gates read it.
   Object.defineProperty(host, "isSecureContext", {
@@ -4376,6 +4512,16 @@ const PRELUDE: &str = r##"
     var handlers = {
       get: function (t, key) {
         if (key === "length") return count();
+        if (key === "namedItem")
+          return function (name) {
+            name = String(name);
+            for (var i = 0, n = count(); i < n; i++) {
+              var el = item(i);
+              if (el && (el.getAttribute("id") === name || el.getAttribute("name") === name))
+                return el;
+            }
+            return null;
+          };
         if (key === "item")
           return function (i) {
             var n = toIndex(i);
@@ -4390,6 +4536,19 @@ const PRELUDE: &str = r##"
         if (key === "forEach")
           return function (fn, thisArg) {
             for (var i = 0, n = count(); i < n; i++) fn.call(thisArg, item(i), i, view);
+          };
+        if (key === "namedItem")
+          return function (name) {
+            // HTMLCollection namedItem: first element with a matching `id`
+            // or `name` (content) attribute. Snapshot-scan over the live
+            // membership; absent names answer null like a browser.
+            name = String(name);
+            for (var i = 0, n = count(); i < n; i++) {
+              var el = item(i);
+              if (el && (el.getAttribute("id") === name || el.getAttribute("name") === name))
+                return el;
+            }
+            return null;
           };
         if (typeof key === "symbol") {
           // Iterating the live list yields snapshots; mutations in the
@@ -4409,7 +4568,7 @@ const PRELUDE: &str = r##"
         return undefined;
       },
       has: function (t, key) {
-        if (key === "length" || key === "item" || key === "forEach" || key === "entries")
+        if (key === "length" || key === "item" || key === "namedItem" || key === "forEach" || key === "entries")
           return true;
         var i = toIndex(key);
         return i >= 0 && i < count();
@@ -5524,11 +5683,52 @@ const PRELUDE: &str = r##"
     if (host.__ironsurfDomHasDoc()) host.__ironsurfDomDocumentWrite(0, s);
   }
 
+  // HTML's document ready state, advanced by `__ironsurfContentLoaded`
+  // (the runtime calls it right after the document's script batch — the
+  // point where a browser fires DOMContentLoaded).
+  var __readyState = "loading";
+  // DOMContentLoaded + window `load` (task: reddit's PoW shell): the shell's
+  // inline script schedules its form submission on DOMContentLoaded with
+  // `{once:true}` — if the event never fires the gate is never answered and
+  // reddit serves nothing but the spinning-snoo shell. The runtime fires
+  // this after the page's scripts run: listeners registered in them (the
+  // common pattern, reddit's included) are in place, exactly like a browser
+  // where DOMContentLoaded follows parsing + inline scripts. Browsers keep
+  // `interactive` and `complete` apart (load fires after subresources); we
+  // have no subresource-load bookkeeping in the realm, so both land here in
+  // order, DOMContentLoaded first.
+  host.__ironsurfContentLoaded = function () {
+    if (__readyState !== "loading") return;
+    __readyState = "interactive";
+    // Fired at the document, bubbling to window (the DOM event that is
+    // NOT cancelable and has no default to prevent).
+    firePath(eventPath(document), makeEvent("DOMContentLoaded", document, { bubbles: true, cancelable: false }));
+    __readyState = "complete";
+    firePath(eventPath(host), makeEvent("load", host, { bubbles: false, cancelable: false }));
+  };
+
   var document = {
     nodeType: 9,
     __d: 0,
-    readyState: "complete",
+    // HTML's ready-state lifecycle: "loading" while the document's scripts
+    // run (they were parsed, so this is the same state a classic script sees
+    // mid-parse), then the runtime's DOMContentLoaded hook flips it to
+    // "interactive" and fires the event, and "complete" with window `load`
+    // (reddit's PoW shell schedules its submit on DOMContentLoaded exactly
+    // this way — the event never firing left the gate unanswered forever).
+    get readyState() { return __readyState; },
     visibilityState: "visible",
+    // `document.location` is the SAME object as `window.location` (spec:
+    // readonly attribute assigning the Location). Reddit's PoW shell's
+    // onsubmit reads `document.location.search`; without the alias the read
+    // threw `cannot convert 'null' or 'undefined' to object` out of the
+    // handler. `document.URL`/`documentURI` are the spec's other URL
+    // reflections pages probe.
+    get location() { return documentLocation; },
+    get URL() { return host.__ironsurfUrl; },
+    get documentURI() { return host.__ironsurfUrl; },
+    get baseURI() { return host.__ironsurfUrl; },
+    get referrer() { return ""; },
     hidden: false,
     // This tab always holds focus in IronSurf's single-window model, and no
     // script can take it back, so the honest answer is `true`.
@@ -5551,6 +5751,13 @@ const PRELUDE: &str = r##"
     get body() {
       if (!host.__ironsurfDomHasDoc()) return bodyFallback();
       return wrapNode(0, host.__ironsurfDomBody(0));
+    },
+    // document.forms (task: reddit's PoW shell reads `document.forms[0]`):
+    // the live HTMLCollection of `<form>` elements in tree order, over the
+    // same live-list machinery `getElementsByTagName` uses.
+    get forms() {
+      if (!host.__ironsurfDomHasDoc()) return makeList(0, 1, 0, "form");
+      return makeList(0, 1, 0, "form");
     },
     doctype: null,
     // document.dir / document.lang mirror the <html> element's attributes
@@ -5897,6 +6104,105 @@ const PRELUDE: &str = r##"
   urlDecomp("username", function (s) { return anchorParts(s).username; });
   urlDecomp("password", function (s) { return anchorParts(s).password; });
   urlDecomp("origin", anchorOrigin);
+  // ---------------------------------------------------------------------
+  // HTMLFormElement glue (task: reddit's PoW shell).
+  //
+  // Reddit's first navigation is gated behind a tiny JS proof-of-work page:
+  // one inline script doubles a token, stamps it into a hidden input and
+  // `requestSubmit()`s a GET form whose default action carries the answer
+  // back — only then is the real subreddit served. The three members that
+  // script needs (`document.forms`, `form.elements.namedItem`,
+  // `requestSubmit`) are the whole gate.
+  //
+  // * `elements` snapshots the listed controls the form owns (the same
+  //   ownership rule the tab's entry list uses), so script-appended inputs
+  //   appear and `namedItem` finds them by name or id.
+  // * `requestSubmit` fires the (cancelable, bubbling) `submit` event —
+  //   inline/property handlers included — and, unless a handler cancelled
+  //   it, resolves the submission through the tab's OWN form-entry-list
+  //   algorithm (`__ironsurfFormSubmit`, which reads the live document, so
+  //   script-set `value`s and appended hidden inputs submit exactly like a
+  //   click-submitted form) and queues a GET navigation on the poll loop's
+  //   JS-navigation queue. POST submissions have no JS-queue transport
+  //   (the hook carries no body), so they report and do nothing — the
+  //   click/Enter paths own those.
+  // * `submit()` is requestSubmit minus the event.
+  // Members on other tags answer like a browser's `undefined`/throw-free
+  // own-property semantics: nothing here navigates from a `<div>`.
+  function isFormTag(self) { return tagUpper(self) === "FORM"; }
+  protoGet("elements", function () {
+    if (!isFormTag(this)) return undefined;
+    var d = this.__d, n = this.__n;
+    var ids = host.__ironsurfFormControlIds(d, n) || [];
+    var items = [];
+    for (var i = 0; i < ids.length; i++) items.push(wrapNode(d, ids[i]));
+    function named(name) {
+      name = String(name);
+      for (var j = 0; j < items.length; j++) {
+        var el = items[j];
+        if (el && (el.getAttribute("name") === name || el.getAttribute("id") === name))
+          return el;
+      }
+      return null;
+    }
+    var handlers = {
+      get: function (t, key) {
+        if (key === "length") return items.length;
+        if (key === "namedItem") return named;
+        if (key === "item")
+          return function (i) { return items[toIndex(i)] || null; };
+        if (typeof key === "symbol") {
+          if (key === Symbol.toStringTag) return "HTMLFormControlsCollection";
+          return undefined;
+        }
+        var idx = toIndex(key);
+        if (idx >= 0) return items[idx];
+        return named(key);
+      },
+      has: function (t, key) { return key === "length" || key === "namedItem" || key === "item" || toIndex(key) >= 0 || typeof named(key) === "object"; },
+      ownKeys: function () {
+        var keys = ["length", "item", "namedItem"];
+        for (var j = 0; j < items.length; j++) keys.push(String(j));
+        return keys;
+      },
+      getOwnPropertyDescriptor: function (t, key) {
+        if (key === "length")
+          return { value: items.length, writable: false, enumerable: true, configurable: true };
+        return undefined;
+      },
+    };
+    return new Proxy({}, handlers);
+  });
+  protoGet("length", function () {
+    if (!isFormTag(this)) return undefined;
+    var ids = host.__ironsurfFormControlIds(this.__d, this.__n) || [];
+    return ids.length;
+  });
+  function submitForm(self, fire) {
+    if (!isFormTag(self) || !self.__n) return;
+    if (fire) {
+      // HTML: requestSubmit fires `submit` at the form (bubbles, cancelable);
+      // a cancelled event means no navigation, exactly like a browser.
+      var ev = fireDomEvent("submit", self, { bubbles: true, cancelable: true });
+      if (ev.defaultPrevented) return;
+    }
+    var sub = host.__ironsurfFormSubmit(self.__d, self.__n);
+    if (!sub) return;
+    if (String(sub[1]) === "post") {
+      // The script-side navigation hook carries no body, so a POST from
+      // script cannot be honoured here (the click/Enter paths own POST).
+      reportError("form.requestSubmit: POST submissions from script are not supported");
+      return;
+    }
+    navTo(String(sub[0]), false);
+  }
+  protoMethod("requestSubmit", function (submitter) {
+    if (submitter !== undefined && submitter !== null && (!isFormTag(this) || submitter.__n === undefined)) {
+      throw new TypeError("requestSubmit: submitter must be a submit button of this form");
+    }
+    submitForm(this, true);
+  });
+  protoMethod("submit", function () { submitForm(this, false); });
   // Leading non-negative integer (HTML's parsing rules: optional whitespace,
   // then digits — anything else means the attribute has no value).
   function nonNegativeInt(raw, fallback) {
@@ -6655,6 +6961,12 @@ const PRELUDE: &str = r##"
   }
   DOMException.prototype = Object.create(Error.prototype);
   DOMException.prototype.constructor = DOMException;
+  // `String(exception)` is `"Name: message"` (what browsers answer), which
+  // also keeps one-line console reporting readable (boa pretty-prints the
+  // bare object across many lines otherwise).
+  DOMException.prototype.toString = function () {
+    return this.name + ": " + this.message;
+  };
   (function () {
     var legacy = {
       INDEX_SIZE_ERR: 1, DOMSTRING_SIZE_ERR: 2, HIERARCHY_REQUEST_ERR: 3,
@@ -6673,6 +6985,75 @@ const PRELUDE: &str = r##"
     });
   })();
   host.DOMException = DOMException;
+
+  // ---------------------------------------------------------------------
+  // `customElements` + `HTMLElement` (task: reddit). Missing entirely, the
+  // name alone killed whole script bundles: reddit's telemetry module died
+  // on `customElements is not defined` before wiring anything, and every
+  // web-component bundle (`class X extends HTMLElement`) needs the base
+  // class to even parse. What exists here is the honest minimum this engine
+  // can keep true: a REGISTRY — define/get/getName/whenDefined/upgrade —
+  // with spec name validation and one-definition errors, plus a real
+  // `HTMLElement` base class subclassing works against. There are NO
+  // upgrades: no shadow roots, no lifecycle callbacks (connectedCallback et
+  // al), elements keep their server-rendered markup. This matches the
+  // engine-level invariant the blitz-dom patch encodes (every element is
+  // `:defined`; nothing is ever awaiting definition) — pages feature-detect
+  // `customElements.get(...)` instead of crashing, and SSR pages (reddit's
+  // entire feed is server-rendered) render untouched.
+  // ---------------------------------------------------------------------
+  var __customElements = Object.create(null);
+  var __customElementWaiters = Object.create(null);
+  function isValidCustomElementName(name) {
+    return /^[a-z][.0-9_a-z]*-[.0-9_a-z]*$/.test(name);
+  }
+  var customElements = {
+    define: function (name, ctor, options) {
+      name = String(name);
+      if (!isValidCustomElementName(name)) {
+        throw new DOMException("The element name is not valid: " + name, "SyntaxError");
+      }
+      if (typeof ctor !== "function") {
+        throw new TypeError("The argument is not a constructor");
+      }
+      if (__customElements[name] !== undefined) {
+        throw new DOMException("This element is already defined: " + name, "NotSupportedError");
+      }
+      __customElements[name] = ctor;
+      var waiters = __customElementWaiters[name];
+      if (waiters) {
+        delete __customElementWaiters[name];
+        for (var i = 0; i < waiters.length; i++) waiters[i]();
+      }
+    },
+    get: function (name) {
+      return __customElements[String(name)];
+    },
+    getName: function (ctor) {
+      var keys = Object.keys(__customElements);
+      for (var i = 0; i < keys.length; i++) {
+        if (__customElements[keys[i]] === ctor) return keys[i];
+      }
+      return null;
+    },
+    whenDefined: function (name) {
+      name = String(name);
+      if (__customElements[name] !== undefined) return Promise.resolve();
+      var waiters = __customElementWaiters[name];
+      if (!waiters) waiters = __customElementWaiters[name] = [];
+      return new Promise(function (resolve) { waiters.push(resolve); });
+    },
+    // No upgrades happen in this engine (see above): a no-op like a
+    // browser's upgrade() over a document with no matching elements.
+    upgrade: function () {},
+  };
+  host.customElements = customElements;
+  function HTMLElement() {}
+  HTMLElement.prototype = Object.create(Object.prototype);
+  HTMLElement.prototype.constructor = HTMLElement;
+  host.HTMLElement = HTMLElement;
+  globalThis.HTMLElement = HTMLElement;
+  globalThis.customElements = customElements;
 
   // ---------------------------------------------------------------------
   // DOMParser (task: real DOMParser). `parseFromString` hands back a REAL
@@ -9848,7 +10229,31 @@ impl JsRuntime {
         if let Some(err) = self.drain_jobs() {
             errors.push(err);
         }
+        // DOMContentLoaded + window `load` (task: reddit's PoW shell): the
+        // point a browser fires them — after the document's scripts (listeners
+        // registered in them, the universal pattern, are in place), before
+        // anything else consumes the document. The PRELUDE hook advances
+        // `document.readyState` (loading → interactive → complete) and
+        // dispatches both events through the realm's event machinery.
+        self.fire_document_events();
         errors
+    }
+
+    /// Fire the document lifecycle events once (see [`Self::run_scripts`]):
+    /// the PRELUDE hook is idempotent (no-ops after the first call), errors
+    /// inside listeners are reported by the event machinery and never
+    /// propagate here, and promises the handlers spawn are drained.
+    pub fn fire_document_events(&mut self) {
+        let _active = self.activate();
+        let outcome = self.context.eval(Source::from_bytes(
+            "try { if (typeof window.__ironsurfContentLoaded === 'function') { window.__ironsurfContentLoaded(); } } catch (e) { if (typeof console === 'object' && console.error) console.error(e); }",
+        ));
+        if let Err(err) = outcome {
+            debug!("DOMContentLoaded hook did not run: {err}");
+        }
+        if let Some(err) = self.drain_jobs() {
+            debug!("DOMContentLoaded listener error: {}", err.message);
+        }
     }
 
     /// Evaluate one ES module (task: `<script type="module">` loading): parse
@@ -14014,6 +14419,190 @@ mod foreign_name_case {
                 .local
                 .to_string(),
             "div"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Document lifecycle + web-platform glue (task: reddit.com PoW shell).
+// The realm-side pieces (events, readyState, customElements,
+// PerformanceObserver) run in the snapshot host world; the DOM-facing form
+// machinery has the live-document e2e in `tests/pow_shell.rs`.
+// ---------------------------------------------------------------------------
+#[cfg(test)]
+mod reddit_pow_tests {
+    use super::*;
+
+    fn fresh_host() -> HostRef {
+        Rc::new(RefCell::new(HostState::new(
+            "https://www.reddit.com/r/LocalLLaMA/",
+            None,
+            None,
+        )))
+    }
+
+    fn eval_string(source: &str, host: &HostRef) -> String {
+        let mut runtime = JsRuntime::new(Rc::clone(host));
+        let value = runtime.eval(source).expect("snippet should evaluate");
+        value
+            .as_string()
+            .map(|string| string.to_std_string_escaped())
+            .unwrap_or_else(|| format!("<not a string: {}>", value.display()))
+    }
+
+    /// Evaluate several snippets against ONE realm (so state and job-queue
+    /// results survive between them) and return each completion value.
+    fn eval_seq(sources: &[&str], host: &HostRef) -> Vec<String> {
+        let mut runtime = JsRuntime::new(Rc::clone(host));
+        sources
+            .iter()
+            .map(|source| {
+                let value = runtime.eval(source).expect("snippet should evaluate");
+                value
+                    .as_string()
+                    .map(|string| string.to_std_string_escaped())
+                    .unwrap_or_else(|| format!("<not a string: {}>", value.display()))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn document_content_loaded_fires_once_with_the_ready_state_lifecycle() {
+        let host = fresh_host();
+        // Load first, then DOMContentLoaded, then readyState lands "complete".
+        assert_eq!(
+            eval_string(
+                r##"
+                var order = [];
+                var dcl = 0, load = 0;
+                document.addEventListener("DOMContentLoaded", function () {
+                    dcl++;
+                    order.push("dcl:" + document.readyState);
+                }, { once: true });
+                window.addEventListener("load", function () {
+                    load++;
+                    order.push("load:" + document.readyState);
+                });
+                window.__ironsurfContentLoaded();
+                window.__ironsurfContentLoaded(); // idempotent: no double fire
+                order.join("|") + "#dcl=" + dcl + "#load=" + load +
+                    "#rs=" + document.readyState;
+                "##,
+                &host,
+            ),
+            "dcl:interactive|load:complete#dcl=1#load=1#rs=complete",
+            "DOMContentLoaded → load with the matching readyState reads, once",
+        );
+        // Before the hook runs, scripts see the parse-time state.
+        let host = fresh_host();
+        assert_eq!(
+            eval_string("document.readyState", &host),
+            "loading",
+            "page scripts run while the document is still `loading`",
+        );
+    }
+
+    #[test]
+    fn custom_elements_is_a_real_registry_with_the_spec_surface() {
+        let host = fresh_host();
+        assert_eq!(
+            eval_string(
+                r##"
+                class One extends HTMLElement {}
+                class Two extends HTMLElement {}
+                var out = [];
+                customElements.define("faceplate-perfmark", One);
+                out.push(String(customElements.get("faceplate-perfmark") === One));
+                out.push(String(customElements.getName(One)));
+                out.push(String(customElements.get("never-defined")));
+                var p = customElements.whenDefined("shreddit-app");
+                var resolvedEarly = "pending";
+                p.then(function () { resolvedEarly = "resolved"; });
+                customElements.define("shreddit-app", Two);
+                out.push(resolvedEarly === "pending" ? "waiter-pending" : "waiter-early");
+                try { customElements.define("faceplate-perfmark", Two); out.push("dup-allowed"); }
+                catch (e) { out.push(e.name); }
+                try { customElements.define("BadName", Two); out.push("bad-name-allowed"); }
+                catch (e) { out.push(e.name); }
+                customElements.upgrade();
+                // The engine's HTMLElement/Element interfaces share the bridge
+                // prototype and use `Symbol.hasInstance`, so a registered
+                // subclass answers by prototype chain, not by predicate.
+                out.push(String(Object.getPrototypeOf(One.prototype) === HTMLElement.prototype));
+                out.join("|");
+                "##,
+                &host,
+            ),
+            // whenDefined resolves ASYNC (microtask), so it is still pending
+            // in the same synchronous turn; the dup/bad-name throws carry the
+            // spec exception names.
+            "true|faceplate-perfmark|undefined|waiter-pending|NotSupportedError|SyntaxError|true",
+            "registry get/getName/whenDefined/define errors/upgrade/HTMLElement base",
+        );
+        // The whenDefined promise settles when the job queue drains, which
+        // happens between evals: the same realm sees it on the next snippet.
+        let host = fresh_host();
+        let seq = eval_seq(
+            &[
+                r##"var state = "unset";
+                   customElements.whenDefined("shreddit-app").then(function () { state = "resolved"; });
+                   customElements.define("shreddit-app", function () {});
+                   state;"##,
+                "state",
+            ],
+            &host,
+        );
+        assert_eq!(
+            seq,
+            vec!["unset".to_string(), "resolved".to_string()],
+            "whenDefined resolves through the job drain of the same realm",
+        );
+    }
+
+    #[test]
+    fn performance_observer_is_the_record_only_surface() {
+        let host = fresh_host();
+        assert_eq!(
+            eval_string(
+                r##"
+                var out = [];
+                var obs = new PerformanceObserver(function () { out.push("fired"); });
+                obs.observe({ type: "navigation", buffered: true });
+                obs.observe({ type: "resource" });
+                obs.disconnect();
+                out.push(String(out.length === 0));            // nothing ever fires
+                out.push(String(obs.takeRecords().length));    // empty timeline
+                out.push(String(Array.isArray(PerformanceObserver.supportedEntryTypes) &&
+                                PerformanceObserver.supportedEntryTypes.length === 0));
+                out.push(String(typeof obs.observe === "function" &&
+                                typeof obs.disconnect === "function"));
+                try { new PerformanceObserver(); out.push("no-callback-allowed"); }
+                catch (e) { out.push(e.name); }
+                out.join("|");
+                "##,
+                &host,
+            ),
+            "true|0|true|true|TypeError",
+            "observe/disconnect/takeRecords/supportedEntryTypes + callback check",
+        );
+    }
+
+    #[test]
+    fn dom_exception_prints_one_line_like_a_browser() {
+        let host = fresh_host();
+        assert_eq!(
+            eval_string(
+                r##"var msg = "none";
+                   try { customElements.define("faceplate-perfmark", function(){}); }
+                   catch (e) { msg = String(e); }
+                   var again = "no-throw";
+                   try { customElements.define("faceplate-perfmark", function(){}); }
+                   catch (e) { again = String(e); }
+                   msg + " / " + again;"##,
+                &host,
+            ),
+            "none / NotSupportedError: This element is already defined: faceplate-perfmark",
+            "DOMException stringifies Name: message (single-line console errors)",
         );
     }
 }

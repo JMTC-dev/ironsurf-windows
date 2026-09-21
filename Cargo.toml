@@ -12,6 +12,11 @@ members = ["crates/*"]
 # thirdparty/boa/PATCH.md). Upstream main is still unfixed as of 2026-08.
 [patch.crates-io]
 boa_ast = { path = "thirdparty/boa/boa_ast" }
+# blitz-dom fork: `:defined` matched no element (`NonTSPseudoClass::Defined`
+# answered `false`), so the standard web-component FOUC rule
+# `:not(:defined){visibility:hidden}` hid whole pages (reddit.com loads as a
+# single background pixel). See thirdparty/blitz-dom/PATCH.md.
+blitz-dom = { path = "thirdparty/blitz-dom" }
 
 [workspace.dependencies]
 # GPU acceleration: `backend-linuxkms-noseat` compiles Slint's LinuxKMS backend

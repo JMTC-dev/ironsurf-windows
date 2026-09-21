@@ -957,8 +957,40 @@ The binding surface stays:
   behaviour); `undefined` changes nothing; a throw is reported like any script error. Matching
   the shell contract, which passes `javascript:` text through to the tab.
 
-### HTML forms (`src/forms.rs`)
-Blitz parses forms but its submission algorithm is incomplete (`<select>` values are a TODO in
+**Reddit's JS proof-of-work gate is passed** (task: reddit.com renders the subreddit feed). The
+first response is a shell page whose inline script — on `DOMContentLoaded`, with `{once:true}`
+— reads `document.forms[0]`, stamps a computed token through `form.elements.namedItem(...)` and
+`form.requestSubmit()`s the GET form; only the answered request gets the real page. So the
+realm grew the document lifecycle and three form members: (1) `document.readyState` is a real
+lifecycle (`loading` while the document's scripts run, `interactive` when the runtime's
+`__ironsurfContentLoaded` hook fires, `complete` with `window` `load` — the hook is idempotent
+and fires both events through the realm's event machinery, after the page's scripts, the point
+a browser fires `DOMContentLoaded`); (2) `customElements` is an honest **registry** only
+(define/get/getName/whenDefined/upgrade, spec name validation, `SyntaxError`/`NotSupportedError`
+on bad or duplicate names, `whenDefined` resolving through the job drain) over a real
+`HTMLElement` base — there are **no upgrades** (no shadow roots, no lifecycle callbacks; every
+element stays `:defined`, the invariant the vendored `thirdparty/blitz-dom` patch's stylo
+`:defined` handling encodes), which is correct for reddit's SSR feed and lets
+`class X extends HTMLElement` bundles parse instead of dying on the name; (3) `PerformanceObserver`
+is the record-only surface (`observe`/`disconnect`/`takeRecords`, `supportedEntryTypes: []`,
+`TypeError` on a non-function callback) so telemetry bundles keep feature-detecting; (4)
+`document.forms` is a live list, `form.elements` a live `HTMLFormControlsCollection`(Proxy) with
+`namedItem`/`item`/numeric+name indexing, and `requestSubmit`/`submit` fire the cancelable
+bubbling `submit` event then resolve the submission through `__ironsurfFormSubmit` — the tab's
+own live entry list — queueing a GET navigation on the poll loop's JS-navigation queue (a
+script-set `value` and script-appended hidden inputs submit exactly like a click; POST from
+script reports, since the JS hook carries no body). `DOMException.prototype.toString` answers
+`"Name: message"` like a browser so console errors stay one line. Verified live (23
+`shreddit-post` nodes, real post titles, zero load-blocking js errors) and pinned by
+`js::reddit_pow_tests` (lifecycle/registry/observer/realm surface) plus
+`tests/pow_shell.rs`, whose localhost fixture only reads `POW-OK` when the queued navigation
+carried the doubled token.
+**One known page-noise error** on reddit: a deferred script copy inside the suspense flow
+re-runs in our engine (no upgrades to gate it), so the second, unguarded
+`customElements.define("faceplate-perfmark", …)` throws `NotSupportedError` — the same throw a
+browser without upgrades would make; the feed renders regardless.
+
+### HTML forms (`src/forms.rs`)Blitz parses forms but its submission algorithm is incomplete (`<select>` values are a TODO in
 `construct_entry_list`; actions resolving outside `http(s):`/`data:`/`mailto:` are dropped), so
 the tab owns submission outright — blitz's own submission is never used for its triggers:
 - Triggers: a left-click press on a submit control (*arms*, finalised on release — a page JS
