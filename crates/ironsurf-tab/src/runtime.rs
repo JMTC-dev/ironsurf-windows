@@ -563,6 +563,19 @@ pub struct Tab {
     /// scheduled by page scripts fire from the poll loop. Rebuilt per
     /// navigation (which cancels the previous document's timers with it).
     js: Option<js::JsRuntime>,
+    /// `<link rel=stylesheet>` nodes whose `load` event has already been
+    /// dispatched for the current document. Blitz applies a fetched sheet to
+    /// the stylist but never fires the DOM event; the Vite preload helper
+    /// awaits exactly that event before it calls the dynamic `import()` for a
+    /// lazy route chunk, so without this a route's component never mounts.
+    link_loads_fired: HashSet<NodeId>,
+    /// Monotonic clock feeding `BaseDocument::resolve`'s
+    /// `current_time_for_animations`. Blitz applies CSS animations/transitions
+    /// at this time; passing a constant 0 froze every `@keyframes`-driven
+    /// property at its 0% value — Mastodon's `.status{animation:…fade}`
+    /// (`0%{opacity:0}`) left every rendered post at `opacity:0`, so a column
+    /// full of fetched statuses painted blank.
+    anim_clock: Instant,
     /// Paint state: set when a resolve produced (or may have produced) new
     /// pixels; coalesced into at most ~30 fps of `FromTab::Frame`.
     needs_paint: bool,
@@ -945,6 +958,8 @@ impl Tab {
             js_title: None,
             js_status: None,
             js: None,
+            link_loads_fired: HashSet::new(),
+            anim_clock: Instant::now(),
             needs_paint: false,
             last_paint: None,
             offline_fixtures: args.offline_fixtures.clone(),
@@ -1395,17 +1410,66 @@ impl Tab {
         // query instead of trusting stale byte ranges. Cheap when idle: only a
         // live query costs anything, and only once per settle.
         self.find_stale = true;
-        let Some(doc) = self.doc.as_mut() else { return };
-        doc.resolve(0.);
-        for _ in 0..8 {
-            if !doc.has_pending_critical_resources() {
-                break;
+        let now = self.anim_clock.elapsed().as_secs_f64();
+        {
+            let Some(doc) = self.doc.as_mut() else { return };
+            doc.resolve(now);
+            for _ in 0..8 {
+                if !doc.has_pending_critical_resources() {
+                    break;
+                }
+                doc.handle_messages();
+                doc.resolve(now);
             }
             doc.handle_messages();
-            doc.resolve(0.);
+            doc.resolve(now);
         }
-        doc.handle_messages();
-        doc.resolve(0.);
+        // A stylesheet that arrived in this settle has its `load` event owed
+        // to the page (blitz applies the sheet but never dispatches the DOM
+        // event — see `dispatch_stylesheet_loads`).
+        self.dispatch_stylesheet_loads();
+    }
+
+    /// Fire the `load` event on every `<link rel=stylesheet>` whose sheet
+    /// blitz has applied since the last settle. Blitz's resource plumbing
+    /// stops at `add_stylesheet_for_node` (it marks the node's
+    /// `SpecialElementData::Stylesheet`) and never dispatches a DOM event, so
+    /// the ledger here is the browser side of the contract. The Vite preload
+    /// helper (`__vitePreload`) resolves its CSS dependency promises on
+    /// exactly this event and only then calls the route chunk's dynamic
+    /// `import()`: without it a lazy route stays on its loading spinner
+    /// forever even though every byte was fetched.
+    fn dispatch_stylesheet_loads(&mut self) {
+        if self.js.is_none() {
+            return;
+        }
+        let ready: Vec<NodeId> = match self.doc.as_ref() {
+            Some(doc) => doc
+                .tree()
+                .iter()
+                .filter(|(id, node)| {
+                    !self.link_loads_fired.contains(id)
+                        && node.element_data().is_some_and(|el| {
+                            el.name.local.as_ref() == "link"
+                                && matches!(
+                                    el.special_data,
+                                    blitz_dom::node::SpecialElementData::Stylesheet(_)
+                                )
+                        })
+                })
+                .map(|(id, _)| id)
+                .collect(),
+            None => return,
+        };
+        for id in ready {
+            self.link_loads_fired.insert(id);
+            debug!("stylesheet loaded: firing `load` on link node {id:?}");
+            let js = self.js.as_mut();
+            let doc = self.doc.as_mut();
+            if let (Some(js), Some(doc)) = (js, doc) {
+                js.fire_event(doc, Some(id), "load", "{}");
+            }
+        }
     }
 
     fn resolve_and_maybe_paint(&mut self) {
@@ -1767,6 +1831,9 @@ impl Tab {
             runtime.has_timers()
         );
         self.js = Some(runtime);
+        // A new document has a new node space: no link of the old one can
+        // resolve here, so start the stylesheet-load ledger empty.
+        self.link_loads_fired.clear();
         // Page scripts may have mutated the DOM (created nodes, changed
         // attributes/styles): restyle + relayout now so the pending paint
         // (and any title mutation) reflects the post-script tree.
@@ -5156,6 +5223,40 @@ mod tests {
         let on_disk =
             std::fs::read_to_string(dir.path().join("cookies.json")).expect("cookies.json");
         assert!(on_disk.contains("shared"), "{on_disk}");
+    }
+
+    /// CSS animations advance with the tab's monotonic clock: blitz resolves
+    /// keyframe values at `current_time_for_animations`, and a constant 0 left
+    /// every `animation: … fade` (`0% { opacity: 0 }`) element invisible — the
+    /// reason Mastodon's fetched `/explore` posts painted blank.
+    #[test]
+    fn css_animation_advances_with_the_tab_clock() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut tab = form_tab(dir.path());
+        let url = write_page(
+            dir.path(),
+            "<!doctype html><html><head><style>\
+             @keyframes fade{0%{opacity:0}100%{opacity:1}}\
+             .status{opacity:1;animation:.15s linear fade}\
+             </style></head><body><div class=\"status\" id=\"s\">post</div></body></html>",
+        );
+        assert!(tab.navigate(&url, NavHistory::Fresh));
+        // The animation starts at the clock's zero (navigate resolves there).
+        // Jump the clock a full second past the 0.15 s fade and settle again:
+        // a clock-driven resolve reads the finished animation (opacity 1),
+        // while the old constant-0 resolve stayed pinned at the 0% keyframe.
+        tab.anim_clock = Instant::now() - Duration::from_secs(1);
+        tab.settle();
+        let end: f64 = status_opacity(&mut tab).parse().expect("opacity number");
+        assert!(end > 0.95, "after the fade the status is opaque, got {end}");
+    }
+
+    fn status_opacity(tab: &mut Tab) -> String {
+        let doc = tab.doc.as_ref().expect("document loaded");
+        let id = doc.get_element_by_id("s").expect("#s in the document");
+        let node = doc.get_node(id).expect("live node");
+        let styles = node.primary_styles().expect("resolved styles");
+        crate::js::computed_style_value(&*styles, "opacity")
     }
 
     fn form_tab(dir: &std::path::Path) -> Tab {

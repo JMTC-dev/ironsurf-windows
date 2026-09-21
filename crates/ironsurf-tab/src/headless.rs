@@ -76,6 +76,16 @@ pub struct HeadlessArgs {
     /// `<input>`'s id/type/checked state to stderr for harness diagnostics.
     pub clicks: Vec<(f32, f32)>,
     pub dump_inputs: bool,
+    /// `--dump-layout`: print the client rect of the first `<article>` and
+    /// every ancestor element (tag/class + rect) to stderr, so a blank column
+    /// can be told apart from a zero-height scroll container.
+    pub dump_layout: bool,
+    /// `--dump-paint`: paint into a recording `Scene` and print a command
+    /// histogram, so a laid-out-but-invisible subtree can be told apart from a
+    /// paint-culling bug.
+    pub dump_paint: bool,
+    /// `--hit X,Y` (repeatable): print the element chain under each point.
+    pub hits: Vec<(f32, f32)>,
 }
 
 impl HeadlessArgs {
@@ -88,6 +98,9 @@ impl HeadlessArgs {
         let mut find_jumps: usize = 0;
         let mut clicks = Vec::new();
         let mut dump_inputs = false;
+        let mut dump_layout = false;
+        let mut dump_paint = false;
+        let mut hits = Vec::new();
         let mut saw_url = false;
 
         // Every flag the *normal* parser must not see (headless-only surface).
@@ -125,6 +138,18 @@ impl HeadlessArgs {
                     ));
                 }
                 "--dump-inputs" => dump_inputs = true,
+                "--dump-layout" => dump_layout = true,
+                "--dump-paint" => dump_paint = true,
+                "--hit" => {
+                    let v = value("hit")?;
+                    let (x, y) = v
+                        .split_once(',')
+                        .ok_or_else(|| format!("--hit must be X,Y, got {v:?}"))?;
+                    hits.push((
+                        x.parse().map_err(|_| format!("bad x in --hit {v:?}"))?,
+                        y.parse().map_err(|_| format!("bad y in --hit {v:?}"))?,
+                    ));
+                }
                 "--size" => {
                     let v = value("size")?;
                     let (w, h) = v
@@ -171,6 +196,9 @@ impl HeadlessArgs {
             find_jumps,
             clicks,
             dump_inputs,
+            dump_layout,
+            dump_paint,
+            hits,
             width: size.0.max(1),
             height: size.1.max(1),
         })
@@ -241,6 +269,26 @@ pub fn run(args: &[String]) -> Result<(), Box<dyn Error>> {
     if args.dump_inputs {
         if let Some(doc) = tab.document_mut() {
             dump_input_state(doc);
+        }
+    }
+    if args.dump_layout {
+        if let Some(doc) = tab.document_mut() {
+            dump_article_layout(doc);
+        }
+    }
+    if args.dump_paint {
+        if let Some(doc) = tab.document_mut() {
+            dump_paint_scene(doc, args.width, args.height);
+        }
+    }
+    for (x, y) in args.hits.clone() {
+        if let Some(doc) = tab.document_mut() {
+            dump_hit_chain(doc, x, y);
+        }
+    }
+    if args.dump_layout {
+        if let Some(doc) = tab.document_mut() {
+            dump_big_boxes(doc);
         }
     }
 
@@ -358,6 +406,266 @@ fn dump_hit_chain(doc: &blitz_html::HtmlDocument, x: f32, y: f32) {
         cur = node.parent;
     }
     eprintln!("HIT {x},{y}: {}", names.join(" < "));
+}
+
+/// Print the client rect of the first `<article>` and every ancestor element
+/// (tag + first class + x/y/w/h) to stderr. `--dump-layout`'s twin: a column
+/// whose markup is present but blank is either a zero-height scroll container
+/// or a paint problem, and the rect chain says which.
+fn dump_article_layout(doc: &blitz_html::HtmlDocument) {
+    let Some(article) = doc
+        .tree()
+        .iter()
+        .find(|(_, node)| {
+            node.element_data()
+                .is_some_and(|el| el.name.local.as_ref() == "article")
+        })
+        .map(|(id, _)| id)
+    else {
+        eprintln!("LAYOUT: no <article> in the document");
+        return;
+    };
+    let viewport = doc.viewport_scroll();
+    eprintln!("LAYOUT viewport_scroll=({:.1},{:.1})", viewport.x, viewport.y);
+    let mut cur = Some(article);
+    while let Some(id) = cur {
+        let Some(node) = doc.get_node(id) else { break };
+        let desc = match node.element_data() {
+            Some(el) => format!(
+                "{}{}",
+                el.name.local,
+                el.attr(blitz_dom::local_name!("class"))
+                    .map(|c| format!(".{}", c.split_whitespace().next().unwrap_or("")))
+                    .unwrap_or_default()
+            ),
+            None => "#non-element".to_string(),
+        };
+        let rect = doc
+            .get_client_bounding_rect(id)
+            .map(|r| format!("x={:.1} y={:.1} w={:.1} h={:.1}", r.x, r.y, r.width, r.height))
+            .unwrap_or_else(|| "<no rect>".to_string());
+        let scroll = node.scroll_offset();
+        let overflow = node.scrollable_overflow();
+        let paint_children = node.paint_children.borrow();
+        let paint_info = match paint_children.as_ref() {
+            Some(children) => format!(
+                " paint_children={} has_article={}",
+                children.len(),
+                children.contains(&article)
+            ),
+            None => " paint_children=None".to_string(),
+        };
+        let style = node
+            .primary_styles()
+            .map(|s| {
+                let prop = |p: &str| crate::js::computed_style_value(&*s, p);
+                format!(
+                    " opacity={} vis={} display={} overflow=({},{})",
+                    prop("opacity"),
+                    prop("visibility"),
+                    prop("display"),
+                    prop("overflow-x"),
+                    prop("overflow-y"),
+                )
+            })
+            .unwrap_or_default();
+        eprintln!(
+            "LAYOUT {desc}: {rect} scroll=({:.1},{:.1}) overflow=({:.1},{:.1},{:.1},{:.1}){style}{paint_info}",
+            scroll.x,
+            scroll.y,
+            overflow.x0,
+            overflow.y0,
+            overflow.width(),
+            overflow.height()
+        );
+        cur = node.parent;
+    }
+    // Descend from the article: a stale/empty `paint_children` on any level
+    // stops the paint traversal even though layout is correct.
+    dump_paint_chain_rec(doc, article, 0);
+    // …and the text-bearing subtree specifically.
+    if let Some(content) = doc.tree().iter().find_map(|(id, node)| {
+        let el = node.element_data()?;
+        let class = el.attr(blitz_dom::local_name!("class"))?;
+        class.contains("status__content").then_some(id)
+    }) {
+        eprintln!("PAINTTEXT from {content:?}");
+        dump_paint_chain_rec(doc, content, 0);
+    }
+}
+
+fn dump_paint_chain_rec(doc: &blitz_html::HtmlDocument, id: blitz_dom::NodeId, depth: usize) {
+    if depth > 4 {
+        return;
+    }
+    let Some(node) = doc.get_node(id) else { return };
+    let children: Vec<blitz_dom::NodeId> = node.children.iter().copied().collect();
+    let paint: Vec<blitz_dom::NodeId> = node
+        .paint_children
+        .borrow()
+        .as_ref()
+        .map(|v| v.iter().copied().collect())
+        .unwrap_or_default();
+    for (index, child_id) in children.iter().enumerate() {
+        let Some(child) = doc.get_node(*child_id) else { continue };
+        let desc = child
+            .element_data()
+            .map(|el| {
+                format!(
+                    "{}{}",
+                    el.name.local,
+                    el.attr(blitz_dom::local_name!("class"))
+                        .map(|c| format!(".{}", c.split_whitespace().next().unwrap_or("")))
+                        .unwrap_or_default()
+                )
+            })
+            .unwrap_or_else(|| "#text".to_string());
+        let painted = paint.contains(child_id);
+        let child_paint = child
+            .paint_children
+            .borrow()
+            .as_ref()
+            .map(|v| v.len())
+            .unwrap_or(0);
+        let child_style = child
+            .primary_styles()
+            .map(|s| {
+                let prop = |p: &str| crate::js::computed_style_value(&*s, p);
+                format!(
+                    " opacity={} vis={} display={}",
+                    prop("opacity"),
+                    prop("visibility"),
+                    prop("display")
+                )
+            })
+            .unwrap_or_default();
+        let bb = if child.element_data().is_some() {
+            *child.scrollable_overflow()
+        } else {
+            kurbo::Rect::ZERO
+        };
+        eprintln!(
+            "PAINCHAIN {}{} idx={index} painted={painted} paint_children={child_paint} inline_root={} ovf=({:.0},{:.0},{:.0},{:.0}){child_style}",
+            "  ".repeat(depth),
+            desc,
+            child.flags.is_inline_root(),
+            bb.x0,
+            bb.y0,
+            bb.x1,
+            bb.y1
+        );
+        if index == 0 {
+            dump_paint_chain_rec(doc, *child_id, depth + 1);
+        }
+    }
+}
+
+/// Paint the settled document into `anyrender`'s recording `Scene` and print a
+/// command histogram (`--dump-paint`). Glyph runs are bucketed by their
+/// transform's translation so a blank article column shows up as "zero glyph
+/// runs below y=100" even though layout says the text is there.
+fn dump_paint_scene(doc: &mut blitz_html::HtmlDocument, width: u32, height: u32) {
+    use anyrender::recording::RenderCommand;
+    use kurbo::Shape as _;
+    let mut scene = anyrender::recording::Scene::new();
+    blitz_paint::paint_scene(&mut scene, doc, 1.0, width, height, 0, 0);
+    let mut glyphs = 0usize;
+    let mut glyphs_in_articles = 0usize;
+    let mut fills = 0usize;
+    let mut strokes = 0usize;
+    let mut clips = 0usize;
+    let mut clip_shapes: Vec<String> = Vec::new();
+    let mut glyph_positions: Vec<String> = Vec::new();
+    let mut big_fills: Vec<String> = Vec::new();
+    for cmd in &scene.commands {
+        match cmd {
+            RenderCommand::PushClipLayer(clip) => {
+                let bb = clip.transform.transform_rect_bbox(clip.clip.bounding_box());
+                clip_shapes.push(format!(
+                    "({:.0},{:.0})-({:.0},{:.0})",
+                    bb.x0, bb.y0, bb.x1, bb.y1
+                ));
+            }
+            RenderCommand::PushLayer(layer) => {
+                let bb = layer.transform.transform_rect_bbox(layer.clip.bounding_box());
+                clip_shapes.push(format!(
+                    "L({:.0},{:.0})-({:.0},{:.0})",
+                    bb.x0, bb.y0, bb.x1, bb.y1
+                ));
+            }
+            _ => {}
+        }
+    }
+    eprintln!("PAINTCLIPS {}", clip_shapes.join(" "));
+    for cmd in &scene.commands {
+        match cmd {
+            RenderCommand::GlyphRun(run) => {
+                glyphs += 1;
+                let [_, _, _, _, tx, ty] = run.transform.as_coeffs();
+                if tx >= 340.0 && tx <= 940.0 && ty >= 100.0 && ty <= 700.0 {
+                    glyphs_in_articles += 1;
+                }
+                if glyph_positions.len() < 40 {
+                    glyph_positions.push(format!(
+                        "({tx:.0},{ty:.0})fs{:.0}x{}",
+                        run.font_size,
+                        run.glyphs.len()
+                    ));
+                }
+            }
+            RenderCommand::Fill(fill) => {
+                fills += 1;
+                let bb = fill.transform.transform_rect_bbox(fill.shape.bounding_box());
+                let area = (bb.x1 - bb.x0) * (bb.y1 - bb.y0);
+                if area > 5000.0 {
+                    let brush = match &fill.brush {
+                        anyrender::Paint::Solid(c) => {
+                            format!("{},{},{},{}", c.components[0], c.components[1], c.components[2], c.components[3])
+                        }
+                        _ => "non-solid".to_string(),
+                    };
+                    big_fills.push(format!(
+                        "({:.0},{:.0})-({:.0},{:.0}) rgba({brush})",
+                        bb.x0, bb.y0, bb.x1, bb.y1
+                    ));
+                }
+            }
+            RenderCommand::Stroke(_) => strokes += 1,
+            RenderCommand::PushClipLayer(_) | RenderCommand::PushLayer(_) => clips += 1,
+            _ => {}
+        }
+    }
+    eprintln!("PAINTGLYPHS {}", glyph_positions.join(" "));
+    eprintln!("PAINTFILLS {}", big_fills.join(" "));
+    eprintln!(
+        "PAINT commands={} glyph_runs={glyphs} glyph_runs_in_column_top={glyphs_in_articles} fills={fills} strokes={strokes} layers={clips}",
+        scene.commands.len()
+    );
+}
+
+/// Print every element whose layout box is bigger than 500x500 (or is an
+/// `svg`/`canvas`/`video`/`img` bigger than 200x200) — the twin of a paint
+/// histogram full of huge unexpected fills.
+fn dump_big_boxes(doc: &blitz_html::HtmlDocument) {
+    for (id, node) in doc.tree().iter() {
+        let Some(el) = node.element_data() else { continue };
+        let Some(rect) = doc.get_client_bounding_rect(id) else { continue };
+        let tag = el.name.local.as_ref();
+        let special = matches!(tag, "svg" | "canvas" | "video" | "img");
+        let threshold = if special { 200.0 } else { 500.0 };
+        if rect.width > threshold || rect.height > threshold {
+            eprintln!(
+                "BIGBOX {tag}.{}: x={:.0} y={:.0} w={:.0} h={:.0}",
+                el.attr(blitz_dom::local_name!("class"))
+                    .map(|c| c.split_whitespace().next().unwrap_or("").to_string())
+                    .unwrap_or_default(),
+                rect.x,
+                rect.y,
+                rect.width,
+                rect.height
+            );
+        }
+    }
 }
 
 fn dump_input_state(doc: &blitz_html::HtmlDocument) {

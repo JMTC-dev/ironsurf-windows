@@ -703,6 +703,26 @@ rejections print error **stacks** — the single most valuable debug affordance 
 Honest gaps: SVG content paints as empty boxes (structure exists, rendering doesn't), timers
 still drive nothing off `document.visibilityState`, and unhead/helmet's deferred-init timer
 still throws once (`createContext` undefined there — a module-cycle quirk, page survives).
+**Lazy route chunks actually mount** (task: infosec.exchange/explore posts render): three
+pieces close the Vite/React-lazy chain. (1) `rel` is a **reflected** string attribute on
+`<link>`/`<a>`/`<area>`/`<form>` (with `as`/`crossOrigin` on `<link>`) — blitz's
+`load_linked_stylesheet` reads the `rel` *content attribute*, so `link.rel = "stylesheet"`
+must write it (a stored own property left the dynamically inserted sheet inert and never
+fetched); tags without the member keep own-property semantics. (2) Blitz applies a fetched
+sheet to the stylist but never fires the link's DOM `load` event, and `__vitePreload`
+resolves its CSS-dependency promise on exactly that event before calling the route chunk's
+dynamic `import()`; `Tab::dispatch_stylesheet_loads` (called from every `settle`) fires it
+once per node, keyed by `SpecialElementData::Stylesheet`. (3) `<a>`/`<area>` carry the
+HTMLAnchorElement **URL decomposition members** (`protocol`/`host`/`hostname`/`port`/
+`pathname`/`search`/`hash`/`username`/`password`/`origin`) over the resolved `href` —
+Mastodon's link-card builds an anchor and reads `.hostname`, and an absent member is
+`undefined`, which its punycode decoder then `split`s into a `TypeError` that aborts the
+whole status render. Finally, `Tab.anim_clock` feeds `BaseDocument::resolve`'s
+`current_time_for_animations` (was a constant `0.`): Mastodon's `.status{animation:…fade}`
+(`0%{opacity:0}`) was frozen at its start keyframe, so a column full of fetched statuses
+painted blank. Known remaining: an oversized SVG/path fill still paints over the first posts
+(recorded fill bboxes ~720x560 clipped to the column) — a blitz paint bug, separate from the
+fetch/render path.
 **`boa_ast` is forked** (task: the explore-page react-spring `TypeError: cannot convert
 'null' or 'undefined' to object`): upstream `Scope::escape_this_in_enclosing_function_scope`
 stops escaping `this` at the first enclosing function scope — even an arrow's, which cannot

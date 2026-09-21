@@ -997,6 +997,7 @@ impl ModuleLoader for UrlModuleLoader {
         // complete, and boa runs the whole graph in its job-queue drain.
         let specifier = request.specifier().to_std_string_escaped();
         let referrer = Self::referrer_url(&referrer).unwrap_or_else(|| self.base.clone());
+        debug!("module load request: specifier={specifier:?} referrer={referrer}");
         let resolved = match self.resolve_specifier(&specifier, &referrer) {
             Ok(url) => url,
             Err(err) => return std::future::ready(Err(JsNativeError::typ().with_message(err).into())),
@@ -1005,8 +1006,10 @@ impl ModuleLoader for UrlModuleLoader {
         if let Some(module) = self.modules.borrow().get(&key) {
             // Same specifier, same instance: fetched once, one namespace,
             // cycles included.
+            debug!("module load cache hit: {key}");
             return std::future::ready(Ok(module.clone()));
         }
+        debug!("module load fetching: {key}");
         // The context is borrowed for parsing only, never across the fetch.
         let body = match (self.fetch)(&resolved) {
             Ok(body) => body,
@@ -1921,7 +1924,7 @@ fn css(value: &impl style_traits::values::ToCss) -> String {
 /// Mastodon's lightbox boots on `direction`, and layout code reads the
 /// sizing/display members next). Everything stylo resolves for the node;
 /// the empty string is the honest "not modelled" answer.
-fn computed_style_value(
+pub(crate) fn computed_style_value(
     styles: &style::servo_arc::Arc<style::properties::ComputedValues>,
     property: &str,
 ) -> String {
@@ -3880,14 +3883,24 @@ const PRELUDE: &str = r##"
       path = rest.slice(end) || "/";
     }
     var at = auth.indexOf("@");
+    var userinfo = at >= 0 ? auth.slice(0, at) : "";
+    var userCut = userinfo.indexOf(":");
+    var username = userCut >= 0 ? userinfo.slice(0, userCut) : userinfo;
+    var password = userCut >= 0 ? userinfo.slice(userCut + 1) : "";
     var hostport = at >= 0 ? auth.slice(at + 1) : auth;
+    var port = "";
+    var portMatch = /:(\d+)$/.exec(hostport);
+    if (portMatch !== null) port = portMatch[1];
     return {
       protocol: protocol,
       host: hostport,
       hostname: hostport.replace(/:\d+$/, ""),
+      port: port,
       pathname: auth === "" && path === "" ? "" : path,
       search: search,
       hash: hash,
+      username: username,
+      password: password,
     };
   }
 
@@ -5642,6 +5655,72 @@ const PRELUDE: &str = r##"
   protoAccessor("href",
     function () { return urlAttr(this, "href", HREF_TAGS); },
     function (value) { urlAttrSet(this, "href", HREF_TAGS, value); });
+  // Simple reflected string attributes. HTML reflects `rel` on the elements
+  // that carry it; `rel` on a `<link>` is the one that MATTERS to the engine:
+  // blitz reads the `rel` CONTENT ATTRIBUTE to decide whether a `<link>` is a
+  // stylesheet (`load_linked_stylesheet`), so `link.rel = "stylesheet"` must
+  // write the attribute (a stored own property would leave the link inert and
+  // the CSS never fetched — the Vite preload helper then waits forever on the
+  // link's `load` event). Tags without the member keep browser own-property
+  // semantics (`div.rel = "x"` stores).
+  var REL_TAGS = { LINK: 1, A: 1, AREA: 1, FORM: 1 };
+  var LINK_ONLY = { LINK: 1 };
+  function stringAttr(self, key, tags) {
+    if (!tags[tagUpper(self)]) return undefined;
+    var raw = self.getAttribute(key);
+    return raw === null || raw === undefined ? "" : String(raw);
+  }
+  function stringAttrSet(self, key, tags, value) {
+    if (!tags[tagUpper(self)]) { storeOwn(self, key, String(value)); return; }
+    self.setAttribute(key, String(value));
+  }
+  protoAccessor("rel",
+    function () { return stringAttr(this, "rel", REL_TAGS); },
+    function (value) { stringAttrSet(this, "rel", REL_TAGS, value); });
+  protoAccessor("as",
+    function () { return stringAttr(this, "as", LINK_ONLY); },
+    function (value) { stringAttrSet(this, "as", LINK_ONLY, value); });
+  protoAccessor("crossOrigin",
+    function () { return stringAttr(this, "crossorigin", LINK_ONLY); },
+    function (value) { stringAttrSet(this, "crossorigin", LINK_ONLY, value); });
+  // `<a>`/`<area>` URL decomposition (HTMLAnchorElement): every member reads
+  // the RESOLVED `href` through the tab's parser. Mastodon's link-card
+  // component builds `document.createElement("a")`, assigns `.href` and reads
+  // `.hostname`; with the member absent the value is `undefined`, and the
+  // caller's punycode decoder then throws `TypeError: cannot convert 'null'
+  // or 'undefined' to object` out of the whole status render — the exact
+  // failure that left /explore's Posts column empty. Tags that do not carry
+  // the members answer `undefined`, like a browser.
+  var URL_DECOMP_TAGS = { A: 1, AREA: 1 };
+  function anchorHref(self) {
+    var raw = self.getAttribute("href");
+    if (raw === null || raw === undefined) return "";
+    var absolute = host.__ironsurfDomResolveUrl(self.__d, String(raw));
+    return absolute === null ? String(raw) : String(absolute);
+  }
+  function anchorParts(self) { return urlParts(anchorHref(self)); }
+  function anchorOrigin(self) {
+    var p = anchorParts(self);
+    if ((p.protocol === "http:" || p.protocol === "https:") && p.host) {
+      return p.protocol + "//" + p.host;
+    }
+    return p.host ? p.protocol + "//" + p.host : "null";
+  }
+  function urlDecomp(name, compute) {
+    protoAccessor(name, function () {
+      return URL_DECOMP_TAGS[tagUpper(this)] ? compute(this) : undefined;
+    });
+  }
+  urlDecomp("protocol", function (s) { return anchorParts(s).protocol; });
+  urlDecomp("host", function (s) { return anchorParts(s).host; });
+  urlDecomp("hostname", function (s) { return anchorParts(s).hostname; });
+  urlDecomp("port", function (s) { return anchorParts(s).port; });
+  urlDecomp("pathname", function (s) { return anchorParts(s).pathname; });
+  urlDecomp("search", function (s) { return anchorParts(s).search; });
+  urlDecomp("hash", function (s) { return anchorParts(s).hash; });
+  urlDecomp("username", function (s) { return anchorParts(s).username; });
+  urlDecomp("password", function (s) { return anchorParts(s).password; });
+  urlDecomp("origin", anchorOrigin);
   // Leading non-negative integer (HTML's parsing rules: optional whitespace,
   // then digits — anything else means the attribute has no value).
   function nonNegativeInt(raw, fallback) {
@@ -11908,6 +11987,58 @@ mod tests {
         assert!(
             host.borrow().pending_nav.is_none(),
             "reflecting src/href must never queue a navigation"
+        );
+    }
+
+    /// `rel` is a reflected string attribute on the elements that carry it
+    /// (`<link>`, `<a>`, `<area>`, `<form>`): blitz reads the CONTENT
+    /// attribute to decide whether a `<link>` is a stylesheet, so a stored
+    /// own property would leave a dynamically inserted stylesheet inert and
+    /// its `load` event forever un-fired (the Vite preload helper then never
+    /// calls the lazy route's dynamic `import()`). Tags without the member
+    /// keep browser own-property semantics. `<a>`/`<area>` also carry the
+    /// HTMLAnchorElement URL decomposition members over the resolved `href`
+    /// (Mastodon's link-card component reads `.hostname`).
+    #[test]
+    fn rel_and_anchor_url_members_reflect() {
+        let (_host, mut runtime, mut doc) = image_world(DOM_PAGE);
+        let source = r##"
+            (function () {
+                var link = document.createElement("link");
+                link.rel = "stylesheet";
+                if (link.getAttribute("rel") !== "stylesheet" || link.rel !== "stylesheet") return false;
+                link.rel = "preload";
+                if (link.getAttribute("rel") !== "preload") return false;
+                var a = document.createElement("a");
+                a.rel = "noopener";
+                if (a.getAttribute("rel") !== "noopener") return false;
+                var div = document.createElement("div");
+                div.rel = "stored";
+                if (div.rel !== "stored" || div.getAttribute("rel") !== null) return false;
+                return true;
+            })() &&
+            (function () {
+                var a = document.createElement("a");
+                a.href = "https://user:pw@Example.TEST:8443/a/b?q=1#frag";
+                return a.protocol === "https:" &&
+                    a.host === "example.test:8443" &&
+                    a.hostname === "example.test" &&
+                    a.port === "8443" &&
+                    a.pathname === "/a/b" &&
+                    a.search === "?q=1" &&
+                    a.hash === "#frag" &&
+                    a.username === "user" &&
+                    a.password === "pw" &&
+                    a.origin === "https://example.test:8443" &&
+                    document.createElement("a").hostname === "" &&
+                    document.createElement("a").port === "" &&
+                    document.createElement("a").origin === "null" &&
+                    document.createElement("div").hostname === undefined;
+            })();
+            "##;
+        assert!(
+            dom_eval(&mut runtime, &mut doc, source).to_boolean(),
+            "rel and anchor URL members must reflect"
         );
     }
 
