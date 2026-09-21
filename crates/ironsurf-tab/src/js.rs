@@ -1047,6 +1047,12 @@ pub struct HostState {
     pub body_text: Option<String>,
     /// URL the bindings report through `location.href`.
     pub url: String,
+    /// Viewport size in **CSS px** (`window.innerWidth`/`innerHeight`). The tab
+    /// writes the real, post-resize size here ([`crate::runtime::Tab`] on every
+    /// `ToTab::Resize`/`SetZoom` and at realm creation), so responsive code and
+    /// React's measuring hooks read the true viewport instead of a constant.
+    pub viewport_width: u32,
+    pub viewport_height: u32,
     /// Video (task: playback): the `<video>` half of the host. Page reads
     /// (`v.currentTime`, `v.duration`, …) see the snapshot the tab's last
     /// media pump wrote; page writes (`v.play()`, `v.currentTime = 5`, …)
@@ -1099,6 +1105,10 @@ impl HostState {
             title: title.unwrap_or_default().to_string(),
             body_text,
             url: url.into(),
+            // The engine's default window (like `DEFAULT_SIZE`); a real tab
+            // overwrites this with its current size before any script runs.
+            viewport_width: 1024,
+            viewport_height: 768,
             ..HostState::default()
         }
     }
@@ -1660,6 +1670,13 @@ mod dom_native {
     pub(super) const VALUE_SET: &str = "__ironsurfDomValueSet";
     pub(super) const CHECKED: &str = "__ironsurfDomChecked";
     pub(super) const CHECKED_SET: &str = "__ironsurfDomCheckedSet";
+    // CSSOM View geometry: one native answers the whole Element box model as
+    // `[x, y, width, height, offsetLeft, offsetTop, offsetWidth, offsetHeight,
+    //   clientWidth, clientHeight, scrollWidth, scrollHeight,
+    //   scrollLeft, scrollTop, hasBoxes]`.
+    pub(super) const RECT: &str = "__ironsurfDomRect";
+    /// Write `scrollLeft`/`scrollTop` (either axis may be `null` = leave it).
+    pub(super) const SCROLL_SET: &str = "__ironsurfDomScrollSet";
 }
 
 /// Live-collection kinds (the `type` argument of `LIVE_ITEM`/`LIVE_COUNT`).
@@ -2039,6 +2056,123 @@ fn register_dom_natives(context: &mut Context) {
         .unwrap_or_default()
         .unwrap_or_default();
         Ok(JsValue::from(JsString::from(out)))
+    });
+    // CSSOM View geometry (task: React). One native answers everything
+    // `getBoundingClientRect` / `offset*` / `client*` / `scroll*` read, so a
+    // single layout flush serves the whole box model. Like a browser's forced
+    // synchronous layout, `resolve(0.)` runs FIRST: a React `useLayoutEffect`
+    // measures a tree it just committed **within the same script turn**, and
+    // waiting for the runtime's post-turn settle would read a stale (often
+    // zero) box. `hasBoxes` follows blitz's `has_boxes()` (`display:none`,
+    // `display:contents`, detached ⇒ no rect).
+    native!(dom_native::RECT, 2, |_this, args, context| {
+        let doc = arg_doc(args, 0, context)?;
+        let node = arg_node(args, 1, context)?;
+        let values = with_live_doc(doc, |document| -> Option<[f64; 17]> {
+            document.resolve(0.0);
+            let target = document.get_node(node_id(node))?;
+            if target.element_data().is_none() {
+                return None;
+            }
+            let has_boxes = target.has_boxes();
+            let layout = *target.final_layout();
+            // `absolute_position` is the border-box origin in PAGE coords;
+            // subtract the document's viewport scroll for client coords.
+            let pos = target.absolute_position(0.0, 0.0);
+            let scroll = document.viewport_scroll();
+            let (width, height) = if has_boxes {
+                (f64::from(layout.size.width), f64::from(layout.size.height))
+            } else {
+                (0.0, 0.0)
+            };
+            let offset = target.offset_top_left();
+            let (client_w, client_h) = if has_boxes {
+                (f64::from(target.client_width()), f64::from(target.client_height()))
+            } else {
+                (0.0, 0.0)
+            };
+            let (scroll_w, scroll_h) = if has_boxes {
+                (f64::from(target.scroll_width()), f64::from(target.scroll_height()))
+            } else {
+                (0.0, 0.0)
+            };
+            let node_scroll = target.scroll_offset();
+            Some([
+                if has_boxes { f64::from(pos.x) - scroll.x } else { 0.0 },
+                if has_boxes { f64::from(pos.y) - scroll.y } else { 0.0 },
+                width,
+                height,
+                f64::from(offset.x),
+                f64::from(offset.y),
+                width,
+                height,
+                client_w,
+                client_h,
+                scroll_w,
+                scroll_h,
+                node_scroll.x,
+                node_scroll.y,
+                if has_boxes { 1.0 } else { 0.0 },
+                f64::from(layout.border.left),
+                f64::from(layout.border.top),
+            ])
+        })
+        .flatten();
+        let fallback = [0.0f64; 17];
+        let values = values.unwrap_or(fallback);
+        let array = boa_engine::object::builtins::JsArray::from_iter(
+            values.into_iter().map(JsValue::new),
+            context,
+        );
+        Ok(JsValue::from(array))
+    });
+    // `scrollLeft = …` / `scrollTop = …`: the root element scrolls the
+    // document viewport; any other element scrolls its own overflow box. Both
+    // clamp at 0 and ask for a repaint, so a script-driven scroll paints.
+    native!(dom_native::SCROLL_SET, 4, |_this, args, context| {
+        let doc = arg_doc(args, 0, context)?;
+        let node = arg_node(args, 1, context)?;
+        let x = match args.get(2) {
+            Some(value) if !value.is_null_or_undefined() => Some(value.to_number(context)?),
+            _ => None,
+        };
+        let y = match args.get(3) {
+            Some(value) if !value.is_null_or_undefined() => Some(value.to_number(context)?),
+            _ => None,
+        };
+        let changed = with_live_doc(doc, |document| {
+            // `window.scrollTo` passes the DOCUMENT node id (`__ironsurfDomRoot`);
+            // `document.documentElement.scrollTop` passes the <html> element.
+            // Both scroll the viewport.
+            if node_id(node) == document.root_node().id || node_id(node) == document.root_element().id {
+                let mut scroll = document.viewport_scroll();
+                if let Some(x) = x {
+                    scroll.x = x.max(0.0);
+                }
+                if let Some(y) = y {
+                    scroll.y = y.max(0.0);
+                }
+                document.set_viewport_scroll(scroll);
+                true
+            } else if let Some(target) = document.get_node_mut(node_id(node)) {
+                let mut scroll = *target.scroll_offset();
+                if let Some(x) = x {
+                    scroll.x = x.max(0.0);
+                }
+                if let Some(y) = y {
+                    scroll.y = y.max(0.0);
+                }
+                *target.scroll_offset_mut() = scroll;
+                true
+            } else {
+                false
+            }
+        })
+        .unwrap_or(false);
+        if changed {
+            with_host(|host| host.repaint = true);
+        }
+        Ok(JsValue::undefined())
     });
     // `localName`/`tagName` source: the element's RAW local name (case kept
     // — svg `linearGradient` included) and its namespace, packed as one
@@ -3220,6 +3354,12 @@ mod native {
     pub(super) const XHR: &str = "__ironsurfXhr";
     pub(super) const RANDOM_BYTES: &str = "__ironsurfRandomBytes";
     pub(super) const RANDOM_UUID: &str = "__ironsurfRandomUUID";
+    /// `window.innerWidth`/`innerHeight` + the live viewport scroll: one array
+    /// `[width, height, scrollX, scrollY]` (CSS px / CSS px of scroll).
+    pub(super) const VIEWPORT: &str = "__ironsurfViewport";
+    /// A monotonic millisecond clock (`performance.now()`), started when the
+    /// realm was built (the closest thing to this navigation's time origin).
+    pub(super) const PERF_NOW: &str = "__ironsurfPerfNow";
 }
 
 /// Process-wide random source for `crypto.getRandomValues`/`randomUUID`
@@ -3405,6 +3545,13 @@ const PRELUDE: &str = r##"
     // class defined further down is available here).
     var ev = Object.create(Event.prototype);
     Object.assign(ev, {
+      // Marks a REAL event for the dispatch paths: they clone only plain
+      // objects handed to `dispatchEvent` (the `{type: "click"}` shape) and
+      // must pass a genuine `Event` through **unchanged**, so the caller's
+      // `defaultPrevented`/`target`/`currentTarget` reflect the dispatch —
+      // without this marker every `dispatchEvent` copied the event and React's
+      // synthetic-event preventDefault was invisible to the caller.
+      __ironsurfEvent: true,
       type: type,
       target: target,
       currentTarget: target,
@@ -3450,6 +3597,11 @@ const PRELUDE: &str = r##"
         path.push(node);
         node = host.__ironsurfDomParent(d, node.__n) ? wrapNode(d, host.__ironsurfDomParent(d, node.__n)) : null;
       }
+    } else if (target === host) {
+      // Dispatching ON window: window is the top of the path, so its
+      // listeners must run in the AT_TARGET phase. Appending document as
+      // path[0] (the old shape) made window listeners capture-only.
+      return [host];
     } else if (target && target !== document && target !== host) {
       path.push(target);
     }
@@ -3641,16 +3793,32 @@ const PRELUDE: &str = r##"
   host.name = "";
   host.closed = false;
   host.devicePixelRatio = 1;
-  // Viewport constants (task: infosec.exchange). These were 0 — and every
-  // measuring widget (carousels, lazy-render gates, `matchMedia` fallbacks)
-  // behaves pathologically on a 0×0 viewport: the landing carousel's raf loop
-  // never settles its measurement. They now default to the engine's own
-  // default window (DEFAULT_SIZE, 1024×768 CSS px); a live resize is not yet
-  // propagated into the realm (TODO: push ToTab::Resize through here too).
-  host.innerWidth = 1024;
-  host.innerHeight = 768;
-  host.outerWidth = 1024;
-  host.outerHeight = 768;
+  // Viewport metrics (task: React geometry). These were constants; they are
+  // now getters over the tab's LIVE CSS-px viewport (the same size `layout`
+  // uses), written on every `ToTab::Resize`/`SetZoom` — so responsive code,
+  // `matchMedia` fallbacks and React's measuring hooks read the true window.
+  // `scrollX`/`scrollY`/`page*Offset` read the document scroll the tab owns.
+  function viewportInfo() { return host.__ironsurfViewport(0); }
+  Object.defineProperty(host, "innerWidth", { get: function () { return viewportInfo()[0]; }, configurable: true });
+  Object.defineProperty(host, "innerHeight", { get: function () { return viewportInfo()[1]; }, configurable: true });
+  Object.defineProperty(host, "outerWidth", { get: function () { return viewportInfo()[0]; }, configurable: true });
+  Object.defineProperty(host, "outerHeight", { get: function () { return viewportInfo()[1]; }, configurable: true });
+  Object.defineProperty(host, "scrollX", { get: function () { return viewportInfo()[2]; }, configurable: true });
+  Object.defineProperty(host, "scrollY", { get: function () { return viewportInfo()[3]; }, configurable: true });
+  Object.defineProperty(host, "pageXOffset", { get: function () { return viewportInfo()[2]; }, configurable: true });
+  Object.defineProperty(host, "pageYOffset", { get: function () { return viewportInfo()[3]; }, configurable: true });
+  // `window.scrollTo`/`scrollBy` — real viewport scrolls through the same
+  // native the element `scrollTop`/`scrollLeft` setters use.
+  host.scrollTo = function (x, y) {
+    if (x !== null && typeof x === "object") { y = x.top; x = x.left; }
+    host.__ironsurfDomScrollSet(0, host.__ironsurfDomRoot(0),
+      x === undefined ? null : Number(x), y === undefined ? null : Number(y));
+  };
+  host.scrollBy = function (x, y) {
+    if (x !== null && typeof x === "object") { y = x.top; x = x.left; }
+    var v = viewportInfo();
+    host.scrollTo((Number(v[2]) || 0) + (Number(x) || 0), (Number(v[3]) || 0) + (Number(y) || 0));
+  };
   host.location = location;
 
   // ---------------------------------------------------------------------
@@ -3706,8 +3874,90 @@ const PRELUDE: &str = r##"
   host.clearInterval = host.__ironsurfClearTimer;
   host.requestAnimationFrame = host.__ironsurfRaf;
   host.cancelAnimationFrame = host.__ironsurfClearTimer;
-  host.scrollTo = noop;
-  host.scroll = noop;
+  host.scroll = host.scrollTo; // legacy alias of scrollTo
+  // `requestIdleCallback` (task: React ecosystem — Mastodon's
+  // requestidlecallback chunk): a real task on the timer queue with the
+  // deadline shape consumers read. The engine always has "time left", so
+  // `didTimeout` is false and `timeRemaining()` answers a small budget.
+  host.requestIdleCallback = function (callback, _options) {
+    if (typeof callback !== "function") {
+      throw new TypeError("Failed to execute 'requestIdleCallback': callback is not a function");
+    }
+    return host.__ironsurfSetTimeout(function () {
+      callback({
+        didTimeout: false,
+        timeRemaining: function () { return 50; },
+      });
+    }, 1);
+  };
+  host.cancelIdleCallback = function (id) { host.__ironsurfClearTimer(id); };
+  // `performance` (task: React scheduler): a monotonic `now()` from the
+  // native clock plus the no-op User Timing surface libraries feature-detect.
+  host.performance = {
+    now: function () { return host.__ironsurfPerfNow(); },
+    timeOrigin: Date.now() - host.__ironsurfPerfNow(),
+    mark: noop,
+    measure: noop,
+    clearMarks: noop,
+    clearMeasures: noop,
+    getEntries: function () { return []; },
+    getEntriesByName: function () { return []; },
+    getEntriesByType: function () { return []; },
+  };
+  // `isSecureContext`: true for https and the loopback origins browsers treat
+  // as potentially trustworthy. Clipboard/service-worker gates read it.
+  Object.defineProperty(host, "isSecureContext", {
+    get: function () {
+      if (location.protocol === "https:") return true;
+      var h = location.hostname;
+      return h === "localhost" || h === "127.0.0.1" || h === "[::1]";
+    },
+    configurable: true,
+  });
+  // `CSS.escape` (spec algorithm, CSSOM) and a best-effort `CSS.supports`
+  // that round-trips through the real style parser on a scratch element.
+  host.CSS = host.CSS || {};
+  if (typeof host.CSS.escape !== "function") {
+    host.CSS.escape = function (value) {
+      var string = String(value);
+      var out = "";
+      for (var i = 0; i < string.length; i++) {
+        var c = string.charCodeAt(i);
+        if (c === 0) { out += "\uFFFD"; continue; }
+        var ch = string.charAt(i);
+        if ((c >= 0x30 && c <= 0x39) || c === 0x2d || c === 0x5f ||
+            (c >= 0x41 && c <= 0x5a) || (c >= 0x61 && c <= 0x7a) || c > 0x7f) {
+          if (c >= 0x30 && c <= 0x39 && (i === 0 || (i === 1 && string.charAt(0) === "-"))) {
+            out += "\\3" + ch + " ";
+          } else {
+            out += ch;
+          }
+        } else {
+          out += "\\" + ch;
+        }
+      }
+      return out;
+    };
+  }
+  if (typeof host.CSS.supports !== "function") {
+    host.CSS.supports = function (property, value) {
+      var prop, val;
+      if (value === undefined) {
+        var text = String(property);
+        var cut = text.indexOf(":");
+        if (cut < 0) return false;
+        prop = text.slice(0, cut).trim();
+        val = text.slice(cut + 1).trim();
+      } else {
+        prop = String(property);
+        val = String(value);
+      }
+      if (!prop || !val) return false;
+      var probe = document.createElement("div");
+      probe.style.setProperty(prop, val);
+      return probe.style.getPropertyValue(prop) !== "";
+    };
+  }
 
   // ---------------------------------------------------------------------
   // window.matchMedia (task: startpage.com search bar). Media features are
@@ -4571,6 +4821,195 @@ const PRELUDE: &str = r##"
   protoMethod("scrollIntoView", function (_arg) {});
   protoMethod("scroll", function (_arg) {});
   protoMethod("scrollTo", function (_arg) {});
+
+  // ---------------------------------------------------------------------
+  // CSSOM View geometry (task: React). `getBoundingClientRect` and the
+  // offset/client/scroll metrics all read the ONE `__ironsurfDomRect` native;
+  // the Rust side forces a layout flush first (a browser does the same), so a
+  // React `useLayoutEffect` that measures a tree committed in this very turn
+  // sees real numbers instead of a stale/zero box. Rects are viewport-relative
+  // (client) coords; a boxless element (`display:none`/`contents`, detached)
+  // answers the all-zero rect and an empty `getClientRects()`, exactly like
+  // the spec. `offsetWidth`/`clientWidth`/… are rounded integers.
+  // ---------------------------------------------------------------------
+  function rawRect(el) {
+    return host.__ironsurfDomRect(el.__d, el.__n);
+  }
+  function boundingRect(el) {
+    var v = rawRect(el);
+    var x = v[0], y = v[1], w = v[2], h = v[3];
+    return {
+      x: x, y: y, left: x, top: y, right: x + w, bottom: y + h,
+      width: w, height: h,
+      toJSON: function () { return this; },
+    };
+  }
+  protoMethod("getBoundingClientRect", function () {
+    return boundingRect(this);
+  });
+  protoMethod("getClientRects", function () {
+    // One box per element in this engine (no multi-fragment inline split);
+    // a boxless element yields none, like a browser.
+    return rawRect(this)[14] === 1 ? [boundingRect(this)] : [];
+  });
+  protoGet("offsetWidth", function () { return Math.round(rawRect(this)[6]); });
+  protoGet("offsetHeight", function () { return Math.round(rawRect(this)[7]); });
+  protoGet("offsetLeft", function () { return Math.round(rawRect(this)[4]); });
+  protoGet("offsetTop", function () { return Math.round(rawRect(this)[5]); });
+  protoGet("clientWidth", function () { return Math.round(rawRect(this)[8]); });
+  protoGet("clientHeight", function () { return Math.round(rawRect(this)[9]); });
+  protoGet("clientLeft", function () { return Math.round(rawRect(this)[15]); });
+  protoGet("clientTop", function () { return Math.round(rawRect(this)[16]); });
+  protoGet("scrollWidth", function () { return Math.round(rawRect(this)[10]); });
+  protoGet("scrollHeight", function () { return Math.round(rawRect(this)[11]); });
+  // Scroll position: reads are honest (the node's own scroll offset, which the
+  // tab's Scroll handling writes). Writes are accepted and stored on the node
+  // by the native — a plain setter here would shadow the layout's state.
+  protoAccessor(
+    "scrollLeft",
+    function () { return rawRect(this)[12]; },
+    function (v) { host.__ironsurfDomScrollSet(this.__d, this.__n, Number(v) || 0, null); }
+  );
+  protoAccessor(
+    "scrollTop",
+    function () { return rawRect(this)[13]; },
+    function (v) { host.__ironsurfDomScrollSet(this.__d, this.__n, null, Number(v) || 0); }
+  );
+
+  // ---------------------------------------------------------------------
+  // Node/Element conveniences modern libraries call constantly (task: React
+  // ecosystem). These are thin compositions of the primitives above:
+  // `append`/`prepend`/`before`/`after`/`replaceWith`/`replaceChildren`,
+  // `insertAdjacentHTML`/`Element`/`Text`, `toggleAttribute`, the equality
+  // predicates and `normalize`. Strings become text nodes, exactly like the
+  // spec's conversion.
+  // ---------------------------------------------------------------------
+  function nodesFromArgs(args) {
+    var out = [];
+    for (var i = 0; i < args.length; i++) {
+      var v = args[i];
+      if (v && typeof v === "object" && v.__n) out.push(v);
+      else out.push(document.createTextNode(String(v)));
+    }
+    return out;
+  }
+  function insertAdjacent(node, position, items) {
+    var parent = node.parentNode;
+    if (position === "beforebegin" || position === "afterend") {
+      if (!parent) throw new Error("InvalidStateError: the node has no parent");
+    }
+    var i;
+    if (position === "beforebegin") {
+      for (i = 0; i < items.length; i++) parent.insertBefore(items[i], node);
+    } else if (position === "afterend") {
+      var ref = node.nextSibling;
+      for (i = 0; i < items.length; i++) parent.insertBefore(items[i], ref);
+    } else if (position === "afterbegin") {
+      var first = node.firstChild;
+      for (i = 0; i < items.length; i++) node.insertBefore(items[i], first);
+    } else if (position === "beforeend") {
+      for (i = 0; i < items.length; i++) node.appendChild(items[i]);
+    } else {
+      throw new Error("SyntaxError: invalid insertion position " + position);
+    }
+  }
+  function nodeEqual(a, b) {
+    if (a === b) return true;
+    if (!a || !b || a.nodeType !== b.nodeType) return false;
+    if (a.nodeType === 3 || a.nodeType === 8) return a.nodeValue === b.nodeValue;
+    if (a.nodeName !== b.nodeName) return false;
+    if (a.nodeType === 1) {
+      var aa = a.attributes, bb = b.attributes;
+      if (aa.length !== bb.length) return false;
+      for (var i = 0; i < aa.length; i++) {
+        var attr = aa[i];
+        if (attr === null || b.getAttribute(attr.name) !== attr.value) return false;
+      }
+    }
+    var ac = a.childNodes, bc = b.childNodes;
+    if (ac.length !== bc.length) return false;
+    for (var j = 0; j < ac.length; j++) {
+      if (!nodeEqual(ac[j], bc[j])) return false;
+    }
+    return true;
+  }
+  protoMethod("append", function () {
+    var items = nodesFromArgs(arguments);
+    for (var i = 0; i < items.length; i++) this.appendChild(items[i]);
+  });
+  protoMethod("prepend", function () {
+    var items = nodesFromArgs(arguments);
+    var first = this.firstChild;
+    for (var i = 0; i < items.length; i++) this.insertBefore(items[i], first);
+  });
+  protoMethod("before", function () {
+    insertAdjacent(this, "beforebegin", nodesFromArgs(arguments));
+  });
+  protoMethod("after", function () {
+    insertAdjacent(this, "afterend", nodesFromArgs(arguments));
+  });
+  protoMethod("replaceWith", function () {
+    var parent = this.parentNode;
+    if (!parent) return;
+    insertAdjacent(this, "beforebegin", nodesFromArgs(arguments));
+    parent.removeChild(this);
+  });
+  protoMethod("replaceChildren", function () {
+    while (this.firstChild) this.removeChild(this.firstChild);
+    var items = nodesFromArgs(arguments);
+    for (var i = 0; i < items.length; i++) this.appendChild(items[i]);
+  });
+  protoMethod("insertAdjacentHTML", function (position, html) {
+    var scratch = document.createElement("div");
+    scratch.innerHTML = String(html);
+    var kids = scratch.childNodes;
+    var items = [];
+    for (var i = 0; i < kids.length; i++) items.push(kids[i]);
+    insertAdjacent(this, String(position).toLowerCase(), items);
+  });
+  protoMethod("insertAdjacentElement", function (position, element) {
+    if (!element || typeof element.__n !== "number" || !element.__n) {
+      throw new TypeError("insertAdjacentElement: argument 2 is not an Element");
+    }
+    insertAdjacent(this, String(position).toLowerCase(), [element]);
+    return element;
+  });
+  protoMethod("insertAdjacentText", function (position, text) {
+    insertAdjacent(this, String(position).toLowerCase(), [document.createTextNode(String(text))]);
+  });
+  protoMethod("toggleAttribute", function (name, force) {
+    name = String(name);
+    var has = this.hasAttribute(name);
+    var add = force === undefined ? !has : !!force;
+    if (add) {
+      if (!has) this.setAttribute(name, "");
+      return true;
+    }
+    if (has) this.removeAttribute(name);
+    return false;
+  });
+  protoMethod("isSameNode", function (other) { return this === other; });
+  protoMethod("isEqualNode", function (other) { return nodeEqual(this, other); });
+  protoMethod("normalize", function () {
+    var kids = this.childNodes;
+    var i = 0;
+    while (i < kids.length) {
+      var n = kids[i];
+      if (n !== null && n.nodeType === 3) {
+        var next = n.nextSibling;
+        while (next !== null && next.nodeType === 3) {
+          n.nodeValue = String(n.nodeValue) + String(next.nodeValue);
+          this.removeChild(next);
+          next = n.nextSibling;
+        }
+        if (n.nodeValue === "") this.removeChild(n);
+        else i++;
+      } else {
+        if (n !== null && typeof n.normalize === "function") n.normalize();
+        i++;
+      }
+    }
+  });
   // getElementsByClassName on any element (live, like the document one).
   protoMethod("getElementsByClassName", function (name) {
     // Not scoped to descendants in this bridge — document-wide live list.
@@ -4760,6 +5199,11 @@ const PRELUDE: &str = r##"
       return true;
     },
     get documentElement() {
+      if (!host.__ironsurfDomHasDoc()) return null;
+      return wrapNode(0, host.__ironsurfDomHtml(0));
+    },
+    // The element that scrolls the viewport in standards mode.
+    get scrollingElement() {
       if (!host.__ironsurfDomHasDoc()) return null;
       return wrapNode(0, host.__ironsurfDomHtml(0));
     },
@@ -5638,6 +6082,7 @@ const PRELUDE: &str = r##"
       throw new TypeError("Failed to construct 'Event': The type provided is an empty String");
     }
     init = init || {};
+    this.__ironsurfEvent = true;
     this.type = type;
     this.bubbles = !!init.bubbles;
     this.cancelable = !!init.cancelable;
@@ -6283,6 +6728,63 @@ const PRELUDE: &str = r##"
     return []; // records deliver on task; nothing ever queues behind
   };
   host.IntersectionObserver = IntersectionObserver;
+
+  // ---------------------------------------------------------------------
+  // ResizeObserver (task: React ecosystem). Layout-aware React components
+  // (Mastodon's columns, virtualised lists, chart wrappers) construct one and
+  // die on `ReferenceError` when it is absent. Like the IntersectionObserver
+  // above, this engine feeds JS no resize notifications, so the honest
+  // simplification is ONE optimistic delivery per `observe()`: a box entry
+  // whose `contentRect` is the element's real, currently-settled rect (the
+  // native forces layout). No re-delivery on later resizes, so nothing here
+  // can loop the app; `unobserve`/`disconnect` stop pending and future
+  // deliveries. The entry carries the full modern shape (contentRect plus
+  // borderBoxSize/contentBoxSize/devicePixelContentBoxSize arrays).
+  // ---------------------------------------------------------------------
+  function ResizeObserver(callback) {
+    if (typeof callback !== "function") {
+      throw new TypeError("Failed to construct 'ResizeObserver': callback required");
+    }
+    this.__callback = callback;
+    this.__targets = [];
+    this.__dead = false;
+  }
+  ResizeObserver.prototype.observe = function (target) {
+    if (this.__dead || !target || typeof target.__n !== "number" || !target.__n) return;
+    if (this.__targets.indexOf(target) >= 0) return;
+    this.__targets.push(target);
+    var self = this;
+    host.__ironsurfSetTimeout(function () {
+      if (self.__dead || self.__targets.indexOf(target) < 0) return;
+      var rect = target.getBoundingClientRect();
+      var box = { inlineSize: rect.width, blockSize: rect.height };
+      var entry = {
+        target: target,
+        contentRect: {
+          x: 0, y: 0, top: 0, left: 0,
+          right: rect.width, bottom: rect.height,
+          width: rect.width, height: rect.height,
+        },
+        borderBoxSize: [box],
+        contentBoxSize: [box],
+        devicePixelContentBoxSize: [box],
+      };
+      try {
+        self.__callback([entry], self);
+      } catch (err) {
+        reportError("ResizeObserver callback: " + err);
+      }
+    }, 0);
+  };
+  ResizeObserver.prototype.unobserve = function (target) {
+    var idx = this.__targets.indexOf(target);
+    if (idx >= 0) this.__targets.splice(idx, 1);
+  };
+  ResizeObserver.prototype.disconnect = function () {
+    this.__targets = [];
+    this.__dead = true;
+  };
+  host.ResizeObserver = ResizeObserver;
 
   // ---------------------------------------------------------------------
   // getComputedStyle (task: infosec.exchange). Mastodon's lightbox module
@@ -7963,6 +8465,50 @@ fn build_context_with_modules(
     ) {
         error!("js binding `userAgent` failed to install: {err}");
     }
+    // `performance.now()` (task: React): a monotonic clock captured at realm
+    // build (Instant is Copy, so the closure stays `from_copy_closure`).
+    {
+        let started = std::time::Instant::now();
+        if let Err(err) = context.register_global_builtin_callable(
+            JsString::from(native::PERF_NOW),
+            0,
+            NativeFunction::from_copy_closure(move |_this, _args, _context| {
+                Ok(JsValue::new(started.elapsed().as_secs_f64() * 1000.0))
+            }),
+        ) {
+            error!("js binding `perfNow` failed to install: {err}");
+        }
+    }
+    // window.innerWidth/innerHeight + the viewport scroll (task: React
+    // geometry). The size is the tab's live CSS-px viewport (updated on every
+    // Resize/zoom); the scroll is read from the settled document, so
+    // `window.scrollY` follows a real scroll or an anchor jump.
+    if let Err(err) = context.register_global_builtin_callable(
+        JsString::from(native::VIEWPORT),
+        1,
+        NativeFunction::from_copy_closure(|_this, args, context| {
+            let doc = arg_doc(args, 0, context)?;
+            let (width, height) = with_host(|host| (host.viewport_width, host.viewport_height))
+                .unwrap_or((1024, 768));
+            let (scroll_x, scroll_y) = with_live_doc(doc, |document| {
+                let scroll = document.viewport_scroll();
+                (scroll.x, scroll.y)
+            })
+            .unwrap_or((0.0, 0.0));
+            let array = boa_engine::object::builtins::JsArray::from_iter(
+                [
+                    JsValue::new(width.max(1)),
+                    JsValue::new(height.max(1)),
+                    JsValue::new(scroll_x),
+                    JsValue::new(scroll_y),
+                ],
+                context,
+            );
+            Ok(JsValue::from(array))
+        }),
+    ) {
+        error!("js binding `viewport` failed to install: {err}");
+    }
     // document.title (get reflects prior sets, set asks for a TitleChanged + repaint).
     if let Err(err) = context.register_global_builtin_callable(
         JsString::from(native::TITLE_GET),
@@ -9155,6 +9701,20 @@ impl JsRuntime {
         // Microtasks the handlers queued run at the end of this event turn.
         self.drain_jobs();
         prevented
+    }
+
+    /// Dispatch one event directly on `window` (no DOM node) with `doc`
+    /// registered as the live document, so listeners can read the new viewport
+    /// and geometry. Used by the tab's real resize path (`ToTab::Resize`); the
+    /// page sees the same `resize` event a browser fires after a window change.
+    pub(crate) fn fire_window_event(&mut self, doc: &mut HtmlDocument, kind: &str) {
+        let _active = self.activate();
+        let _live_doc = register_live_doc(doc);
+        let source = format!("window.dispatchEvent(new Event({kind:?}))");
+        if let Err(err) = self.context.eval(Source::from_bytes(&source)) {
+            warn!("js window {kind} dispatch failed: {err}");
+        }
+        self.drain_jobs();
     }
 
     /// Execute every timer callback due at `now`, in due order. Exceptions
@@ -10807,6 +11367,229 @@ mod tests {
             "#,
         );
         assert!(threw.to_boolean(), "non-node child must be a TypeError");
+    }
+
+    /// CSSOM View geometry (task: React): a browser forces layout on a
+    /// geometry read, and so does the `__ironsurfDomRect` native — a tree
+    /// committed and measured in one turn answers real numbers. The box model
+    /// here is `width:200px; padding:5px` ⇒ 210×60 border box, 210 client
+    /// width (no border), one client rect; a detached element has no box.
+    #[test]
+    fn dom_geometry_reports_the_live_box_model() {
+        dom_true(
+            r#"
+            var box = document.createElement("div");
+            box.style.width = "200px";
+            box.style.height = "50px";
+            box.style.padding = "5px";
+            document.body.appendChild(box);
+            var r = box.getBoundingClientRect();
+            var ok = Math.round(r.width) === 210 && Math.round(r.height) === 60 &&
+                     Math.round(r.right) === Math.round(r.left + r.width) &&
+                     Math.round(r.bottom) === Math.round(r.top + r.height) &&
+                     box.offsetWidth === 210 && box.offsetHeight === 60 &&
+                     box.clientWidth === 210 && box.clientHeight === 60 &&
+                     box.scrollWidth >= 210 && box.scrollHeight >= 60 &&
+                     box.getClientRects().length === 1;
+            // A detached element generates no box: the all-zero rect, no rects.
+            var lone = document.createElement("div");
+            lone.style.width = "10px";
+            var lr = lone.getBoundingClientRect();
+            var detachedOk = lr.width === 0 && lr.height === 0 &&
+                             lone.offsetWidth === 0 && lone.getClientRects().length === 0;
+            document.body.removeChild(box);
+            ok && detachedOk;
+            "#,
+        );
+    }
+
+    /// `display:none` (and `display:contents`) elements produce no box, so
+    /// `getBoundingClientRect` is all-zero and `getClientRects` is empty —
+    /// React's measuring hooks and lazy-mount gates branch on exactly this.
+    #[test]
+    fn dom_geometry_is_zero_for_boxless_elements() {
+        dom_true(
+            r#"
+            var box = document.createElement("div");
+            box.style.display = "none";
+            box.style.width = "100px";
+            box.style.height = "100px";
+            document.body.appendChild(box);
+            var r = box.getBoundingClientRect();
+            var ok = r.width === 0 && r.height === 0 && box.offsetWidth === 0 &&
+                     box.getClientRects().length === 0;
+            document.body.removeChild(box);
+            ok;
+            "#,
+        );
+    }
+
+    /// `window.innerWidth`/`innerHeight` are live reads of the tab's CSS-px
+    /// viewport (not constants): the host cell is the source of truth.
+    #[test]
+    fn window_viewport_metrics_read_the_host_size() {
+        let (mut runtime, mut doc) = dom_world();
+        {
+            let host = runtime.host();
+            let mut host = host.borrow_mut();
+            host.viewport_width = 900;
+            host.viewport_height = 640;
+        }
+        let ok = dom_eval(
+            &mut runtime,
+            &mut doc,
+            "window.innerWidth === 900 && window.innerHeight === 640 &&
+             window.outerWidth === 900 && typeof window.scrollY === 'number'",
+        );
+        assert!(ok.to_boolean(), "innerWidth/innerHeight must track the host size");
+    }
+
+    /// `dispatchEvent` passes the caller's REAL `Event` through (no clone), so
+    /// `preventDefault()` inside a listener is visible to the caller
+    /// (`defaultPrevented`, the `false` return) and `target` is the element.
+    /// Plain-object events still work, and a dispatch ON `window` reaches
+    /// window listeners in the AT_TARGET phase.
+    #[test]
+    fn dom_dispatch_event_keeps_identity_and_records_default_prevented() {
+        dom_true(
+            r#"
+            var el = document.createElement("div");
+            document.body.appendChild(el);
+            var seen = 0, same = false;
+            el.addEventListener("x", function (ev) { seen++; same = ev === e; ev.preventDefault(); });
+            var e = new Event("x", { cancelable: true });
+            var ret = el.dispatchEvent(e);
+            var nodeOk = seen === 1 && same && e.defaultPrevented === true &&
+                         ret === false && e.target === el;
+            var winSeen = 0, winTarget = null;
+            window.addEventListener("w", function (ev) { winSeen++; winTarget = ev.target; });
+            var we = new Event("w");
+            window.dispatchEvent(we);
+            var winOk = winSeen === 1 && winTarget === window && we.target === window;
+            // The plain-object shape still dispatches.
+            var plainSeen = 0;
+            el.addEventListener("p", function () { plainSeen++; });
+            var plain = el.dispatchEvent({ type: "p" });
+            document.body.removeChild(el);
+            nodeOk && winOk && plainSeen === 1 && plain === true;
+            "#,
+        );
+    }
+
+    /// The modern mutation/equality conveniences libraries call: strings
+    /// become text nodes, insertion positions match the spec, `toggleAttribute`
+    /// flips and reports, and `isEqualNode`/`normalize` do a structural compare
+    /// and a text merge.
+    #[test]
+    fn dom_modern_mutation_helpers_compose_the_primitives() {
+        dom_true(
+            r#"
+            var d = document.createElement("div");
+            d.append("x", document.createElement("b"));
+            var appended = d.childNodes.length === 2 && d.firstChild.nodeType === 3 &&
+                           d.lastChild.nodeName === "B";
+            d.prepend("p");
+            var prepended = d.firstChild.nodeValue === "p";
+            var b = d.lastChild;
+            b.before("B"); b.after("A");
+            var around = d.childNodes.length === 5 && b.previousSibling.nodeValue === "B" &&
+                         b.nextSibling.nodeValue === "A";
+            b.replaceWith(document.createElement("i"));
+            var hasI = false;
+            for (var k = 0; k < d.childNodes.length; k++) {
+              if (d.childNodes[k].nodeName === "I") hasI = true;
+            }
+            var replaced = hasI && b.parentNode === null;
+            d.replaceChildren(document.createElement("u"), "t");
+            var cleared = d.childNodes.length === 2 && d.firstChild.nodeName === "U";
+            d.innerHTML = "<p>mid</p>";
+            d.insertAdjacentHTML("beforeend", "<span>end</span>");
+            d.insertAdjacentHTML("afterbegin", "<em>start</em>");
+            var adjacent = d.childNodes.length === 3 && d.firstChild.nodeName === "EM" &&
+                           d.lastChild.nodeName === "SPAN";
+            var toggled = d.toggleAttribute("hidden") === true &&
+                          d.toggleAttribute("hidden") === false && !d.hasAttribute("hidden");
+            var e1 = document.createElement("div");
+            e1.innerHTML = "<p class='x'>hi</p>";
+            var e2 = document.createElement("div");
+            e2.innerHTML = "<p class='x'>hi</p>";
+            var e3 = document.createElement("div");
+            e3.innerHTML = "<p class='y'>hi</p>";
+            var equal = e1.isEqualNode(e2) === true && e1.isEqualNode(e3) === false &&
+                        e1.isSameNode(e1) === true && e1.isSameNode(e2) === false;
+            var n = document.createElement("div");
+            n.appendChild(document.createTextNode("a"));
+            n.appendChild(document.createTextNode("b"));
+            n.normalize();
+            var merged = n.childNodes.length === 1 && n.firstChild.nodeValue === "ab";
+            appended && prepended && around && replaced && cleared && adjacent &&
+              toggled && equal && merged;
+            "#,
+        );
+    }
+
+    /// `window.scrollTo`/`scrollBy` and `documentElement.scrollTop` move the
+    /// viewport, and `scrollY`/`pageYOffset` read it back.
+    #[test]
+    fn window_scroll_moves_the_viewport_and_reads_back() {
+        let (mut runtime, mut doc) = dom_world();
+        let ok = dom_eval(
+            &mut runtime,
+            &mut doc,
+            r#"
+            var start = window.scrollY === 0 && window.pageYOffset === 0;
+            window.scrollTo(0, 25);
+            var to = window.scrollY === 25 && window.pageYOffset === 25;
+            window.scrollBy(0, 5);
+            var by = window.scrollY === 30;
+            document.documentElement.scrollTop = 7;
+            var viaElement = window.scrollY === 7;
+            start && to && by && viaElement;
+            "#,
+        );
+        assert!(ok.to_boolean(), "scrollTo/scrollBy/scrollTop must move the viewport");
+    }
+
+    /// `performance`, `requestIdleCallback`, `ResizeObserver`, `CSS` and
+    /// `isSecureContext` exist and really run: the idle callback and the
+    /// observer's one optimistic delivery both fire from the poll loop.
+    #[test]
+    fn performance_idle_callback_and_resize_observer_really_run() {
+        let (mut runtime, mut doc) = dom_world();
+        let armed = dom_eval(
+            &mut runtime,
+            &mut doc,
+            r#"
+            window.__probe = 0;
+            var sync = typeof performance.now === "function" && performance.now() >= 0 &&
+                       Array.isArray(performance.getEntries()) &&
+                       CSS.escape("a b") === "a\\ b" && CSS.supports("display", "block") === true &&
+                       typeof isSecureContext === "boolean";
+            if (sync) window.__probe += 100;
+            requestIdleCallback(function (deadline) {
+              if (deadline && typeof deadline.timeRemaining === "function") window.__probe += 1;
+            });
+            var ro = new ResizeObserver(function (entries) {
+              if (entries.length === 1 && entries[0].contentRect.width >= 0) window.__probe += 10;
+            });
+            var el = document.createElement("div");
+            el.style.width = "40px";
+            el.style.height = "10px";
+            document.body.appendChild(el);
+            ro.observe(el);
+            true;
+            "#,
+        );
+        assert!(armed.to_boolean());
+        let errors =
+            runtime.run_due_timers(Instant::now() + Duration::from_millis(50), Some(&mut doc));
+        assert!(errors.is_empty(), "{errors:?}");
+        let probe = dom_eval(&mut runtime, &mut doc, "window.__probe");
+        assert_eq!(
+            probe.as_number(),
+            Some(111.0),
+            "performance/CSS sync surface plus the idle + resize deliveries"
+        );
     }
 
     #[test]
@@ -12614,11 +13397,18 @@ mod typeerror_message_taxonomy {
     use super::*;
 
     fn eval_err(src: &str) -> String {
+        eval_err_full(src).lines().next().unwrap_or_default().to_owned()
+    }
+
+    /// The WHOLE error text, backtrace lines included — the stack-taxonomy
+    /// test below asserts on the frame line, so it cannot go through the
+    /// first-line-only `eval_err`.
+    fn eval_err_full(src: &str) -> String {
         let host = Rc::new(RefCell::new(HostState::new("https://example.test/p.html", None, None)));
         let mut runtime = JsRuntime::new(Rc::clone(&host));
         match runtime.eval(src) {
             Ok(_) => String::new(),
-            Err(e) => format!("{e}").lines().next().unwrap_or_default().to_owned(),
+            Err(e) => format!("{e}"),
         }
     }
 
@@ -12636,7 +13426,7 @@ mod typeerror_message_taxonomy {
     /// name — used to localize the infosec `at P (:2:6210)` crash.
     #[test]
     fn failure_inside_function_reports_inner_column() {
-        let err = eval_err("function P({ text: t }) { return t.startsWith(`#`); } P({})");
+        let err = eval_err_full("function P({ text: t }) { return t.startsWith(`#`); } P({})");
         println!("inside-fn err: {err}");
         assert!(err.starts_with("TypeError: cannot convert"), "{err}");
         let line2 = err.lines().nth(1).unwrap_or_default();

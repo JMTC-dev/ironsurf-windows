@@ -797,6 +797,55 @@ The binding surface stays:
   not silently GET the base URL — pinned), the caller's init is never mutated, and the `Request`
   wrapper returns the raw instance keeping `instanceof` semantics (`tests/fetch_init.rs` pins the
   full axios-shaped init end-to-end against a live local server, incl. the relative-path case).
+- **Real React runs end-to-end** (task: ECMAScript/React support; `tests/react_render.rs`).
+  The committed React 19 + react-dom IIFE bundle (`tests/fixtures/react19/`, MIT, see its
+  NOTICE) mounts through the DOM bridge on a headless localhost tab: `createRoot(...).render()`
+  paints a real tree, `useState`/`useEffect`/`useLayoutEffect` run, synthetic events fire from
+  `el.click()`, the keyed list reconciles, and the page's own title reports the measured box,
+  click count, viewport width and the `Symbol`/`Object.assign`/`Promise` feature checks. The
+  ES6/DOM/timer floor the task named is pinned in the same file (`es6_dom_timer_surface_is_complete`)
+  and by the extensive `js.rs` unit surface.
+- **`dispatchEvent` keeps event identity** (task: React synthetic events). The dispatch paths
+  (`Node.prototype`, `document`, `window`) cloned every event that lacked the internal
+  `__ironsurfEvent` marker to support plain-object `{type: "click"}` events — but the marker was
+  never set, so they cloned *real* events too: a listener's `preventDefault()` set
+  `defaultPrevented` on the copy, invisible to the caller, and `ev.target === el` failed. `Event`
+  (and every `makeEvent`/UI-event instance, which copies its keys) now carries the marker, so a
+  genuine event flows through **unchanged** — `defaultPrevented`, the `false` return and `target`
+  all reflect the dispatch — while plain objects are still wrapped. `eventPath(host)` also
+  special-cases a dispatch **on `window`** (path `[host]`): the old shape appended `document` as
+  the target slot, so window listeners only ever ran in the capture phase.
+- **CSSOM View geometry is bridged and forces layout** (task: React measuring hooks). ONE native,
+  `__ironsurfDomRect(docId, nodeId)`, answers the whole box model as an array; the PRELUDE accessors
+  compose it: `getBoundingClientRect()`/`getClientRects()` (viewport/client coords, `[]` for a
+  boxless node), `offsetWidth`/`offsetHeight`/`offsetLeft`/`offsetTop` (blitz's spec `offset_top_left`
+  against the real `offsetParent`), `clientWidth`/`clientHeight`/`clientTop`/`clientLeft`,
+  `scrollWidth`/`scrollHeight`, and `scrollLeft`/`scrollTop` (reads plus a real writer that scrolls
+  the root's viewport or any element's overflow box, clamped at 0, and asks for a repaint). The
+  native calls `document.resolve(0.)` **first**, like a browser's forced synchronous layout: a React
+  `useLayoutEffect` that measures a tree committed earlier in the same script turn reads real
+  numbers (a `width:200px; padding:5px` box answers 210×60, not a stale zero). `display:none`,
+  `display:contents` and detached elements answer the all-zero rect and an empty `getClientRects()`.
+- **The viewport is live** (task: React responsive code). `window.innerWidth`/`innerHeight`/
+  `outerWidth`/`outerHeight` are getters over the tab's CSS-px size (`HostState::viewport_width/height`,
+  written at realm creation and on every `ToTab::Resize`), not the old 1024×768 constants;
+  `window.scrollX`/`scrollY`/`pageXOffset`/`pageYOffset` read the document's viewport scroll, and
+  `window.scrollTo`/`scrollBy` (and the legacy `window.scroll` alias) move it. A real `ToTab::Resize`
+  also dispatches a `resize` event on `window` **after** layout settles, so the page's handler sees
+  the new `innerWidth` and React re-renders (`tests/react_render.rs` asserts `RESIZED:900` after a
+  1024→900 resize).
+- **Framework plumbing that a React ecosystem feature-detects** (task: React ecosystem):
+  `performance` (`now()` from a monotonic native clock started at realm build, plus `timeOrigin`
+  and no-op User Timing methods, empty `getEntries*`), `requestIdleCallback`/`cancelIdleCallback`
+  (a one-tick task on the timer queue with the real `{didTimeout, timeRemaining}` deadline),
+  `ResizeObserver` (optimistic like `IntersectionObserver`: one delivery per `observe()` carrying
+  the element's real settled `contentRect` plus the modern `*BoxSize` arrays; no re-delivery, so
+  nothing loops), `CSS.escape` (the CSSOM algorithm) and a `CSS.supports` that round-trips through
+  the real style parser, and `isSecureContext` (https or loopback). Plus the Node/Element
+  conveniences libraries call constantly — `append`/`prepend`/`before`/`after`/`replaceWith`/
+  `replaceChildren` (strings become text nodes), `insertAdjacentHTML`/`Element`/`Text` (parse via
+  the existing `innerHTML` path), `toggleAttribute`, `isSameNode`/`isEqualNode` and `normalize` —
+  all thin compositions of the primitives above.
 - `console.log/info/warn/error` → tab stderr + `FromTab::StatusText` **and** a
   `FromTab::ConsoleLog { source: "js", level, message }` per line (all four levels, page order).
 - **`window.alert`/`confirm`/`prompt` are implemented as real synchronous modals**: the native

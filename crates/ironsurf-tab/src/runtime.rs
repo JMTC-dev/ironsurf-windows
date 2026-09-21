@@ -1628,6 +1628,11 @@ impl Tab {
         // window.alert/confirm/prompt block on the shell through this cell
         // (task: JS dialogs); headless already disabled it.
         host.borrow_mut().dialog = Some(Arc::clone(&self.dialog));
+        // window.innerWidth/innerHeight read the tab's live CSS-px viewport
+        // (task: React geometry): seed it before any script runs, and keep it
+        // in step on every Resize/zoom below.
+        host.borrow_mut().viewport_width = self.width.max(1);
+        host.borrow_mut().viewport_height = self.height.max(1);
         // `navigator.userAgent` reads the tab's live effective-UA cell
         // (same shared-handle pattern as the dialog host above).
         host.borrow_mut().user_agent = Some(Arc::clone(&self.user_agent));
@@ -2500,6 +2505,13 @@ impl Tab {
                 } else {
                     self.scale
                 };
+                // The realm reads innerWidth/innerHeight live: push the new
+                // CSS-px size before the page's resize handlers run.
+                if let Some(runtime) = self.js.as_ref() {
+                    let mut host = runtime.host().borrow_mut();
+                    host.viewport_width = self.width;
+                    host.viewport_height = self.height;
+                }
                 let viewport = self.viewport();
                 if let Some(doc) = self.doc.as_mut() {
                     // `set_viewport` is THE resize entry point (no resize()
@@ -2509,6 +2521,12 @@ impl Tab {
                 self.needs_paint = true;
                 self.last_paint = None; // force a frame at the new size
                 self.resolve_and_maybe_paint();
+                // Browsers fire `resize` on the window AFTER the viewport and
+                // layout have settled (task: React geometry) — a page's
+                // responsive handler must read the new innerWidth, not the old.
+                if let (Some(runtime), Some(doc)) = (self.js.as_mut(), self.doc.as_mut()) {
+                    runtime.fire_window_event(doc, "resize");
+                }
             }
             ToTab::SetZoom { zoom } => {
                 // The shell owns the step/clamp policy; the tab only rejects

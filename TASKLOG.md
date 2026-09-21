@@ -65,15 +65,6 @@
   (`cookie_header_at`/`capture_set_cookies_at`/`lookup_at`/`store_at`); spawn_http + document + `<script src>` + media pass the shared
   `Arc<Mutex<..>>` handles instead of guards, so a page's images/CSS/fonts download in parallel and `Tab.cache` is `provider.cache_handle()`
   (ONE NetCache per tab). New rendezvous unit test (503 if a lock serialises the pair), tab 215u + all suites green, ws check clean.
-## #52 One shared FetchWorker per process: BlitzNetProvider::new now takes shared_worker() (the static OnceLock already
-  used by fetch_document_report) instead of FetchWorker::new(), so a tab's document, scripts, subresources and media all ride
-  ONE reqwest pool (keep-alive, TLS sessions, DNS cache) — previously two clients could never share connections. Grep-verified
-  no other production FetchWorker::new/default/with_timeout remains (only test-only worker_for_test with_timeout left);
-  with_worker() override kept for custom-timeout tests. tab all suites green, cargo check --workspace clean.
-## #51 Transport tuning (tab): reqwest 0.12→0.13 (one reqwest in the tree with blitz-net; `rustls-tls`→`rustls`) + gzip/brotli/
-  deflate/charset features; FetchWorker::built both clients gain pool_max_idle_per_host(16), connect_timeout(10s), tcp_nodelay; main
-  client also HTTP/2 keep-alive interval 30s/timeout 10s + adaptive window (0.12's blocking builder lacked the keep-alive knobs — reason
-  for the bump). No test touched Accept-Encoding (grep-verified); tab 256u green, ws check clean (KMS -dev libs reinstalled via apt).
 ## #50 Archive-server front page pre-traverses the timeline: `/` renders each visit row AND its saved sites as
   `<visit>/<host[:port]>/` child links under it (capped 250 visits x 100 entries, "… more" dim rows, unreadable
   visits note themselves, never break the page), so no timestamp needs a click to reach an archived page; deeper
@@ -95,3 +86,11 @@
   Boa reports failing ops at the enclosing call column, pinned in js.rs typeerror_message_taxonomy tests) aborts the
   whole React render pass; react-redux context spy (fx11) chasing which member is null. Also landed: IntersectionObserver,
   focus()/click()/event constructors, viewport constants — fx6 boot is console-clean.
+## #76 React runs on IronSurf: real React 19 mounts/measures/reconciles (committed IIFE fixture e2e `tests/react_render.rs`, title pins
+  `geo=123x20/123;n=2;iw=1024;items=3`; a live `ToTab::Resize` re-renders at `RESIZED:900`) + an ES6/DOM/timer floor e2e. Gaps closed: (a) CSSOM
+  View geometry via one `__ironsurfDomRect` native that forces `document.resolve` (a `useLayoutEffect` sees the box it just committed) behind
+  getBoundingClientRect/getClientRects/offset*/client*/scroll* (writable); (b) `dispatchEvent` cloned real events — marker never set — so
+  preventDefault/target were wrong; `__ironsurfEvent` marks real events + window dispatch hits AT_TARGET; (c) live inner/outerWidth/Height, scrollX/Y,
+  page*Offset, scrollTo/scrollBy, and Resize fires `resize` after layout; (d) performance.now, requestIdleCallback, ResizeObserver, CSS.escape/supports,
+  isSecureContext, append/prepend/before/after/replaceWith/replaceChildren/insertAdjacent*/toggleAttribute/isEqualNode/normalize. 278u + react_render/e2e
+  green (pre-existing: userscripts clear-title assert, subresource_pool flake); LIVE infosec.exchange 19,795 B React tree, ZERO js:error/warn.
