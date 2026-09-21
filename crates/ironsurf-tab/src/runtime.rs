@@ -1186,7 +1186,8 @@ impl Tab {
             &self.cache,
             netmod::now_unix(),
             &self.user_agent,
-            Some(&|event| {
+            Some(&|mut event: NetEvent| {
+                event.initiator = Some("document".to_owned());
                 doc_events
                     .lock()
                     .expect("doc net events mutex")
@@ -1459,7 +1460,10 @@ impl Tab {
             cache,
             netmod::now_unix(),
             user_agent,
-            Some(&|event| events.lock().expect("net events mutex").push(event)),
+            Some(&|mut event: NetEvent| {
+                event.initiator = Some("script".to_owned());
+                events.lock().expect("net events mutex").push(event)
+            }),
         )
         .map(|script| {
             // Archive mode: an external script payload is a
@@ -1646,6 +1650,10 @@ impl Tab {
         // (minus HttpOnly, enforced in the native) and cookies scripts set
         // go out on the next request — one jar, both directions.
         host.borrow_mut().cookies = Some(Arc::clone(&self.jar));
+        // The JS `fetch()` backend (`js::TabFetcher`) reports into this very
+        // queue, so a page `fetch()` lands in the DevTools network panel like
+        // XHR and subresources (task: XHR/fetch in the network panel).
+        host.borrow_mut().net_events = Some(Arc::clone(&self.net_events));
         // `XMLHttpRequest.send` runs on THIS network stack (task:
         // infosec.exchange posts): Mastodon's axios picks its XHR adapter
         // whenever the constructor exists, and without it not one `/api/`
@@ -1670,7 +1678,10 @@ impl Tab {
                     &mut jar_access,
                     netmod::now_unix(),
                     &user_agent,
-                    Some(&|event| events.lock().expect("net events mutex").push(event)),
+                    Some(&|mut event: NetEvent| {
+                        event.initiator = Some("xhr".to_owned());
+                        events.lock().expect("net events mutex").push(event)
+                    }),
                 )
             }))
         };

@@ -243,6 +243,9 @@ pub struct ConsoleRow {
 pub struct NetRow {
     pub method: String,
     pub url: String,
+    /// What initiated the request (`"document"`, `"script"`, `"resource"`,
+    /// `"xhr"`, `"fetch"`), or [`MISSING`] when the engine did not say.
+    pub initiator: String,
     /// Status code, or the failure text when the request never answered.
     pub status: String,
     pub size: String,
@@ -271,6 +274,7 @@ impl TabState {
             .map(|e| NetRow {
                 method: e.method.clone(),
                 url: e.url.clone(),
+                initiator: e.initiator.clone().unwrap_or_else(|| MISSING.to_string()),
                 // A failed request has no status: say *why* instead (the panel
                 // paints the whole cell red when `failed`).
                 status: match (&e.status, &e.error) {
@@ -559,6 +563,7 @@ mod tests {
             response_bytes: status.map(|_| 1234),
             duration_ms: status.map(|_| 42),
             error,
+            initiator: Some("document".into()),
         }
     }
 
@@ -609,6 +614,7 @@ mod tests {
                 response_bytes: None,
                 duration_ms: Some(1500),
                 error: Some("dns failed".into()),
+                initiator: Some("xhr".into()),
             },
         });
         let rows = s.net_rows();
@@ -617,6 +623,7 @@ mod tests {
             NetRow {
                 method: "GET".into(),
                 url: "https://example.com".into(),
+                initiator: "document".into(),
                 status: "200".into(),
                 // the fixture event is 1234 B / 42 ms
                 size: "1.2 kB".into(),
@@ -624,6 +631,7 @@ mod tests {
                 failed: false,
             }
         );
+        assert_eq!(rows[1].initiator, "xhr");
         // A failure speaks for itself in the status column, in red.
         assert_eq!(rows[1].status, "dns failed");
         assert!(rows[1].failed);

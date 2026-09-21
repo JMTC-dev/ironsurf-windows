@@ -57,7 +57,10 @@ use boa_engine::js_string;
 use boa_engine::module::{ModuleLoader, ModuleRequest, Referrer};
 use boa_engine::object::JsObject;
 use boa_engine::property::Attribute;
-use boa_engine::{Context, JsNativeError, JsString, JsValue, Module, NativeFunction, Source};
+use boa_engine::{
+    Context, Finalize, JsData, JsNativeError, JsString, JsValue, Module, NativeFunction, Source,
+    Trace,
+};
 use blitz_dom::node::{ImageData, SpecialElementData};
 use blitz_dom::{local_name, BaseDocument, LocalName, Node, NodeData, NodeId, Prefix, QualName};
 use blitz_html::HtmlDocument;
@@ -65,7 +68,7 @@ use url::Url;
 
 // Page-side diagnostics: `console.*` and script errors go to stderr at the
 // level the page itself asked for (see [`log_console`]).
-use ironsurf_common::{debug, error, info, trace, warn, DialogKind};
+use ironsurf_common::{debug, error, info, trace, warn, DialogKind, NetEvent};
 
 /// Emit one `console.*` line to stderr at the level the page chose.
 /// The same line also reaches the shell (status text) via the host capture.
@@ -718,6 +721,143 @@ impl std::ops::Deref for XhrFetch {
     }
 }
 
+/// The tab's JS `fetch()` backend (task: XHR/fetch in the DevTools network
+/// panel): boa_runtime's fetch surface (`fetch`, `Request`, `Response`,
+/// `Headers`) stays exactly as it is — only the *backend* changes from a
+/// private reqwest client to the tab's own network stack. So a page
+/// `fetch()` rides the same cookie jar, User-Agent cell, redirect policy and
+/// DevTools queue as `XMLHttpRequest` and every subresource: one [`NetEvent`]
+/// per completed or failed request, tagged `initiator = "fetch"`.
+#[derive(Clone, Debug, Trace, Finalize, JsData)]
+pub struct TabFetcher {
+    #[unsafe_ignore_trace]
+    host: HostRef,
+}
+
+impl TabFetcher {
+    /// Backend for the realm's `FetchExtension` (`host` is the very cell the
+    /// XHR handle and the other bindings read).
+    #[must_use]
+    pub fn new(host: HostRef) -> Self {
+        Self { host }
+    }
+}
+
+/// `true` when `signal` is a real `AbortSignal` already aborted (the shape
+///boa_runtime's stock backend checks for before and after the exchange).
+fn is_aborted(signal: Option<&JsObject>) -> bool {
+    match signal.and_then(|sig| sig.downcast_ref::<boa_runtime::abort::JsAbortSignal>()) {
+        Some(sig_ref) => sig_ref.is_aborted(),
+        None => false,
+    }
+}
+
+impl boa_runtime::fetch::Fetcher for TabFetcher {
+    /// Resolve a string resource against the document base — path-relative
+    /// `fetch("/api/x")` (the Mastodon/axios shape) reaches the tab's stack
+    /// as an absolute URL; an unparseable string is passed through unchanged
+    /// (the request then fails the same way it would in the browser).
+    fn resolve_uri(&self, uri: String, _context: &mut Context) -> boa_engine::JsResult<String> {
+        let base = self.host.borrow().url.clone();
+        match Url::parse(&base).and_then(|base| base.join(&uri)) {
+            Ok(resolved) => Ok(resolved.to_string()),
+            Err(_) => Ok(uri),
+        }
+    }
+
+    fn fetch(
+        self: Rc<Self>,
+        request: boa_runtime::fetch::request::JsRequest,
+        signal: Option<JsObject>,
+        _context: &RefCell<&mut Context>,
+    ) -> impl Future<Output = boa_engine::JsResult<boa_runtime::fetch::response::JsResponse>> {
+        // An already-aborted signal rejects before any wire work (spec).
+        if is_aborted(signal.as_ref()) {
+            return std::future::ready(Err(boa_engine::JsError::from_opaque(
+                js_string!("AbortError").into(),
+            )));
+        }
+        let inner = request.into_inner();
+        let method = inner.method().to_string();
+        let url_text = inner.uri().to_string();
+        let headers: Vec<(String, String)> = inner
+            .headers()
+            .iter()
+            .map(|(name, value)| {
+                (
+                    name.as_str().to_owned(),
+                    value.to_str().unwrap_or("").to_owned(),
+                )
+            })
+            .collect();
+        let body = inner.body().clone();
+        let parsed = match Url::parse(&url_text) {
+            Ok(url) => url,
+            Err(err) => return std::future::ready(Err(boa_engine::JsError::from_rust(err))),
+        };
+        // Clone the shared cells out of the host BEFORE the blocking exchange
+        // (the XHR native's rule: no host borrow held across the request).
+        let (jar, net_events, user_agent) = {
+            let host = self.host.borrow();
+            (
+                host.cookies.clone(),
+                host.net_events.clone(),
+                host.user_agent.clone(),
+            )
+        };
+        let Some(jar) = jar else {
+            return std::future::ready(Err(JsNativeError::typ()
+                .with_message("fetch: no network host attached")
+                .into()));
+        };
+        let user_agent = user_agent.unwrap_or_else(|| crate::netmod::new_user_agent(None));
+        let report = move |mut event: NetEvent| {
+            event.initiator = Some("fetch".to_owned());
+            if let Some(queue) = &net_events {
+                queue.lock().expect("net events mutex").push(event);
+            }
+        };
+        let mut jar_ref: &std::sync::Mutex<_> = &jar;
+        let reply = crate::netmod::xhr_fetch_report(
+            &method,
+            &parsed,
+            &headers,
+            (!body.is_empty()).then_some(body.as_slice()),
+            &mut jar_ref,
+            crate::netmod::now_unix(),
+            &user_agent,
+            Some(&report),
+        );
+        let reply = match reply {
+            Ok(reply) => reply,
+            Err(message) => {
+                return std::future::ready(Err(JsNativeError::typ()
+                    .with_message(message)
+                    .into()));
+            }
+        };
+        // A signal aborted while the (blocking) request was in flight also
+        // rejects, like the stock backend.
+        if is_aborted(signal.as_ref()) {
+            return std::future::ready(Err(boa_engine::JsError::from_opaque(
+                js_string!("AbortError").into(),
+            )));
+        }
+        let mut builder = http::Response::builder().status(reply.status);
+        for (name, value) in &reply.headers {
+            builder = builder.header(name.as_str(), value.as_str());
+        }
+        let response = match builder.body(reply.body) {
+            Ok(response) => response,
+            Err(err) => return std::future::ready(Err(boa_engine::JsError::from_rust(err))),
+        };
+        std::future::ready(Ok(boa_runtime::fetch::response::JsResponse::basic(
+            JsString::from(reply.final_url.as_str()),
+            response,
+        )))
+    }
+}
+
 /// The document's ES-module loader (task: `<script type="module">` loading):
 /// resolves every specifier through the document's [`ImportMap`] when it has
 /// one (read at resolution time — the map is installed before the first
@@ -1094,6 +1234,14 @@ pub struct HostState {
     /// the Rust side. `None` (bare JS tests, the headless harness) behaves
     /// like a cookieless document: reads return `""`, writes are ignored.
     pub cookies: Option<SharedCookieJar>,
+    /// The tab's DevTools **network queue** (task: XHR/fetch in the network
+    /// panel): the very `Arc` the tab loop drains into
+    /// `FromTab::NetworkEvent`. The JS `fetch()` backend ([`TabFetcher`])
+    /// pushes one event per request here, so page `fetch()` calls land in
+    /// the network panel exactly like `XMLHttpRequest` and subresources do.
+    /// `None` (bare JS tests, no tab attached) makes `fetch()` report
+    /// nowhere.
+    pub net_events: Option<Arc<std::sync::Mutex<Vec<NetEvent>>>>,
 }
 
 impl HostState {
@@ -8414,9 +8562,10 @@ fn build_context_with_modules(
         (
             boa_runtime::extensions::ConsoleExtension::default(),
             boa_runtime::extensions::ProcessExtension,
-            boa_runtime::extensions::FetchExtension(
-                boa_runtime::fetch::BlockingReqwestFetcher::default(),
-            ),
+            // `fetch()` runs on the TAB's network stack ([`TabFetcher`]), not
+            // boa_runtime's private reqwest client: same jar, UA, redirects
+            // and DevTools queue as XHR and subresources.
+            boa_runtime::extensions::FetchExtension(TabFetcher::new(host.clone())),
         ),
         None,
         &mut context,
@@ -8960,7 +9109,7 @@ fn build_context_with_modules(
                 "statusText": reply.status_text,
                 "url": reply.final_url,
                 "headers": reply.headers,
-                "body": reply.body,
+                "body": String::from_utf8_lossy(&reply.body),
             });
             let text = serde_json::to_string(&envelope)
                 .map_err(|err| JsNativeError::typ().with_message(format!("xhr: {err}")))?;

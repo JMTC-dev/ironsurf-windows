@@ -47,6 +47,27 @@ const FINAL_PAGE: &str = r#"<!doctype html>
 <html><head><title>Final</title></head><body style="margin:0;background:#ffffff"><p>final hop</p></body></html>
 "#;
 
+/// A page whose inline script issues one `XMLHttpRequest` and, once it lands,
+/// one `fetch()` — the two JS-initiated request paths the network panel must
+/// show (task: XHR/fetch in the DevTools network tab).
+const XHR_FETCH_PAGE: &str = r#"<!doctype html>
+<html>
+  <head><title>JS net</title></head>
+  <body style="margin: 0; background: #ffffff">
+    <script>
+      var x = new XMLHttpRequest();
+      x.open("GET", "/api-xhr");
+      x.onload = function () {
+        fetch("/api-fetch").then(function (r) { return r.text(); }).then(function (t) {
+          document.title = "JS-NET:" + t;
+        });
+      };
+      x.send();
+    </script>
+  </body>
+</html>
+"#;
+
 /// Minimal HTTP/1.0 fixture on 127.0.0.1 (one request per connection);
 /// returns the bound port. Kept alive for the whole test process.
 fn spawn_local_http() -> u16 {
@@ -81,6 +102,9 @@ fn spawn_local_http() -> u16 {
                 "/img.png" => http_response(200, "image/png", IMG),
                 "/r" => format!("HTTP/1.0 302 Found\r\nLocation: /final\r\nConnection: close\r\n\r\n"),
                 "/final" => http_response(200, "text/html", FINAL_PAGE.as_bytes()),
+                "/xhr-fetch.html" => http_response(200, "text/html", XHR_FETCH_PAGE.as_bytes()),
+                "/api-xhr" => http_response(200, "text/plain", b"XHR-BODY"),
+                "/api-fetch" => http_response(200, "text/plain", b"FETCH-BODY"),
                 _ => http_response(404, "text/plain", b"no such route"),
             };
             let _ = stream.write_all(response.as_bytes());
@@ -233,6 +257,11 @@ fn network_events_report_documents_hops_and_subresources() {
         doc.duration_ms.is_some(),
         "document duration measured: {doc:?}"
     );
+    assert_eq!(
+        doc.initiator.as_deref(),
+        Some("document"),
+        "the navigation names itself the initiator: {doc:?}"
+    );
 
     // 2. The `<img>` subresource through the NetProvider: GET, 200, exact
     // byte count of the served body.
@@ -245,6 +274,11 @@ fn network_events_report_documents_hops_and_subresources() {
         "img byte count: {img:?}"
     );
     assert!(img.error.is_none(), "img event: {img:?}");
+    assert_eq!(
+        img.initiator.as_deref(),
+        Some("resource"),
+        "a Blitz subresource is a plain resource: {img:?}"
+    );
 
     // Sanity: the page really parsed and ran (its inline console line rides
     // the same IPC stream as a StatusText, exactly like the e2e JS tests).
@@ -292,6 +326,40 @@ fn network_events_report_documents_hops_and_subresources() {
     assert_eq!(dead.method, "GET", "failure event: {dead:?}");
     let reason = dead.error.clone().expect("checked above");
     assert!(!reason.is_empty(), "failure reason empty: {dead:?}");
+}
+
+/// JS-initiated requests show in the panel too (task: XHR/fetch in the
+/// DevTools network tab): one `XMLHttpRequest` reports with initiator
+/// `"xhr"`, one `fetch()` reports with initiator `"fetch"`, and both carry
+/// the real status/body size of the served response.
+#[test]
+fn xhr_and_fetch_requests_reach_the_network_panel() {
+    let port = spawn_local_http();
+    let profile = tempfile::tempdir().expect("profile dir");
+    let base = format!("http://127.0.0.1:{port}");
+    let mut tab = spawn_tab(&format!("{base}/xhr-fetch.html"), profile.path());
+
+    let xhr = tab.wait_net("XHR event", |e| e.url.ends_with("/api-xhr"));
+    assert_eq!(xhr.method, "GET", "xhr event: {xhr:?}");
+    assert_eq!(xhr.status, Some(200), "xhr event: {xhr:?}");
+    assert_eq!(xhr.response_bytes, Some(8), "XHR-BODY is 8 bytes: {xhr:?}");
+    assert!(xhr.error.is_none(), "xhr event: {xhr:?}");
+    assert_eq!(
+        xhr.initiator.as_deref(),
+        Some("xhr"),
+        "XMLHttpRequest names itself: {xhr:?}"
+    );
+
+    let fetch = tab.wait_net("fetch event", |e| e.url.ends_with("/api-fetch"));
+    assert_eq!(fetch.method, "GET", "fetch event: {fetch:?}");
+    assert_eq!(fetch.status, Some(200), "fetch event: {fetch:?}");
+    assert_eq!(fetch.response_bytes, Some(10), "FETCH-BODY is 10 bytes: {fetch:?}");
+    assert!(fetch.error.is_none(), "fetch event: {fetch:?}");
+    assert_eq!(
+        fetch.initiator.as_deref(),
+        Some("fetch"),
+        "window.fetch names itself: {fetch:?}"
+    );
 }
 
 /// No-spam rule: an inline `data:` subresource is not a request and must

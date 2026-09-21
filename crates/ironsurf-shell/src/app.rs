@@ -1169,6 +1169,7 @@ impl Core {
         sync_model(&self.dt_net, &p.state.net_rows().into_iter().map(|r| NetRow {
             method: r.method.into(),
             url: r.url.into(),
+            initiator: r.initiator.into(),
             status: r.status.into(),
             size: r.size.into(),
             time: r.time.into(),

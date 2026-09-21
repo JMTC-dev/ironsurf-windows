@@ -283,6 +283,9 @@ pub struct NetEvent {
     pub response_bytes: Option<u64>,
     pub duration_ms: Option<u64>,
     pub error: Option<String>,
+    // What initiated the request: "document" | "script" | "resource" | "xhr" | "fetch";
+    // None when the engine did not say.
+    pub initiator: Option<String>,
 }
 
 /// One userscript URL pattern vs one document URL (both lowercased — paths
@@ -596,13 +599,17 @@ in `ironsurf-tab/src/netmod.rs` and pass `Arc<OurProvider>` as `DocumentConfig.n
 - Container isolation holds even in Passthrough: one process = one container; its on-disk
   state lives under the sandbox-visible profile dir only.
 - **DevTools network reporting**: one `FromTab::NetworkEvent` per settled or failed page
-  request — main documents (every followed redirect hop, via the reporting fetch variants)
-  and provider subresources (`<img>`, `<script src>`, CSS) alike. A completed request carries
-  method/status/bytes/duration; a failed one carries `error: Some(…)`, `status: None` — never
-  both. `data:` and unsupported schemes report nothing (no-spam); revalidated cache hits
-  report the cached entry's status/size, and a direct fresh serve (no network at all) is
-  one event for the original URL with that same status/size and duration 0. The shell
-  appends these into the per-tab network log.
+  request — main documents (every followed redirect hop, via the reporting fetch variants),
+  provider subresources (`<img>`, `<script src>`, CSS) **and JS-initiated requests**
+  (`XMLHttpRequest.send` and `fetch()`, which both run on the tab's own network stack)
+  alike. A completed request carries method/status/bytes/duration; a failed one carries
+  `error: Some(…)`, `status: None` — never both. Every event names its **initiator** in
+  `initiator: Some(…)`: `"document"` (navigation / form POST), `"script"` (`<script src>`,
+  ES modules), `"resource"` (images/CSS/fonts), `"xhr"`, or `"fetch"`. `data:` and
+  unsupported schemes report nothing (no-spam); revalidated cache hits report the cached
+  entry's status/size, and a direct fresh serve (no network at all) is one event for the
+  original URL with that same status/size and duration 0. The shell appends these into the
+  per-tab network log and renders the initiator column.
 
 ### DevTools CSS seam (`src/logging.rs`)
 
@@ -655,8 +662,10 @@ locale formatting works with no system data), `temporal`, `float16`, `xsum` (+ `
 **`boa_runtime`** layer registers on every fresh realm before the IronSurf glue:
 `atob`/`btoa`, `queueMicrotask`, `structuredClone`, `TextEncoder`/`TextDecoder`,
 `AbortController`/`AbortSignal`, `URL`, a richer `console`, `process` (its `env` map is
-emptied before page code runs — the tab leaks no environment) and `fetch` (reqwest's
-blocking client; the workspace's reqwest already compiles a rustls crypto provider). The
+emptied before page code runs — the tab leaks no environment) and `fetch`: the fetch
+classes stay boa_runtime's, but the backend is the tab's own `TabFetcher` (the container
+cookie jar, User-Agent cell, redirect policy and DevTools `NetworkEvent` queue — not
+boa_runtime's private reqwest client), one `initiator: "fetch"` event per request. The
 IronSurf glue registers over the names the tab must own — `console` (stderr + capture) and
 the timers (the poll loop, not the runtime's internal timer channel) — via its plain
 sloppy-mode assignments. Boa 0.22 does **not** drain its job queue inside `eval`, so the
@@ -978,8 +987,8 @@ UI (`crates/ironsurf-shell/ui/ironsurf.slint`):
 - DevTools panel (F12 / Ctrl-I toggle, per tab): bottom-docked overlay Rectangle over the
   page area (never a `PopupWindow` — LinuxKMS has no popups), header [Console ‹n› |
   Network ‹n› | ✕] plus a Console view (level icon + colour, `[source] message`) and a
-  Network table (Method | URL | Status | Size | Time; unknown values `—`; a failed request
-  shows its error text in red instead of the status). Fed by the per-tab bounded logs
+  Network table (Method | URL | Initiator | Status | Size | Time; unknown values `—`; a
+  failed request shows its error text in red instead of the status). Fed by the per-tab bounded logs
   (`TabState::console` / `network`), re-pushed on every drain tick while open.
 - JS dialog overlay (`window.alert`/`confirm`/`prompt`): a centred modal Rectangle (title =
   the requesting tab, message, prompt LineEdit prefilled with the page's default, Cancel —
@@ -1162,8 +1171,9 @@ host and port are edited on the server's own HTML page.
 
 Per tab, a bottom-docked overlay (Console + Network panes, see the UI bullet above) fed by
 the tab's `ConsoleLog`/`NetworkEvent` stream: Console shows JS/CSS/DOM entries (`[source]
-message`, level icon + colour); Network shows Method | URL | Status | Size | Time per
-request, failures in red with their error text. Screenshots: `docs/screenshots/devtools.png`
+message`, level icon + colour); Network shows Method | URL | Initiator | Status | Size |
+Time per request (the initiator names what triggered it: document / script / resource /
+xhr / fetch), failures in red with their error text. Screenshots: `docs/screenshots/devtools.png`
 (Console) and `devtools-network.png`, reproducible with `scripts/demo.sh` (launches the real
 browser on `$DISPLAY` against a localhost fixture and drives it through synthetic xdotool
 input). Known limitation inherited from the tab: parse errors inside `<link>`-fetched

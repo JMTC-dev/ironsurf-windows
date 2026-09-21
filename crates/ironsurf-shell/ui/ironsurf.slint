@@ -43,9 +43,12 @@ export struct ConsoleRow {
 
 /// One DevTools network row: pre-formatted columns (`—` for values the engine
 /// never sent); `failed` paints the status cell red with the error text in it.
+/// `initiator` is what triggered the request (document / script / resource /
+/// xhr / fetch).
 export struct NetRow {
     method: string,
     url: string,
+    initiator: string,
     status: string,
     size: string,
     time: string,
@@ -226,11 +229,13 @@ component PageSurface inherits FocusScope {
 }
 
 /// One row (or the caption row) of the DevTools network table: Method | URL |
-/// Status | Size | Time, laid out with explicit geometry so captions and data
-/// lines up, and the URL is the column that absorbs the window's width.
+/// Initiator | Status | Size | Time, laid out with explicit geometry so
+/// captions and data line up, and the URL is the column that absorbs the
+/// window's width.
 component NetRowCells inherits Rectangle {
     in property <string> method: "";
     in property <string> url: "";
+    in property <string> initiator: "";
     in property <string> status: "";
     in property <string> bytes: "";
     in property <string> time: "";
@@ -243,12 +248,17 @@ component NetRowCells inherits Rectangle {
         vertical-alignment: center; overflow: elide;
     }
     u := Text {
-        x: 70px; width: Math.max(60px, parent.width - 320px); height: parent.height;
+        x: 70px; width: Math.max(60px, parent.width - 382px); height: parent.height;
         text: root.url; color: root.cell-color;
         vertical-alignment: center; overflow: elide;
     }
+    i := Text {
+        x: parent.width - 312px; width: 80px; height: parent.height;
+        text: root.initiator; color: root.cell-color;
+        vertical-alignment: center; overflow: elide;
+    }
     s := Text {
-        x: parent.width - 236px; width: 100px; height: parent.height;
+        x: parent.width - 232px; width: 100px; height: parent.height;
         text: root.status; color: root.status-color;
         vertical-alignment: center; overflow: elide;
     }
@@ -778,6 +788,7 @@ export component AppWindow inherits Window {
                                     cell-color: #8a8a8a;
                                     method: "Method";
                                     url: "URL";
+                                    initiator: "Initiator";
                                     status: "Status";
                                     bytes: "Size";
                                     time: "Time";
@@ -794,6 +805,7 @@ export component AppWindow inherits Window {
                                         height: parent.height;
                                         method: dtn.method;
                                         url: dtn.url;
+                                        initiator: dtn.initiator;
                                         status: dtn.status;
                                         bytes: dtn.size;
                                         time: dtn.time;

@@ -415,6 +415,12 @@ pub struct NetEvent {
     /// Failure reason; `Some` exactly when the request failed (`status` is
     /// then `None`).
     pub error: Option<String>,
+    /// What initiated the request, DevTools-style: `"document"` (a
+    /// navigation / form POST), `"script"` (`<script src>`, ES modules),
+    /// `"resource"` (any other subresource: images, CSS, fonts), `"xhr"`
+    /// (`XMLHttpRequest`), or `"fetch"` (`window.fetch`). `None` when the
+    /// engine did not say (older events, bare unit tests).
+    pub initiator: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
@@ -971,6 +977,7 @@ mod tests {
                 response_bytes: Some(0),
                 duration_ms: Some(7),
                 error: None,
+                initiator: Some("document".into()),
             },
         });
         frame_round_trip(FromTab::CursorChanged { cursor: CursorIcon::Default });
@@ -1068,6 +1075,7 @@ mod tests {
                 response_bytes: Some(4096),
                 duration_ms: Some(42),
                 error: None,
+                initiator: Some("resource".into()),
             },
         });
         // A failed request: no status, an error instead.
@@ -1079,6 +1087,7 @@ mod tests {
                 response_bytes: None,
                 duration_ms: None,
                 error: Some("connection refused".into()),
+                initiator: Some("xhr".into()),
             },
         });
         // A bare minimum event (only method + url known).
@@ -1090,6 +1099,7 @@ mod tests {
                 response_bytes: None,
                 duration_ms: None,
                 error: None,
+                initiator: None,
             },
         });
     }

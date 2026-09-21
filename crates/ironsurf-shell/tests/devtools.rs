@@ -38,7 +38,7 @@ fn console_rows(ui: &AppWindow) -> Vec<(String, String)> {
 
 /// The network table exactly as the panel renders it (all columns pre-formatted).
 #[allow(clippy::type_complexity)]
-fn net_rows(ui: &AppWindow) -> Vec<(String, String, String, String, String, bool)> {
+fn net_rows(ui: &AppWindow) -> Vec<(String, String, String, String, String, String, bool)> {
     let rows = ui.get_net_rows();
     (0..rows.row_count())
         .map(|i| {
@@ -46,6 +46,7 @@ fn net_rows(ui: &AppWindow) -> Vec<(String, String, String, String, String, bool
             (
                 r.method.to_string(),
                 r.url.to_string(),
+                r.initiator.to_string(),
                 r.status.to_string(),
                 r.size.to_string(),
                 r.time.to_string(),
@@ -116,6 +117,7 @@ fn devtools_panel_fills_reduces_and_toggles_per_tab() {
             (
                 "GET".into(),
                 "https://example.com/".into(),
+                "document".into(),
                 "200".into(),
                 "1.2 kB".into(),
                 "42 ms".into(),
@@ -124,6 +126,7 @@ fn devtools_panel_fills_reduces_and_toggles_per_tab() {
             (
                 "POST".into(),
                 "https://api.invalid/upload".into(),
+                "xhr".into(),
                 // a failure names itself in the status column, in red
                 "dns failure".into(),
                 "\u{2014}".into(),
@@ -152,6 +155,7 @@ fn devtools_panel_fills_reduces_and_toggles_per_tab() {
         &(
             "GET".into(),
             "https://example.com/next".into(),
+            "document".into(),
             "301".into(),
             // 0 bytes renders as a count, not as "no value"
             "0 B".into(),

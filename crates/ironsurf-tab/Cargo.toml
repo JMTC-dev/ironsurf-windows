@@ -18,6 +18,13 @@ euclid = "0.22"
 # builder is where the HTTP/2 keep-alive/adaptive-window knobs live, and
 # `rustls-tls` was renamed `rustls` there.
 reqwest = { version = "0.13", default-features = false, features = ["rustls", "blocking", "gzip", "brotli", "deflate", "http2", "charset"] }
+# The `fetch()` backend names `http::Response` when building the `Response`
+# object boa_runtime's fetch surface hands back (same 1.x version boa_runtime
+# and reqwest already lock).
+http = "1"
+# `#[derive(Trace, Finalize)]` on `js::TabFetcher` expands to `boa_gc::…`
+# paths, so the crate has to name boa_gc directly (same 0.22 the engine uses).
+boa_gc = "0.22"
 
 # Engine stack (ARCHITECTURE.md, pinned; pure Rust — no mozjs, no wgpu/GPU)
 # `floats` is MANDATORY, not an optimisation: blitz-dom registers every CSS

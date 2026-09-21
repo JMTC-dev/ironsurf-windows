@@ -74,6 +74,9 @@ fn net_ok(method: &str, url: &Url, status: u16, response_bytes: u64, duration_ms
         response_bytes: Some(response_bytes),
         duration_ms: Some(duration_ms),
         error: None,
+        // The reporting boundary tags the initiator (document/script/xhr/…):
+        // it is the layer that knows *why* the request exists.
+        initiator: None,
     }
 }
 
@@ -86,6 +89,7 @@ fn net_failed(method: &str, url: &Url, duration_ms: u64, error: String) -> NetEv
         response_bytes: None,
         duration_ms: Some(duration_ms),
         error: Some(error),
+        initiator: None,
     }
 }
 
@@ -1322,7 +1326,9 @@ pub struct XhrReply {
     pub status_text: String,
     pub final_url: String,
     pub headers: Vec<(String, String)>,
-    pub body: String,
+    /// Raw response bytes (the XHR glue lossy-decodes them to UTF-8 for
+    /// `responseText`; `fetch()` keeps them byte-exact).
+    pub body: Vec<u8>,
 }
 
 /// One `XMLHttpRequest` exchange (task: infosec.exchange posts): ANY method,
@@ -1423,7 +1429,7 @@ where
         status_text,
         final_url: final_url.to_string(),
         headers,
-        body: String::from_utf8_lossy(&bytes).into_owned(),
+        body: bytes.to_vec(),
     })
 }
 
@@ -1955,19 +1961,23 @@ impl BlitzNetProvider {
 
     /// A locally served subresource answered as an instant 200.
     fn report_local(&self, method: &str, url: &Url, status: u16, response_bytes: u64) {
+        let mut event = net_ok(method, url, status, response_bytes, 0);
+        event.initiator = Some("resource".to_owned());
         self.net_events
             .lock()
             .expect("net events mutex")
-            .push(net_ok(method, url, status, response_bytes, 0));
+            .push(event);
     }
 
     /// A locally served subresource that failed: `status: None`, reason in
     /// `error`.
     fn report_local_failed(&self, method: &str, url: &Url, error: String) {
+        let mut event = net_failed(method, url, 0, error);
+        event.initiator = Some("resource".to_owned());
         self.net_events
             .lock()
             .expect("net events mutex")
-            .push(net_failed(method, url, 0, error));
+            .push(event);
     }
 
     /// Ready-to-share (`Arc<dyn NetProvider>`) form for `DocumentConfig`.
@@ -2082,7 +2092,12 @@ impl BlitzNetProvider {
             }
             // Every settled request lands in the tab loop's DevTools queue
             // (redirect hops report individually — same rule as documents).
-            let report = |event: NetEvent| events.lock().expect("net events mutex").push(event);
+            // These are Blitz's subresource loads (images, CSS, fonts, …),
+            // so every event is tagged with the `"resource"` initiator.
+            let report = |mut event: NetEvent| {
+                event.initiator = Some("resource".to_owned());
+                events.lock().expect("net events mutex").push(event);
+            };
             let outcome = if managed {
                 // No lock rides along with the fetch: the jar and the cache
                 // are shared `Mutex`es and the fetch takes each one only for

@@ -472,6 +472,7 @@ fn emit_feed(emit: &mut impl FnMut(FromTab), batch: u8) {
                 response_bytes: Some(1234),
                 duration_ms: Some(42),
                 error: None,
+                initiator: Some("document".into()),
             },
         });
         emit(FromTab::NetworkEvent {
@@ -482,6 +483,7 @@ fn emit_feed(emit: &mut impl FnMut(FromTab), batch: u8) {
                 response_bytes: None,
                 duration_ms: Some(7),
                 error: Some("dns failure".into()),
+                initiator: Some("xhr".into()),
             },
         });
     } else {
@@ -498,6 +500,7 @@ fn emit_feed(emit: &mut impl FnMut(FromTab), batch: u8) {
                 response_bytes: Some(0),
                 duration_ms: Some(1500),
                 error: None,
+                initiator: Some("document".into()),
             },
         });
     }
