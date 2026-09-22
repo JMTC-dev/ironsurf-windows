@@ -193,6 +193,10 @@ impl TabState {
             // acts on it (bind the server / mirror the settings), the tab's
             // own line never changes.
             FromTab::ArchiveServerStart { .. } | FromTab::ArchiveServerSettingsChanged { .. } => false,
+            // DevTools Inspector: the contract landed with the snapshot stream and
+            // the pane is task #82 (shell side) — reducing it to nothing until then
+            // keeps the pump honest (there is no inspector state to show yet).
+            FromTab::InspectSnapshot { .. } | FromTab::InspectHover { .. } | FromTab::InspectPicked { .. } => false,
             FromTab::Closed => {
                 if self.closed {
                     false

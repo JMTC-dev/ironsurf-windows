@@ -140,6 +140,18 @@ pub enum FromTab {
     // something and after a load re-ran a live query; `query` names the text the
     // numbers describe, so a stale reply the bar has typed past is recognisable.
     FindResult       { query: String, matches: usize, active: usize },
+    // **DevTools Inspector**: the document tree as one flat pre-order list, sent when the pane
+    // opens ([`ToTab::SetInspect`]), after every navigation while it stays open, whenever the tab
+    // itself changed what is selected, and whenever the markup changed under a live inspector
+    // (the tab re-walks the tree on its poll tick and stays **silent** while it is unchanged, so
+    // an open pane never floods the pipe). Node ids are valid inside `generation` only.
+    InspectSnapshot  { snapshot: InspectSnapshot },
+    // **inspect element**: the deepest element under the cursor changed while the picker was
+    // armed (`None` = pointer off page, or nothing hit-answers).
+    InspectHover     { node: Option<u64> },
+    // **inspect element**: a click landed with the picker armed — the tab selected `node`, sent a
+    // fresh `InspectSnapshot`, and disarmed the picker.
+    InspectPicked    { node: u64 },
     // **archive browsing server** (`ironsurf://archive`): the tab asks the shell to bring
     // up the localhost server over the archive folder — tabs are sandboxed and the archive
     // tree belongs to the shell, so only the shell binds a socket. Every override is
@@ -219,8 +231,76 @@ pub enum ToTab {
     SetFind          { query: String },
     FindNext,                             // next hit (wrapping), scrolls into view
     FindPrevious,                          // previous hit (wrapping)
+    // DevTools **Inspector** pane open/closed for this tab: `true` snapshots the document now and
+    // keeps the shell's tree current (one tree walk per change, never one per frame); `false`
+    // stops snapshotting and drops the on-page highlight.
+    SetInspect     { open: bool },
+    // **inspect element** picker (Firefox's crosshair, and the context menu's "Inspect Element"):
+    // while armed the tab **swallows** left-pointer events instead of handing them to blitz (no
+    // hover DOM events, no click actuation, no selection drag), emits `FromTab::InspectHover` for
+    // what is under the cursor, and answers the click with `FromTab::InspectPicked` — then disarms
+    // itself and lets the page have pointers again.
+    SetInspectPick { enabled: bool },
+    // the shell selected a tree row / breadcrumb step: highlight that element's box over the page
+    // and scroll it into view when it is not fully visible; `None` clears the highlight. An id
+    // from an older `generation` is ignored, never an error (the pane can lag a navigation).
+    InspectSelect  { node: Option<u64> },
+    // right-click → **Inspect Element**: hit-test the page point (logical px, the space of
+    // `ToTab::Pointer`) and select the deepest element there, as if that point had been clicked
+    // with the picker armed, **minus** the pick event. The tab answers with a fresh
+    // `InspectSnapshot` whose `selected` is the hit node.
+    InspectPickAt  { x: f32, y: f32 },
     Destroy,
 }
+
+/// One node of the DevTools Inspector tree. The tree is **flat**: children follow their parent in
+/// pre-order and carry `parent` + `depth`, so the shell indents, folds and re-selects without
+/// parsing markup. `id` is a handle valid only inside one [`InspectSnapshot::generation`] (blitz
+/// recycles its own node ids across navigations, so the tab mints these from 0 in document order).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct InspectNode {
+    pub id: u64,
+    pub parent: Option<u64>,
+    pub kind: InspectKind,     // Element | Text | Comment | Doctype | Document
+    /// Tag name for `Element` (lower-cased in HTML, the parser's spelling in foreign content,
+    /// `xlink:`-style prefix kept); `""` for every other kind.
+    pub tag: String,
+    /// Content attributes in document order (JS-set properties that never touched an attribute are
+    /// absent, exactly like Firefox's markup view). Capped by `MAX_INSPECT_ATTRS`, each value cut
+    /// to `MAX_INSPECT_ATTR_VALUE` chars with a trailing `…`.
+    pub attrs: Vec<(String, String)>,
+    /// Text node text / comment body / doctype subset (`html` for `<!DOCTYPE html>`); `""` for
+    /// elements — their text lives in their `Text` children. Whitespace-only runs are **dropped**
+    /// by the tab, other text is whitespace-collapsed and cut to `MAX_INSPECT_TEXT` chars with a
+    /// trailing `…`.
+    pub text: String,
+    pub depth: usize,          // 0 = the `Document` row; the shell's indent unit
+    /// `Some` only for a laid-out element with a non-empty box; `None` for `display: none` /
+    /// `display: contents` / never-laid-out subtrees (`<head>`) / every non-element kind.
+    pub bounds: Option<InspectBox>,
+}
+
+/// Border box in **viewport CSS px** — the space of `Element.getBoundingClientRect()`: the
+/// document's scroll offset is already applied, page zoom is **not**. Negative coordinates are
+/// honest (the element is scrolled out of view).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct InspectBox { pub x: f32, pub y: f32, pub width: f32, pub height: f32 }
+
+/// A whole document tree for the DevTools Inspector pane, size-bounded (`MAX_INSPECT_NODES` nodes;
+/// the walk stops rather than cutting a subtree in half) so a real page never bloats an IPC frame.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct InspectSnapshot {
+    pub generation: u64,        // bumped per new document
+    pub url: String,            // post-redirect document URL
+    pub nodes: Vec<InspectNode>,
+    pub selected: Option<u64>,  // the box the tab paints on the page
+    pub truncated: bool,        // a cap gave up; the pane says so at the bottom
+}
+
+pub const MAX_INSPECT_NODES: usize = 4096;        // nodes per snapshot
+pub const MAX_INSPECT_ATTRS: usize = 24;          // attributes per element row
+pub const MAX_INSPECT_ATTR_VALUE: usize = 256;    // chars per attribute value
+pub const MAX_INSPECT_TEXT: usize = 200;          // chars per text row
 
 /// A user-defined JS program run on matching pages (Tampermonkey-style).
 /// Empty pattern list matches nothing; patterns see `userscript_matches`.
@@ -1144,12 +1224,29 @@ UI (`crates/ironsurf-shell/ui/ironsurf.slint`):
   (no byte counts), so the progress is honestly indeterminate and the sweep is the
   progress. Then status text + loading spinner (timer animation) + https/lock
   indicator (⛬ / http warning).
-- DevTools panel (F12 / Ctrl-I toggle, per tab): bottom-docked overlay Rectangle over the
+- DevTools panel (F12 / Ctrl-Shift-I toggle, per tab): bottom-docked overlay Rectangle over the
   page area (never a `PopupWindow` — LinuxKMS has no popups), header [Console ‹n› |
-  Network ‹n› | ✕] plus a Console view (level icon + colour, `[source] message`) and a
-  Network table (Method | URL | Initiator | Status | Size | Time; unknown values `—`; a
-  failed request shows its error text in red instead of the status). Fed by the per-tab bounded logs
-  (`TabState::console` / `network`), re-pushed on every drain tick while open.
+  Network ‹n› | Inspector | ⌖ | Clear | ✕] plus a Console view (level icon + colour,
+  `[source] message`), a Network table (Method | URL | Initiator | Status | Size | Time;
+  unknown values `—`; a failed request shows its error text in red instead of the status) and
+  an **Inspector** (HTML tree, see §Developer tools). `Clear` empties the visible pane's feed
+  (Console / Network only); ⌖ toggles *inspect element* (`Ctrl-Shift-C`) for the whole tab.
+  Fed by the per-tab bounded logs (`TabState::console` / `network`) and the tab's
+  `InspectSnapshot`, re-pushed on every drain tick while open.
+- **Inspector pane** (third DevTools tab): breadcrumb row (the selected node's ancestor chain,
+  `html › body › div#main`, rightmost first, each clickable) over a ListView of the tree. Each
+  row is `depth × 12px` indented, shows a `+/−` twisty on elements with children, then syntax
+  **highlighted** markup built from nested token models — a row is `Vec<Token>` where a token is
+  `{ text, kind }` and kind maps to a fixed colour table: punctuation `<`/`>`/`/`/`=`/quotes grey,
+  tag name orange, attribute name blue, attribute value green, text near-white, comment
+  grey-italic, doctype grey-italic, `id`/`class` values get their own accent. Whitespace-only text
+  nodes are never shown; a `truncated` snapshot says so as a dim last row. Clicking a row selects
+  that node (`ToTab::InspectSelect` → the tab paints its box and scrolls it into view) and
+  highlights the row (selected row background + the breadcrumb rewritten); `+/−` folds a subtree,
+  `Enter`/click on the twisty folds it too, and selection from the page (⌖ pick, or the context
+  menu's **Inspect Element** → `ToTab::InspectPickAt`) moves the tree: the selected row and every
+  collapsed ancestor are expanded and made visible. Right-clicking the page keeps its
+  **Inspect Element** row (already there, now wired to select the hit node and open the pane).
 - JS dialog overlay (`window.alert`/`confirm`/`prompt`): a centred modal Rectangle (title =
   the requesting tab, message, prompt LineEdit prefilled with the page's default, Cancel —
   hidden for alerts — + OK), declared after the page so it outranks every page overlay; the
@@ -1228,8 +1325,12 @@ Process/tab management (`src/tabs.rs`):
   via `slint::Weak<AppWindow>` invoke; throttle Frame messages: coalesce to newest).
 - `Frame` → `slint::Image` from raw RGBA buffer (`slint::Image::from_rgba8_slab`/PixelBuffer API — verify name).
 - Keyboard focus routing: Slint focus on page area → forward keys; Ctrl-L focuses URL bar;
-  Esc unfocuses; F12 / Ctrl-I toggle the DevTools panel (consumed by the shell, never sent
-  to the page; they act on the focused page, i.e. not while the URL bar holds focus).
+  Esc unfocuses; F12 / Ctrl-Shift-I toggle the DevTools panel (consumed by the shell, never sent
+  to the page; they act on the focused page, i.e. not while the URL bar holds focus);
+  Ctrl-Shift-K / Ctrl-Shift-Y open the Console / Network panes and **Ctrl-Shift-C** arms
+  *inspect element* (opening the panel + Inspector pane if needed, toggling off when armed); the
+  same chord with the picker armed disarms it. `Esc` also disarms the picker before it
+  unfocuses.
 - **Text selection & copy/paste — the shell owns the session clipboard**: copy chords are
   never consumed (Ctrl-C/V/X/A always reach the tab — `keymap::clipboard_chords_always_reach_the_page`),
   every `FromTab::ClipboardText` (page Ctrl+C, editor copy/cut) is filed on the shell's
@@ -1327,10 +1428,10 @@ host and port are edited on the server's own HTML page.
   every tab on a change (and announces a stop from the control page), `Closed` lets the shell
   drop its handle. Quitting the shell shuts the server down, releasing the port.
 
-### Developer tools (F12 / Ctrl-I)
+### Developer tools (F12 / Ctrl-Shift-I)
 
-Per tab, a bottom-docked overlay (Console + Network panes, see the UI bullet above) fed by
-the tab's `ConsoleLog`/`NetworkEvent` stream: Console shows JS/CSS/DOM entries (`[source]
+Per tab, a bottom-docked overlay (Console + Network + **Inspector** panes, see the UI bullet
+above) fed by the tab's `ConsoleLog`/`NetworkEvent`/`InspectSnapshot` stream: Console shows JS/CSS/DOM entries (`[source]
 message`, level icon + colour); Network shows Method | URL | Initiator | Status | Size |
 Time per request (the initiator names what triggered it: document / script / resource /
 xhr / fetch), failures in red with their error text. Screenshots: `docs/screenshots/devtools.png`
@@ -1338,6 +1439,21 @@ xhr / fetch), failures in red with their error text. Screenshots: `docs/screensh
 browser on `$DISPLAY` against a localhost fixture and drives it through synthetic xdotool
 input). Known limitation inherited from the tab: parse errors inside `<link>`-fetched
 stylesheets never reach the console (see §ironsurf-tab DevTools CSS seam).
+
+**Inspector — how the two sides split it.** The **tab** owns the document: it walks the DOM
+(`DocumentEnd`/root down, same node-visit rules as the `--body-out` serializer, skipping
+anonymous blocks) into the flat [`InspectSnapshot`], stamps each element's
+[`InspectBox`] from the *live* layout (the same resolve + `absolute_position` − `viewport_scroll`
+path the find highlights use, in CSS px, so a scroll/resize moves the highlight without a new
+snapshot), hit-tests ⌖ picks with the engine's own hit-testing (`document_descendants_for`
+/point-query, deepest node first, ignoring `<html>` when something smaller answers), paints the
+selected/hovered box **over the page** in the same pass as the find highlights (content-box fill
+`rgba(255,147,38,110)`, 2px outline `rgba(255,213,0,220)`, never a repaint loop — the box is
+re-measured every frame it is shown), and swallows pick-mode pointers. The **shell** owns the
+presentation: tree folding, selection, breadcrumb, the `+/−` twisties and the syntax colouring
+(it re-renders `<tag attr="value">` from `tag`/`attrs` — the tab never sends markup text).
+Because blitz node ids are recycled, the tab's snapshot ids are positional handles; the shell
+treats an unknown id as "tree is stale" and waits for the next snapshot rather than guessing.
 
 Tests (headless CI-safe): tab-proc message pump logic + `FromTab` state reduction tested
 against a **fake tab process** (a small test bin that scripts `FromTab` sequences) so shell

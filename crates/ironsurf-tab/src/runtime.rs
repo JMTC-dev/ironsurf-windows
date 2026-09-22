@@ -2914,6 +2914,15 @@ impl Tab {
             ToTab::SetFind { query } => self.set_find(query),
             ToTab::FindNext => self.find_jump(true),
             ToTab::FindPrevious => self.find_jump(false),
+            // DevTools Inspector (HTML tree + inspect element): the contract landed
+            // with these variants; the tree walk, the picker and the highlight are
+            // wired in src/inspector.rs (task: Inspector — tab side). Until then the
+            // tab answers them with nothing, which is legal: `InspectSelect` for an
+            // unknown id and an unopened pane are both no-ops.
+            ToTab::SetInspect { .. }
+            | ToTab::SetInspectPick { .. }
+            | ToTab::InspectSelect { .. }
+            | ToTab::InspectPickAt { .. } => {}
             ToTab::DialogResponse { dialog_id, .. } => {
                 // A reply with no modal open: it either raced the tab-side
                 // cancel (shell quit mid-dialog) or is stale — nothing to

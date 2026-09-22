@@ -163,6 +163,34 @@ pub enum FromTab {
         matches: usize,
         active: usize,
     },
+    /// **DevTools Inspector**: a snapshot of the live document tree. Emitted
+    /// when the shell opens the Inspector pane ([`ToTab::SetInspect`]), after
+    /// every navigation while the pane stays open, whenever a
+    /// [`ToTab::InspectPickAt`] / [`FromTab::InspectPicked`] changes what is
+    /// selected, and whenever the markup changes under a live inspector (the
+    /// tab re-walks the tree on its poll tick and stays **silent** while it is
+    /// unchanged, so an open pane never floods the pipe). `nodes` is the whole
+    /// document in pre-order, bounded by [`MAX_INSPECT_NODES`], and every
+    /// [`InspectNode::id`] belongs to this snapshot's `generation` alone.
+    InspectSnapshot {
+        snapshot: InspectSnapshot,
+    },
+    /// **Inspect element** ([`ToTab::SetInspectPick`] armed): the deepest
+    /// element under the cursor changed (`None` = the pointer left the page,
+    /// or nothing hit-answers). The tab paints that element's box over the
+    /// page while the picker is armed; the page itself sees nothing — see
+    /// [`ToTab::SetInspectPick`].
+    InspectHover {
+        node: Option<u64>,
+    },
+    /// **Inspect element**: the user clicked with the picker armed. The tab
+    /// selected `node` (box highlighted, scrolled into view), answered with a
+    /// fresh [`Self::InspectSnapshot`] carrying it as
+    /// [`InspectSnapshot::selected`], and **disarmed** the picker — one pick
+    /// per arming, exactly like Firefox.
+    InspectPicked {
+        node: u64,
+    },
     /// **Archive browsing server** (`ironsurf://archive`): the tab asks the
     /// shell to bring up the localhost server that serves the archive folder
     /// (or to talk to the one already running). Tabs cannot serve — they are
@@ -312,8 +340,147 @@ pub enum ToTab {
     /// Jump to the previous hit (wrapping at the start) — otherwise exactly
     /// [`ToTab::FindNext`].
     FindPrevious,
+    /// DevTools **Inspector** pane open/closed for this tab. `true`: the tab
+    /// snapshots the document immediately and keeps the shell's tree current
+    /// (a fresh snapshot after every navigation, and on its poll tick whenever
+    /// the markup actually changed). `false`: the tab stops snapshotting and
+    /// drops the on-page highlight. While open the pane costs the tab one tree
+    /// walk per change, never a per-frame one.
+    SetInspect {
+        open: bool,
+    },
+    /// **Inspect element** picker armed/disarmed — Firefox's crosshair, and
+    /// the context menu's "Inspect Element". While armed the tab **swallows**
+    /// left-pointer events instead of feeding them to the engine (no hover DOM
+    /// events, no click actuation, no selection drag), reports
+    /// [`FromTab::InspectHover`] as what is under the cursor changes, and
+    /// answers the click with [`FromTab::InspectPicked`] — after which the
+    /// picker is disarmed and the page takes pointers again. Arming it for a
+    /// page that is still loading is harmless: the picker simply has no
+    /// document to hit-test yet.
+    SetInspectPick {
+        enabled: bool,
+    },
+    /// The shell selected a node of the inspector tree (a click on a row,
+    /// a breadcrumb step): the tab highlights that element's box over the page
+    /// and scrolls it into view when it is not fully visible. `None` clears the
+    /// highlight. An id from a **previous generation** is ignored, never an
+    /// error — the tree on screen can lag a navigation by one message.
+    InspectSelect {
+        node: Option<u64>,
+    },
+    /// Right-click → **Inspect Element**: hit-test the page point (`x`, `y`)
+    /// — logical px, the same space as [`ToTab::Pointer`] — and select the
+    /// deepest element there, exactly as if that point had been clicked with
+    /// [`ToTab::SetInspectPick`] armed, **minus** the pick event (the shell
+    /// asked, so it already knows a selection happened). The tab answers with a
+    /// fresh [`FromTab::InspectSnapshot`] whose
+    /// [`InspectSnapshot::selected`] is the hit node.
+    InspectPickAt {
+        x: f32,
+        y: f32,
+    },
     Destroy,
 }
+
+// ---------------------------------------------------------------------------
+// DevTools Inspector (the HTML tree + "inspect element")
+
+/// What kind of DOM node an [`InspectNode`] is. `Document` is the tree's root
+/// (exactly one, `depth` 0); `Doctype` is the `<!DOCTYPE html>` node when the
+/// parser kept one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum InspectKind {
+    Element,
+    Text,
+    Comment,
+    Doctype,
+    Document,
+}
+
+/// The border box of an inspected element, in **viewport CSS px** — the space
+/// of `Element.getBoundingClientRect()`: the origin already carries the
+/// document's scroll offset and page zoom is **not** applied. Negative or
+/// partly-offscreen coordinates are honest (the element is scrolled away).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct InspectBox {
+    pub x: f32,
+    pub y: f32,
+    pub width: f32,
+    pub height: f32,
+}
+
+/// One node of the inspector tree. The tree is **flat**: children follow their
+/// parent in pre-order and carry its [`InspectNode::id`] plus their own
+/// [`InspectNode::depth`], so the shell renders/indents it without re-parsing
+/// anything, and a click on a row hands the id straight back.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct InspectNode {
+    /// Handle, unique within one snapshot generation. The tab mints ids from
+    /// 0 in document order; they mean nothing in another generation (blitz
+    /// node ids are arena indices that a navigation recycles).
+    pub id: u64,
+    /// Parent element's id (`None` at the root; text/comment nodes hanging off
+    /// the document root carry the root's id).
+    pub parent: Option<u64>,
+    pub kind: InspectKind,
+    /// Tag name for [`InspectKind::Element`] — lower-cased in HTML, the real
+    /// spelling in foreign content, with an `xlink:`-style prefix when the
+    /// element has one. `""` for every other kind.
+    pub tag: String,
+    /// Content attributes in document order (JS-set properties that never
+    /// touched an attribute are not here, exactly like Firefox's markup view).
+    /// Bounded by [`MAX_INSPECT_ATTRS`] entries, each value by
+    /// [`MAX_INSPECT_ATTR_VALUE`] chars with a trailing `…` when cut.
+    pub attrs: Vec<(String, String)>,
+    /// Text node text / comment body / doctype subset (`html` for
+    /// `<!DOCTYPE html>`). `""` for elements — an element's own text lives in
+    /// its `Text` children. Runs of whitespace-only text are **dropped** by
+    /// the tab (a formatted document would otherwise be mostly blank rows),
+    /// other text is collapsed to single spaces and capped at
+    /// [`MAX_INSPECT_TEXT`] chars with a trailing `…`.
+    pub text: String,
+    /// Nesting depth (`0` = the `Document` node) — the shell's indentation
+    /// unit.
+    pub depth: usize,
+    /// `Some` for an element the engine laid out with a non-empty box; `None`
+    /// for `display: none`, `display: contents`, `visibility`-only nodes,
+    /// never-laid-out subtrees (`<head>`), and every non-element kind.
+    pub bounds: Option<InspectBox>,
+}
+
+/// A whole document tree, as one flat pre-order list — the DevTools Inspector's
+/// data. Size-bounded: at most [`MAX_INSPECT_NODES`] nodes, and the walk stops
+/// there rather than truncating the tree in the middle of a subtree
+/// ([`InspectSnapshot::truncated`] then says so).
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct InspectSnapshot {
+    /// Bumped by the tab for every **new document** (navigation): node ids are
+    /// only meaningful inside one generation.
+    pub generation: u64,
+    /// Document URL the tree belongs to (after redirects).
+    pub url: String,
+    pub nodes: Vec<InspectNode>,
+    /// The node the tab highlights on the page — its view of the selection.
+    /// The shell owns selection when it drives it (tree clicks), so it never
+    /// has to wait for this field to agree.
+    pub selected: Option<u64>,
+    /// The walk or a field cap gave up somewhere (too many nodes, a huge
+    /// attribute value, a long text run): the pane shows it dimmed at the
+    /// bottom instead of pretending the tree is complete.
+    pub truncated: bool,
+}
+
+/// Nodes in one inspector snapshot. A real page runs to tens of thousands of
+/// DOM nodes; the pane shows a tree, not an audit, so the walk stops here.
+pub const MAX_INSPECT_NODES: usize = 4096;
+/// Attributes carried per element row.
+pub const MAX_INSPECT_ATTRS: usize = 24;
+/// Characters per attribute value (a `srcset` or a data-URI `src` is not worth
+/// a megabyte of IPC).
+pub const MAX_INSPECT_ATTR_VALUE: usize = 256;
+/// Characters per text-node row.
+pub const MAX_INSPECT_TEXT: usize = 200;
 
 /// Which of the three synchronous window dialogs the page asked for.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
