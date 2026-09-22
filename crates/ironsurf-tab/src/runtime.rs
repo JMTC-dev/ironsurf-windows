@@ -1539,6 +1539,14 @@ impl Tab {
     }
 
     fn run_scripts(&mut self, url: &Url) {
+        // The document being replaced takes its Web Workers with it (task: real
+        // worker threads): a worker thread must not outlive the realm that
+        // created it, and `attach_workers` below hands the new document its own
+        // wiring (the spec's "workers die with their document", enforced here
+        // rather than trusted to the page calling `terminate()`).
+        if let Some(previous) = self.js.as_ref() {
+            previous.close_workers();
+        }
         // Fresh document: the CSS seam forgets last document's content hashes
         // so the same sheet on a new page is reported once again.
         self.css_scan.reset();
@@ -1821,6 +1829,48 @@ impl Tab {
                 runtime.run_userscript(name, code, self.doc.as_mut());
             }
         }
+        // Web Workers (task: real worker threads): wire the realm's worker host
+        // BEFORE any page script runs, so a worker built by the first inline
+        // script already has a document base URL, a script backend, the tab's
+        // cookie jar / User-Agent cell / DevTools queue and the wake pipe. The
+        // fetch backend is the very `fetch_script_body` path the `<script src>`
+        // pool and the module loader use (one jar/cache locked per operation,
+        // archive sink, managed policy), so a worker's script and
+        // `importScripts` bodies are indistinguishable from a `<script src>` in
+        // the network log — and it is `Arc`-based (not the `Rc` the in-thread
+        // callers use) because the worker thread calls it from its own thread.
+        let worker_policy = policy;
+        runtime.attach_workers(crate::worker::WorkerAttachment {
+            base_url: url.as_str().to_owned(),
+            fetch: {
+                let jar = Arc::clone(&self.jar);
+                let cache = Arc::clone(&self.cache);
+                let net_events = Arc::clone(&self.net_events);
+                let user_agent = Arc::clone(&self.user_agent);
+                let archive = Arc::clone(&self.archive);
+                Arc::new(move |script_url: &Url| {
+                    Self::fetch_script_body(
+                        script_url,
+                        worker_policy,
+                        &jar,
+                        &cache,
+                        &net_events,
+                        &user_agent,
+                        &archive,
+                    )
+                })
+            },
+            jar: Arc::clone(&self.jar),
+            net_events: Arc::clone(&self.net_events),
+            user_agent: Arc::clone(&self.user_agent),
+            // A worker's reply wakes this loop out of `poll_inputs`, so the
+            // page's `onmessage` runs on the next tick instead of whenever the
+            // idle timer happens to fire.
+            wake: {
+                let pipe = Arc::clone(&self.pipe);
+                Box::new(move || pipe.wake())
+            },
+        });
         // The live document is registered for the duration of the run, so
         // page JS can read and mutate the real DOM (docId 0).
         let errors = runtime.run_scripts(&extraction.scripts, self.doc.as_mut());
@@ -2232,6 +2282,26 @@ impl Tab {
     /// surfaces as `FromTab::StatusText` (same shape as a `ScriptError`).
     /// `0` = nothing scheduled or nothing due (cheap on the idle path).
     fn run_due_timers(&mut self) -> usize {
+        // Web Worker replies first (task: real worker threads): a worker posts
+        // from its own thread, and the page's `onmessage` has to run on *this*
+        // thread — the only one that may touch the realm. Delivered replies are
+        // DOM-visible (`#status.textContent = …` is how an Anubis gate shows its
+        // result), so the settle/repaint bookkeeping below is owed for them even
+        // when the page has no JS timer armed.
+        if self.drain_workers() > 0 {
+            self.settle();
+            self.needs_paint = true;
+            // The handler the delivery ran may have logged or thrown (a worker
+            // reply is how an Anubis page reports itself, and DevTools shows
+            // those lines) — the host capture fills during the turn, so it folds
+            // here, exactly as the timer callbacks below do, rather than waiting
+            // for a wake an idle page never gets.
+            self.consume_js_status(None, &[]);
+            self.take_js_title();
+            self.check_meta();
+            self.maybe_repaint();
+            self.emit_js_status();
+        }
         if self
             .js
             .as_ref()
@@ -2271,6 +2341,18 @@ impl Tab {
         // no "load finished" ordering to honour outside navigation time).
         self.emit_js_status();
         fired
+    }
+
+    /// Deliver every Web Worker reply queued since the last poll (task: real
+    /// worker threads) — cheap when nothing is pending, which is the state of
+    /// every page that never constructs a worker (one `Vec` emptiness test).
+    /// `0` whenever there is no JS world; a throwing page handler is caught
+    /// inside the realm glue and never reaches here.
+    fn drain_workers(&mut self) -> usize {
+        self.js
+            .as_mut()
+            .map(|runtime| runtime.deliver_worker_messages())
+            .unwrap_or(0)
     }
 
     /// Flush the status text the last script run raised. Called after the
@@ -4931,6 +5013,13 @@ pub fn run(args: TabArgs) -> i32 {
         // 2a″. Console: fetch-side CSS diagnostics (wrong `Content-Type` on a
         // `.css` response) join the DevTools console here (src/logging.rs).
         tab.drain_console_events();
+
+        // 2a‴. Web Workers (task: real worker threads): the timer step below
+        // delivers every message a worker thread posted since the last poll,
+        // because a page's `onmessage` is a JS turn like a timer callback's and
+        // owes the same settle/repaint/console bookkeeping. Draining here instead
+        // would leave that turn's console entries (and its title/DOM writes)
+        // sitting in the realm until a wake that an idle page never gets.
 
         // 2b. JS timers: execute every callback due since the last poll
         // (setTimeout/setInterval/rAF), settle, and repaint coalesced exactly

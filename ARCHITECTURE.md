@@ -990,7 +990,68 @@ re-runs in our engine (no upgrades to gate it), so the second, unguarded
 `customElements.define("faceplate-perfmark", …)` throws `NotSupportedError` — the same throw a
 browser without upgrades would make; the feed renders regardless.
 
-### HTML forms (`src/forms.rs`)Blitz parses forms but its submission algorithm is incomplete (`<select>` values are a TODO in
+### Web Workers (`src/worker.rs`)
+
+Classic dedicated workers on **real OS threads**: `new Worker(url)` (same-origin script or a
+`blob:` URL the document made with `URL.createObjectURL`) starts a thread that owns its own Boa
+realm, and the tab keeps one message bus per navigation. A worker realm is built from
+`WORKER_PRELUDE` (scope as event target, `self`, `postMessage`, `importScripts`, the realm's own
+timers, `console`, `crypto`, `location`/`name`, `fetch` on the tab's network stack); the document
+realm gets `WORKER_PRELUDE_MAIN` (`Blob`, `URL.createObjectURL`/`revokeObjectURL`, `Worker`,
+`__ironsurfDeliverWorkerMessages`). Both preludes are `pub const` strings in `worker.rs`, appended
+to the realm they belong to — the page-facing bindings stay in `js.rs`.
+
+The contract is deliberately narrower than the platform, and the narrowness is the API: payloads
+travel as **JSON text** (`JSON.stringify` on the way in, `JSON.parse` on the way out; a circular
+or `undefined` payload is refused rather than silently emptied), no `MessagePort`/
+`MessageChannel`/`BroadcastChannel`, no transferables, no module workers (`{type: "module"}`
+answers with a named error), `Worker.terminate()` is synchronous, and a worker dies with its
+document (navigation clears the registry, no persistent origin). Deliberately absent: `WebSocket`
+and `EventSource` (no socket or event-stream transport in this engine — a `ReferenceError` beats a
+stub that drops data).
+
+Three boundaries are load-bearing and tested:
+
+- **Worker → tab**: posted messages land on a queue in the `WorkerHost` (`WorkerMessage` = worker
+  id, kind, JSON payload) and the tab's wake pipe is poked, so a page with idle workers costs no
+  wakeups. The tab loop calls `JsRuntime::deliver_worker_messages()` per turn; that hands the whole
+  batch to the realm glue as **one JSON string literal** (`json_string`-escaped) — the glue parses
+  it once and returns the number of events it dispatched. Passing the batch as an array/object
+  expression instead makes the glue's `JSON.parse` fail and silently drop every message.
+- **Tab → worker**: `worker.postMessage(data)` resolves against the *document's* URL for `blob:`/
+  relative script URLs, and every request a worker makes (script body, `importScripts`, `fetch`) is
+  reported to the same DevTools network queue as a document request, with the shared jar and live
+  user-agent cell — a worker is a network client of its document, not a separate principal.
+- **Delivery is a JS turn**: `JsRuntime::deliver_worker_messages()` runs inside `Tab::run_due_timers`,
+  not at the top of the loop, because the page's `onmessage` is a script turn and owes exactly what a
+  `setTimeout` callback gets — `settle()`, a repaint request, `take_js_title()`, and
+  `consume_js_status()`. Skipping that last step strands the `console.*` lines a page logs from its
+  own `onmessage` in the realm's host capture (an idle page never wakes again to ship them), which is
+  why a drain outside the timer step silently loses the reply's DevTools output.
+
+Tests: unit tests in `worker.rs` (blob store, registry lifecycle, `terminate`, wake counts, and
+`a_page_realm_talks_to_a_worker_thread`, which runs a page realm, a worker thread and the delivery
+step together) plus `tests/workers.rs`, which drives the **real** tab binary against a localhost
+fixture and asserts a page receives an object its worker posted (and that a worker's `fetch` shares
+the document's cookie jar).
+
+### SHA-256 (`src/sha256.rs`)
+
+The engine answers exactly one digest natively: `crypto.subtle.digest("SHA-256", …)` in **worker**
+realms, backed by the `__ironsurfSha256` native (dependency-free FIPS 180-4 — the 64 round
+constants, the standard message schedule, the compression function). It exists for one class of
+pages: Anubis proof-of-work gates (startpage.com's search and the rest of that family, including
+the ones that hand the work to a `Worker`), whose challenge asks for `floor(difficulty / 2)`
+leading zero **bytes** of `SHA-256(randomData ‖ nonce)` — tens of thousands of digests that hold a
+page at “Calculating…” for minutes interpreted and finish in well under a second natively. Nothing
+else is implemented and nothing is pretended: `digest` rejects every other algorithm with
+`NotSupportedError` instead of answering with a different digest, `subtle.sign`/`encrypt`/
+`deriveBits` are absent, and the **document** realm keeps `crypto.subtle` missing entirely (task:
+XMLHttpRequest + Web Crypto), so feature detection stays honest in both realms.
+
+### HTML forms (`src/forms.rs`)
+
+Blitz parses forms but its submission algorithm is incomplete (`<select>` values are a TODO in
 `construct_entry_list`; actions resolving outside `http(s):`/`data:`/`mailto:` are dropped), so
 the tab owns submission outright — blitz's own submission is never used for its triggers:
 - Triggers: a left-click press on a submit control (*arms*, finalised on release — a page JS

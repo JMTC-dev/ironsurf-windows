@@ -1231,6 +1231,14 @@ pub struct HostState {
     /// (bare JS tests, no tab attached) makes every `send()` complete with
     /// a network error, exactly like a browser whose network is dead.
     pub xhr: Option<XhrFetch>,
+    /// Web Worker host (task: real worker threads): one live thread with its
+    /// own realm per `new Worker(url)`, the `blob:` store the realm's `Blob`
+    /// writes, and the queue worker replies land on. The tab attaches it to
+    /// the document's network cells as soon as the realm exists and drains the
+    /// queue in its poll loop
+    /// ([`JsRuntime::deliver_worker_messages`](crate::js::JsRuntime::deliver_worker_messages)).
+    /// A page that never constructs a worker leaves it empty and unattached.
+    pub workers: crate::worker::WorkerHost,
     /// The container's **cookie jar** cell (task: `document.cookie`).
     /// The very `Arc` the tab's fetchers write `Set-Cookie` into, handed to
     /// the bindings so `document.cookie` reads and writes the live jar:
@@ -3742,6 +3750,15 @@ fn split_attr_name(name: &str) -> (Option<String>, String) {
 
 /// Borrow the active host mutably. Never called across a re-entry point (all
 /// JS→Rust string conversions happen before the borrow).
+/// The live document realm's [`WorkerHost`](crate::worker::WorkerHost) (task:
+/// real worker threads). The worker/blob natives resolve it here rather than
+/// capturing it, because boa's `from_copy_closure` requires `Copy` captures and
+/// the host is an `Arc` pair — exactly how every other native reaches
+/// [`HostState`]. `None` outside an evaluation, when no realm is active.
+pub(crate) fn active_workers() -> Option<crate::worker::WorkerHost> {
+    with_host(|host| host.workers.clone())
+}
+
 fn with_host<R>(f: impl FnOnce(&mut HostState) -> R) -> Option<R> {
     let scope = ACTIVE_HOSTS.with(|stack| stack.borrow().last().cloned())?;
     let outcome = f(&mut scope.host.borrow_mut());
@@ -3801,8 +3818,9 @@ mod native {
 /// Process-wide random source for `crypto.getRandomValues`/`randomUUID`
 /// (task: infosec.exchange posts): a splitmix64 seeded from the clock.
 /// Pages spend this on ids (Mastodon stamps request ids with `randomUUID`),
-/// not keys — and nothing here is a security boundary.
-fn next_random_u64() -> u64 {
+/// not keys — and nothing here is a security boundary. Worker threads use it
+/// too (their `crypto`, their blob ids), which is why it is crate-visible.
+pub(crate) fn next_random_u64() -> u64 {
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::LazyLock;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -9213,6 +9231,12 @@ fn build_context_with_modules(
     if let Err(err) = context.eval(Source::from_bytes("process.env = {};")) {
         error!("process.env reset failed: {err}");
     }
+    // Web Workers (task: real worker threads) — the document realm's natives:
+    // start/terminate/postMessage, the `blob:` store behind `Blob` and
+    // `URL.createObjectURL`. The glue that turns them into the page-facing
+    // classes runs after the main prelude below (it needs `location` and the
+    // DOM bridge). A page that never touches a worker never pays for this.
+    crate::worker::register_main_bindings(&mut context);
 
     for (name, value) in [
         (native::URL, JsValue::from(JsString::from(url))),
@@ -9950,6 +9974,10 @@ fn build_context_with_modules(
         // the globals that did install, and let the tab run.
         error!("js prelude failed to evaluate: {err}");
     }
+    if let Err(err) = context.eval(Source::from_bytes(crate::worker::WORKER_PRELUDE_MAIN)) {
+        // Same policy as the prelude above: our glue, reported, never fatal.
+        error!("js worker prelude failed to evaluate: {err}");
+    }
 
     context
 }
@@ -10054,6 +10082,86 @@ impl JsRuntime {
     /// The host cell the bindings write through (title, console, notes).
     pub fn host(&self) -> &HostRef {
         &self.host
+    }
+
+    /// Hand the document realm's worker host its wiring (script backend, jar,
+    /// UA cell, DevTools queue, wake pipe) — called by the tab once per
+    /// navigation, before page scripts run. Attaching also closes the workers
+    /// of the document that was attached before, which is what the spec's
+    /// "workers die with their document" requires (task: real worker threads).
+    pub fn attach_workers(&mut self, attachment: crate::worker::WorkerAttachment) {
+        self.host.borrow().workers.attach(attachment);
+    }
+
+    /// Deliver every message workers posted since the last call into this
+    /// realm (task: real worker threads). Cheap when nothing is pending, which
+    /// is the state of every page that never constructs a worker; the batch is
+    /// JSON-encoded **inside** the realm glue (`__ironsurfDeliverWorkerMessages`
+    /// parses it once) so the tab thread does no JSON work per message, and a
+    /// throwing page handler is caught by the glue, never by us. Returns how
+    /// many events the realm dispatched.
+    pub fn deliver_worker_messages(&mut self) -> usize {
+        let host = self.host.borrow().workers.clone();
+        if !host.has_messages() {
+            return 0;
+        }
+        let batch = host.take_messages();
+        debug!(
+            "delivering {} worker message(s) into the document realm",
+            batch.len()
+        );
+        let mut envelope = String::from("[");
+        for (index, message) in batch.iter().enumerate() {
+            if index > 0 {
+                envelope.push(',');
+            }
+            envelope.push_str(&format!(
+                "{{\"worker\":{},\"kind\":{},\"payload\":{}}}",
+                message.worker,
+                crate::worker::json_string(&message.kind),
+                crate::worker::json_string(&message.payload),
+            ));
+        }
+        envelope.push(']');
+        // The glue answers with the count it dispatched; reading it back as a
+        // string keeps this independent of which numeric accessor a number
+        // answers through, and a batch counts as delivered when the glue was
+        // replaced by page code (the messages were taken either way).
+        // The glue takes the batch as one JSON *string* (it parses it once), so
+        // the envelope goes into the expression as a string literal.
+        let expression = format!(
+            "String(__ironsurfDeliverWorkerMessages({}))",
+            crate::worker::json_string(&envelope)
+        );
+        // The same world page scripts see: this runtime's scope pushed, the
+        // expression evaluated, microtasks drained (a page handler that returns
+        // a promise gets its continuations run in this turn).
+        let outcome = {
+            let _active = self.activate();
+            let evaluated = self.context.eval(Source::from_bytes(&expression));
+            self.drain_jobs();
+            evaluated
+        };
+        match outcome {
+            Ok(value) => value
+                .as_string()
+                .and_then(|text| text.to_std_string_escaped().parse::<usize>().ok())
+                .unwrap_or(batch.len()),
+            Err(err) => {
+                // The realm has no glue (a worker prelude that failed to
+                // install); report and keep the tab alive (contract: a JS error
+                // never kills the tab).
+                error!("worker message delivery failed: {}", first_line(&err));
+                0
+            }
+        }
+    }
+
+    /// Terminate every worker of this realm (navigation teardown). Threads see
+    /// the flag at the top of their loop and the channel close ends it too, so
+    /// no worker thread outlives the realm that created it.
+    pub fn close_workers(&self) {
+        self.host.borrow().workers.close_all();
     }
 
     /// Did a native DOM binding throw during the evaluation that just failed

@@ -17,7 +17,9 @@ mod logging;
 mod media;
 mod netmod;
 mod runtime;
+mod sha256;
 mod spike;
+mod worker;
 
 // (The stderr logger arrives under an alias: `logging` is this crate's own
 // DevTools-console module — src/logging.rs.)
