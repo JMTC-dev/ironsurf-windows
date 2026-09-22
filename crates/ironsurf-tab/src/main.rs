@@ -12,6 +12,7 @@ mod archive;
 mod find;
 mod forms;
 mod headless;
+mod inspector;
 mod js;
 mod logging;
 mod media;

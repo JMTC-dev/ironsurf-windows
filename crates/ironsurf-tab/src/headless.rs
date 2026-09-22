@@ -84,6 +84,20 @@ pub struct HeadlessArgs {
     /// histogram, so a laid-out-but-invisible subtree can be told apart from a
     /// paint-culling bug.
     pub dump_paint: bool,
+    /// `--inspect-out FILE`: write the DevTools Inspector's
+    /// [`ironsurf_common::InspectSnapshot`] of the settled page as JSON — the
+    /// `FromTab` message a DevTools pane renders, produced by the tab's own walk
+    /// (so the doctype row, the positional ids, the caps and the live bounds are
+    /// all the real thing). `--inspect-select ID` selects a row of that tree
+    /// first, the way clicking a row in the pane does.
+    pub inspect_out: Option<PathBuf>,
+    pub inspect_select: Option<u64>,
+    /// `--inspect-pick X,Y`: run the *inspect element* hit-test a picker click
+    /// (or the context menu's Inspect Element) would run at that window point —
+    /// select it, scroll it into view, mark it. Repeatable; the last one wins.
+    /// With `--inspect-out` the picked row is the dump's `selected` (and
+    /// `--log debug` shows what the tab found under the cursor).
+    pub inspect_pick: Vec<(f32, f32)>,
     /// `--dump-paint-detail`: for every large fill record its untransformed
     /// path, its transform and the enclosing clip stack — the fingerprint that
     /// tells a mis-scaled vector (SVG/path) fill from an oversized CSS box.
@@ -104,6 +118,9 @@ impl HeadlessArgs {
         let mut dump_inputs = false;
         let mut dump_layout = false;
         let mut dump_paint = false;
+        let mut inspect_out = None;
+        let mut inspect_select = None;
+        let mut inspect_pick = Vec::new();
         let mut dump_paint_detail = false;
         let mut hits = Vec::new();
         let mut saw_url = false;
@@ -145,6 +162,24 @@ impl HeadlessArgs {
                 "--dump-inputs" => dump_inputs = true,
                 "--dump-layout" => dump_layout = true,
                 "--dump-paint" => dump_paint = true,
+                "--inspect-out" => inspect_out = Some(PathBuf::from(value("inspect-out")?)),
+                "--inspect-select" => {
+                    inspect_select = Some(
+                        value("inspect-select")?
+                            .parse()
+                            .map_err(|_| "--inspect-select needs a row id")?,
+                    )
+                }
+                "--inspect-pick" => {
+                    let v = value("inspect-pick")?;
+                    let (x, y) = v
+                        .split_once(',')
+                        .ok_or_else(|| format!("--inspect-pick must be X,Y, got {v:?}"))?;
+                    inspect_pick.push((
+                        x.parse().map_err(|_| format!("bad x in --inspect-pick {v:?}"))?,
+                        y.parse().map_err(|_| format!("bad y in --inspect-pick {v:?}"))?,
+                    ));
+                }
                 "--dump-paint-detail" => dump_paint_detail = true,
                 "--hit" => {
                     let v = value("hit")?;
@@ -205,6 +240,9 @@ impl HeadlessArgs {
             dump_layout,
             dump_paint,
             dump_paint_detail,
+            inspect_out,
+            inspect_select,
+            inspect_pick,
             hits,
             width: size.0.max(1),
             height: size.1.max(1),
@@ -304,6 +342,22 @@ pub fn run(args: &[String]) -> Result<(), Box<dyn Error>> {
         }
     }
 
+    // The Inspector (`--inspect-pick X,Y [--inspect-select ID] --inspect-out F`):
+    // the same commands a DevTools pane drives, run in the same order, so what
+    // lands on disk is the wire format a pane would render — never a second tree
+    // walk with its own rules. A headless tab emits into `/dev/null`, which is
+    // why the dump hands the snapshot back instead of reading it off the pipe.
+    for (x, y) in args.inspect_pick.clone() {
+        tab.handle_to_tab(ToTab::InspectPickAt { x, y });
+    }
+    if let Some(id) = args.inspect_select {
+        tab.handle_to_tab(ToTab::InspectSelect { node: Some(id) });
+    }
+    if let Some(path) = &args.inspect_out {
+        let snapshot = tab.inspect_dump();
+        dump_inspect_snapshot(path, snapshot.as_ref())?;
+    }
+
     // A scripted search (`--find`): exactly the command the shell sends when the
     // reader types in the find bar, so the shot shows the highlights a live
     // search paints — every match yellow, the current one light blue.
@@ -332,11 +386,17 @@ pub fn run(args: &[String]) -> Result<(), Box<dyn Error>> {
     // The highlights are measured from the live layout at the shot's own scale
     // (before the document is borrowed for painting), then drawn over the
     // finished page scene.
-    let highlights = if args.shot.is_some() {
+    let mut highlights = if args.shot.is_some() {
         tab.find_highlights(1.0)
     } else {
         Vec::new()
     };
+    // The Inspector's marker goes on the same shot with the pane's own colours,
+    // so `--inspect-pick X,Y --shot s.ppm` is evidence of what "inspect element"
+    // selected and where it put the highlight.
+    if args.shot.is_some() {
+        highlights.extend(tab.inspect_highlights(1.0));
+    }
     let shot_len = match (&args.shot, tab.document_mut()) {
         (Some(path), Some(doc)) => {
             if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
@@ -390,6 +450,29 @@ pub fn run(args: &[String]) -> Result<(), Box<dyn Error>> {
 /// Serialise every `<input>` element's `id`/`type`/checkedness to stderr
 /// (`INPUT id=… type=… checked=true|false`) — the diagnostics twin of
 /// `--click`, so a harness can watch a checkbox toggle from the DOM side.
+/// Write the Inspector snapshot as pretty JSON — a harness must be able to tell
+/// "the flag did nothing" from "the page had no tree".
+fn dump_inspect_snapshot(
+    path: &Path,
+    snapshot: Option<&ironsurf_common::InspectSnapshot>,
+) -> Result<(), Box<dyn Error>> {
+    // `null` rather than an empty tree: the file says "the tab had no document
+    // to walk", and a pane reading it back gets the type it would get off the
+    // wire (`FromTab::InspectTree` is never sent for a document that is not
+    // there) instead of a plausible-looking empty document.
+    let json = match snapshot {
+        Some(snapshot) => serde_json::to_string_pretty(snapshot)?,
+        None => "null".to_string(),
+    };
+    if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(path, format!("{json}\n"))?;
+    let rows = snapshot.map(|s| s.nodes.len()).unwrap_or(0);
+    ironsurf_common::warn!("inspect: dumped {rows} row(s) to {}", path.display());
+    Ok(())
+}
+
 /// Print the element chain under a viewport point, hit-test style.
 fn dump_hit_chain(doc: &blitz_html::HtmlDocument, x: f32, y: f32) {
     let Some(start) = doc.element_from_point(x, y) else {

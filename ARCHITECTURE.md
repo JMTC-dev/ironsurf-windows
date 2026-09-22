@@ -1445,8 +1445,9 @@ stylesheets never reach the console (see §ironsurf-tab DevTools CSS seam).
 anonymous blocks) into the flat [`InspectSnapshot`], stamps each element's
 [`InspectBox`] from the *live* layout (the same resolve + `absolute_position` − `viewport_scroll`
 path the find highlights use, in CSS px, so a scroll/resize moves the highlight without a new
-snapshot), hit-tests ⌖ picks with the engine's own hit-testing (`document_descendants_for`
-/point-query, deepest node first, ignoring `<html>` when something smaller answers), paints the
+snapshot), hit-tests ⌖ picks with the engine's own hit-testing (`BaseDocument::element_from_point`,
+the same point query `document.elementFromPoint()` answers with — anonymous boxes and text resolve
+to their nearest element, a point over the background resolves to the root), paints the
 selected/hovered box **over the page** in the same pass as the find highlights (content-box fill
 `rgba(255,147,38,110)`, 2px outline `rgba(255,213,0,220)`, never a repaint loop — the box is
 re-measured every frame it is shown), and swallows pick-mode pointers. The **shell** owns the
@@ -1454,6 +1455,10 @@ presentation: tree folding, selection, breadcrumb, the `+/−` twisties and the 
 (it re-renders `<tag attr="value">` from `tag`/`attrs` — the tab never sends markup text).
 Because blitz node ids are recycled, the tab's snapshot ids are positional handles; the shell
 treats an unknown id as "tree is stale" and waits for the next snapshot rather than guessing.
+Headless CI reaches the same data without a shell: `ironsurf-tab --headless --inspect-out FILE`
+writes the document's snapshot as one indented [`InspectSnapshot`] (`null` in the file is the tab
+saying it had no document to walk, never a plausible-looking empty one), and
+`--inspect-pick X,Y [--inspect-select ID]` runs the same commands a pane drives before the dump.
 
 Tests (headless CI-safe): tab-proc message pump logic + `FromTab` state reduction tested
 against a **fake tab process** (a small test bin that scripts `FromTab` sequences) so shell

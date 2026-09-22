@@ -583,3 +583,385 @@ fn svg_viewbox_case_survives_setattribute_and_icons_paint_their_size() {
         "expected the two 24px icon glyphs to paint, saw {icons} black fills:\n{stderr}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// `--inspect-out` / `--inspect-pick` / `--inspect-select`: the DevTools
+// Inspector's tree, written by the tab's own walk.
+
+/// A page with the shapes an inspector tree has to get right: a doctype, a
+/// `<head>` subtree that is never laid out, inline content inside a block, an
+/// attribute or two, and a `display: none` subtree.
+const INSPECT_FIXTURE: &str = r#"<!DOCTYPE html>
+<html class="root">
+  <head>
+    <title>Inspect fixture</title>
+    <style>p { color: #123456 }</style>
+  </head>
+  <body>
+    <h1 id=top>Inspect top</h1>
+    <p class="body">plain <b id=bold>bold</b> and <a id=link href="/next">a link</a></p>
+    <div id=hidden style="display:none">hidden text</div>
+  </body>
+</html>
+"#;
+
+/// Run the headless binary over `INSPECT_FIXTURE` with `extra`, and return the
+/// `--inspect-out` file (and the `--shot` file when `extra` asked for one) as
+/// raw bytes.
+fn inspect_run(dir: &Path, name: &str, extra: &[&str]) -> (Vec<u8>, Option<Vec<u8>>) {
+    let fixture = dir.join(format!("{name}.html"));
+    fs::write(&fixture, INSPECT_FIXTURE).expect("write fixture");
+    let out = dir.join(format!("{name}.json"));
+    let shot = dir.join(format!("{name}.ppm"));
+    let output = Command::new(env!("CARGO_BIN_EXE_ironsurf-tab"))
+        .arg("--headless")
+        .arg("--url")
+        .arg(
+            url::Url::from_file_path(&fixture)
+                .expect("file url")
+                .as_str(),
+        )
+        .arg("--wait")
+        .arg("150")
+        .arg("--inspect-out")
+        .arg(out.to_str().unwrap())
+        .args(extra)
+        .output()
+        .expect("spawn ironsurf-tab --headless");
+    assert!(
+        output.status.success(),
+        "exit {:?}\nstderr:\n{}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    (
+        fs::read(&out).expect("--inspect-out was written"),
+        shot.is_file().then(|| fs::read(&shot).expect("read shot")),
+    )
+}
+
+/// [`inspect_run`] with the dump decoded as the contract type a pane reads off
+/// the wire.
+fn inspect_dump(dir: &Path, name: &str, extra: &[&str]) -> ironsurf_common::InspectSnapshot {
+    let (json, _) = inspect_run(dir, name, extra);
+    serde_json::from_slice(&json).expect("the dump is an InspectSnapshot")
+}
+
+/// A `P6` PPM body, as produced by `--shot`.
+fn ppm(bytes: &[u8]) -> (usize, usize, &[u8]) {
+    let header_end = bytes[..32]
+        .windows(4)
+        .rposition(|w| w == b"255\n")
+        .map(|i| i + 4)
+        .expect("P6 header");
+    let head = String::from_utf8_lossy(&bytes[..header_end]).to_string();
+    let (_, rest) = head.split_once('\n').expect("magic");
+    let (size, _) = rest.split_once('\n').expect("dimensions");
+    let (w, h) = size
+        .split_once(' ')
+        .expect("width height");
+    (w.parse().expect("width"), h.parse().expect("height"), &bytes[header_end..])
+}
+
+fn pixel(bytes: &[u8], w: usize, x: usize, y: usize) -> (u8, u8, u8) {
+    let i = (y * w + x) * 3;
+    match bytes[i..i + 3] {
+        [r, g, b] => (r, g, b),
+        _ => unreachable!(),
+    }
+}
+
+/// How many pixels of the shot are exactly `want`.
+fn count_pixels(px: &[u8], w: usize, h: usize, want: (u8, u8, u8)) -> usize {
+    px.chunks_exact(3)
+        .take(w * h)
+        .filter(|rgb| (rgb[0], rgb[1], rgb[2]) == want)
+        .count()
+}
+
+fn tag_of<'a>(
+    snapshot: &'a ironsurf_common::InspectSnapshot,
+    tag: &str,
+) -> &'a ironsurf_common::InspectNode {
+    snapshot
+        .nodes
+        .iter()
+        .find(|node| node.tag == tag)
+        .unwrap_or_else(|| panic!("no <{tag}> row in {:?}", snapshot.nodes.iter().map(|n| &n.tag).collect::<Vec<_>>()))
+}
+
+#[test]
+fn headless_inspect_out_is_the_tree_a_pane_renders() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let snapshot = inspect_dump(dir.path(), "plain", &[]);
+
+    // The envelope a pane reads the tree out of.
+    assert!(
+        snapshot.url.ends_with("plain.html"),
+        "the dump names its document: {:?}",
+        snapshot.url
+    );
+    assert!(snapshot.generation >= 1, "a document is a generation");
+    assert!(!snapshot.truncated, "a page this size is not truncated");
+    assert_eq!(snapshot.selected, None, "nothing was selected");
+
+    // The root row, then pre-order ids that nest the way the pane indents.
+    let root = &snapshot.nodes[0];
+    assert_eq!(root.kind, ironsurf_common::InspectKind::Document);
+    assert_eq!(root.id, 0);
+    assert_eq!(root.parent, None);
+    assert_eq!(root.depth, 0);
+    let depth_of: std::collections::BTreeMap<u64, usize> = snapshot
+        .nodes
+        .iter()
+        .map(|node| (node.id, node.depth))
+        .collect();
+    for node in &snapshot.nodes {
+        match node.parent {
+            Some(parent) => {
+                assert!(parent < node.id, "a parent is walked before its child");
+                assert_eq!(
+                    depth_of[&parent] + 1,
+                    node.depth,
+                    "<{}> hangs off its parent's depth",
+                    node.tag
+                );
+            }
+            None => assert_eq!(node.id, 0, "only the root has no parent"),
+        }
+    }
+    assert_eq!(
+        snapshot.nodes.len(),
+        depth_of.len(),
+        "ids are unique within one generation"
+    );
+
+    // The doctype — blitz's parser drops the node, so nothing else could report
+    // it, and it is the document's first child before `<html>`.
+    let doctype = snapshot
+        .nodes
+        .iter()
+        .find(|node| node.kind == ironsurf_common::InspectKind::Doctype)
+        .expect("a doctype row for `<!DOCTYPE html>`");
+    assert_eq!(doctype.text, "html");
+    assert_eq!(doctype.parent, Some(0));
+    assert_eq!(doctype.depth, 1);
+
+    // Elements carry their tags and content attributes, lower-cased, verbatim.
+    assert_eq!(tag_of(&snapshot, "html").tag, "html");
+    let attrs_of = |tag: &str, name: &str| -> Option<String> {
+        tag_of(&snapshot, tag)
+            .attrs
+            .iter()
+            .find(|(key, _)| key == name)
+            .map(|(_, value)| value.clone())
+    };
+    assert_eq!(attrs_of("html", "class").as_deref(), Some("root"));
+    assert_eq!(attrs_of("p", "class").as_deref(), Some("body"));
+    assert_eq!(attrs_of("a", "href").as_deref(), Some("/next"));
+    assert!(
+        tag_of(&snapshot, "title").attrs.is_empty(),
+        "an element with no attributes says so with an empty list"
+    );
+
+    // Text rows carry collapsed text; whitespace-only runs are dropped, so the
+    // pretty-printed indentation of the fixture never becomes rows.
+    let texts: Vec<&str> = snapshot
+        .nodes
+        .iter()
+        .filter(|node| node.kind == ironsurf_common::InspectKind::Text)
+        .map(|node| node.text.as_str())
+        .collect();
+    assert!(
+        texts.iter().all(|text| !text.trim().is_empty()),
+        "no blank rows: {texts:?}"
+    );
+    assert!(
+        texts.iter().any(|text| text.contains("bold")),
+        "the <b>'s text is a row of its own: {texts:?}"
+    );
+    assert!(
+        texts.iter().any(|text| text.contains("hidden text")),
+        "`display: none` content is still in the tree — only its box went"
+    );
+
+    // Bounds: laid out, `display: none`, and never-laid-out `<head>`.
+    let h1 = tag_of(&snapshot, "h1").bounds.expect("a heading has a box");
+    assert!(h1.width > 0.0 && h1.height > 0.0, "{h1:?}");
+    assert_eq!(
+        tag_of(&snapshot, "head").bounds,
+        None,
+        "<head> is never laid out"
+    );
+    assert_eq!(
+        tag_of(&snapshot, "style").bounds,
+        None,
+        "nor anything inside it"
+    );
+    assert_eq!(
+        tag_of(&snapshot, "div").bounds,
+        None,
+        "`display: none` has no box"
+    );
+    // Inline content is the case a hand-rolled box misses: the `<b>` is a
+    // fragment of its line, and the engine gives it exactly that.
+    let para = tag_of(&snapshot, "p").bounds.expect("a paragraph has a box");
+    let bold = tag_of(&snapshot, "b").bounds.expect("inline content has a box");
+    assert!(
+        bold.width > 0.0 && bold.width < para.width,
+        "the <b> covers its word, not its line: {bold:?} vs {para:?}"
+    );
+    assert!(bold.x > para.x && bold.y < para.y + para.height, "{bold:?} vs {para:?}");
+    let link = tag_of(&snapshot, "a").bounds.expect("link text has a box");
+    assert!(link.x > bold.x, "the link follows the <b> it is after: {link:?}");
+
+    // A comment row: none here, and no other kinds leak in as empty rows.
+    assert!(snapshot
+        .nodes
+        .iter()
+        .all(|node| node.kind == ironsurf_common::InspectKind::Document
+            || node.kind == ironsurf_common::InspectKind::Element
+            || node.kind == ironsurf_common::InspectKind::Text
+            || node.kind == ironsurf_common::InspectKind::Doctype));
+}
+
+/// Where "inspect element" lands, and the row it selects.
+///
+/// The three points are chosen against the geometry this fixture lays out at
+/// 1024x768 (the `<h1>` starts at `y = 21`, its `<b>` at `x = 53.4`, its `<a>` at
+/// `x = 132.8`), and each one has exactly one element's box under it — so the
+/// answer is not "the nearest thing", it is the deepest thing. This is the test
+/// that the hit-test and the traversal agree on row ids: the doctype row shifts
+/// every id by one, and if the two sides computed ids differently every pick
+/// here would name its parent.
+#[test]
+fn headless_inspect_pick_selects_the_row_of_the_thing_under_the_cursor() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    for (x, y, tag) in [(30.0, 40.0, "h1"), (90.0, 90.0, "b"), (150.0, 90.0, "a")] {
+        let name = format!("pick_{x}_{}", (y * 10.0) as u32);
+        let snapshot = inspect_dump(
+            dir.path(),
+            &name,
+            &["--inspect-pick", &format!("{x},{y}")],
+        );
+        let selected = snapshot
+            .selected
+            .unwrap_or_else(|| panic!("({x},{y}) selected nothing"));
+        let row = snapshot
+            .nodes
+            .iter()
+            .find(|node| node.id == selected)
+            .expect("the selected id is a row of the same snapshot");
+        assert_eq!(
+            row.tag, tag,
+            "({x},{y}) is inside exactly one element's box"
+        );
+        let bounds = row.bounds.expect("the selected row has a box");
+        assert!(
+            bounds.x <= x && x <= bounds.x + bounds.width,
+            "the row the hit-test named owns ({x},{y}): {bounds:?}"
+        );
+        assert!(
+            bounds.y <= y && y <= bounds.y + bounds.height,
+            "the row the hit-test named owns ({x},{y}): {bounds:?}"
+        );
+    }
+
+    // A point over the page background answers the root element (blitz's rule,
+    // the one `elementFromPoint` uses) and still selects a row.
+    let background = inspect_dump(dir.path(), "pick_background", &["--inspect-pick", "30,20"]);
+    assert_eq!(
+        tag_of(&background, "html").id,
+        background.selected.expect("the root element is selectable")
+    );
+
+    // Selecting a row by id does the same thing from the tree side, and the tree
+    // the pane is looking at is unchanged by it.
+    let plain = inspect_dump(dir.path(), "plain", &[]);
+    let link_id = tag_of(&plain, "a").id;
+    let selected_by_id = inspect_dump(
+        dir.path(),
+        "selected",
+        &["--inspect-select", &link_id.to_string()],
+    );
+    assert_eq!(selected_by_id.selected, Some(link_id));
+    assert_eq!(
+        selected_by_id.nodes, plain.nodes,
+        "selecting is not a tree change"
+    );
+}
+
+/// The marker is painted into the page, not drawn over it by a harness.
+///
+/// The Inspector's colours are a translucent amber fill and a yellow ring
+/// (`inspector::COLOR_FILL` / `COLOR_OUTLINE`); composited over this fixture's
+/// white page at the headless device scale of 1.0 they land on exact RGB values,
+/// so the shot can be checked pixel for pixel. The unselected shot of the same
+/// page is the control: neither colour occurs anywhere in it.
+#[test]
+fn headless_inspect_shot_carries_the_marker_on_the_selected_box() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let amber = (255u8, 208u8, 161u8);
+    let ring = (255u8, 212u8, 23u8);
+
+    // Control: the same page, shot the same way, nothing selected.
+    let plain_shot = dir.path().join("plain.ppm");
+    let (_, plain_bytes) = inspect_run(
+        dir.path(),
+        "plain",
+        &["--shot", plain_shot.to_str().unwrap()],
+    );
+    let plain_px = plain_bytes.expect("the control shot was written");
+    let (w, h, px) = ppm(&plain_px);
+    assert_eq!((w, h), (1024, 768));
+    assert_eq!(count_pixels(px, w, h, amber), 0, "an amber page");
+    assert_eq!(count_pixels(px, w, h, ring), 0, "a yellow page");
+
+    // Pick the `<a>`, whose box this fixture lays out at x 132.8..177.6, y 81..100.
+    let shot = dir.path().join("marked.ppm");
+    let (marked_json, marked_shot) = inspect_run(
+        dir.path(),
+        "marked",
+        &[
+            "--inspect-pick",
+            "150,90",
+            "--shot",
+            shot.to_str().unwrap(),
+        ],
+    );
+    let snapshot: ironsurf_common::InspectSnapshot =
+        serde_json::from_slice(&marked_json).expect("the dump is an InspectSnapshot");
+    let marked_shot = marked_shot.expect("--shot was asked for");
+    let (w, h, px) = ppm(&marked_shot);
+    assert_eq!((w, h), (1024, 768));
+    assert_eq!(
+        tag_of(&snapshot, "a").id,
+        snapshot.selected.expect("the pick selected the link"),
+        "the shot shows what the same run selected"
+    );
+    // The ring sits on the border box, the fill inside it.
+    let inside = pixel(px, w, 150, 90);
+    assert!(
+        count_pixels(px, w, h, amber) > 200,
+        "the content box is filled with the marker: {amber:?} found {} times",
+        count_pixels(px, w, h, amber)
+    );
+    assert!(
+        count_pixels(px, w, h, ring) > 100,
+        "the border box is ringed with the marker: {ring:?} found {} times",
+        count_pixels(px, w, h, ring)
+    );
+    assert_ne!(inside, (255, 255, 255), "the box under the cursor is marked");
+    // …and it is confined to that box. The `<a>` is ~45x19 device px, so the
+    // whole marker is a few hundred pixels; if the marker leaked (scaled wrong,
+    // painted over the viewport, painted twice per frame) these counts would run
+    // away, and a page the colour of nothing else in the fixture is untouched.
+    let marked_pixels = count_pixels(px, w, h, amber) + count_pixels(px, w, h, ring);
+    assert!(
+        marked_pixels < 5_000,
+        "the marker covers {marked_pixels} px of a {} px image",
+        w * h
+    );
+    assert_eq!(pixel(px, w, 900, 90), (255, 255, 255), "same line, past the text");
+    assert_eq!(pixel(px, w, 600, 300), (255, 255, 255), "below the content");
+}

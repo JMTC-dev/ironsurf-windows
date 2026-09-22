@@ -10802,7 +10802,7 @@ pub fn body_text_snapshot(doc: &BaseDocument) -> Option<String> {
 // Unit tests (headless; no blitz document needed for the binding surface)
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     /// Evaluate a snippet in a fresh per-document runtime (what the binding
@@ -12069,7 +12069,10 @@ mod tests {
 
     /// Run `source` against `doc` (registered as the live document) and
     /// return the completion value; panics with the snippet on JS errors.
-    fn dom_eval(
+    ///
+    /// `pub(crate)` (test-only): the Inspector's tests mutate a real DOM with
+    /// `createElement`+append through here instead of growing a second harness.
+    pub(crate) fn dom_eval(
         runtime: &mut JsRuntime,
         doc: &mut blitz_html::HtmlDocument,
         source: &str,
@@ -12084,7 +12087,7 @@ mod tests {
     }
 
     /// Fresh runtime + live document for `DOM_PAGE`.
-    fn dom_world() -> (JsRuntime, blitz_html::HtmlDocument) {
+    pub(crate) fn dom_world() -> (JsRuntime, blitz_html::HtmlDocument) {
         let runtime = JsRuntime::new(sample_host());
         let doc = dom(DOM_PAGE);
         (runtime, doc)

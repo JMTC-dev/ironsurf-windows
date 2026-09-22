@@ -79,8 +79,8 @@ use blitz_traits::navigation::{NavigationOptions, NavigationProvider};
 use blitz_traits::shell::{ClipboardError, ColorScheme, ShellProvider, Viewport};
 use ironsurf_common::{
     read_frame, write_frame, userscripts_for_url, ContextAction, ContextTarget, ContainerId,
-    CursorIcon, DialogKind, FromTab, KeyEvent, Modifiers, NetEvent, PointerEvent, PointerKind,
-    ScrollEvent, TabId, ToTab, Userscript, MAX_CONTEXT_TEXT, MAX_DIALOG_MESSAGE,
+    CursorIcon, DialogKind, FromTab, InspectSnapshot, KeyEvent, Modifiers, NetEvent, PointerEvent,
+    PointerKind, ScrollEvent, TabId, ToTab, Userscript, MAX_CONTEXT_TEXT, MAX_DIALOG_MESSAGE,
 };
 use keyboard_types::{Code, Key, Location, Modifiers as KMods};
 use kurbo::{Affine, Rect, Size};
@@ -96,6 +96,7 @@ use url::Url;
 
 use crate::find;
 use crate::forms::{self, FormMethod, FormSubmission};
+use crate::inspector;
 use crate::js::{self, HostRef};
 use crate::media::player::{MediaPlayer, PlayerEvent, PlayerState, MAX_VIDEO_BYTES};
 use crate::media::widget::VideoWidget;
@@ -667,6 +668,36 @@ pub struct Tab {
     /// no longer be the ones the search saw. Cleared by the next re-run, which
     /// happens lazily: only when a jump needs the hits or a frame paints them.
     find_stale: bool,
+    /// **DevTools Inspector** (task: tab-side inspector): the pane is the
+    /// shell's, the document is ours. `true` between [`ToTab::SetInspect`]
+    /// open/close, and while it holds, the poll hook [`Tab::inspect_check`]
+    /// re-walks the tree and ships only what changed.
+    inspect_enabled: bool,
+    /// [`ToTab::SetInspectPick`] — the crosshair. While armed the tab swallows
+    /// pointers (the page sees nothing), reports [`FromTab::InspectHover`], and
+    /// takes a left release as the pick.
+    inspect_pick: bool,
+    /// What is under the armed crosshair, and what the shell selected in the
+    /// tree (an id of **this** generation; `None` = nothing). Both are painted
+    /// on the page, both die with the document.
+    inspect_hover: Option<u64>,
+    inspect_selected: Option<u64>,
+    /// The generation stamped on the rows this tab walked last: node ids mean
+    /// nothing outside it, because blitz recycles arena indices (see
+    /// [`inspector`]).
+    inspect_gen: u64,
+    /// The blitz node behind each row id of that walk — `inspect_nodes[i]` is
+    /// [`ironsurf_common::InspectNode::id`] `i`. This is what makes selecting,
+    /// painting the marker and hit-testing cost nothing per frame.
+    inspect_nodes: Vec<NodeId>,
+    /// The [`inspector::fingerprint`] of the snapshot last shipped, so an idle
+    /// document costs a walk and **no** IPC.
+    inspect_fp: Option<u64>,
+    /// The `<!DOCTYPE …>` blitz's parser throws away, sniffed out of the source
+    /// [`load_html`] handed the parser (see [`inspector::doctype_from_source`]).
+    /// Part of every row count: the walk and the hit-test have to agree on it,
+    /// or the ids the shell holds shift by one.
+    inspect_doctype: Option<String>,
     /// Userscripts installed by the shell (`ToTab::SetUserscripts`, task:
     /// userscripts): **replace-wholesale**, in the shell's store order, every
     /// entry enabled (the shell never sends disabled ones). Matching against a
@@ -992,6 +1023,14 @@ impl Tab {
             find_hits: Vec::new(),
             find_active: None,
             find_stale: false,
+            inspect_enabled: false,
+            inspect_pick: false,
+            inspect_hover: None,
+            inspect_selected: None,
+            inspect_gen: 0,
+            inspect_nodes: Vec::new(),
+            inspect_fp: None,
+            inspect_doctype: None,
             userscripts: Vec::new(),
             user_agent,
             archive,
@@ -1411,6 +1450,11 @@ impl Tab {
         // the shell's live query against the new document (it emits the new
         // counts, and the frame below already paints the highlights).
         self.find_on_new_document();
+
+        // The inspector's row ids died with the previous document, and the
+        // doctype this source carries is part of the next walk's row count.
+        self.inspect_doctype = inspector::doctype_from_source(html);
+        self.inspect_on_new_document();
 
         // Force a first frame for the new document (bypasses the throttle).
         self.needs_paint = true;
@@ -2503,6 +2547,9 @@ impl Tab {
         // takes the document mutably — and drawn **last**, over the finished
         // page, so the text underneath them stays readable.
         let highlights = self.find_highlights(f64::from(scale));
+        // …and the Inspector's marker for the selected/hovered element, measured
+        // in the same space and painted over everything else.
+        let inspected = self.inspect_highlights(f64::from(scale));
         let buffer = render_to_buffer::<VelloCpuImageRenderer, _>(
             |scene| {
                 scene.fill(
@@ -2526,6 +2573,7 @@ impl Tab {
                     0,
                 );
                 find::paint(scene, &highlights);
+                inspector::paint(scene, &inspected);
             },
             width,
             height,
@@ -2578,6 +2626,12 @@ impl Tab {
             self.last_title = Some(title.clone());
             self.emit(FromTab::TitleChanged { title });
         }
+
+        // The document tree is a delta like the title and the url, and this is
+        // the one place every path — navigation, a JS timer, the live poll loop,
+        // a headless pump — lands after a settle, so it is where an open
+        // Inspector pane learns the markup moved. A closed pane costs a boolean.
+        self.inspect_check();
     }
 
     // -- find in page (Ctrl-F) ------------------------------------------------
@@ -2716,6 +2770,257 @@ impl Tab {
             return Vec::new();
         };
         find::highlight_rects(doc, &self.find_hits, self.find_active, scale)
+    }
+
+    // -- devtools inspector (the F12 tree + "inspect element") ---------------
+
+    /// Open or close the Inspector pane for this tab. Opening makes the tab
+    /// responsible for the shell's tree: the current one goes out immediately,
+    /// and [`Tab::inspect_check`] keeps it current from here on. Closing drops
+    /// the whole tab-side half — rows, ids, selection, marker — and stops the
+    /// stream; nothing about the page changes either way.
+    fn set_inspect(&mut self, open: bool) {
+        if open == self.inspect_enabled {
+            return;
+        }
+        self.inspect_enabled = open;
+        if !open {
+            self.inspect_pick = false;
+            self.inspect_selected = None;
+            self.inspect_hover = None;
+            self.inspect_nodes.clear();
+            self.inspect_fp = None;
+            info!("inspect: pane closed");
+            // The marker was painted on the page; closing the pane takes it off.
+            self.needs_paint = true;
+            self.maybe_repaint();
+            return;
+        }
+        info!("inspect: pane open");
+        self.inspect_snapshot(true);
+        self.flush_stdout();
+        self.needs_paint = true;
+        self.maybe_repaint();
+    }
+
+    /// Arm or disarm the *inspect element* crosshair (the shell's Ctrl-Shift-C
+    /// and its context-menu item). Arming swallows pointers (see
+    /// [`Tab::handle_pointer`]); disarming leaves the selection and its marker
+    /// alone but takes the hovered one, and tells the shell the cursor stopped
+    /// answering.
+    fn set_inspect_pick(&mut self, armed: bool) {
+        if self.inspect_pick == armed {
+            return;
+        }
+        self.inspect_pick = armed;
+        debug!("inspect: picker {}", if armed { "armed" } else { "disarmed" });
+        if !armed && self.inspect_hover.take().is_some() {
+            self.emit(FromTab::InspectHover { node: None });
+            self.needs_paint = true;
+            self.maybe_repaint();
+        }
+    }
+
+    /// The shell clicked a row of the tree or a breadcrumb step (or sent `None`
+    /// to clear): paint that element's box and scroll it fully into view when
+    /// the page shows it only partly. An id of a **previous** generation
+    /// resolves to nothing, so both the marker and the scroll do nothing — the
+    /// contract's "ignored, never an error", for a shell that may be a message
+    /// behind the page.
+    fn inspect_select(&mut self, node: Option<u64>) {
+        self.inspect_selected = node;
+        if let Some(rect) = node.and_then(|id| self.inspect_box(id)) {
+            let (w, h) = self.inspect_viewport();
+            if let Some(doc) = self.doc.as_mut() {
+                inspector::scroll_rect_into_view(doc, rect, w, h);
+            }
+        }
+        self.needs_paint = true;
+        self.maybe_repaint();
+    }
+
+    /// The deepest element at a point in [`ToTab::Pointer`] space — window CSS
+    /// px, with the page zoom still multiplied in, exactly as the shell sends it
+    /// (the house hit-tests divide by zoom first, see [`Tab::context_target`]).
+    /// `None` for a point outside the viewport, or for no document.
+    fn inspect_hit(&self, x: f32, y: f32) -> Option<u64> {
+        let z = self.zoom();
+        let doc = self.doc.as_ref()?;
+        inspector::hit_element_at_with(doc, x / z, y / z, self.inspect_doctype.as_deref())
+    }
+
+    /// The pick — a click with the crosshair armed, or the context menu's
+    /// **Inspect Element** ([`ToTab::InspectPickAt`], the same thing minus the
+    /// event): select what is under the point, mark it, scroll it into view, and
+    /// answer with the same generation carrying the new selection plus
+    /// [`FromTab::InspectPicked`]. For a real pick the crosshair then disarms
+    /// itself — one pick per arming, like Firefox.
+    ///
+    /// This works with the pane **closed**, which is a context menu's normal
+    /// state: the shell asked, so it gets the snapshot and the highlight, and
+    /// opening the pane sends [`ToTab::SetInspect`] to take over the stream.
+    fn inspect_pick_at(&mut self, x: f32, y: f32) {
+        let Some(id) = self.inspect_hit(x, y) else {
+            debug!("inspect: nothing under ({x:.0}, {y:.0}) to inspect");
+            return;
+        };
+        debug!("inspect: picked row {id} at ({x:.0}, {y:.0})");
+        self.inspect_select(Some(id));
+        self.inspect_snapshot(true);
+        self.flush_stdout();
+        self.emit(FromTab::InspectPicked { node: id });
+        self.set_inspect_pick(false);
+        self.flush_stdout();
+    }
+
+    /// While the crosshair is armed, what is under the cursor: reported as it
+    /// changes (never twice for the same element) and painted on the page, so
+    /// the user sees what a click would take before taking it.
+    fn inspect_hover_at(&mut self, ev: &PointerEvent) {
+        let id = match ev.kind {
+            PointerKind::Out => None,
+            PointerKind::Over | PointerKind::Move => self.inspect_hit(ev.x, ev.y),
+            // A press is not a change of cursor; the release is the pick.
+            PointerKind::Down | PointerKind::Up => self.inspect_hover,
+        };
+        if id == self.inspect_hover {
+            return;
+        }
+        self.inspect_hover = id;
+        self.emit(FromTab::InspectHover { node: id });
+        self.needs_paint = true;
+        self.maybe_repaint();
+    }
+
+    /// A new document. Its nodes are new arena entries and the previous
+    /// generation's handles must never be resolved again, so they go, and the
+    /// selection dies with them. An open pane gets this tree under a fresh
+    /// generation (contract: a snapshot after every navigation while it is open).
+    fn inspect_on_new_document(&mut self) {
+        self.inspect_gen += 1;
+        self.inspect_nodes.clear();
+        self.inspect_selected = None;
+        self.inspect_hover = None;
+        self.inspect_fp = None;
+        if self.inspect_enabled {
+            self.inspect_snapshot(true);
+            self.flush_stdout();
+        }
+    }
+
+    /// The poll hook, run from [`Tab::check_meta`] after every settle: re-walk
+    /// the settled document and ship only when the walk differs from the
+    /// snapshot the shell holds. An idle page with the pane open costs one walk
+    /// per settle and no IPC; a script that appends a `<section>` reaches the
+    /// pane on the next tick (see [`inspector::fingerprint`]).
+    fn inspect_check(&mut self) {
+        if self.inspect_enabled {
+            self.inspect_snapshot(false);
+        }
+    }
+
+    /// Walk the current document and — unless the walk is the tree the shell
+    /// already has (`force` skips that comparison) — ship it as
+    /// [`FromTab::InspectSnapshot`]. The walk's row→node handles are kept either
+    /// way: a row set the fingerprint matches still names the nodes to paint and
+    /// to hit-test, and keeping them refreshed is what survives a page that
+    /// removes and re-adds identical markup.
+    ///
+    /// Returns the snapshot whether or not it went out, which is how
+    /// `--inspect-out` dumps the wire format instead of re-deriving a tree.
+    fn inspect_snapshot(&mut self, force: bool) -> Option<InspectSnapshot> {
+        let (url, walk) = {
+            let doc = self.doc.as_ref()?;
+            let url = self
+                .url_override
+                .clone()
+                .unwrap_or_else(|| doc.url().as_str().to_owned());
+            let walk = inspector::walk(
+                doc,
+                &url,
+                self.inspect_gen,
+                self.inspect_selected,
+                self.inspect_doctype.as_deref(),
+            );
+            (url, walk)
+        };
+        let snapshot = walk.snapshot;
+        let stamp = inspector::fingerprint(&snapshot);
+        // The row→node handles are kept **either** way, before the comparison: a
+        // page that removes and re-adds identical markup fingerprints the same
+        // while blitz recycles the arena ids underneath it, and the marker, the
+        // scroll and the hit-test all resolve rows through this table.
+        self.inspect_nodes = walk.nodes;
+        if !force && self.inspect_fp == Some(stamp) {
+            return Some(snapshot);
+        }
+        self.inspect_fp = Some(stamp);
+        debug!(
+            "inspect: snapshot gen {} · {} row(s){} · {url}",
+            snapshot.generation,
+            snapshot.nodes.len(),
+            if snapshot.truncated { " (truncated)" } else { "" },
+        );
+        self.emit(FromTab::InspectSnapshot {
+            snapshot: snapshot.clone(),
+        });
+        Some(snapshot)
+    }
+
+    /// The live border box of a row, in CSS px (see [`inspector::box_rect`]).
+    /// `None` for a stale id, for a non-element row, or for a node a script
+    /// removed — which is also why a stale selection paints nothing instead of
+    /// guessing at a box.
+    fn inspect_box(&mut self, id: u64) -> Option<Rect> {
+        let node = inspector::node_of(&self.inspect_nodes, id)?;
+        let doc = self.doc.as_ref()?;
+        let node = doc.get_node(node)?;
+        inspector::box_rect(doc, node)
+    }
+
+    /// The viewport the rows are measured against: the window in CSS px, the
+    /// same reading [`Tab::focus_active_hit`] takes for find's jump.
+    fn inspect_viewport(&self) -> (f64, f64) {
+        (f64::from(self.width), f64::from(self.height))
+    }
+
+    /// This frame's marker(s): the selection, plus the hovered element while the
+    /// crosshair is armed (at most one of each). Measured from the live document
+    /// **every frame it is shown**, so scrolling and scripted restyles move the
+    /// box without a new snapshot — and it never asks for a repaint of its own
+    /// (contract: "never a repaint loop"), so an idle page with a selection
+    /// costs geometry and no frames.
+    pub(crate) fn inspect_highlights(&mut self, scale: f64) -> Vec<inspector::Highlight> {
+        let mut nodes = Vec::new();
+        for id in [self.inspect_selected, self.inspect_hover]
+            .into_iter()
+            .flatten()
+        {
+            if let Some(node) = inspector::node_of(&self.inspect_nodes, id) {
+                if !nodes.contains(&node) {
+                    nodes.push(node);
+                }
+            }
+        }
+        if nodes.is_empty() {
+            return Vec::new();
+        }
+        let Some(doc) = self.doc.as_ref() else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        for node in nodes {
+            out.extend(inspector::marker(doc, node, scale));
+        }
+        out
+    }
+
+    /// `--inspect-out` (headless harness): the snapshot a DevTools pane would be
+    /// handed, produced by the commands and the walk the live tab uses. The dump
+    /// is the wire format, not a second serializer. (A headless tab's `FromTab`
+    /// sink is `/dev/null`, hence handing the tree back directly.)
+    pub(crate) fn inspect_dump(&mut self) -> Option<InspectSnapshot> {
+        self.inspect_snapshot(true)
     }
 
     // -- shell event handling -------------------------------------------------
@@ -2914,15 +3219,16 @@ impl Tab {
             ToTab::SetFind { query } => self.set_find(query),
             ToTab::FindNext => self.find_jump(true),
             ToTab::FindPrevious => self.find_jump(false),
-            // DevTools Inspector (HTML tree + inspect element): the contract landed
-            // with these variants; the tree walk, the picker and the highlight are
-            // wired in src/inspector.rs (task: Inspector — tab side). Until then the
-            // tab answers them with nothing, which is legal: `InspectSelect` for an
-            // unknown id and an unopened pane are both no-ops.
-            ToTab::SetInspect { .. }
-            | ToTab::SetInspectPick { .. }
-            | ToTab::InspectSelect { .. }
-            | ToTab::InspectPickAt { .. } => {}
+            // The tab half of the DevTools Inspector (task: Inspector — tab side,
+            // see src/inspector.rs): the shell owns the pane, the folding and the
+            // selection it drives; we own the walk, the ids, the marker and the
+            // hit-tests. Dispatched outside the stdin block, like the find bar's
+            // commands, because the pane wants its first tree now — not on the
+            // tick after the shell's next message.
+            ToTab::SetInspect { open } => self.set_inspect(open),
+            ToTab::SetInspectPick { enabled } => self.set_inspect_pick(enabled),
+            ToTab::InspectSelect { node } => self.inspect_select(node),
+            ToTab::InspectPickAt { x, y } => self.inspect_pick_at(x, y),
             ToTab::DialogResponse { dialog_id, .. } => {
                 // A reply with no modal open: it either raced the tab-side
                 // cancel (shell quit mid-dialog) or is stale — nothing to
@@ -3315,6 +3621,21 @@ impl Tab {
     /// hover move only when it moved onto a different element.
     fn handle_pointer(&mut self, ev: &PointerEvent) -> bool {
         use ironsurf_common::MouseButton;
+
+        // **Inspect element** (task: Inspector — tab side): while the crosshair
+        // is armed the page sees nothing — no hover DOM events, no link or
+        // button actuation, no selection drag — because none of this reaches
+        // blitz. The tab reports the cursor instead ([`FromTab::InspectHover`])
+        // and a left release *is* the pick ([`FromTab::InspectPicked`], one per
+        // arming, then it disarms itself).
+        if self.inspect_pick {
+            if matches!(ev.kind, PointerKind::Up) && ev.button == MouseButton::Left {
+                self.inspect_pick_at(ev.x, ev.y);
+            } else {
+                self.inspect_hover_at(ev);
+            }
+            return true;
+        }
 
         let button = match ev.button {
             MouseButton::Left => MouseEventButton::Main,
@@ -6568,6 +6889,614 @@ mod tests {
         assert!(presented >= 1, "the software decoder presented no frames");
         assert_eq!(player.natural_size(), Some((960, 540)));
         assert!(!player.is_paused());
+    }
+
+    // -------------------------------------------------------------------
+    // DevTools Inspector — the tab half (task: Inspector — tab side)
+    //
+    // `src/inspector.rs` holds the pure half (the walk, the ids, the
+    // fingerprint, the marker). These drive a real `Tab` with the messages a real
+    // shell sends, in the order it sends them, and read the `FromTab` frames back
+    // off the tab's own output stream — so the contract is tested at its seam,
+    // not against a paraphrase of it.
+    // -------------------------------------------------------------------
+
+    use crate::inspector;
+    use ironsurf_common::{InspectKind, InspectSnapshot, MAX_INSPECT_NODES};
+
+    /// A page laid out for the inspector: a link and a nested box in the first
+    /// screenful (so a pick is unambiguous and a swallowed click is unmistakable
+    /// — the page itself records whether it felt a pointer), a tall gap and a row
+    /// below the fold for the "jump only when hidden" rule, and a script that
+    /// appends a row a quarter-second in, for the delta stream.
+    const INSPECT_PAGE: &str = r##"<!doctype html>
+<html lang="en"><head><title>I</title><style>body{margin:0;font:16px monospace}</style></head>
+<body>
+  <!-- a note between tags -->
+  <a id="l" href="#next" style="display:block;width:200px;height:40px">link</a>
+  <span id="o">untouched</span>
+  <div id="deep" style="display:block;padding:8px"><span id="span">x</span></div>
+  <div id="tall" style="height:1200px"></div>
+  <p id="far">far below</p>
+  <script>
+    document.getElementById('l').addEventListener('click', function () {
+      document.getElementById('o').textContent = 'seen';
+    });
+    setTimeout(function () {
+      var s = document.createElement('section');
+      s.id = 'born-late';
+      document.body.appendChild(s);
+    }, 250);
+  </script>
+</body></html>"##;
+
+    /// A capturing tab sized 800×600 with `INSPECT_PAGE` loaded — the state a
+    /// shell is in when its user hits F12.
+    fn inspect_tab(dir: &std::path::Path) -> (Tab, Arc<std::sync::Mutex<Vec<u8>>>) {
+        let (mut tab, sink) = capturing_tab(dir);
+        tab.handle_to_tab(ToTab::Resize {
+            width: 800,
+            height: 600,
+            scale: 1.0,
+        });
+        let url = write_page(dir, INSPECT_PAGE);
+        tab.navigate(&url, NavHistory::Fresh);
+        (tab, sink)
+    }
+
+    /// Every [`FromTab::InspectSnapshot`] a tab has shipped, oldest first.
+    fn snapshots_of(sink: &Arc<std::sync::Mutex<Vec<u8>>>) -> Vec<InspectSnapshot> {
+        emitted(sink)
+            .into_iter()
+            .filter_map(|msg| match msg {
+                FromTab::InspectSnapshot { snapshot } => Some(snapshot),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The newest tree the pane was sent.
+    fn latest_snapshot(sink: &Arc<std::sync::Mutex<Vec<u8>>>) -> InspectSnapshot {
+        snapshots_of(sink)
+            .pop()
+            .expect("the pane was sent a tree")
+    }
+
+    /// The `FromTab::InspectPicked` nodes, in order.
+    fn picks_of(sink: &Arc<std::sync::Mutex<Vec<u8>>>) -> Vec<u64> {
+        emitted(sink)
+            .into_iter()
+            .filter_map(|msg| match msg {
+                FromTab::InspectPicked { node } => Some(node),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The `FromTab::InspectHover` nodes, in order (`None` = the cursor stopped
+    /// answering, which is what disarming reports).
+    fn hovers_of(sink: &Arc<std::sync::Mutex<Vec<u8>>>) -> Vec<Option<u64>> {
+        emitted(sink)
+            .into_iter()
+            .filter_map(|msg| match msg {
+                FromTab::InspectHover { node } => Some(node),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The row of the element carrying `id="…"` — the way a test names an element
+    /// without knowing how many rows the walk produced before it.
+    fn row_of<'a>(snapshot: &'a InspectSnapshot, id_attr: &str) -> Option<&'a ironsurf_common::InspectNode> {
+        snapshot.nodes.iter().find(|node| {
+            node.kind == InspectKind::Element
+                && node
+                    .attrs
+                    .iter()
+                    .any(|(name, value)| name == "id" && value == id_attr)
+        })
+    }
+
+    /// The centre of the element's live box, in [`ToTab::Pointer`] space (window
+    /// CSS px): measured, not guessed, so the test survives a font change.
+    fn point_of(tab: &mut Tab, id_attr: &str) -> (f32, f32) {
+        let doc = tab.document_mut().expect("document loaded");
+        let id = doc
+            .get_element_by_id(id_attr)
+            .unwrap_or_else(|| panic!("#{id_attr} is in the page"));
+        let rect = inspector::box_rect(doc, doc.get_node(id).expect("node"))
+            .unwrap_or_else(|| panic!("#{id_attr} has a box"));
+        (
+            ((rect.x0 + rect.x1) / 2.0) as f32,
+            ((rect.y0 + rect.y1) / 2.0) as f32,
+        )
+    }
+
+    /// Root scroller position (the jump tests read the page, not the tab).
+    fn scroll_y(tab: &mut Tab) -> f64 {
+        tab.document_mut().expect("doc").viewport_scroll().y
+    }
+
+    #[test]
+    fn opening_the_inspector_ships_the_tree_and_reopening_ships_nothing() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let (mut tab, sink) = inspect_tab(dir.path());
+
+        // A closed pane costs the tab nothing at all: the document exists and no
+        // tree was ever shipped.
+        assert!(
+            snapshots_of(&sink).is_empty(),
+            "a closed inspector streams nothing"
+        );
+
+        tab.handle_to_tab(ToTab::SetInspect { open: true });
+        let shots = snapshots_of(&sink);
+        assert_eq!(shots.len(), 1, "opening the pane ships exactly one tree");
+        let shot = &shots[0];
+        assert_eq!(shot.generation, 1, "the first document is generation 1");
+        assert_eq!(shot.url, write_page_url(dir.path()).as_str(), "the page the pane shows");
+        assert_eq!(shot.selected, None, "nothing is selected yet");
+        assert!(!shot.truncated, "a small page is not truncated");
+
+        // One root row for the document (`depth 0` is the shell's indent unit),
+        // and the doctype is a row of the tree even though blitz's parser throws
+        // the text away — `<html>` hangs off the document beside it, not off it.
+        assert_eq!(shot.nodes[0].kind, InspectKind::Document);
+        assert_eq!(shot.nodes[0].parent, None);
+        assert_eq!(shot.nodes[0].depth, 0);
+        assert_eq!(shot.nodes[1].kind, InspectKind::Doctype);
+        assert_eq!(shot.nodes[1].text, "html");
+        assert_eq!(shot.nodes[1].parent, Some(0));
+        assert_eq!(shot.nodes[2].kind, InspectKind::Element);
+        assert_eq!(shot.nodes[2].tag, "html");
+        assert_eq!(shot.nodes[2].parent, Some(0), "<html> is a child of the document row");
+
+        // Row ids are dense positions, and anonymous layout boxes never get one:
+        // every row is something the serializer can show.
+        for (i, node) in shot.nodes.iter().enumerate() {
+            assert_eq!(node.id, i as u64, "row ids are positions");
+            assert!(
+                matches!(
+                    node.kind,
+                    InspectKind::Document
+                        | InspectKind::Doctype
+                        | InspectKind::Element
+                        | InspectKind::Text
+                        | InspectKind::Comment
+                ),
+                "every row is a real DOM node: {node:?}"
+            );
+            if node.kind != InspectKind::Element {
+                assert_eq!(node.tag, "", "only elements carry a tag: {node:?}");
+            }
+        }
+        // Text and comments are rows (the shell folds them), and `<head>` is not
+        // skipped: the pane shows a document, not just a body.
+        assert!(
+            shot.nodes.iter().any(|n| n.kind == InspectKind::Comment),
+            "the HTML comment between tags is a row"
+        );
+        assert!(
+            shot.nodes
+                .iter()
+                .any(|n| n.kind == InspectKind::Text && n.text == "link"),
+            "the link's text node is a row of its own"
+        );
+        assert!(shot.nodes.iter().any(|n| n.tag == "title"), "<head> children are rows");
+        assert!(
+            shot.nodes.iter().any(|n| n.tag == "script"),
+            "the <script> element is a row (its body is the text row under it)"
+        );
+
+        // Elements on screen carry live bounds; `#l` sits two levels under the
+        // root and its box is where the layout put it.
+        let link = row_of(shot, "l").expect("#l is a row");
+        assert_eq!(link.tag, "a");
+        assert_eq!(link.depth, 3, "document > html > body > a");
+        let bounds = link.bounds.expect("#l is laid out");
+        assert!(bounds.x < 1.0 && bounds.y < 1.0, "the link starts at the origin: {bounds:?}");
+        assert!((bounds.width - 200.0).abs() < 0.6, "width 200 CSS px: {bounds:?}");
+
+        // Reopening an open pane is not a re-request: no second tree.
+        tab.handle_to_tab(ToTab::SetInspect { open: true });
+        assert_eq!(
+            snapshots_of(&sink).len(),
+            1,
+            "open then open again ships one tree, not two"
+        );
+    }
+
+    /// `write_page` returns the URL string; tests need it as a URL to compare
+    /// against the snapshot's own `url` field.
+    fn write_page_url(dir: &std::path::Path) -> url::Url {
+        url::Url::from_file_path(dir.join("index.html")).expect("file url")
+    }
+
+    #[test]
+    fn a_new_document_renumbers_the_tree_and_drops_the_selection() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let (mut tab, sink) = inspect_tab(dir.path());
+        tab.handle_to_tab(ToTab::SetInspect { open: true });
+        let first = latest_snapshot(&sink);
+        let far = row_of(&first, "far").expect("#far is a row").id;
+        tab.handle_to_tab(ToTab::InspectSelect { node: Some(far) });
+        assert_eq!(tab.inspect_selected, Some(far));
+
+        // A second document with the same shape as the first: blitz recycles its
+        // node arena, so the row ids mean something else entirely now. The tab
+        // re-mints them from 0 under a new generation and drops the selection —
+        // which is the whole reason the shell must treat an unknown id as stale.
+        let second = dir.path().join("second.html");
+        std::fs::write(
+            &second,
+            INSPECT_PAGE.replace("<title>I</title>", "<title>II</title>")
+                .replace(r##"<p id="far">far below</p>"##, r##"<p id="far">still far</p>"##),
+        )
+        .expect("write second page");
+        tab.navigate(
+            url::Url::from_file_path(&second).expect("file url").as_str(),
+            NavHistory::Fresh,
+        );
+        let latest = latest_snapshot(&sink);
+        assert!(
+            latest.generation > first.generation,
+            "a navigation bumps the generation ({} → {})",
+            first.generation,
+            latest.generation
+        );
+        assert_eq!(latest.url, url::Url::from_file_path(&second).expect("file url").as_str());
+        assert_eq!(
+            latest.nodes[0].kind,
+            InspectKind::Document,
+            "the document row stays row 0 in a new generation"
+        );
+        assert_eq!(latest.nodes[1].kind, InspectKind::Doctype, "and the doctype row 1");
+        assert_eq!(latest.selected, None, "a fresh document has no selection");
+        assert_eq!(tab.inspect_selected, None);
+
+        // An id from the dead generation resolves to nothing: no marker, and the
+        // page does not move (contract: ignored, never an error).
+        let before = scroll_y(&mut tab);
+        tab.handle_to_tab(ToTab::InspectSelect {
+            node: Some(first.nodes.len() as u64 + 7),
+        });
+        assert!(
+            tab.inspect_highlights(1.0).is_empty(),
+            "a stale id paints nothing"
+        );
+        assert_eq!(scroll_y(&mut tab), before, "and scrolls nothing");
+    }
+
+    #[test]
+    fn inspect_element_picks_the_deepest_element_and_answers_with_it() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let (mut tab, sink) = inspect_tab(dir.path());
+        tab.handle_to_tab(ToTab::SetInspect { open: true });
+        let shot = latest_snapshot(&sink);
+        let span = row_of(&shot, "span").expect("#span is a row");
+        let deep = row_of(&shot, "deep").expect("#deep is a row");
+        assert_eq!(span.parent, Some(deep.id), "#span hangs off #deep in the tree");
+
+        // Pick the middle of the <span> nested in the padded <div>: the deepest
+        // ELEMENT answers — not its ancestor, and not the text node inside it.
+        let (x, y) = point_of(&mut tab, "span");
+        tab.handle_to_tab(ToTab::InspectPickAt { x, y });
+        assert_eq!(
+            picks_of(&sink).last().copied(),
+            Some(span.id),
+            "the deepest element at the point is the pick"
+        );
+        assert_ne!(span.id, deep.id);
+
+        // …answered with the same generation, carrying the new selection.
+        let after = latest_snapshot(&sink);
+        assert_eq!(after.generation, shot.generation, "a pick is not a new document");
+        assert_eq!(after.selected, Some(span.id));
+        assert_eq!(tab.inspect_selected, Some(span.id));
+
+        // And the marker is on the page: one content-box fill plus the outline
+        // band, measured where the element actually is.
+        let marks = tab.inspect_highlights(1.0);
+        assert_eq!(marks.len(), 5, "content fill + four outline edges");
+        assert_eq!(marks[0].1, inspector::COLOR_FILL, "the fill is the content box");
+        assert!(marks[0].0.contains(kurbo::Point::new(f64::from(x), f64::from(y))));
+        assert!(
+            marks[1..].iter().all(|(_, color)| *color == inspector::COLOR_OUTLINE),
+            "the band around the border box"
+        );
+
+        // The same hit-test the status bar and `document.elementFromPoint()` use:
+        // a point over the link picks the link, wherever its text lands.
+        let (x, y) = point_of(&mut tab, "l");
+        tab.handle_to_tab(ToTab::InspectPickAt { x, y });
+        let picks = picks_of(&sink);
+        assert_eq!(picks.len(), 2);
+        let shot = latest_snapshot(&sink);
+        assert_eq!(row_of(&shot, "l").expect("#l").id, picks[1]);
+
+        // A point off the page answers nothing — and says nothing either.
+        tab.handle_to_tab(ToTab::InspectPickAt {
+            x: 100_000.0,
+            y: 100_000.0,
+        });
+        assert_eq!(
+            picks_of(&sink).len(),
+            2,
+            "a point outside the viewport picks nothing and emits nothing"
+        );
+        assert!(
+            tab.inspect_highlights(1.0).len() <= 5,
+            "still only the one selection marked"
+        );
+    }
+
+    #[test]
+    fn the_armed_picker_swallows_the_page_and_reports_the_cursor() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let (mut tab, sink) = inspect_tab(dir.path());
+        tab.handle_to_tab(ToTab::SetInspect { open: true });
+        let shot = latest_snapshot(&sink);
+        let link = row_of(&shot, "l").expect("#l is a row").id;
+        let (x, y) = point_of(&mut tab, "l");
+
+        // Arming the picker is inert until the cursor moves somewhere.
+        tab.handle_to_tab(ToTab::SetInspectPick { enabled: true });
+        assert!(tab.inspect_pick);
+        assert!(hovers_of(&sink).is_empty(), "arming reports nothing");
+
+        // Move: the cursor's element is reported and painted.
+        tab.handle_to_tab(ptr(x, y, PointerKind::Move));
+        let hovers = hovers_of(&sink);
+        assert_eq!(hovers, vec![Some(link)], "the cursor names the link's row");
+        assert_eq!(tab.inspect_hover, Some(link));
+        assert_eq!(tab.inspect_selected, None, "hovering is not selecting");
+
+        // Motion within one element is not news: no second report.
+        tab.handle_to_tab(ptr(x + 4.0, y + 1.0, PointerKind::Move));
+        assert_eq!(
+            hovers_of(&sink).len(),
+            1,
+            "moving inside the same element stays quiet"
+        );
+
+        // Click the link with the crosshair armed: the page feels nothing. Its
+        // own click handler writes into #o, and it never runs.
+        tab.handle_to_tab(ptr(x, y, PointerKind::Down));
+        tab.handle_to_tab(ptr(x, y, PointerKind::Up));
+        let untouched = tab
+            .document_mut()
+            .and_then(|doc| text_of(doc, "#o"))
+            .unwrap_or_default();
+        assert_eq!(
+            untouched, "untouched",
+            "the page's click handler never ran — nothing reached blitz"
+        );
+        assert_eq!(
+            picks_of(&sink).last().copied(),
+            Some(link),
+            "the release was the pick"
+        );
+        assert!(!tab.inspect_pick, "one pick per arming: the crosshair disarms");
+
+        // Disarmed (the shell's Esc), the very same click goes to the engine.
+        tab.handle_to_tab(ptr(x, y, PointerKind::Move));
+        tab.handle_to_tab(ptr(x, y, PointerKind::Down));
+        tab.handle_to_tab(ptr(x, y, PointerKind::Up));
+        let seen = tab
+            .document_mut()
+            .and_then(|doc| text_of(doc, "#o"))
+            .unwrap_or_default();
+        assert_eq!(seen, "seen", "with the picker off, blitz takes the click");
+
+        // Re-arm, hover, then disarm: the hover report is taken back, and the
+        // selection the pick made survives.
+        tab.handle_to_tab(ToTab::SetInspectPick { enabled: true });
+        tab.handle_to_tab(ptr(x, y, PointerKind::Move));
+        let mut expected = hovers_of(&sink);
+        let before = expected.len();
+        assert_eq!(expected.last().copied(), Some(Some(link)));
+        tab.handle_to_tab(ToTab::SetInspectPick { enabled: false });
+        assert_eq!(tab.inspect_hover, None);
+        expected.truncate(before);
+        expected.push(None);
+        assert_eq!(
+            hovers_of(&sink),
+            expected,
+            "disarming says the cursor stopped answering"
+        );
+        assert_eq!(tab.inspect_selected, Some(link), "the pick's selection survives");
+        assert_eq!(tab.inspect_highlights(1.0).len(), 5, "and is the only marker");
+    }
+
+    #[test]
+    fn selecting_a_row_scrolls_only_when_the_page_hides_it() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let (mut tab, sink) = inspect_tab(dir.path());
+        tab.handle_to_tab(ToTab::SetInspect { open: true });
+        let shot = latest_snapshot(&sink);
+
+        // A row already fully on screen must not jump the page (contract).
+        let deep = row_of(&shot, "deep").expect("#deep is a row").id;
+        tab.handle_to_tab(ToTab::InspectSelect { node: Some(deep) });
+        assert_eq!(scroll_y(&mut tab), 0.0, "a visible row does not move the page");
+        assert_eq!(tab.inspect_selected, Some(deep), "but it is selected");
+        assert_eq!(tab.inspect_highlights(1.0).len(), 5, "and marked");
+
+        // The row below the fold does: select it and the page brings it up.
+        let far = row_of(&shot, "far").expect("#far is a row").id;
+        tab.handle_to_tab(ToTab::InspectSelect { node: Some(far) });
+        let y = scroll_y(&mut tab);
+        assert!(y > 0.0, "a hidden row scrolls the page to it (scroll_y {y})");
+        let doc = tab.document_mut().expect("doc");
+        let id = doc.get_element_by_id("far").expect("#far");
+        let rect = inspector::box_rect(doc, doc.get_node(id).expect("node")).expect("box");
+        assert!(
+            rect.y0 >= 0.0 && rect.y1 <= 600.0,
+            "after the jump it is fully visible: {rect:?}"
+        );
+
+        // Clearing the selection takes the marker off and leaves the page put.
+        tab.handle_to_tab(ToTab::InspectSelect { node: None });
+        assert_eq!(scroll_y(&mut tab), y, "clearing does not scroll");
+        assert!(tab.inspect_highlights(1.0).is_empty(), "and unmarks");
+
+        // The marker is re-measured from the stored node every frame, so it
+        // rides the scroll without the tree being walked again: wheel the page
+        // and the same selection's box moves with it, landing on the element's
+        // live box — and no snapshot is needed for it, or shipped.
+        tab.handle_to_tab(ToTab::InspectSelect { node: Some(deep) });
+        let shots = snapshots_of(&sink).len();
+        let before = tab.inspect_highlights(1.0);
+        tab.handle_to_tab(ToTab::Scroll(ScrollEvent {
+            x: 400.0,
+            y: 300.0,
+            delta_x: 0.0,
+            delta_y: 120.0,
+        }));
+        let after = tab.inspect_highlights(1.0);
+        assert_eq!(before.len(), 5);
+        assert_eq!(after.len(), 5);
+        assert_ne!(before[0].0.y0, after[0].0.y0, "the marker moved with the page");
+        assert_eq!(
+            snapshots_of(&sink).len(),
+            shots,
+            "scrolling is not a tree change: no snapshot for it"
+        );
+        assert_eq!(
+            after[0].0.x0, before[0].0.x0,
+            "the marker stayed on the element's own column as the page moved"
+        );
+        assert_eq!(after[0].0.width(), before[0].0.width(), "and kept its width");
+        // (The box moved because it is measured from the node every frame: a box
+        // remembered from the snapshot would still be at `before`.)
+    }
+
+    #[test]
+    fn the_open_pane_hears_a_dom_mutation_and_stays_quiet_when_nothing_moved() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let (mut tab, sink) = inspect_tab(dir.path());
+        tab.handle_to_tab(ToTab::SetInspect { open: true });
+        let before = latest_snapshot(&sink);
+        assert!(
+            !before.nodes.iter().any(|n| n.tag == "section"),
+            "the page's script has not run yet"
+        );
+
+        // A script appends a <section> 250 ms in. The next pump runs it, and the
+        // pane learns the tree moved — under the SAME generation, because a DOM
+        // mutation is not a navigation.
+        std::thread::sleep(std::time::Duration::from_millis(400));
+        tab.headless_pump();
+        let after = latest_snapshot(&sink);
+        assert!(
+            after.nodes.iter().any(|n| n.tag == "section"),
+            "createElement + appendChild reaches the pane"
+        );
+        assert_eq!(
+            after.generation, before.generation,
+            "a mutation is not a new document"
+        );
+        assert!(after.nodes.len() > before.nodes.len());
+        assert_eq!(after.nodes.len(), before.nodes.len() + 1, "one row was born");
+
+        // …and an idle page then says nothing at all: the walk still happens, the
+        // fingerprint keeps the wire quiet.
+        let quiet = snapshots_of(&sink).len();
+        for _ in 0..4 {
+            tab.headless_pump();
+        }
+        assert_eq!(
+            snapshots_of(&sink).len(),
+            quiet,
+            "an unchanged tree ships once, not per pump"
+        );
+
+        // Closing the pane drops the tab's half of the state and stops the stream.
+        tab.handle_to_tab(ToTab::SetInspect { open: false });
+        assert!(!tab.inspect_enabled);
+        assert!(tab.inspect_nodes.is_empty(), "closing drops the node handles");
+        assert_eq!(tab.inspect_selected, None);
+        assert!(tab.inspect_fp.is_none());
+        for _ in 0..3 {
+            tab.headless_pump();
+        }
+        assert_eq!(
+            snapshots_of(&sink).len(),
+            quiet,
+            "a closed pane is silent again"
+        );
+        // …and its ids are gone: even an id that existed a moment ago is inert.
+        tab.handle_to_tab(ToTab::InspectSelect { node: Some(1) });
+        assert!(tab.inspect_highlights(1.0).is_empty());
+    }
+
+    /// The caps in `ironsurf-common` are the tab's to honour: a page deeper or
+    /// wider than the contract allows is trimmed, flagged, and never a panic or a
+    /// message over the frame limit.
+    #[test]
+    fn an_enormous_document_is_trimmed_and_flagged_not_dropped() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        // One element with 40 attributes (the contract allows 24) and a value
+        // twice the length limit; then a tree of more rows than MAX_INSPECT_NODES.
+        let many_attrs = (0..40)
+            .map(|i| format!(r#" data-a{i}="{}""#, "v".repeat(60)))
+            .collect::<String>();
+        let long_value = "l".repeat(3 * ironsurf_common::MAX_INSPECT_ATTR_VALUE);
+        let mut html = format!(
+            r##"<!doctype html><html><head><title>Big</title></head><body><div {many_attrs} data-long="{long_value}" id="wide">"##
+        );
+        let rows_to_build = MAX_INSPECT_NODES + 64;
+        for _ in 0..rows_to_build {
+            html.push_str("<p>x</p>");
+        }
+        html.push_str("</div></body></html>");
+        let url = write_page(dir.path(), &html);
+
+        let (mut tab, sink) = capturing_tab(dir.path());
+        tab.handle_to_tab(ToTab::Resize {
+            width: 800,
+            height: 600,
+            scale: 1.0,
+        });
+        tab.navigate(&url, NavHistory::Fresh);
+        tab.handle_to_tab(ToTab::SetInspect { open: true });
+
+        let shot = latest_snapshot(&sink);
+        assert!(shot.truncated, "the walk stopped at the row cap");
+        assert_eq!(
+            shot.nodes.len(),
+            MAX_INSPECT_NODES,
+            "exactly the capped row count (the cap is the contract)"
+        );
+        // Every shipped row stays inside its own caps, whatever the page did.
+        assert!(
+            shot.nodes.iter().all(|n| n.attrs.len() <= ironsurf_common::MAX_INSPECT_ATTRS),
+            "attributes capped per element"
+        );
+        assert!(
+            shot.nodes
+                .iter()
+                .all(|n| n.text.chars().count() <= ironsurf_common::MAX_INSPECT_TEXT),
+            "content capped per row"
+        );
+        let wide = shot
+            .nodes
+            .iter()
+            .find(|n| n.kind == InspectKind::Element && n.tag == "div" && !n.attrs.is_empty())
+            .expect("the wide element's row");
+        assert_eq!(wide.attrs.len(), ironsurf_common::MAX_INSPECT_ATTRS);
+        assert!(wide
+            .attrs
+            .iter()
+            .all(|(_, value)| value.chars().count() <= ironsurf_common::MAX_INSPECT_ATTR_VALUE));
+        // The tree the shell gets is well-formed regardless: ids dense, every
+        // parent older than its child (so a pane can build it in one pass).
+        for (i, node) in shot.nodes.iter().enumerate() {
+            assert_eq!(node.id, i as u64);
+            if let Some(parent) = node.parent {
+                assert!(parent < node.id, "parents precede children: {node:?}");
+            }
+        }
     }
 }
 

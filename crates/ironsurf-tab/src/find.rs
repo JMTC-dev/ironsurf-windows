@@ -307,7 +307,7 @@ pub fn scroll_hit_into_view(doc: &mut BaseDocument, hit: &Hit, viewport_w: f64, 
 // tests
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     fn occurrences(hay: &str, needle: &str) -> Vec<String> {
@@ -350,7 +350,10 @@ mod tests {
 
     /// A settled document for the geometry/collect tests: the same flow the tab
     /// uses (parse with a viewport → resolve), no network, no window.
-    pub(super) fn document(html: &str) -> blitz_html::HtmlDocument {
+    ///
+    /// `pub(crate)` under `cfg(test)` because the Inspector's tests build their
+    /// documents the same way rather than growing a second harness.
+    pub(crate) fn document(html: &str) -> blitz_html::HtmlDocument {
         use blitz_dom::DocumentConfig;
         use blitz_traits::shell::{ColorScheme, Viewport};
         let mut doc = blitz_html::HtmlDocument::from_html(
