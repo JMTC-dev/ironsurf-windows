@@ -73,9 +73,13 @@ fn right_click_opens_the_menu_the_target_deserves_and_the_rows_act() {
             "Copy",
             "Copy link address",
             "Copy page address",
+            "⌖ Inspect Element",
         ],
         "empty clipboard ⇒ no Paste row yet"
     );
+    // Whatever was right-clicked, the tree of the page it landed in is
+    // reachable from the last row.
+    assert_eq!(labels(&ui).last().unwrap(), "⌖ Inspect Element");
     // The menu sits at the click point.
     assert_eq!(ui.get_menu_x(), 120.0);
     assert_eq!(ui.get_menu_y(), 60.0);
@@ -101,6 +105,7 @@ fn right_click_opens_the_menu_the_target_deserves_and_the_rows_act() {
             "Copy link address",
             "Paste",
             "Copy page address",
+            "⌖ Inspect Element",
         ]
     );
 

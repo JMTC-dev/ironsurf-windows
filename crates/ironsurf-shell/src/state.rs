@@ -365,6 +365,511 @@ impl Security {
     }
 }
 
+// ---- DevTools Inspector pane ----------------------------------------------
+//
+// The tab owns the document, the shell owns the presentation (ARCH §Developer
+// tools). What arrives on the wire is an [`ironsurf_common::InspectSnapshot`]:
+// a **flat** pre-order list — every node's children follow it in document
+// order, one deeper per level, so `depth` alone describes the tree and the ids
+// are positional handles (blitz recycles its own node ids, which is why the
+// `generation` counter says when to throw them away). Folding, selection, the
+// breadcrumb and the syntax colouring are all computed from that flat list
+// here, in pure Rust, and pushed to the UI as row/token *models* rather than
+// pre-formatted strings so the palette stays in the .slint file.
+
+use ironsurf_common::{InspectKind, InspectNode, InspectSnapshot};
+
+/// Token kinds: a row's markup is a `Vec<Tok>` of these, and `inspect-kind-color`
+/// in `ui/ironsurf.slint` maps each kind to one entry of the fixed colour table.
+pub const TOK_TEXT: u8 = 0; // near-white
+pub const TOK_TAG: u8 = 1; // orange
+pub const TOK_ATTR: u8 = 2; // blue
+pub const TOK_STR: u8 = 3; // green
+pub const TOK_PUNCT: u8 = 4; // grey — `<` `>` `/` `=` quotes
+pub const TOK_DANGER: u8 = 5; // red — `<script>`/`<style>`/`<head>` names, `data:` values
+/// Comment markup (drawn grey-italic).
+pub const TOK_COMMENT: u8 = 6;
+/// Doctype markup (drawn grey-italic).
+pub const TOK_DOCTYPE: u8 = 7;
+/// The value slot of an `id`/`class` attribute, which gets its own accent.
+pub const TOK_IDENT: u8 = 8;
+
+/// One syntax-highlighted token: `(text, kind)` — the contract's `Tok`.
+pub type Tok = (String, u8);
+
+#[inline]
+fn tok(text: impl Into<String>, kind: u8) -> Tok {
+    (text.into(), kind)
+}
+
+/// The quotes around an attribute value: `"` normally, `'` when the value
+/// already contains a `"` (a row is markup a human reads, never re-parsed).
+fn quote_attr(value: &str) -> (&'static str, &'static str) {
+    if value.contains('"') && !value.contains('\'') {
+        ("'", "'")
+    } else {
+        ("\"", "\"")
+    }
+}
+
+/// Tag names whose *contents* a reader should not skim past: the row is painted
+/// in the danger colour, the way a `data:` URL is.
+pub fn tag_is_dangerous(tag: &str) -> bool {
+    matches!(tag, "script" | "style" | "head")
+}
+
+/// Whether an attribute value is a `data:` URL — said in the danger colour
+/// rather than printed as ordinary green, because these are the values that
+/// hide a whole document (or a payload) in one attribute.
+pub fn value_is_dangerous(value: &str) -> bool {
+    value.trim_start().to_ascii_lowercase().starts_with("data:")
+}
+
+/// Element nodes are the only ones with a tag name, attributes and children.
+#[inline]
+pub fn dom_is_element(n: &InspectNode) -> bool {
+    n.kind == InspectKind::Element
+}
+
+/// Text nodes carry their (already collapsed and bounded) text in `text`.
+#[inline]
+pub fn dom_is_text(n: &InspectNode) -> bool {
+    n.kind == InspectKind::Text
+}
+
+/// Everything else: `#document`, `<!doctype html>`, `#comment`.
+#[inline]
+pub fn dom_is_other(n: &InspectNode) -> bool {
+    !dom_is_element(n) && !dom_is_text(n)
+}
+
+/// How many of the snapshot's nodes are elements — the number the Inspector
+/// button shows (text, comment and document nodes do not earn a count).
+pub fn dom_element_count(nodes: &[InspectNode]) -> usize {
+    nodes.iter().filter(|n| dom_is_element(n)).count()
+}
+
+fn shorten(s: &str, max: usize) -> &str {
+    let mut end = s.len().min(max);
+    while !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
+}
+
+/// A node's short name for the breadcrumb: `div#main`, `body`, `#text`, …
+/// (`id` first, else the first `class`, the way a reader finds a node they
+/// wrote CSS for).
+pub fn node_label(n: &InspectNode) -> String {
+    match n.kind {
+        InspectKind::Element => {
+            let mut s = n.tag.clone();
+            if let Some(id) = n.attrs.iter().find(|(k, _)| k == "id").map(|(_, v)| v.as_str()) {
+                if !id.is_empty() {
+                    s.push('#');
+                    s.push_str(shorten(id, 24));
+                }
+            } else if let Some(class) = n.attrs.iter().find(|(k, _)| k == "class").map(|(_, v)| v.as_str()) {
+                if let Some(first) = class.split_whitespace().next() {
+                    s.push('.');
+                    s.push_str(shorten(first, 24));
+                }
+            }
+            s
+        }
+        InspectKind::Text => "#text".into(),
+        InspectKind::Comment => "#comment".into(),
+        InspectKind::Document => "#document".into(),
+        InspectKind::Doctype => "<!doctype html>".into(),
+    }
+}
+
+/// The markup tokens for one row: `<div class="x">` broken into punctuation,
+/// tag, attribute and value tokens; text in the text colour; `<!-- … -->` and
+/// `<!doctype html>` in their own greys; dangerous tags and `data:` values in
+/// red. An element with nothing inside it also gets its `</tag>`.
+pub fn node_tokens(n: &InspectNode, has_children: bool) -> Vec<Tok> {
+    let mut out: Vec<Tok> = Vec::new();
+    let danger = dom_is_element(n) && tag_is_dangerous(&n.tag);
+    let name = if danger { TOK_DANGER } else { TOK_TAG };
+    match n.kind {
+        InspectKind::Element => {
+            out.push(tok("<", TOK_PUNCT));
+            out.push(tok(n.tag.clone(), name));
+            for (attr, value) in &n.attrs {
+                out.push(tok(format!(" {attr}"), TOK_ATTR));
+                out.push(tok("=", TOK_PUNCT));
+                let kind = if value_is_dangerous(value) {
+                    TOK_DANGER
+                } else if attr == "id" || attr == "class" {
+                    TOK_IDENT
+                } else {
+                    TOK_STR
+                };
+                let (open, close) = quote_attr(value);
+                out.push(tok(open, TOK_PUNCT));
+                out.push(tok(value.clone(), kind));
+                out.push(tok(close, TOK_PUNCT));
+            }
+            out.push(tok(">", TOK_PUNCT));
+            if !has_children {
+                out.push(tok("</", TOK_PUNCT));
+                out.push(tok(n.tag.clone(), name));
+                out.push(tok(">", TOK_PUNCT));
+            }
+        }
+        InspectKind::Text => out.push(tok(n.text.clone(), TOK_TEXT)),
+        InspectKind::Comment => {
+            out.push(tok("<!--", TOK_PUNCT));
+            out.push(tok(n.text.clone(), TOK_COMMENT));
+            out.push(tok("-->", TOK_PUNCT));
+        }
+        InspectKind::Document => out.push(tok("#document", TOK_PUNCT)),
+        InspectKind::Doctype => {
+            out.push(tok("<!", TOK_PUNCT));
+            out.push(tok(
+                if n.text.is_empty() { "doctype".into() } else { n.text.clone() },
+                TOK_DOCTYPE,
+            ));
+            out.push(tok(">", TOK_PUNCT));
+        }
+    }
+    out
+}
+
+/// One visible row of the Inspector tree (a folded-away node simply has no row).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct InspectorRow {
+    /// The snapshot node this row stands for (a positional handle).
+    pub node: u64,
+    /// Nesting level, for the `depth × 12px` indent.
+    pub depth: usize,
+    /// The row's markup as syntax-highlighted tokens.
+    pub toks: Vec<Tok>,
+    /// Something inside this node: the row gets a `+/−` twisty.
+    pub has_children: bool,
+    pub collapsed: bool,
+    pub selected: bool,
+    /// Comments and the doctype are drawn italic.
+    pub italic: bool,
+}
+
+/// The Inspector pane's whole view-model for **one tab**: the tree the tab last
+/// sent, plus everything the shell owns on top of it — which nodes are folded,
+/// which one is selected (and therefore what the breadcrumb says), whether
+/// *inspect element* is armed, and whether a tree has been asked for but not
+/// answered yet.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct InspectorUi {
+    snapshot: Option<InspectSnapshot>,
+    selected: Option<u64>,
+    /// Nodes the reader folded shut.
+    collapsed: Vec<u64>,
+    /// ⌖ *inspect element* armed for this tab.
+    pick: bool,
+    /// A tree was asked for (`ToTab::SetInspect { open: true }` or
+    /// `ToTab::InspectPickAt`) and no snapshot has landed since — the pane
+    /// shows its honest empty state instead of a blank rectangle.
+    pending: bool,
+}
+
+impl InspectorUi {
+    /// The tree, if the tab has sent one.
+    pub fn snapshot(&self) -> Option<&InspectSnapshot> {
+        self.snapshot.as_ref()
+    }
+
+    /// File a snapshot. Ids are positional, so a page that changed under the
+    /// pane can make any of them mean something else: folds that no longer name
+    /// a node are dropped, and a new `generation` re-takes the selection from
+    /// the tab (`InspectSnapshot::selected`) instead of guessing.
+    pub fn set_snapshot(&mut self, snapshot: InspectSnapshot) {
+        let new_generation = self
+            .snapshot
+            .as_ref()
+            .is_none_or(|s| s.generation != snapshot.generation);
+        let keep = self.selected;
+        self.pending = false;
+        self.snapshot = Some(snapshot);
+        let snap = self.snapshot.as_ref().expect("just set");
+        self.collapsed.retain(|id| snap.nodes.iter().any(|n| n.id == *id));
+        let carried = keep.filter(|id| !new_generation && snap.nodes.iter().any(|n| n.id == *id));
+        self.selected = carried
+            .or(snap.selected)
+            .or_else(|| snap.nodes.first().map(|n| n.id));
+    }
+
+    /// Forget the tree — the pane closed, or the tab it described is gone. The
+    /// fold set goes with it; the pick state does not (that is the tab's ⌖).
+    pub fn clear_tree(&mut self) {
+        self.snapshot = None;
+        self.selected = None;
+        self.collapsed.clear();
+        self.pending = true;
+    }
+
+    /// ⌖ armed for this tab?
+    pub fn pick(&self) -> bool {
+        self.pick
+    }
+
+    pub fn set_pick(&mut self, pick: bool) {
+        self.pick = pick;
+    }
+
+    /// A tree was asked for and has not arrived.
+    pub fn pending(&self) -> bool {
+        self.pending
+    }
+
+    /// Say a tree is about to be asked for (the pane opened, a pick was made).
+    pub fn expect_tree(&mut self) {
+        self.pending = true;
+    }
+
+    /// The node the breadcrumb describes.
+    pub fn selected(&self) -> Option<u64> {
+        self.selected
+    }
+
+    /// Select a node by id. An id the tree does not contain is "the snapshot is
+    /// stale", never a guess, so it is ignored; a real selection unfolds every
+    /// collapsed ancestor, or the row the reader clicked would stay hidden.
+    pub fn select(&mut self, node: u64) {
+        let Some(index) = self.index_of(node) else { return };
+        self.selected = Some(node);
+        for a in self.ancestor_ids(index) {
+            self.collapsed.retain(|c| *c != a);
+        }
+    }
+
+    /// Fold or unfold one node's subtree. Returns the node's new folded state —
+    /// `false` for a node with nothing inside it (a leaf has no subtree to
+    /// hide, so its row shows no twisty and its twisty is not clickable).
+    pub fn toggle_fold(&mut self, node: u64) -> bool {
+        let Some(i) = self.index_of(node) else { return false };
+        let has_children = self
+            .snapshot
+            .as_ref()
+            .and_then(|s| s.nodes.get(i + 1).map(|nx| nx.depth > s.nodes[i].depth))
+            .unwrap_or(false);
+        if !has_children {
+            return false;
+        }
+        match self.collapsed.iter().position(|c| *c == node) {
+            Some(i) => {
+                self.collapsed.remove(i);
+                false
+            }
+            None => {
+                self.collapsed.push(node);
+                true
+            }
+        }
+    }
+
+    /// Nodes in the tree (text and comments included).
+    pub fn node_count(&self) -> usize {
+        self.snapshot.as_ref().map(|s| s.nodes.len()).unwrap_or(0)
+    }
+
+    /// Elements in the tree — what the Inspector button counts.
+    pub fn element_count(&self) -> usize {
+        self.snapshot
+            .as_ref()
+            .map(|s| dom_element_count(&s.nodes))
+            .unwrap_or(0)
+    }
+
+    /// The tree hit `MAX_INSPECT_NODES`: the pane says so as a dim last row.
+    pub fn truncated(&self) -> bool {
+        self.snapshot.as_ref().is_some_and(|s| s.truncated)
+    }
+
+    pub fn generation(&self) -> Option<u64> {
+        self.snapshot.as_ref().map(|s| s.generation)
+    }
+
+    /// The document address the snapshot was taken at (the tab stamps it).
+    pub fn address(&self) -> Option<&str> {
+        self.snapshot.as_ref().map(|s| s.url.as_str())
+    }
+
+    fn index_of(&self, node: u64) -> Option<usize> {
+        self.snapshot.as_ref()?.nodes.iter().position(|n| n.id == node)
+    }
+
+    fn node_at(&self, index: usize) -> Option<&InspectNode> {
+        self.snapshot.as_ref()?.nodes.get(index)
+    }
+
+    /// `(root, node)` ancestor ids of the node at `index`, root first.
+    fn ancestor_ids(&self, index: usize) -> Vec<u64> {
+        let snap = match self.snapshot.as_ref() {
+            Some(s) => s,
+            None => return Vec::new(),
+        };
+        let mut out: Vec<u64> = Vec::new();
+        let mut parent = snap.nodes[index].parent;
+        while let Some(p) = parent {
+            if out.len() > snap.nodes.len() {
+                break; // a cycle would be a walker bug, not a tree
+            }
+            match snap.nodes.iter().position(|n| n.id == p) {
+                Some(i) => {
+                    out.push(snap.nodes[i].id);
+                    parent = snap.nodes[i].parent;
+                }
+                None => break, // a parent we cannot find is a stale snapshot
+            }
+        }
+        out.reverse();
+        out
+    }
+
+    /// The selected node's ancestor chain ending with the node itself, root
+    /// first — the breadcrumb `html › body › div#main`.
+    pub fn crumb(&self) -> Vec<(u64, String)> {
+        let index = match self.selected.and_then(|id| self.index_of(id)) {
+            Some(i) => i,
+            None => return Vec::new(),
+        };
+        let mut ids = self.ancestor_ids(index);
+        let last = match self.node_at(index) {
+            Some(n) => n.id,
+            None => return Vec::new(),
+        };
+        ids.push(last);
+        ids.into_iter().filter_map(|id| self.id_label(id)).collect()
+    }
+
+    fn id_label(&self, id: u64) -> Option<(u64, String)> {
+        let index = self.index_of(id)?;
+        let n = self.node_at(index)?;
+        Some((id, node_label(n)))
+    }
+
+    /// The breadcrumb as the pane wants it: one clickable entry per crumb with
+    /// its name already split the way the tree splits it, so `div#main` shows a
+    /// tag colour and an id/class colour instead of one flat label.
+    pub fn crumb_items(&self) -> Vec<(u64, String, String)> {
+        self.crumb()
+            .into_iter()
+            .filter_map(|(id, label)| {
+                let index = self.index_of(id)?;
+                let n = self.node_at(index)?;
+                if n.kind == InspectKind::Element {
+                    let ident = label.strip_prefix(n.tag.as_str()).unwrap_or("").to_string();
+                    Some((id, n.tag.clone(), ident))
+                } else {
+                    Some((id, label, String::new()))
+                }
+            })
+            .collect()
+    }
+
+    /// How many subtrees the reader folded shut. Together with the generation,
+    /// node count and selection this says whether the rendered tree is still
+    /// current (see `app::Core::write_devtools`).
+    pub fn collapsed_len(&self) -> usize {
+        self.collapsed.len()
+    }
+
+    /// The breadcrumb with its own syntax colours: `div#main` is a tag token
+    /// plus an id/class token, not one flat string.
+    pub fn crumb_path(&self) -> Vec<Tok> {
+        let mut out: Vec<Tok> = Vec::new();
+        for (id, label) in self.crumb() {
+            let n = match self.index_of(id).and_then(|i| self.node_at(i)) {
+                Some(n) => n,
+                None => continue,
+            };
+            if n.kind == InspectKind::Element {
+                out.push(tok(n.tag.clone(), if tag_is_dangerous(&n.tag) { TOK_DANGER } else { TOK_TAG }));
+                if let Some(rest) = label.strip_prefix(n.tag.as_str()) {
+                    if !rest.is_empty() {
+                        out.push(tok(rest.to_string(), TOK_IDENT));
+                    }
+                }
+            } else {
+                out.push(tok(label, TOK_PUNCT));
+            }
+        }
+        out
+    }
+
+    /// The tree as visible rows, in document order: a node appears when none of
+    /// its ancestors is folded. Whitespace-only text nodes never get a row (the
+    /// tab does not send them; a stray one would be an invisible row a reader
+    /// could click).
+    pub fn rows(&self) -> Vec<InspectorRow> {
+        let snap = match self.snapshot.as_ref() {
+            Some(s) => s,
+            None => return Vec::new(),
+        };
+        let mut rows: Vec<InspectorRow> = Vec::new();
+        // While set, every node at least this deep belongs to a folded subtree.
+        let mut hide_below: Option<usize> = None;
+        for (i, n) in snap.nodes.iter().enumerate() {
+            if let Some(depth) = hide_below {
+                if n.depth >= depth {
+                    continue;
+                }
+                hide_below = None;
+            }
+            let has_children = snap.nodes.get(i + 1).is_some_and(|nx| nx.depth > n.depth);
+            if dom_is_text(n) && n.text.trim().is_empty() {
+                continue;
+            }
+            let collapsed = has_children && self.collapsed.contains(&n.id);
+            if collapsed {
+                hide_below = Some(n.depth + 1);
+            }
+            rows.push(InspectorRow {
+                node: n.id,
+                depth: n.depth,
+                toks: node_tokens(n, has_children),
+                has_children,
+                collapsed,
+                selected: self.selected == Some(n.id),
+                italic: matches!(n.kind, InspectKind::Comment | InspectKind::Doctype),
+            });
+        }
+        rows
+    }
+
+    /// What the pane says when there is nothing to show — never a blank
+    /// rectangle, always the actual reason.
+    pub fn empty_hint(&self) -> String {
+        if self.pending {
+            "asking the tab for its document tree \u{2026}".into()
+        } else if self.snapshot.is_none() {
+            "no document tree yet \u{2014} the tab snapshots when this pane opens".into()
+        } else {
+            "the tab sent a tree with no nodes".into()
+        }
+    }
+
+    /// The pane's header line: `Inspector — <title> · 7 element(s)`, with a
+    /// truncation note when the tree was cut short. Empty with no tree, so the
+    /// .slint shows only the dim hint then.
+    pub fn summary(&self, heading: Option<&str>) -> String {
+        if self.snapshot.is_none() {
+            return String::new();
+        }
+        let address = self.address().filter(|u| !u.trim().is_empty());
+        let mut s = match heading.filter(|t| !t.trim().is_empty()).or(address) {
+            Some(t) => format!("Inspector \u{2014} {t}"),
+            None => "Inspector".into(),
+        };
+        s.push_str(&format!(" \u{b7} {} element(s)", self.element_count()));
+        if self.truncated() {
+            s.push_str(" \u{b7} truncated");
+        }
+        s
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -719,5 +1224,263 @@ mod tests {
         assert_eq!(Security::of(""), Security::None);
         assert_eq!(Security::Https.render().0, "⛬");
         assert!(Security::InsecureHttp.render().0.contains("http"));
+    }
+
+    // ---- Inspector pane view-model ----------------------------------------
+
+    fn ins(
+        id: u64,
+        parent: Option<u64>,
+        depth: usize,
+        kind: InspectKind,
+        tag: &str,
+        text: &str,
+        attrs: &[(&str, &str)],
+    ) -> InspectNode {
+        InspectNode {
+            id,
+            parent,
+            kind,
+            tag: tag.into(),
+            attrs: attrs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect(),
+            text: text.into(),
+            depth,
+            bounds: None,
+        }
+    }
+
+    /// The tree every Inspector test reads: a document, its doctype, a
+    /// `<head>` with a title, a `<body id=main class="page home">` holding a
+    /// `<div data-src="data:…">` with text, a comment, and a `<script>`.
+    fn fixture_tree() -> InspectSnapshot {
+        InspectSnapshot {
+            generation: 1,
+            url: "https://example.com/".into(),
+            selected: Some(6),
+            truncated: false,
+            nodes: vec![
+                ins(0, None, 0, InspectKind::Document, "", "", &[]),
+                ins(1, Some(0), 1, InspectKind::Doctype, "", "html", &[]),
+                ins(2, Some(0), 1, InspectKind::Element, "html", "", &[]),
+                ins(3, Some(2), 2, InspectKind::Element, "head", "", &[]),
+                ins(4, Some(3), 3, InspectKind::Element, "title", "", &[]),
+                ins(5, Some(4), 4, InspectKind::Text, "", "Inspector fixture", &[]),
+                ins(6, Some(2), 2, InspectKind::Element, "body", "", &[("id", "main"), ("class", "page home")]),
+                ins(7, Some(6), 3, InspectKind::Element, "div", "", &[("data-src", "data:image/png;base64,AAAA")]),
+                ins(8, Some(7), 4, InspectKind::Text, "", "hello", &[]),
+                ins(9, Some(6), 3, InspectKind::Comment, "", " keep the footer ", &[]),
+                ins(10, Some(2), 2, InspectKind::Element, "script", "", &[("src", "app.js")]),
+            ],
+        }
+    }
+
+    fn ui_with_tree() -> InspectorUi {
+        let mut ui = InspectorUi::default();
+        ui.expect_tree();
+        ui.set_snapshot(fixture_tree());
+        ui
+    }
+
+    #[test]
+    fn dom_helpers_split_the_kinds_and_count_elements() {
+        let snap = fixture_tree();
+        let elements = snap.nodes.iter().filter(|n| dom_is_element(n)).count();
+        assert_eq!(elements, 6, "html head title body div script");
+        assert_eq!(dom_element_count(&snap.nodes), elements);
+        assert!(dom_is_text(&snap.nodes[5]));
+        assert!(dom_is_other(&snap.nodes[0]) && dom_is_other(&snap.nodes[1]) && dom_is_other(&snap.nodes[9]));
+        assert!(!dom_is_other(&snap.nodes[6]));
+    }
+
+    #[test]
+    fn a_row_is_markup_broken_into_colour_kinds() {
+        let body = &fixture_tree().nodes[6];
+        let toks = node_tokens(body, true);
+        let kinds: Vec<( &str, u8)> = toks.iter().map(|(t, k)| (t.as_str(), *k)).collect();
+        assert_eq!(
+            kinds,
+            vec![
+                ("<", TOK_PUNCT),
+                ("body", TOK_TAG),
+                (" id", TOK_ATTR),
+                ("=", TOK_PUNCT),
+                ("\"", TOK_PUNCT),
+                ("main", TOK_IDENT), // `id`/`class` values get their own accent
+                ("\"", TOK_PUNCT),
+                (" class", TOK_ATTR),
+                ("=", TOK_PUNCT),
+                ("\"", TOK_PUNCT),
+                ("page home", TOK_IDENT),
+                ("\"", TOK_PUNCT),
+                (">", TOK_PUNCT),
+            ],
+            "an element with children stops at the closing angle bracket"
+        );
+
+        // An empty element shows its closing tag; a `<script>` is a danger colour.
+        let script = node_tokens(&fixture_tree().nodes[10], false);
+        let rendered: String = script.iter().map(|(t, _)| t.as_str()).collect();
+        assert_eq!(rendered, "<script src=\"app.js\"></script>");
+        assert_eq!(script[1].1, TOK_DANGER, "the tag name of <script> is red");
+        assert_eq!(script[2].1, TOK_ATTR);
+        assert_eq!(script[5].1, TOK_STR, "an ordinary value stays green");
+
+        // …and so is a `data:` URL, wherever it hides.
+        let div = node_tokens(&fixture_tree().nodes[7], true);
+        assert!(
+            div.iter().any(|(t, k)| t == "data:image/png;base64,AAAA" && *k == TOK_DANGER),
+            "data: URLs are painted in the danger colour: {div:?}"
+        );
+    }
+
+    #[test]
+    fn comments_doctypes_and_text_get_their_own_colours() {
+        let snap = fixture_tree();
+        let comment = node_tokens(&snap.nodes[9], false);
+        assert_eq!(
+            comment.iter().map(|(t, k)| (t.as_str(), *k)).collect::<Vec<_>>(),
+            vec![("<!--", TOK_PUNCT), (" keep the footer ", TOK_COMMENT), ("-->", TOK_PUNCT)]
+        );
+        let doctype = node_tokens(&snap.nodes[1], false);
+        assert_eq!(
+            doctype.iter().map(|(t, k)| (t.as_str(), *k)).collect::<Vec<_>>(),
+            vec![("<!", TOK_PUNCT), ("html", TOK_DOCTYPE), (">", TOK_PUNCT)]
+        );
+        let text = node_tokens(&snap.nodes[8], false);
+        assert_eq!(text, vec![("hello".to_string(), TOK_TEXT)]);
+    }
+
+    #[test]
+    fn folding_is_a_shell_side_view_over_the_flat_list() {
+        let mut ui = ui_with_tree();
+        assert_eq!(ui.rows().len(), 11, "nothing folded: every node is a row");
+        let twisties: Vec<u64> = ui.rows().iter().filter(|r| r.has_children).map(|r| r.node).collect();
+        assert_eq!(twisties, vec![0, 2, 3, 4, 6, 7], "leaves have no +/−");
+
+        assert!(ui.toggle_fold(6), "body folds");
+        let rows = ui.rows();
+        assert_eq!(rows.len(), 8, "body's three descendants disappear");
+        assert_eq!(rows.iter().find(|r| r.node == 6).map(|r| (r.collapsed, r.has_children)), Some((true, true)));
+        assert!(!rows.iter().any(|r| r.node == 7 || r.node == 8 || r.node == 9));
+
+        assert!(!ui.toggle_fold(6), "the same twisty unfolds");
+        assert_eq!(ui.rows().len(), 11);
+        // Folding a leaf is not a thing, and a stale id folds nothing.
+        assert!(!ui.toggle_fold(5));
+        assert!(!ui.toggle_fold(999));
+    }
+
+    #[test]
+    fn selecting_a_row_rewrites_the_breadcrumb_and_unfolds_it() {
+        let mut ui = ui_with_tree();
+        // The tab's own selection arrives with the snapshot.
+        assert_eq!(ui.selected(), Some(6));
+        let crumb = ui.crumb();
+        let labels: Vec<&str> = crumb.iter().map(|(_, l)| l.as_str()).collect();
+        assert_eq!(labels, ["#document", "html", "body#main"], "root first");
+
+        ui.select(8);
+        let labels: Vec<String> = ui.crumb().into_iter().map(|(_, l)| l).collect();
+        assert_eq!(labels, ["#document", "html", "body#main", "div", "#text"]);
+
+        // A folded ancestor opens up, or the reader would have selected a row
+        // they cannot see.
+        ui.toggle_fold(2);
+        assert!(ui.rows().iter().all(|r| r.node <= 2));
+        ui.select(7);
+        assert!(ui.rows().iter().any(|r| r.node == 7), "html unfolded for the selection");
+        assert!(ui.rows().iter().find(|r| r.node == 7).map(|r| r.selected).unwrap_or(false));
+
+        // An id the snapshot does not contain is a stale tree, never a guess.
+        ui.select(4242);
+        assert_eq!(ui.selected(), Some(7));
+        assert_eq!(ui.crumb().len(), 4);
+    }
+
+    #[test]
+    fn the_breadcrumb_keeps_the_syntax_colours() {
+        let ui = ui_with_tree();
+        let path = ui.crumb_path();
+        let rendered: String = path.iter().map(|(t, _)| t.as_str()).collect();
+        assert_eq!(rendered, "#documenthtmlbody#main");
+        assert_eq!(path[1], ("html".to_string(), TOK_TAG));
+        assert_eq!(path[2], ("body".to_string(), TOK_TAG));
+        assert_eq!(path[3], ("#main".to_string(), TOK_IDENT), "the id is its own token");
+    }
+
+    #[test]
+    fn a_node_without_an_id_is_labelled_by_its_first_class() {
+        let mut ui = ui_with_tree();
+        ui.select(7);
+        assert_eq!(ui.crumb().last().map(|(_, l)| l.as_str()), Some("div"));
+        let mut div_class = fixture_tree();
+        div_class.nodes[7].attrs.push(("class".into(), "card wide".into()));
+        ui.set_snapshot(div_class);
+        ui.select(7);
+        assert_eq!(ui.crumb().last().map(|(_, l)| l.as_str()), Some("div.card"));
+    }
+
+    #[test]
+    fn a_new_generation_replaces_the_selection_the_tab_chose() {
+        let mut ui = ui_with_tree();
+        ui.select(8);
+        let mut next = fixture_tree();
+        next.generation = 2;
+        next.selected = Some(10);
+        next.nodes.truncate(4); // a shorter document: old ids are now nothing
+        ui.set_snapshot(next);
+        assert_eq!(ui.selected(), Some(10), "the tab's selection, not a stale id");
+        assert_eq!(ui.generation(), Some(2));
+        assert_eq!(ui.element_count(), 2, "html head");
+        assert_eq!(ui.rows().len(), 4);
+    }
+
+    #[test]
+    fn counts_and_the_truncation_notice_come_from_the_snapshot() {
+        let mut ui = ui_with_tree();
+        assert_eq!(ui.node_count(), 11);
+        assert_eq!(ui.element_count(), 6, "the pane counts elements, not text nodes");
+        assert!(!ui.truncated());
+        assert!(ui.summary(Some("Fixture")).contains("6 element(s)"));
+
+        let mut cut = fixture_tree();
+        cut.truncated = true;
+        ui.set_snapshot(cut);
+        assert!(ui.truncated());
+        assert!(ui.summary(None).ends_with("truncated"), "{}", ui.summary(None));
+    }
+
+    #[test]
+    fn the_pane_never_shows_a_blank_rectangle() {
+        let mut ui = InspectorUi::default();
+        assert!(ui.rows().is_empty());
+        assert!(ui.summary(None).is_empty());
+        let hint = ui.empty_hint();
+        assert!(hint.contains("no document tree yet"), "{hint}");
+
+        ui.expect_tree();
+        assert!(ui.pending());
+        assert!(ui.empty_hint().contains("asking the tab"), "{}", ui.empty_hint());
+
+        ui.set_snapshot(InspectSnapshot { generation: 3, url: "about:blank".into(), nodes: vec![], selected: None, truncated: false });
+        assert!(!ui.pending(), "the snapshot answered");
+        assert!(ui.empty_hint().contains("no nodes"), "{}", ui.empty_hint());
+
+        // Closing the pane keeps ⌖ but drops the tree.
+        ui.set_snapshot(fixture_tree());
+        ui.set_pick(true);
+        ui.clear_tree();
+        assert!(ui.pending() && ui.snapshot().is_none() && ui.pick());
+    }
+
+    #[test]
+    fn whitespace_only_text_never_earns_a_row() {
+        let mut snap = fixture_tree();
+        // The tab drops these; a stray one still must not be an invisible row.
+        snap.nodes.push(ins(11, Some(6), 3, InspectKind::Text, "", "  \n ", &[]));
+        let mut ui = InspectorUi::default();
+        ui.set_snapshot(snap);
+        assert_eq!(ui.rows().len(), 11);
+        assert!(!ui.rows().iter().any(|r| r.node == 11));
     }
 }

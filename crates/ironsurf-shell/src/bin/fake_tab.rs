@@ -8,7 +8,7 @@ use std::io::BufReader;
 
 use ironsurf_common::{
     read_frame, write_frame, ContextAction, ContextTarget, ContainerId, CursorIcon, DialogKind,
-    FromTab, MouseButton, PointerKind, TabId, ToTab,
+    FromTab, InspectKind, InspectNode, InspectSnapshot, MouseButton, PointerKind, TabId, ToTab,
 };
 
 /// The fake tab's "page": the text its find-in-page searches, standing in for
@@ -46,6 +46,10 @@ fn main() {
     let mut dialog_feed = false;
     let mut cursor = false;
     let mut expect_userscripts = false;
+    // Inspector harness (task: Inspector — shell side): counts every
+    // `ToTab::SetInspect` this fake receives, so a test can prove the shell asks
+    // for a document once when the pane opens and never on a redraw.
+    let mut inspect_streamed = 0u32;
     // User-Agent-switcher harness (task: per-container UA): the launch
     // `--user-agent` is this fake tab's *initial* current value (exactly how
     // the real tab seeds its UA cell), and with `--expect-user-agent` every
@@ -430,11 +434,20 @@ fn main() {
             // tab would at best — an empty tree of a blank document, and status-line
             // echoes that let the shell-side tests prove the wiring fires.
             ToTab::SetInspect { open } => {
+                inspect_streamed += 1;
                 if open {
                     emit(FromTab::InspectSnapshot {
-                        snapshot: ironsurf_common::InspectSnapshot::default(),
+                        snapshot: fake_document(&url, tab_id, None),
                     });
                 }
+                // Counted echo: the shell-side tests prove the pane asks for a
+                // document once when it opens and never again on a redraw.
+                emit(FromTab::StatusText {
+                    text: Some(format!(
+                        "inspect-stream:{}:{inspect_streamed}",
+                        if open { "on" } else { "off" }
+                    )),
+                });
             }
             ToTab::SetInspectPick { enabled } => emit(FromTab::StatusText {
                 text: Some(format!("pick:{}", if enabled { "on" } else { "off" })),
@@ -442,9 +455,19 @@ fn main() {
             ToTab::InspectSelect { node } => emit(FromTab::StatusText {
                 text: Some(format!("select:{}", node.map(|n| n.to_string()).unwrap_or("-".into()))),
             }),
-            ToTab::InspectPickAt { x, y } => emit(FromTab::StatusText {
-                text: Some(format!("pick-at:{x},{y}")),
-            }),
+            // …and answering "what is under this point" the way the real tab
+            // does: highlight it, send the same generation carrying the new
+            // selection, answer with `InspectPicked`, disarm.
+            ToTab::InspectPickAt { x, y } => {
+                emit(FromTab::StatusText {
+                    text: Some(format!("pick-at:{x},{y}")),
+                });
+                let hit = inspect_base(tab_id) + 6;
+                emit(FromTab::InspectSnapshot {
+                    snapshot: fake_document(&url, tab_id, Some(hit)),
+                });
+                emit(FromTab::InspectPicked { node: hit });
+            }
             // Userscripts (task: userscript execution): only the REAL tab runs
             // them; this fake has no JS engine, so the set is accepted and
             // dropped. The point is that the message never breaks the pump.
@@ -599,6 +622,46 @@ fn announce(emit: &mut impl FnMut(FromTab), url: &str, with_nav_history: bool) {
         can_go_forward: false,
     });
     emit(FromTab::LoadingChanged { loading: false });
+}
+
+/// Node ids of this fake tab's scripted document. Offset by tab id so a test
+/// with two tabs can tell whose tree the window is painting.
+fn inspect_base(tab: TabId) -> u64 {
+    u64::from(tab.0) * 1000
+}
+
+/// The scripted document the Inspector pane shows: `document > html > (head >
+/// title > text)` and `(body > p > text)`, with this tab's URL as the title's
+/// text so the pane's summary names the tab it came from. `selected` is what the
+/// tab has highlighted, reported back exactly as the real tab reports it.
+fn fake_document(url: &str, tab: TabId, selected: Option<u64>) -> InspectSnapshot {
+    let b = inspect_base(tab);
+    let node = |id: u64, parent: Option<u64>, depth: usize, kind: InspectKind, tag: &str, text: &str, attrs: &[(&str, &str)]| InspectNode {
+        id: b + id,
+        parent: parent.map(|p| b + p),
+        kind,
+        tag: tag.into(),
+        attrs: attrs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect(),
+        text: text.into(),
+        depth,
+        bounds: None,
+    };
+    InspectSnapshot {
+        generation: 1,
+        url: url.into(),
+        selected,
+        truncated: false,
+        nodes: vec![
+            node(0, None, 0, InspectKind::Document, "", "", &[]),
+            node(1, Some(0), 1, InspectKind::Element, "html", "", &[]),
+            node(2, Some(1), 2, InspectKind::Element, "head", "", &[("lang", "en")]),
+            node(3, Some(2), 3, InspectKind::Element, "title", "", &[]),
+            node(4, Some(3), 4, InspectKind::Text, "", &format!("Fake — {url}"), &[]),
+            node(5, Some(1), 2, InspectKind::Element, "body", "", &[("id", "main")]),
+            node(6, Some(5), 3, InspectKind::Element, "p", "", &[("class", "note")]),
+            node(7, Some(6), 4, InspectKind::Text, "", "fake body text", &[]),
+        ],
+    }
 }
 
 fn frame(size: (u32, u32)) -> FromTab {

@@ -31,13 +31,13 @@ use crate::archive;
 use crate::archive_server::{self, ServeEvent, ServeHandle, Spec};
 use crate::classify::classify_input;
 use crate::keymap::{self, Shortcut};
-use crate::state::TabState;
+use crate::state::{InspectorUi, TabState};
 use crate::tabs::{PumpedMessage, TabProc};
 use crate::uisettings::UiSettings;
 use crate::{AppWindow, ContainerInfo, MenuItem, TabInfo};
 // The Slint-side row structs the DevTools panel renders (`state`'s own
 // view-models of the same name are converted into these).
-use crate::{ConsoleRow, NetRow};
+use crate::{ConsoleRow, CrumbItem, InspectRow, NetRow, Tok};
 // The pure userscript-menu helpers (src/userscripts.rs).
 use crate::userscripts::{build_new_userscript, enabled_userscripts, parse_patterns, userscript_rows};
 // The pure User-Agent-switcher helpers (src/user_agents.rs).
@@ -109,7 +109,28 @@ struct Proc {
     /// zoom factor: switching tabs switches the panel to the new tab's feed,
     /// and a freshly opened tab starts closed.
     devtools_open: bool,
-    /// Which pane the panel shows for this tab (Console / Network).
+    /// A document tree was asked of this tab — its Inspector pane is open, ⌖ is
+    /// armed for it, or its context menu asked what is under the cursor — and no
+    /// `FromTab::InspectSnapshot` has come back since. That is the pane's
+    /// “asking the tab…” state, and what stops the shell from asking one tab for
+    /// the same tree on every redraw.
+    /// The last `ToTab::SetInspect` sent to this tab: `true` while the tab is
+    /// under instruction to keep its Inspector pane’s document up to date. The
+    /// “we asked and no snapshot has landed yet” state is `InspectorUi::pending`;
+    /// conflating the two means a pane that closes never re-asks when it opens.
+    inspect_stream: bool,
+    /// The Inspector pane’s view state for this tab: the tree the tab last sent
+    /// plus what the shell owns about it — folds, selection, the ⌖ flag. `None`
+    /// while nobody has asked this tab for a document. It lives on the tab
+    /// record, not in the window, so switching tabs switches documents instead of
+    /// repainting the last one under a new title, and a background tab never
+    /// keeps a tree it cannot show (≤ 400 KB of it).
+    inspector: Option<InspectorUi>,
+    /// Which document `inspector` describes. Node ids are positional handles
+    /// inside one snapshot of one document, so the window is only ever painted
+    /// from a record whose target is the tab on screen.
+    inspector_target: Option<TabId>,
+    /// Which pane the panel shows for this tab (Console / Network / Inspector).
     devtools_view: DevToolsView,
     /// Find-in-page bar open for *this* tab (Ctrl-`F`). Per tab like the panel:
     /// switching tabs switches the bar to the other tab's search, and the
@@ -145,6 +166,9 @@ pub enum DevToolsView {
     #[default]
     Console,
     Network,
+    /// The **Inspector**: the element tree of this tab's document (the panel's
+    /// third pane, `devtools-view` index 2).
+    Inspector,
 }
 
 impl DevToolsView {
@@ -152,15 +176,46 @@ impl DevToolsView {
         match self {
             DevToolsView::Console => 0,
             DevToolsView::Network => 1,
+            DevToolsView::Inspector => 2,
         }
     }
 
     pub fn from_index(idx: i32) -> Self {
         match idx {
             1 => DevToolsView::Network,
+            2 => DevToolsView::Inspector,
             _ => DevToolsView::Console,
         }
     }
+}
+
+/// What the Inspector pane says about a tab that was never asked for a document
+/// (the pane is per tab, and a tree only exists after `ToTab::SetInspect`).
+const NO_TREE_HINT: &str =
+    "no document tree yet \u{2014} this tab sends one when the pane opens";
+
+/// A read of the Inspector pane; see [`Core::inspector_probe`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct InspectorProbe {
+    /// The panel is open on this tab and its Inspector pane is showing.
+    pub pane_open: bool,
+    /// This tab has been asked for its document and has not answered yet.
+    pub stream_wanted: bool,
+    /// The tab the pane's tree was captured from.
+    pub target: Option<TabId>,
+    /// The tree belongs to the tab on screen (else the window shows nothing).
+    pub tree_for_active: bool,
+    /// Whose document, and how far through it.
+    pub generation: Option<u64>,
+    /// Rows the tab sent (folded away or not), of which real elements.
+    pub nodes: usize,
+    pub elements: usize,
+    /// Subtrees the shell has folded up over them.
+    pub collapsed: usize,
+    /// The selected row, if any.
+    pub selected: Option<u64>,
+    /// ⌖ is armed for this tab.
+    pub pick: bool,
 }
 
 /// A tab process that is gone: log it loudly (with whatever stderr — hence
@@ -237,6 +292,13 @@ pub struct Core {
     dt_console: Rc<VecModel<ConsoleRow>>,
     /// The DevTools network table (same reason).
     dt_net: Rc<VecModel<NetRow>>,
+    /// The Inspector tree and the breadcrumb as the window sees them. Rebuilt
+    /// only when the view-model changes (see `dt_inspect_stamp`): folding a node
+    /// rewrites the rows below it, and neither folding nor the picker may cost a
+    /// document walk — that is the tab's job, and only when asked.
+    dt_inspect: Rc<VecModel<InspectRow>>,
+    dt_crumb: Rc<VecModel<CrumbItem>>,
+    dt_inspect_stamp: RefCell<Option<(usize, Option<u64>, usize, Option<u64>, usize)>>,
     /// Script id of each userscript-menu row, in `us-scripts` model order:
     /// the overlay mutates by row index, the Store (and the wire) speak ids.
     /// Refreshed from the Store whenever the menu list is re-pushed.
@@ -331,6 +393,9 @@ impl App {
             dialog_shown: RefCell::new(None),
             dt_console: Rc::new(VecModel::default()),
             dt_net: Rc::new(VecModel::default()),
+            dt_inspect: Rc::new(VecModel::default()),
+            dt_crumb: Rc::new(VecModel::default()),
+            dt_inspect_stamp: RefCell::new(None),
             us_ids: RefCell::new(Vec::new()),
             us_edit_id: RefCell::new(None),
             archive_dir: RefCell::new(archive_root),
@@ -543,6 +608,9 @@ impl Core {
                         zoom: 1.0,
                         crashed: false,
                         devtools_open: false,
+                        inspect_stream: false,
+                        inspector: None,
+                        inspector_target: None,
                         devtools_view: DevToolsView::default(),
                         find_open: false,
                     });
@@ -926,14 +994,26 @@ impl Core {
                 self.toggle_devtools();
                 return;
             }
+            Some(Shortcut::Inspector) => {
+                // Ctrl-Shift-C: ⌖ *inspect element* for this tab. Page focus only,
+                // exactly like F12 — it is a page tool, and it opens the panel and
+                // its Inspector pane when they are not up yet.
+                self.toggle_inspect_pick();
+                return;
+            }
             Some(Shortcut::PageFocus) => {
                 // Escape closes an open find bar first (that is what the reader
                 // is aiming at), then dismisses an open context menu, and
                 // abandons an address being typed: focus goes back to the page
-                // and the bar shows the tab's real URL again.
+                // and the bar shows the tab's real URL again. An armed ⌖ is
+                // dropped first, before focus moves — the picker would otherwise
+                // keep eating the page's clicks with nothing on screen to show.
                 if self.find_open_active() {
                     self.close_find();
                     return;
+                }
+                if let Some(i) = self.active_proc_index() {
+                    self.disarm_inspect_pick(i);
                 }
                 self.close_context_menu();
                 self.url_draft.set(None);
@@ -1009,6 +1089,9 @@ impl Core {
         drop(procs);
         info!("DevTools {} on tab {id}", if open { "opened" } else { "closed" });
         self.sync_ui();
+        // The Inspector pane is one of the panes, so F12 is also the moment this
+        // tab starts or stops walking its document.
+        self.sync_inspect_stream(i);
     }
 
     /// The panel's “✕” row (and nothing else) closes it for the active tab.
@@ -1022,9 +1105,10 @@ impl Core {
             procs[i].devtools_open = false;
         }
         self.sync_ui();
+        self.sync_inspect_stream(i);
     }
 
-    /// A header row picked a pane (Console / Network).
+    /// A header row picked a pane (Console / Network / Inspector).
     fn set_devtools_view(&self, view: DevToolsView) {
         let Some(i) = self.active_proc_index() else { return };
         {
@@ -1034,6 +1118,298 @@ impl Core {
             }
             procs[i].devtools_view = view;
         }
+        self.sync_ui();
+        // Moving to or from the Inspector pane starts and stops this tab's
+        // snapshot stream; the other two panes never ask for a document.
+        self.sync_inspect_stream(i);
+    }
+
+    // ---- DevTools **Inspector** pane ---------------------------------------
+
+    /// This tab's Inspector view-model, created on first use and stamped with the
+    /// tab it belongs to (a node id means nothing outside its own document, which
+    /// is why the stamp is a real field and not an assumption).
+    fn with_inspector<T>(&self, i: usize, f: impl FnOnce(&mut InspectorUi) -> T) -> Option<T> {
+        let mut procs = self.procs.borrow_mut();
+        let p = procs.get_mut(i)?;
+        let out = f(p.inspector.get_or_insert_with(InspectorUi::default));
+        p.inspector_target = Some(p.tab.id);
+        Some(out)
+    }
+
+    /// The tab the window's Inspector pane is bound to, and whether ⌖ is armed
+    /// for it (`(tab, pick)`; integration tests assert on this).
+    pub fn inspector_target(&self) -> Option<(TabId, bool)> {
+        let procs = self.procs.borrow();
+        let i = self.active_proc_index()?;
+        let p = &procs[i];
+        p.inspector_target.map(|id| (id, p.inspector.as_ref().is_some_and(|ui| ui.pick())))
+    }
+
+    /// Everything the Inspector pane of the active tab is showing, in one
+    /// snapshot of state, for tests and diagnostics (`#[derive(PartialEq)]` so a
+    /// test can compare a whole situation at once). `tree_for_active` says the
+    /// tree the numbers describe belongs to the tab on screen; a tab with the
+    /// pane open and no answer yet has `stream_wanted` and no tree.
+    pub fn inspector_probe(&self) -> InspectorProbe {
+        let procs = self.procs.borrow();
+        let Some(p) = self.active_proc_index().and_then(|i| procs.get(i)) else {
+            return InspectorProbe::default();
+        };
+        let tree_for_active = p.inspector_target == Some(p.tab.id);
+        let ui = p.inspector.as_ref().filter(|_| tree_for_active);
+        InspectorProbe {
+            pane_open: p.devtools_open && p.devtools_view == DevToolsView::Inspector,
+            stream_wanted: p.inspect_stream,
+            target: p.inspector_target,
+            tree_for_active,
+            generation: ui.and_then(|ui| ui.generation()),
+            nodes: ui.map(|ui| ui.node_count()).unwrap_or(0),
+            elements: ui.map(|ui| ui.element_count()).unwrap_or(0),
+            collapsed: ui.map(|ui| ui.collapsed_len()).unwrap_or(0),
+            selected: ui.and_then(|ui| ui.selected()),
+            pick: ui.is_some_and(|ui| ui.pick()),
+        }
+    }
+
+    /// Tell a tab whether it has to walk its document for us. `ToTab::SetInspect`
+    /// is per tab, and so are the panel and its pane, so `devtools_open` and
+    /// `devtools_view` decide it together. It goes out only on a real change: a
+    /// tab answers every `open: true` with a fresh snapshot, and an open pane
+    /// must not turn into a re-walk per redraw.
+    fn sync_inspect_stream(&self, i: usize) {
+        let Some((id, want, streaming)) = self.procs.borrow().get(i).map(|p| {
+            (
+                p.tab.id,
+                p.devtools_open && p.devtools_view == DevToolsView::Inspector,
+                p.inspect_stream,
+            )
+        }) else {
+            return;
+        };
+        if want == streaming {
+            return;
+        }
+        if !want && self.with_inspector(i, |ui| ui.pick()).unwrap_or(false) {
+            // Leaving the Inspector pane ends ⌖ as well: a page that swallows
+            // pointers for a picker nobody can see is a bug, not a mode.
+            self.disarm_inspect_pick(i);
+        }
+        debug!("DevTools inspector: tab {id} should stream its document: {want}");
+        if let Err(err) = self.send_to(id, ToTab::SetInspect { open: want }) {
+            warn!("tab {id} would not take the inspector stream switch: {err}");
+        }
+        let mut procs = self.procs.borrow_mut();
+        let Some(p) = procs.get_mut(i) else { return };
+        p.inspect_stream = want;
+        if want {
+            p.inspector_target = Some(id);
+            p.inspector.get_or_insert_with(InspectorUi::default).expect_tree();
+        } else if let Some(ui) = p.inspector.as_mut() {
+            // The tree belongs to this document, and so do the folds on it: with
+            // the pane shut there is nothing to paint, and a background tab that
+            // keeps a snapshot it cannot show is only memory.
+            ui.clear_tree();
+        }
+    }
+
+    /// ⌖ *inspect element* (Ctrl-Shift-C, or the pane's ⌖ button): the picking is
+    /// the tab's, the arming is the shell's. Arming pulls the panel and its
+    /// Inspector pane up first, because the point of the mode is to land on a row
+    /// in that pane, and the same chord again disarms it. While armed the page
+    /// swallows pointers for the picker, so the ⌖ button stays lit.
+    fn toggle_inspect_pick(&self) {
+        let Some(i) = self.active_proc_index() else {
+            debug!("⌖ inspect-element toggle dropped: no active tab");
+            return;
+        };
+        let armed = self.procs.borrow()[i]
+            .inspector
+            .as_ref()
+            .is_some_and(|ui| ui.pick());
+        let id = self.procs.borrow()[i].tab.id;
+        if armed {
+            self.set_inspect_pick(i, false);
+        } else {
+            {
+                let mut procs = self.procs.borrow_mut();
+                if let Some(p) = procs.get_mut(i) {
+                    p.devtools_open = true;
+                    p.devtools_view = DevToolsView::Inspector;
+                }
+            }
+            self.sync_inspect_stream(i);
+            self.set_inspect_pick(i, true);
+            info!("⌖ inspect element armed on tab {id}: the next click in the page names a node");
+        }
+        if let Err(err) = self.send_to(id, ToTab::SetInspectPick { enabled: !armed }) {
+            warn!("tab {id} would not take the inspect-element pick: {err}");
+        }
+        self.sync_ui();
+    }
+
+    /// Move the ⌖ flag on the record (the message to the tab is the caller's, so
+    /// one exit path can disarm without re-arming another mode behind its back).
+    fn set_inspect_pick(&self, i: usize, enabled: bool) {
+        self.with_inspector(i, |ui| ui.set_pick(enabled));
+    }
+
+    /// Disarm the picker of one tab, reporting whether it was armed. Escape does
+    /// this before handing focus back to the page, and closing the panel or
+    /// leaving the Inspector pane does it too — a page that eats clicks for a
+    /// picker nobody can see is a bug, not a mode.
+    fn disarm_inspect_pick(&self, i: usize) -> bool {
+        let Some(id) = self.procs.borrow().get(i).map(|p| p.tab.id) else { return false };
+        if !self.with_inspector(i, |ui| ui.pick()).unwrap_or(false) {
+            return false;
+        }
+        self.set_inspect_pick(i, false);
+        if let Err(err) = self.send_to(id, ToTab::SetInspectPick { enabled: false }) {
+            warn!("tab {id} would not disarm the inspect-element pick: {err}");
+        }
+        info!("⌖ inspect element disarmed on tab {id}");
+        true
+    }
+
+    /// The context menu's “⌖ Inspect Element”: ask the tab what is under the
+    /// cursor (`ToTab::InspectPickAt`) with the Inspector pane open to show the
+    /// answer. The tab replies with a snapshot whose `selected` is the hit node,
+    /// so no second selection message is expected — and none is invented here.
+    fn inspect_element_at(&self, x: f32, y: f32) {
+        let Some(i) = self.active_proc_index() else {
+            debug!("Inspect Element dropped: no active tab");
+            return;
+        };
+        let id = self.procs.borrow()[i].tab.id;
+        {
+            let mut procs = self.procs.borrow_mut();
+            if let Some(p) = procs.get_mut(i) {
+                p.devtools_open = true;
+                p.devtools_view = DevToolsView::Inspector;
+            }
+        }
+        self.sync_inspect_stream(i);
+        self.with_inspector(i, |ui| ui.expect_tree());
+        info!("Inspect Element: asking tab {id} what is under ({x:.0},{y:.0})");
+        if let Err(err) = self.send_to(id, ToTab::InspectPickAt { x, y }) {
+            warn!("tab {id} would not answer Inspect Element: {err}");
+        }
+        self.sync_ui();
+    }
+
+    /// A row of the tree was clicked. Selection is the shell's own state; the tab
+    /// only paints the box (`ToTab::InspectSelect`). An id the current tree does
+    /// not know means the snapshot is stale: wait for the next one instead of
+    /// guessing at a node the tab may not have any more.
+    fn inspector_select(&self, node: i32) {
+        let Some(i) = self.active_proc_index() else { return };
+        let id = self.procs.borrow()[i].tab.id;
+        let known = self
+            .with_inspector(i, |ui| {
+                // Membership first: an id from a snapshot the tab has replaced
+                // must not become the selection, or the pane highlights a node
+                // that does not exist and tells the tab to paint one too.
+                let known = ui
+                    .snapshot()
+                    .is_some_and(|s| s.nodes.iter().any(|n| n.id == node as u64));
+                if known {
+                    ui.select(node as u64);
+                }
+                known
+            })
+            .unwrap_or(false);
+        if !known {
+            debug!("inspector row {node} is not in tab {id}'s tree — waiting for a fresh snapshot");
+            self.sync_ui();
+            return;
+        }
+        if let Err(err) = self.send_to(id, ToTab::InspectSelect { node: Some(node as u64) }) {
+            warn!("tab {id} would not take the inspector selection: {err}");
+        }
+        self.sync_ui();
+    }
+
+    /// A `+`/`−` twisty: folding is the shell's own business. The tab is not
+    /// asked to re-send its document, and must not be.
+    fn inspector_toggle_fold(&self, node: i32) {
+        let Some(i) = self.active_proc_index() else { return };
+        let id = self.procs.borrow()[i].tab.id;
+        let collapsed = self
+            .with_inspector(i, |ui| ui.toggle_fold(node as u64))
+            .unwrap_or(false);
+        debug!("inspector: tab {id} node {node} {}", if collapsed { "folded" } else { "unfolded" });
+        self.sync_ui();
+    }
+
+    /// A tree landed. It belongs to one tab and to one generation of that tab's
+    /// document, so the record of *that* tab takes it and the “asking the tab…”
+    /// state ends; the window refreshes when that tab is the one on screen.
+    fn on_inspect_snapshot(&self, tid: TabId, snapshot: ironsurf_common::InspectSnapshot) {
+        let i = {
+            let procs = self.procs.borrow();
+            match procs.iter().position(|p| p.tab.id == tid) {
+                Some(i) => i,
+                None => {
+                    debug!("inspector snapshot for tab {tid} dropped: no such tab");
+                    return;
+                }
+            }
+        };
+        let (nodes, generation) = (snapshot.nodes.len(), snapshot.generation);
+        let on_screen = self.active_tab_id() == Some(tid);
+        let selected = snapshot.selected;
+        self.with_inspector(i, |ui| ui.set_snapshot(snapshot));
+        {
+            let mut procs = self.procs.borrow_mut();
+            if let Some(p) = procs.get_mut(i) {
+                // The snapshot does not end the instruction — the tab keeps the
+                // pane’s document current (a reload sends the next generation).
+                p.inspector_target = Some(tid);
+            }
+        }
+        info!(
+            "tab {tid} inspector: {nodes} node(s) at generation {generation}{}",
+            selected.map(|n| format!(", selected {n}")).unwrap_or_default()
+        );
+        if on_screen {
+            self.sync_ui();
+        }
+    }
+
+    /// The page answered ⌖: the node the cursor was on. One pick per arming — the
+    /// tab disarms its own picker as it answers (a click that hits nothing gets
+    /// no message at all, so the mode stays armed), and the snapshot that names
+    /// the node normally follows on the same tick.
+    fn on_inspect_picked(&self, tid: TabId, node: u64) {
+        let Some(i) = self.procs.borrow().iter().position(|p| p.tab.id == tid) else { return };
+        debug!("tab {tid} ⌖ picked node {node}");
+        self.disarm_inspect_pick(i);
+        self.with_inspector(i, |ui| ui.select(node));
+        if self.active_tab_id() == Some(tid) {
+            self.sync_ui();
+        }
+    }
+
+    /// `Clear` in the panel header: the Console and Network panes each empty their
+    /// own bounded feed on this tab's record. The Inspector pane has no feed of
+    /// its own — its contents *are* the document — so the header disables the
+    /// button there and this refuses to guess.
+    fn devtools_clear(&self) {
+        let Some(i) = self.active_proc_index() else { return };
+        let view = self.procs.borrow()[i].devtools_view;
+        if view == DevToolsView::Inspector {
+            debug!("DevTools Clear ignored on the Inspector pane: the tree is the document");
+            return;
+        }
+        let mut procs = self.procs.borrow_mut();
+        let Some(p) = procs.get_mut(i) else { return };
+        match view {
+            DevToolsView::Console => p.state.console.clear(),
+            DevToolsView::Network => p.state.network.clear(),
+            DevToolsView::Inspector => {}
+        }
+        info!("DevTools: cleared the {view:?} feed on tab {}", p.tab.id);
+        drop(procs);
         self.sync_ui();
     }
 
@@ -1177,6 +1553,79 @@ impl Core {
         }).collect::<Vec<_>>());
         ui.set_console_count(self.dt_console.row_count() as i32);
         ui.set_network_count(self.dt_net.row_count() as i32);
+
+        // ---- the Inspector pane ------------------------------------------
+        // Only a tree captured *for this tab* may paint: node ids are positional
+        // handles inside one document, so a record of another one is dropped
+        // rather than clicked on blind.
+        let model = (p.inspector_target == Some(p.tab.id))
+            .then(|| p.inspector.as_ref())
+            .flatten();
+        ui.set_inspector_pick(model.is_some_and(|ui| ui.pick()));
+        ui.set_inspector_truncated(model.is_some_and(|ui| ui.truncated()));
+        ui.set_inspector_count(model.map(|ui| ui.element_count()).unwrap_or(0) as i32);
+        ui.set_inspector_summary(
+            model
+                 .map(|ui| ui.summary(Some(p.state.title.as_str())).into())
+                .unwrap_or_default(),
+        );
+        ui.set_inspector_empty(model.is_none_or(|ui| ui.node_count() == 0));
+        ui.set_inspector_hint(
+            model
+                .map(|ui| ui.empty_hint().into())
+                .unwrap_or_else(|| NO_TREE_HINT.into()),
+        );
+        // The tree and its breadcrumb are rebuilt when the view-model changed —
+        // a new snapshot, a different selection, a different set of folds — and
+        // not on every console line that scrolls past the panel.
+        let stamp = model
+            .map(|ui| (p.tab.id.0 as usize, ui.generation(), ui.node_count(), ui.selected(), ui.collapsed_len()));
+        if *self.dt_inspect_stamp.borrow() != stamp {
+            *self.dt_inspect_stamp.borrow_mut() = stamp;
+            let rows: Vec<InspectRow> = model
+                .map(|ui| {
+                    ui.rows()
+                        .into_iter()
+                        .map(|r| InspectRow {
+                            // ids live below `MAX_INSPECT_NODES` inside one
+                            // generation, so they fit the window's `int`
+                            node: r.node.try_into().unwrap_or(i32::MAX),
+                            depth: r.depth as i32,
+                            twisty: if !r.has_children {
+                                String::new().into()
+                            } else if r.collapsed {
+                                "+".into()
+                            } else {
+                                "\u{2212}".into()
+                            },
+                            // `state::TOK_*` is the colour table the window reads
+                            toks: ModelRc::from(Rc::new(VecModel::from(
+                                r.toks
+                                    .into_iter()
+                                    .map(|(text, kind)| Tok { text: text.into(), kind: kind as i32 })
+                                    .collect::<Vec<_>>(),
+                            ))),
+                            selected: r.selected,
+                            italic: r.italic,
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            let crumb: Vec<CrumbItem> = model
+                .map(|ui| {
+                    ui.crumb_items()
+                        .into_iter()
+                        .map(|(id, tag, ident)| CrumbItem {
+                            node: id.try_into().unwrap_or(i32::MAX),
+                            tag: tag.into(),
+                            ident: ident.into(),
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            sync_model(&self.dt_inspect, &rows);
+            sync_model(&self.dt_crumb, &crumb);
+        }
     }
 
     fn page_pointer(&self, x: f32, y: f32, kind: i32, button: i32) {
@@ -1337,6 +1786,16 @@ impl Core {
                     self.send_active(ToTab::ContextAction(ContextAction::Paste { text }));
                 }
             }
+            // The point the menu opened at is the point to ask about: Slint
+            // keeps it in `menu-x`/`menu-y` for as long as the menu is up.
+            MenuAction::InspectElement => {
+                let (x, y) = self
+                    .ui()
+                    .map(|ui| (ui.get_menu_x(), ui.get_menu_y()))
+                    .unwrap_or((0.0, 0.0));
+                self.close_context_menu();
+                self.inspect_element_at(x, y);
+            }
             MenuAction::ToggleVideo => {
                 self.send_active(ToTab::ContextAction(ContextAction::ToggleVideo))
             }
@@ -1467,6 +1926,9 @@ impl Core {
                         zoom,
                         crashed: false,
                         devtools_open,
+                        inspect_stream: false,
+                        inspector: None,
+                        inspector_target: None,
                         devtools_view,
                         find_open,
                     },
@@ -1477,8 +1939,11 @@ impl Core {
             }
             let mut old = old;
             old.tab.destroy();
-            // The replacement process is new: seed its userscript set too.
+            // The replacement process is new: seed its userscript set too, and
+            // re-issue the Inspector instruction — the pane is still open on this
+            // tab, and the new process has never been asked for its document.
             self.seed_userscripts(id);
+            self.sync_inspect_stream(at);
         }
         self.manager_open(false);
         self.sync_ui();
@@ -2361,6 +2826,27 @@ impl Core {
                 // DevTools network panel: the row data is the reduced per-tab
                 // log (`TabState::network`); nothing to log per message.
                 FromTab::NetworkEvent { .. } => devtools_feed = true,
+                // DevTools **Inspector**: the tree is the record's own view-model
+                // (handled below); the line says what arrived without naming the
+                // markup, which is the one thing here worth not formatting.
+                FromTab::InspectSnapshot { snapshot } => {
+                    devtools_feed = true;
+                    info!(
+                        "tab {tid} sent its document: {} node(s), gen {}, selected {:?}{}",
+                        snapshot.nodes.len(),
+                        snapshot.generation,
+                        snapshot.selected,
+                        if snapshot.truncated { ", truncated" } else { "" }
+                    )
+                }
+                // Every move would be a message: the pick is the interesting one.
+                FromTab::InspectHover { node } => {
+                    trace!("tab {tid} inspector hover: {node:?}")
+                }
+                FromTab::InspectPicked { node } => {
+                    devtools_feed = true;
+                    info!("tab {tid} ⌖ picked {node:?}")
+                }
                 // Archive mode: the bytes themselves go to disk below — the
                 // log line stays tiny (never format a multi-MB body).
                 FromTab::ArchivedFetch { url, is_document, bytes } => debug!(
@@ -2480,6 +2966,16 @@ impl Core {
             // click point (task: context menu).
             if let FromTab::ContextMenu { x, y, target } = &msg {
                 self.open_context_menu(*x, *y, target);
+            }
+            // The Inspector's document: filed on *this* tab's record (ids are
+            // meaningless in another tab's tree), then pushed if we are looking
+            // at that tab.
+            if let FromTab::InspectSnapshot { snapshot } = &msg {
+                self.on_inspect_snapshot(tid, snapshot.clone());
+            }
+            // ⌖ answered: the mode ends and the pane selects what was clicked.
+            if let FromTab::InspectPicked { node } = &msg {
+                self.on_inspect_picked(tid, *node);
             }
             // `alert`/`confirm`/`prompt` → the tab is now blocked on the
             // pipe; the overlay opens (on the requesting tab, brought to
@@ -2859,11 +3355,23 @@ impl Core {
         // (see `write_devtools`), the two intents come back to the core.
         ui.set_console_rows(ModelRc::from(self.dt_console.clone()));
         ui.set_net_rows(ModelRc::from(self.dt_net.clone()));
+        ui.set_inspector_rows(ModelRc::from(self.dt_inspect.clone()));
+        ui.set_inspector_crumb(ModelRc::from(self.dt_crumb.clone()));
         {
             let c = self.clone();
             ui.on_devtools_select_view(move |view| c.set_devtools_view(DevToolsView::from_index(view)));
         }
         bind0!(on_devtools_close, |c: &Rc<Core>| c.close_devtools());
+        bind0!(on_devtools_clear, |c: &Rc<Core>| c.devtools_clear());
+        bind0!(on_devtools_toggle_pick, |c: &Rc<Core>| c.toggle_inspect_pick());
+        {
+            let c = self.clone();
+            ui.on_devtools_select_node(move |node| c.inspector_select(node));
+        }
+        {
+            let c = self.clone();
+            ui.on_devtools_toggle_fold(move |node| c.inspector_toggle_fold(node));
+        }
 
         // Userscript menu (task: userscript menu): the toolbar toggle, the
         // scrim/✕ close, and the row/footer intents — every mutation lands in
@@ -2990,6 +3498,10 @@ pub enum MenuAction {
     CopyText(String),
     Paste,
     ToggleVideo,
+    /// “⌖ Inspect Element”: the click point is the menu's own (the menu opened
+    /// under the cursor), which is exactly the point `ToTab::InspectPickAt`
+    /// wants — see `Core::menu_pick`.
+    InspectElement,
 }
 
 /// The menu for one right-click, in display order. Entries exist exactly
@@ -3067,6 +3579,9 @@ pub fn context_menu_items(
             ));
         }
     }
+    // Last, as in every browser: whatever was right-clicked, the tree of the
+    // page it lives in is always reachable from here.
+    items.push(("⌖ Inspect Element".into(), MenuAction::InspectElement));
     items
 }
 
@@ -3271,7 +3786,10 @@ mod tests {
     fn the_plain_page_menu_is_history_reload_and_address() {
         let items = context_menu_items(&target(None, None, None, None, false), Some("https://example.com/"), true, false, true);
         let labels: Vec<&str> = items.iter().map(|(l, _)| l.as_str()).collect();
-        assert_eq!(labels, ["← Back", "⟳ Reload", "Copy page address"]);
+        assert_eq!(
+            labels,
+            ["← Back", "⟳ Reload", "Copy page address", "⌖ Inspect Element"]
+        );
         assert_eq!(items[2].1, MenuAction::CopyText("https://example.com/".into()));
     }
 
@@ -3287,7 +3805,13 @@ mod tests {
         let labels: Vec<&str> = items.iter().map(|(l, _)| l.as_str()).collect();
         assert_eq!(
             labels,
-            ["⟳ Reload", "Open link in new tab", "Copy link address", "Copy page address"]
+            [
+                "⟳ Reload",
+                "Open link in new tab",
+                "Copy link address",
+                "Copy page address",
+                "⌖ Inspect Element",
+            ]
         );
         assert_eq!(
             items[1].1,
@@ -3323,6 +3847,7 @@ mod tests {
                 "Copy video address",
                 "Paste",
                 "Copy page address",
+                "⌖ Inspect Element",
             ]
         );
         assert_eq!(items[3].1, MenuAction::CopyText("selected words".into()));
@@ -3336,7 +3861,11 @@ mod tests {
             false,
             true,
         );
-        assert_eq!(bare.len(), 1, "just Reload when there is nothing else");
+        assert_eq!(
+            bare.len(),
+            2,
+            "Reload, and the tree of the page the click landed in"
+        );
     }
 
     #[test]

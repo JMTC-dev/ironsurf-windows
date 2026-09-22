@@ -55,6 +55,35 @@ export struct NetRow {
     failed: bool,
 }
 
+/// One syntax-highlighted token of the DevTools Inspector tree: `kind` is a
+/// `state::TOK_*` value and `inspect-kind-color` below is the colour table —
+/// a row is a list of these, never a pre-formatted string.
+export struct Tok {
+    text: string,
+    kind: int,
+}
+
+/// One Inspector tree row. `node` is the snapshot's node id (a click reports it
+/// back for `ToTab::InspectSelect`), `depth × 12px` is the indent, `twisty` is
+/// `+` / `−` (`""` on a leaf, which is therefore not clickable), `toks` the
+/// markup, `selected` the highlight and `italic` comments and the doctype.
+export struct InspectRow {
+    node: int,
+    depth: int,
+    twisty: string,
+    toks: [Tok],
+    selected: bool,
+    italic: bool,
+}
+
+/// One breadcrumb crumb: the node id plus its name split the way the tree
+/// splits it (`div` + `#main`), so `div#main` is not one flat label.
+export struct CrumbItem {
+    node: int,
+    tag: string,
+    ident: string,
+}
+
 /// One userscript-menu row, reduced from a stored `Userscript` by
 /// `userscripts::userscript_rows` (`patterns` is the URL-pattern list joined
 /// by `", "`, painted dim under the name; `enabled` drives the CheckBox).
@@ -372,6 +401,22 @@ export component AppWindow inherits Window {
     in property <int> network-count: 0;
     in property <[ConsoleRow]> console-rows;
     in property <[NetRow]> net-rows;
+    // DevTools **Inspector** pane (third pane, `devtools-view == 2`). The tab
+    // owns the document and sends a flat `InspectSnapshot`; Rust folds it,
+    // selects, builds the breadcrumb and re-renders the markup as tokens, then
+    // pushes the result here: `inspector-count` is the element count on the
+    // header button (dim while `inspector-truncated`), `inspector-pick` says
+    // ⌖ is armed for this tab, `inspector-summary` names the document, the
+    // breadcrumb is clickable, and `inspector-empty`/`inspector-hint` is the
+    // honest empty state (never a blank rectangle).
+    in property <int> inspector-count: 0;
+    in property <bool> inspector-truncated: false;
+    in property <bool> inspector-pick: false;
+    in property <string> inspector-summary: "";
+    in property <bool> inspector-empty: false;
+    in property <string> inspector-hint: "";
+    in property <[InspectRow]> inspector-rows;
+    in property <[CrumbItem]> inspector-crumb;
 
     // Userscript menu (task: userscript menu): toggled by the "</>" toolbar
     // button. Rust owns the open flag, re-pushes `us-scripts` from the Store
@@ -448,6 +493,14 @@ export component AppWindow inherits Window {
     // DevTools intents: pick a pane (0 console / 1 network) or close the panel.
     callback devtools-select-view(view: int);
     callback devtools-close();
+    // `Clear` on the visible pane's feed (Console / Network), ⌖ *inspect
+    // element* toggle, and the two Inspector intents: a tree row clicked
+    // (`ToTab::InspectSelect`, the tab paints its box) and a `+/−` twisty
+    // (folding is the shell's own business — nothing goes over the wire).
+    callback devtools-clear();
+    callback devtools-toggle-pick();
+    callback devtools-select-node(node: int);
+    callback devtools-toggle-fold(node: int);
     // JS-dialog intents: `OK` (accepted, `dialog-input` carries the prompt
     // text) or `Cancel`/Esc (dismissed). The scrim deliberately does nothing
     // — a modal is dismissed by an answer, never by clicking past it.
@@ -500,6 +553,24 @@ export component AppWindow inherits Window {
         if (level == "warn") { return #e6c07b; }
         if (level == "info") { return #b8b8b8; }
         return #9a9a9a;
+    }
+
+    // The Inspector's fixed colour table (see `state::TOK_*`): punctuation
+    // grey, tag name orange, attribute name blue, attribute value green, text
+    // near-white, comment/doctype grey (italic comes from the row), `id`/`class`
+    // values and dangerous ones (`<script>`/`<style>`/`<head>`, `data:` URLs)
+    // their own colours.
+    function inspect-kind-color(kind: int) -> color {
+        if (kind == 0) { return #e6e6e6; } // text
+        if (kind == 1) { return #e8a33d; } // tag name
+        if (kind == 2) { return #6aa6ff; } // attribute name
+        if (kind == 3) { return #7ec96f; } // attribute value
+        if (kind == 4) { return #8a8a8a; } // punctuation
+        if (kind == 5) { return #ef5350; } // danger
+        if (kind == 6) { return #8a8a8a; } // comment
+        if (kind == 7) { return #8a8a8a; } // doctype
+        if (kind == 8) { return #c586c0; } // id / class value
+        return #cfcfcf;
     }
 
     // fixed palette; index also addresses `palette-color` for add/rename
@@ -742,7 +813,29 @@ export component AppWindow inherits Window {
                                     tint: root.devtools-view == 1 ? #3a3a3a : #262626;
                                     clicked => { root.devtools-select-view(1); }
                                 }
+                                MiniButton {
+                                    label: "Inspector" + (root.inspector-count > 0 ? " " + root.inspector-count : "");
+                                    tint: root.devtools-view == 2 ? #3a3a3a : #262626;
+                                    // a tree the tab had to cut short is said here too
+                                    opacity: root.inspector-truncated ? 0.55 : 1.0;
+                                    clicked => { root.devtools-select-view(2); }
+                                }
+                                // ⌖ *inspect element*: armed for the whole tab, so the
+                                // button stays lit while the page swallows pointers for
+                                // the picker (Ctrl-Shift-C is the same chord).
+                                MiniButton {
+                                    label: "⌖";
+                                    tint: root.inspector-pick ? #7a4a1d : #262626;
+                                    clicked => { root.devtools-toggle-pick(); }
+                                }
                                 Rectangle { horizontal-stretch: 1; }
+                                MiniButton {
+                                    label: "Clear";
+                                    // Console / Network feeds only: the Inspector pane
+                                    // has no feed of its own, its tree is the document.
+                                    enabled: root.devtools-view != 2;
+                                    clicked => { root.devtools-clear(); }
+                                }
                                 MiniButton { label: "✕"; clicked => { root.devtools-close(); } }
                             }
                         }
@@ -813,6 +906,125 @@ export component AppWindow inherits Window {
                                         status-color: dtn.failed ? #ef5350 : #cfcfcf;
                                     }
                                     netrowta := TouchArea { }
+                                }
+                            }
+                        }
+
+                        // ---- Inspector view ------------------------------------
+                        // Breadcrumb over the tree: `html › body › div#main`, the
+                        // selected node's ancestor chain, every crumb clickable.
+                        if root.devtools-view == 2: VerticalLayout {
+                            vertical-stretch: 1;
+                            spacing: 2px;
+                            Rectangle {
+                                height: 18px;
+                                Text {
+                                    x: 2px; width: parent.width; height: parent.height;
+                                    text: root.inspector-summary;
+                                    color: #8a8a8a; font-size: 12px;
+                                    vertical-alignment: center; overflow: elide;
+                                }
+                            }
+                            Rectangle {
+                                height: root.inspector-crumb.length > 0 ? 22px : 0px;
+                                HorizontalLayout {
+                                    spacing: 3px;
+                                    cross-axis-alignment: center;
+                                    for ci[i] in root.inspector-crumb: Rectangle {
+                                        width: crumb-inner.preferred-width + 8px;
+                                        height: 20px;
+                                        border-radius: 3px;
+                                        crumb-bg := Rectangle {
+                                            background: crumb-ta.has-hover ? #3a3a3a : transparent;
+                                            border-radius: 3px;
+                                        }
+                                        crumb-inner := HorizontalLayout {
+                                            padding-left: 3px; padding-right: 3px;
+                                            spacing: 0px;
+                                            Text {
+                                                text: i > 0 ? "› " : "";
+                                                color: #6a6a6a;
+                                                vertical-alignment: center;
+                                            }
+                                            Text {
+                                                text: ci.tag;
+                                                color: root.inspect-kind-color(1);
+                                                vertical-alignment: center;
+                                            }
+                                            Text {
+                                                text: ci.ident;
+                                                color: root.inspect-kind-color(8);
+                                                vertical-alignment: center;
+                                            }
+                                        }
+                                        crumb-ta := TouchArea {
+                                            clicked => { root.devtools-select-node(ci.node); }
+                                        }
+                                    }
+                                }
+                            }
+                            // The tree, or the reason there is none.
+                            if root.inspector-empty: Rectangle {
+                                height: 22px;
+                                Text {
+                                    x: 8px; width: parent.width; height: parent.height;
+                                    text: root.inspector-hint;
+                                    color: #6a6a6a; font-italic: true;
+                                    vertical-alignment: center; overflow: elide;
+                                }
+                            }
+                            if !root.inspector-empty: ListView {
+                                vertical-stretch: 1;
+                                for dr[i] in root.inspector-rows: Rectangle {
+                                    height: 22px;
+                                    dr-bg := Rectangle {
+                                        background: dr-ta.has-hover ? #262626
+                                                  : dr.selected ? #33260f
+                                                  : Math.mod(i, 2) == 0 ? transparent : #1b1b1b;
+                                    }
+                                    // the row itself selects the node; the twisty is
+                                    // declared above it and keeps its own click
+                                    dr-ta := TouchArea {
+                                        clicked => { root.devtools-select-node(dr.node); }
+                                    }
+                                    dr-tw := TouchArea {
+                                        x: 6px + dr.depth * 12px;
+                                        width: 16px;
+                                        height: parent.height;
+                                        visible: dr.twisty != "";
+                                        clicked => { root.devtools-toggle-fold(dr.node); }
+                                    }
+                                    Text {
+                                        x: 6px + dr.depth * 12px;
+                                        width: 16px; height: parent.height;
+                                        text: dr.twisty;
+                                        color: #9a9a9a;
+                                        horizontal-alignment: center;
+                                        vertical-alignment: center;
+                                    }
+                                    HorizontalLayout {
+                                        x: 22px + dr.depth * 12px;
+                                        width: Math.max(0px, parent.width - 22px - dr.depth * 12px);
+                                        height: parent.height;
+                                        spacing: 0px;
+                                        for dt in dr.toks: Text {
+                                            text: dt.text;
+                                            color: root.inspect-kind-color(dt.kind);
+                                            font-italic: dr.italic;
+                                            vertical-alignment: center;
+                                            overflow: elide;
+                                        }
+                                    }
+                                }
+                            }
+                            // A snapshot the tab had to cut short says so, dim, last.
+                            Rectangle {
+                                height: root.inspector-truncated ? 20px : 0px;
+                                Text {
+                                    x: 8px; width: parent.width; height: parent.height;
+                                    text: "\u{2026} the tree is bigger than the tab can send";
+                                    color: #6a6a6a; font-italic: true;
+                                    vertical-alignment: center;
                                 }
                             }
                         }

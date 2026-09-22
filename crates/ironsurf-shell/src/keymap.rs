@@ -37,6 +37,13 @@ pub enum Shortcut {
     ZoomReset,
     /// F12 / Ctrl-`I`: toggle the DevTools panel of the active tab.
     ToggleDevTools,
+    /// Ctrl-Shift-`C`: arm *inspect element* (the DevTools ⌖ picker) on the
+    /// active tab, opening the panel and its Inspector pane when either is
+    /// closed — and disarming when it is already armed. The shifted spelling
+    /// of the chord is the only one `shortcut_for` can see (it takes no shift
+    /// flag), which is why plain Ctrl-`C` copy keeps both of its own spellings
+    /// (`c`, `\u{03}`) and reaches the page.
+    Inspector,
     /// Ctrl-`F`: open the find-in-page bar (and focus its text entry).
     Find,
     /// Esc: return keyboard focus to the page.
@@ -181,6 +188,10 @@ pub fn shortcut_for(text: &str, ctrl: bool, alt: bool, meta: bool) -> Option<Sho
         // Ctrl-`F` opens the find bar. Its control-character spelling is
         // ACK (`\u{06}`), which X11 backends hand over for the same chord.
         'f' | 'F' | '\u{06}' => Some(Shortcut::Find),
+        // Copy lives above this line for ever: `c` and `\u{03}` (ETX) stay
+        // unmapped so a plain Ctrl-`C` always reaches the page's own copy. Only
+        // the shifted glyph — what Ctrl-Shift-`C` arrives as — arms the picker.
+        'C' => Some(Shortcut::Inspector),
         _ => None,
     }
 }
@@ -293,6 +304,19 @@ mod tests {
     }
 
     #[test]
+    fn inspect_element_is_ctrl_shift_c_and_copy_wins_the_rest() {
+        // Ctrl-Shift-`C` arms *inspect element*; the two spellings a plain
+        // Ctrl-`C` arrives in stay with the page, so copy keeps working.
+        assert_eq!(shortcut_for("C", true, false, false), Some(Shortcut::Inspector));
+        assert_eq!(shortcut_for("c", true, false, false), None);
+        assert_eq!(shortcut_for("\u{03}", true, false, false), None, "Ctrl-C (ETX) is copy");
+        // Unmodified and Alt/Meta spellings belong to the page.
+        assert_eq!(shortcut_for("C", false, false, false), None);
+        assert_eq!(shortcut_for("C", false, true, false), None);
+        assert_eq!(shortcut_for("C", true, true, false), None);
+    }
+
+    #[test]
     fn clipboard_chords_always_reach_the_page() {
         // Copy lives in the page's engine (its selection), and paste is the
         // shell's push-then-chord protocol (`is_paste_chord`) — so none of
@@ -300,7 +324,6 @@ mod tests {
         // letter or the control-character spelling X hands over.
         for (text, ctrl) in [
             ("c", true),
-            ("C", true),
             ("\u{03}", true), // Ctrl-C (ETX)
             ("v", true),
             ("V", true),
