@@ -102,6 +102,7 @@ use crate::media::widget::VideoWidget;
 use crate::media::MediaError;
 use crate::logging::{ConsoleQueue, CssScanState};
 use crate::netmod::{self, BlitzNetProvider, MainDocPost, NetPolicy};
+use crate::select;
 
 /// Default page size until the shell sends `ToTab::Resize` (physical px).
 const DEFAULT_SIZE: (u32, u32) = (1024, 768);
@@ -3527,6 +3528,20 @@ impl Tab {
         }
     }
 
+    /// The Ctrl+A chord exactly as the shell forwards it: the letter `a` with
+    /// the Ctrl bit and nothing else (the shell never intercepts clipboard
+    /// chords — `keymap::clipboard_chords_always_reach_the_page` covers `a`).
+    /// Shift/Alt/Meta combinations are different chords (blitz's editor maps
+    /// Ctrl+Shift+A to *deselect*), and auto-repeat must not re-run the select.
+    fn is_select_all_chord(ev: &KeyEvent) -> bool {
+        ev.mods.ctrl()
+            && !ev.mods.shift()
+            && !ev.mods.alt()
+            && !ev.mods.meta()
+            && !ev.repeat
+            && ev.key.eq_ignore_ascii_case("a")
+    }
+
     /// Keyboard input: `ToTab::Key` is a key *press* (the contract has no
     /// release direction). blitz beta.2 has no separate `UnicodeInput`
     /// variant — printable text rides on `BlitzKeyEvent.text` and the whole
@@ -3601,6 +3616,30 @@ impl Tab {
             text,
         };
         self.feed_ui_event(UiEvent::KeyDown(base.clone()));
+        // Ctrl+A outside an editor selects all the text on screen (task:
+        // select all). blitz's own Ctrl+A is editor-only (`node/text.rs`) and
+        // ran on the feed above, so with a text control focused we stay out
+        // of its way; with none focused blitz ignores the chord, and the
+        // document's whole laid-out text becomes the selection. A page that
+        // `preventDefault()`ed the key never gets here — the `keydown` gate
+        // at the top of this function returns first.
+        if Self::is_select_all_chord(ev) {
+            let editor_focused = self.doc.as_ref().is_some_and(|doc| {
+                doc.get_focussed_node_id()
+                    .and_then(|id| doc.get_node(id))
+                    .and_then(|node| node.element_data())
+                    .is_some_and(|data| data.text_input_data().is_some())
+            });
+            if !editor_focused && self.doc.as_mut().is_some_and(|doc| select::select_all(doc)) {
+                let chars = self
+                    .doc
+                    .as_ref()
+                    .and_then(|doc| doc.get_selected_text())
+                    .map(|text| text.chars().count())
+                    .unwrap_or(0);
+                debug!("select-all: {chars} char(s) of page text selected");
+            }
+        }
         let release = BlitzKeyEvent {
             state: KeyState::Released,
             is_auto_repeating: false,
@@ -6103,6 +6142,96 @@ mod tests {
             tab.document_mut().and_then(focused_input_value).as_deref(),
             Some("PASTED"),
             "the second paste replaced the whole value again"
+        );
+    }
+
+    /// Ctrl+A with no editor focused selects every word of laid-out page
+    /// text — spans and paragraphs included, `display: none` text excluded —
+    /// and the result is an ordinary selection: Ctrl+C ships it verbatim.
+    #[test]
+    fn ctrl_a_selects_all_page_text_and_ctrl_c_ships_it() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let page = dir.path().join("all.html");
+        std::fs::write(
+            &page,
+            r#"<!doctype html>
+<html><head><title>A</title></head>
+<body style="margin:0">
+  <p style="margin:0;font-size:20px">Alpha <span>beta</span> gamma</p>
+  <p style="margin:0;font-size:20px">Delta paragraph two</p>
+  <p style="margin:0;display:none">Invisible zebra</p>
+</body></html>"#,
+        )
+        .expect("write page");
+        let (mut tab, sink) = capturing_tab(dir.path());
+        tab.handle_to_tab(ToTab::Resize {
+            width: 800,
+            height: 600,
+            scale: 1.0,
+        });
+        tab.navigate(
+            url::Url::from_file_path(&page).expect("file url").as_str(),
+            NavHistory::Fresh,
+        );
+
+        // Nothing focused, nothing dragged: the chord itself makes the selection.
+        tab.handle_to_tab(ctrl_a());
+        let selected = tab
+            .document_mut()
+            .and_then(|doc| doc.get_selected_text())
+            .expect("Ctrl+A selects the page text");
+        assert!(selected.contains("Alpha beta gamma"), "first paragraph: {selected:?}");
+        assert!(selected.contains("Delta paragraph two"), "second paragraph: {selected:?}");
+        assert!(!selected.contains("Invisible"), "display:none stays unselected: {selected:?}");
+        assert!(!selected.contains("<head>"), "no markup leaks: {selected:?}");
+
+        // And it is the one selection the copy pipeline already knows.
+        tab.handle_to_tab(ctrl_c());
+        tab.drain_copied();
+        assert_eq!(
+            clipboard_texts(&sink).last().map(String::as_str),
+            Some(selected.as_str()),
+            "Ctrl+C copies the Ctrl+A selection verbatim"
+        );
+    }
+
+    /// Ctrl+A selects nothing on a page with no laid-out text (the old
+    /// selection survives), and Ctrl+Shift+A — a different chord — never
+    /// selects the page.
+    #[test]
+    fn ctrl_a_leaves_the_selection_alone_when_it_can_or_must_not_select() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (mut tab, _sink) = selection_tab(dir.path());
+
+        // Ctrl+Shift+A: not the select-all chord.
+        tab.handle_to_tab(ToTab::Key(KeyEvent {
+            key: "A".into(),
+            code: "KeyA".into(),
+            text: Some("A".into()),
+            repeat: false,
+            mods: Modifiers::NONE.with_ctrl().with_shift(),
+        }));
+        assert!(
+            tab.document_mut()
+                .and_then(|doc| doc.get_selected_text())
+                .is_none(),
+            "Ctrl+Shift+A must not select the page"
+        );
+
+        // An empty document has nothing to select; the chord is inert.
+        let empty = dir.path().join("empty.html");
+        std::fs::write(&empty, "<!doctype html><html><head><title>E</title></head><body></body></html>")
+            .expect("write page");
+        tab.navigate(
+            url::Url::from_file_path(&empty).expect("file url").as_str(),
+            NavHistory::Fresh,
+        );
+        tab.handle_to_tab(ctrl_a());
+        assert!(
+            tab.document_mut()
+                .and_then(|doc| doc.get_selected_text())
+                .is_none(),
+            "no laid-out text, no selection"
         );
     }
 

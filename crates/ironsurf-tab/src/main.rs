@@ -17,6 +17,7 @@ mod logging;
 mod media;
 mod netmod;
 mod runtime;
+mod select;
 mod sha256;
 mod spike;
 mod worker;
