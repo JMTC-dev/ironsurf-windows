@@ -1002,18 +1002,27 @@ export component AppWindow inherits Window {
                                         horizontal-alignment: center;
                                         vertical-alignment: center;
                                     }
-                                    HorizontalLayout {
+                                    // Tokens run end to end into one markup string. A
+                                    // Text in a layout has no upper width bound, so with
+                                    // nothing else asking for the leftover, a wide row
+                                    // splits that leftover *equally over every token*
+                                    // and the markup reads `<   div   >`. The stretchy
+                                    // tail claims the rest of the row; and only the last
+                                    // token may elide, so an over-long row truncates at
+                                    // its tail instead of every token becoming `…`.
+                                    dr-toks := HorizontalLayout {
                                         x: 22px + dr.depth * 12px;
                                         width: Math.max(0px, parent.width - 22px - dr.depth * 12px);
                                         height: parent.height;
                                         spacing: 0px;
-                                        for dt in dr.toks: Text {
+                                        for dt[i] in dr.toks: dr-tok := Text {
                                             text: dt.text;
                                             color: root.inspect-kind-color(dt.kind);
                                             font-italic: dr.italic;
                                             vertical-alignment: center;
-                                            overflow: elide;
+                                            overflow: i == dr.toks.length - 1 ? elide : clip;
                                         }
+                                        dr-tail := Rectangle { horizontal-stretch: 1; }
                                     }
                                 }
                             }
