@@ -1049,6 +1049,21 @@ else is implemented and nothing is pretended: `digest` rejects every other algor
 `deriveBits` are absent, and the **document** realm keeps `crypto.subtle` missing entirely (task:
 XMLHttpRequest + Web Crypto), so feature detection stays honest in both realms.
 
+**A whole Anubis gate now passes end to end** (startpage.com's search: challenge page → worker
+PoW → clearance → real page), and the four members it needs beyond the worker/digest machinery
+are pinned by unit tests: `navigator.cookieEnabled` (must exist and be `true` — a missing/falsy
+member sends Anubis down its “browser blocks cookies” error path, which on its themed page
+dereferences `#title`/`#image` it does not have and dies as an unhandled rejection);
+`HTMLElement.lang`/`dir` (reflected string attributes on every HTML element, so
+`document.documentElement.lang` answers the locale instead of `undefined` — the
+`locales/undefined.json` 404 the shell surfaced); `URL.prototype.searchParams` (boa_runtime
+answers it with a hard “not implemented” *error*, and Anubis's pass-challenge step is exactly
+`new URL(…).searchParams.set(…)`; the returned `URLSearchParams` writes the query back through
+every mutator); and the cookie jar's `Expires` parser (`cookies.rs` had a 0-indexed month table
+feeding a 1-indexed `days_from_civil`, so a cookie expiring 30 minutes out was stored as
+already-expired and never rode the pass-challenge request — Anubis answered “cookies appear to
+be disabled”).
+
 ### HTML forms (`src/forms.rs`)
 
 Blitz parses forms but its submission algorithm is incomplete (`<select>` values are a TODO in

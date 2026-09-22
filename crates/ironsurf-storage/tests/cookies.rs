@@ -113,6 +113,28 @@ fn expires_prunes_on_access() {
 }
 
 #[test]
+fn expires_in_the_immediate_future_is_stored_and_sent() {
+    // An Anubis challenge cookie carries `Expires` ~30 minutes out. A month
+    // table that was off by one stored it as a month in the past, so the
+    // pass-challenge request went out without the test cookie and Anubis
+    // answered "cookies appear to be disabled" — the solve failed after the
+    // proof of work had already been found.
+    let jar = jar_with(
+        "spchal=abc; Path=/; Domain=example.com; Expires=Wed, 15 Nov 2023 22:13:20 GMT",
+        "https://www.example.com/",
+    );
+    assert!(
+        jar.cookie_header(&url("https://www.example.com/"), T).is_some(),
+        "a cookie expiring one day after T must be stored and sent at T"
+    );
+    assert_eq!(
+        jar.cookie_header(&url("https://www.example.com/"), T + 86_401),
+        None,
+        "and gone once that exact expiry passes"
+    );
+}
+
+#[test]
 fn already_expired_set_cookie_never_sent() {
     let jar = jar_with("g=1; Path=/; Expires=Wed, 09 Jun 2021 10:18:14 GMT", "https://example.com/");
     // Stored as expired but pruned at any access time after its expiry.

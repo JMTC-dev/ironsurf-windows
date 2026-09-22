@@ -342,18 +342,23 @@ pub(crate) fn parse_http_date(s: &str) -> Option<i64> {
     let day: i64 = day.parse().ok()?;
     let year: i64 = year.parse().ok()?;
     let month = match month.to_ascii_lowercase().as_str() {
-        "jan" => 0,
-        "feb" => 1,
-        "mar" => 2,
-        "apr" => 3,
-        "may" => 4,
-        "jun" => 5,
-        "jul" => 6,
-        "aug" => 7,
-        "sep" => 8,
-        "oct" => 9,
-        "nov" => 10,
-        "dec" => 11,
+        // 1-indexed, the convention `days_from_civil` implements (a 0-based
+        // table here made every month after the first land one calendar month
+        // in the past — an Anubis challenge cookie with `Expires` 30 minutes
+        // out was stored as already expired and never sent, so every
+        // pass-challenge answered "cookies disabled").
+        "jan" => 1,
+        "feb" => 2,
+        "mar" => 3,
+        "apr" => 4,
+        "may" => 5,
+        "jun" => 6,
+        "jul" => 7,
+        "aug" => 8,
+        "sep" => 9,
+        "oct" => 10,
+        "nov" => 11,
+        "dec" => 12,
         _ => return None,
     };
     let mut hms_it = hms.split(':');

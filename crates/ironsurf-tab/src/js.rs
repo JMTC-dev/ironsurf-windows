@@ -4312,6 +4312,12 @@ const PRELUDE: &str = r##"
     maxTouchPoints: 0,
     language: "en-US",
     languages: ["en-US"],
+    // Cookies are always on in this engine: the tab owns a real jar and every
+    // request carries/records them. The member must EXIST and be `true` —
+    // Anubis's challenge treats a missing/falsy `navigator.cookieEnabled` as
+    // "the browser blocks cookies", calls its error path, and never starts the
+    // proof-of-work (task: Anubis gates).
+    cookieEnabled: true,
   };
   host.navigator = navigator;
   host.addEventListener = function (type, fn, options) {
@@ -6084,6 +6090,31 @@ const PRELUDE: &str = r##"
   protoAccessor("crossOrigin",
     function () { return stringAttr(this, "crossorigin", LINK_ONLY); },
     function (value) { stringAttrSet(this, "crossorigin", LINK_ONLY, value); });
+  // `lang`/`dir` reflect on EVERY HTML element (HTMLElement's two string
+  // attributes), `<html>` itself included. Anubis's challenge reads
+  // `document.documentElement.lang` to pick its locale JSON; with the member
+  // absent the read was `undefined`, so the gate requested
+  // `locales/undefined.json`, warned on the 404 crystal-clear — the exact
+  // reading the shell surfaced. Foreign (SVG/MathML) elements have no such
+  // IDL member, so they keep browser own-property semantics: assignment is
+  // stored, a read is `undefined`.
+  function htmlAttrGet(self, key) {
+    var parts = elementNameParts(self);
+    if (parts === null || parts.ns !== "h") return undefined;
+    var raw = self.getAttribute(key);
+    return raw === null || raw === undefined ? "" : String(raw);
+  }
+  function htmlAttrSet(self, key, value) {
+    var parts = elementNameParts(self);
+    if (parts === null || parts.ns !== "h") { storeOwn(self, key, String(value)); return; }
+    self.setAttribute(key, String(value));
+  }
+  protoAccessor("lang",
+    function () { return htmlAttrGet(this, "lang"); },
+    function (value) { htmlAttrSet(this, "lang", value); });
+  protoAccessor("dir",
+    function () { return htmlAttrGet(this, "dir"); },
+    function (value) { htmlAttrSet(this, "dir", value); });
   // `<a>`/`<area>` URL decomposition (HTMLAnchorElement): every member reads
   // the RESOLVED `href` through the tab's parser. Mastodon's link-card
   // component builds `document.createElement("a")`, assigns `.href` and reads
@@ -6787,6 +6818,42 @@ const PRELUDE: &str = r##"
   };
   URLSearchParams.prototype[Symbol.iterator] = URLSearchParams.prototype.entries;
   host.URLSearchParams = URLSearchParams;
+  // `URL.prototype.searchParams` (task: Anubis gates). boa_runtime's `URL`
+  // carries every other member but answers this getter with a hard
+  // `Error: URL.searchParams is not implemented`. Anubis's pass-challenge
+  // step is exactly `new URL(...).searchParams.set(...)`, so the throw landed
+  // in main.mjs's catch — and that error path dereferences `#title`/`#image`,
+  // which the themed challenge page does not have, so the failure resurfaced
+  // as a second throw swallowed as an unhandled rejection: the gate sat on
+  // "Calculating…" forever with a solved nonce in hand. The returned object
+  // writes the query back to the URL through every mutator (`url.search`
+  // reflects it at once, and the serialised href carries it), which is the
+  // spec's observable behaviour; repeated reads hand back fresh-but-consistent
+  // objects rather than one cached identity.
+  (function () {
+    if (typeof URL !== "function") return;
+    Object.defineProperty(URL.prototype, "searchParams", {
+      get: function () {
+        var url = this;
+        var params = new URLSearchParams(url.search);
+        function sync() {
+          var query = params.toString();
+          url.search = query === "" ? "" : "?" + query;
+        }
+        ["append", "set", "delete", "sort", "replace"].forEach(function (name) {
+          var original = params[name];
+          params[name] = function () {
+            var out = original.apply(this, arguments);
+            sync();
+            return out;
+          };
+        });
+        return params;
+      },
+      enumerable: true,
+      configurable: true,
+    });
+  })();
 
   // ---------------------------------------------------------------------
   // Event / CustomEvent / EventTarget (task: infosec.exchange). `Event`
@@ -10753,6 +10820,32 @@ mod tests {
         )))
     }
 
+    #[test]
+    fn url_search_params_write_through_to_the_url() {
+        let host = sample_host();
+        assert_eq!(
+            eval_snippet(
+                r##"
+                var url = new URL("/p?a=1", "https://example.test/base");
+                var initial = url.searchParams.get("a");
+                url.searchParams.set("b", "x y");
+                url.searchParams.append("c", "3");
+                var query = url.search;
+                var href = url.toString();
+                url.searchParams.delete("a");
+                var afterDelete = url.search;
+                String(initial === "1" && query === "?a=1&b=x+y&c=3" &&
+                    href.indexOf("b=x+y") >= 0 && afterDelete === "?b=x+y&c=3");
+                "##,
+                &host,
+            )
+            .as_string()
+            .map(|s| s.to_std_string_escaped())
+            .unwrap_or_default(),
+            "true"
+        );
+    }
+
     /// With no dialog host attached (bare tests; the headless harness), the
     /// three window dialogs exist on `window` and answer their cancelled
     /// readings at once — `confirm` false, `prompt` null, `alert` undefined —
@@ -12960,7 +13053,16 @@ mod tests {
             document.lang = "en-GB";
             var l = document.documentElement.getAttribute("lang") === "en-GB" &&
                 document.lang === "en-GB";
-            d && l;
+            // `document.documentElement.lang` reflects the <html> attribute
+            // (Anubis reads it to choose its locale JSON; a missing member
+            // returned `undefined` and it fetched `locales/undefined.json`).
+            var reflected = document.documentElement.lang === "en-GB";
+            documentElementDotLang();
+            function documentElementDotLang() {
+              document.documentElement.lang = "fr";
+              reflected = reflected && document.documentElement.getAttribute("lang") === "fr";
+            }
+            d && l && reflected;
             "##,
         );
     }
@@ -13878,6 +13980,10 @@ mod user_agent_tests {
         assert_eq!(
             eval_string("navigator.platform", &host).as_str(),
             "Linux x86_64"
+        );
+        assert_eq!(
+            eval_string("String(typeof navigator.cookieEnabled === 'boolean' && navigator.cookieEnabled)", &host).as_str(),
+            "true"
         );
         // appVersion is the UA minus its "Mozilla/" prefix (spec behaviour).
         assert_eq!(
