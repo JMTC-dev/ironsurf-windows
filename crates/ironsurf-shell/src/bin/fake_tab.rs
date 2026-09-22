@@ -425,6 +425,26 @@ fn main() {
                 text: Some("video-toggled".into()),
             }),
             ToTab::SetZoom { .. } => {} // no real layout to rescale
+            // DevTools Inspector (task: Inspector — shell side): the fake tab has no
+            // DOM, so the pane's commands are accepted and answered the way the real
+            // tab would at best — an empty tree of a blank document, and status-line
+            // echoes that let the shell-side tests prove the wiring fires.
+            ToTab::SetInspect { open } => {
+                if open {
+                    emit(FromTab::InspectSnapshot {
+                        snapshot: ironsurf_common::InspectSnapshot::default(),
+                    });
+                }
+            }
+            ToTab::SetInspectPick { enabled } => emit(FromTab::StatusText {
+                text: Some(format!("pick:{}", if enabled { "on" } else { "off" })),
+            }),
+            ToTab::InspectSelect { node } => emit(FromTab::StatusText {
+                text: Some(format!("select:{}", node.map(|n| n.to_string()).unwrap_or("-".into()))),
+            }),
+            ToTab::InspectPickAt { x, y } => emit(FromTab::StatusText {
+                text: Some(format!("pick-at:{x},{y}")),
+            }),
             // Userscripts (task: userscript execution): only the REAL tab runs
             // them; this fake has no JS engine, so the set is accepted and
             // dropped. The point is that the message never breaks the pump.
