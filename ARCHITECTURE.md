@@ -564,6 +564,22 @@ in `ironsurf-tab/src/netmod.rs` and pass `Arc<OurProvider>` as `DocumentConfig.n
   its own jar-computed `Cookie` header for its own origin, and each hop's
   `Set-Cookie`s bind to that hop; POST→GET conversion follows the browser
   rules (303 always, 301/302 convert; 307/308 keep method+body).
+- **`Refresh` navigations are honoured** (task: Anubis `metarefresh` gates): the
+  non-standard HTTP `Refresh:` response header (`2; url=/pass-challenge?…`) and the
+  semantically identical `<meta http-equiv="refresh" content="2; url=…">` both arm a
+  real delayed navigation. The header is parsed by `netmod::parse_refresh`/
+  `refresh_from_headers` while the response is in hand (`DocFetch::refresh`, resolved
+  against the final URL; `None` for local schemes); the meta tag is read from the live
+  document after its scripts run and goes through the same parser. `Tab::schedule_refresh`
+  sets `(deadline, target)`, the poll loop caps its sleep by that deadline (like a JS
+  timer) and `Tab::follow_due_refresh` (step 5 of `drain_nav_hook`, so the headless harness
+  gets it too) navigates when it comes due — never inline with the load that armed it, so a
+  self-refreshing page spins the loop like any browser's refresh loop instead of the stack.
+  The header wins when both are present; a directive with no target reloads the same URL;
+  the separator may be `;` or the legacy `,`, `url=` is case-insensitive, and quotes around
+  the target are stripped. This is exactly what lets a JS-less Anubis `metarefresh` challenge
+  (which randomly emits one form or the other) clear itself: the challenge cookie captured
+  from the gate response rides back on the refresh request, whose 302 lands on the real page.
   `Passthrough` therefore skips only the https-upgrade and the response cache
   on navigations. One jar instance (`Arc<Mutex<CookieJar>>`) is shared by the
   tab's main-document fetches and the provider's subresource fetches — cookies

@@ -39,6 +39,7 @@
 use std::collections::VecDeque;
 use std::fmt;
 use std::io;
+use std::time::Duration;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock};
@@ -2264,13 +2265,110 @@ impl NetProvider for BlitzNetProvider {
 // ---------------------------------------------------------------------------
 // Main-document fetch (always ours, both policies; task 7c drives this)
 
+/// A `Refresh` directive — the non-standard HTTP `Refresh:` response header
+/// and the semantically identical `<meta http-equiv="refresh">` element share
+/// this shape (task: Anubis `metarefresh` gates). `url` is already resolved
+/// against the base that produced it (the response's final URL, or the
+/// document URL for a meta tag), so the caller only has to arm a timer.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RefreshSpec {
+    /// Seconds to wait before navigating (`0` = immediately).
+    pub delay: Duration,
+    /// Where to navigate. A directive with no `url=` reloads the same URL.
+    pub url: Url,
+}
+
+/// Parse a `Refresh` value (`"5"`, `"5; url=/next"`, `"0, url=\"/x\""`): the
+/// delay in seconds plus the optional target text, verbatim. Both the standard
+/// `;` separator and the legacy comma form are accepted, `url=` is
+/// case-insensitive, an optional pair of single/double quotes around the URL
+/// is stripped, and anything after the first separator that is not `url=` is
+/// taken as the target itself (older generators wrote `"5; /next"`). `None`
+/// only for a value that does not start with a number.
+pub fn parse_refresh(value: &str) -> Option<(u64, Option<String>)> {
+    let value = value.trim();
+    let digits = value
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(value.len());
+    if digits == 0 {
+        return None;
+    }
+    let delay: u64 = value[..digits].parse().ok()?;
+    let rest = value[digits..].trim_start();
+    // The separator is optional: `"5"` alone means "reload this URL".
+    let rest = rest
+        .strip_prefix(';')
+        .or_else(|| rest.strip_prefix(','))
+        .map(str::trim_start)
+        .unwrap_or(rest);
+    if rest.is_empty() {
+        return Some((delay, None));
+    }
+    let target = if rest.len() >= 4 && rest[..4].eq_ignore_ascii_case("url=") {
+        rest[4..].trim()
+    } else {
+        rest.trim()
+    };
+    let target = target
+        .strip_prefix('"')
+        .and_then(|t| t.strip_suffix('"'))
+        .or_else(|| {
+            target
+                .strip_prefix('\'')
+                .and_then(|t| t.strip_suffix('\''))
+        })
+        .unwrap_or(target)
+        .trim();
+    if target.is_empty() {
+        return Some((delay, None));
+    }
+    Some((delay, Some(target.to_owned())))
+}
+
+/// The [`RefreshSpec`] a response's headers ask for, resolved against the URL
+/// the response came from (`None` = no `Refresh:` header, or one we cannot
+/// parse).
+pub fn refresh_from_headers(headers: &[(String, String)], base: &Url) -> Option<RefreshSpec> {
+    let raw = headers
+        .iter()
+        .rev()
+        .find(|(name, _)| name.eq_ignore_ascii_case("refresh"))
+        .map(|(_, value)| value.as_str())?;
+    let (seconds, target) = parse_refresh(raw)?;
+    let url = match target {
+        Some(target) => base.join(&target).unwrap_or_else(|_| base.clone()),
+        None => base.clone(),
+    };
+    Some(RefreshSpec {
+        delay: Duration::from_secs(seconds),
+        url,
+    })
+}
+
 /// A fetched main document: post-redirect URL + status + raw bytes
-/// (`String::from_utf8_lossy` at parse time).
+/// (`String::from_utf8_lossy` at parse time) + the `Refresh:` directive the
+/// response carried, if any.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DocFetch {
     pub url: Url,
     pub status: u16,
     pub body: Vec<u8>,
+    /// `Refresh:` header (task: Anubis `metarefresh` gates), resolved against
+    /// [`Self::url`]. The runtime arms a real timer for it; a cached entry
+    /// replays the directive stored with its headers like any browser cache.
+    pub refresh: Option<RefreshSpec>,
+}
+
+/// [`DocFetch`] from a completed exchange, lifting the `Refresh:` header out of
+/// the response headers (used by every http(s) navigation shape).
+fn doc_fetch_from(outcome: FetchOutcome) -> DocFetch {
+    let refresh = refresh_from_headers(&outcome.headers, &outcome.final_url);
+    DocFetch {
+        url: outcome.final_url,
+        status: outcome.status,
+        body: outcome.body,
+        refresh,
+    }
 }
 
 impl DocFetch {
@@ -2525,6 +2623,7 @@ where
             url: url.clone(),
             status: 200,
             body,
+            refresh: None,
         }
     };
     match url.scheme() {
@@ -2577,11 +2676,7 @@ where
         // Non-http scheme that still reached here (unknown scheme): refuse.
         Plan::Pass => {
             plain_http_fetch_report(worker.client(), url, None, post, &user_agent, report)
-                .map(|o| DocFetch {
-                    url: o.final_url,
-                    status: o.status,
-                    body: o.body,
-                })
+                .map(doc_fetch_from)
                 .map_err(|message| NetError::Transport {
                     url: url.clone(),
                     message,
@@ -2599,11 +2694,7 @@ where
             &user_agent,
             report,
         )
-        .map(|o| DocFetch {
-            url: o.final_url,
-            status: o.status,
-            body: o.body,
-        })
+        .map(doc_fetch_from)
         .map_err(|message| NetError::Transport {
             url: url.clone(),
             message,
@@ -2640,11 +2731,7 @@ where
                             elapsed_ms(started),
                         ));
                     }
-                    Ok(DocFetch {
-                        url: o.final_url,
-                        status: o.status,
-                        body: o.body,
-                    })
+                    Ok(doc_fetch_from(o))
                 }
                 Err(reason) => {
                     warn!("https upgrade for {url} failed, navigation blocked: {reason}");
@@ -2758,6 +2845,53 @@ mod tests {
             "https://example.com:8080/x"
         );
         assert!(upgrade_to_https(&url("https://example.com")).is_none());
+    }
+
+    #[test]
+    fn refresh_values_parse_like_browsers_do() {
+        assert_eq!(parse_refresh("5"), Some((5, None)));
+        assert_eq!(parse_refresh("0; url=/next"), Some((0, Some("/next".into()))));
+        assert_eq!(parse_refresh("2, url=/x"), Some((2, Some("/x".into()))));
+        // Quoted target keeps its own `;`/`,` — the separator split happens first.
+        assert_eq!(
+            parse_refresh("7; URL=\"/q?a=1;b=2\""),
+            Some((7, Some("/q?a=1;b=2".into())))
+        );
+        // Legacy generator shape: separator then a bare URL.
+        assert_eq!(parse_refresh("1; /legacy"), Some((1, Some("/legacy".into()))));
+        // Anubis `metarefresh`'s exact header.
+        assert_eq!(
+            parse_refresh("2; url=/.within.website/x/cmd/anubis/api/pass-challenge?challenge=abc&id=1"),
+            Some((
+                2,
+                Some("/.within.website/x/cmd/anubis/api/pass-challenge?challenge=abc&id=1".into())
+            ))
+        );
+        assert_eq!(parse_refresh("nope; url=/x"), None);
+        assert_eq!(parse_refresh("  "), None);
+    }
+
+    #[test]
+    fn refresh_header_resolves_against_the_response_url() {
+        let headers = vec![
+            ("cache-control".to_owned(), "no-store".to_owned()),
+            ("Refresh".to_owned(), "2; url=/pass".to_owned()),
+        ];
+        let spec = refresh_from_headers(&headers, &url("https://gate.example/g/")).unwrap();
+        assert_eq!(spec.delay, Duration::from_secs(2));
+        assert_eq!(spec.url.as_str(), "https://gate.example/pass");
+        // No header (or an unparseable one) → no directive.
+        assert!(refresh_from_headers(&[], &url("https://a/")).is_none());
+        assert!(refresh_from_headers(
+            &[("refresh".to_owned(), "soon".to_owned())],
+            &url("https://a/")
+        )
+        .is_none());
+        // A target-less directive reloads the response URL.
+        let reload =
+            refresh_from_headers(&[("refresh".to_owned(), "3".to_owned())], &url("https://a/b"))
+                .unwrap();
+        assert_eq!(reload.url.as_str(), "https://a/b");
     }
 
     #[test]

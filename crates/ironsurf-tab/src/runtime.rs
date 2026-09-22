@@ -551,6 +551,12 @@ pub struct Tab {
     /// the document's own URL (task: infosec.exchange); wins over
     /// `doc.url()` in `check_meta` until the NEXT real navigation.
     url_override: Option<String>,
+    /// Delayed navigation armed by the response's `Refresh:` header or a
+    /// `<meta http-equiv="refresh">` in the document (task: Anubis
+    /// `metarefresh` gates): `(deadline, target)`, followed by the poll loop
+    /// once due. Cleared by every real navigation, replaced when the newly
+    /// loaded document carries its own directive.
+    refresh_at: Option<(Instant, Url)>,
     last_title: Option<Option<String>>,
     /// `document.title` as last assigned by page JavaScript (task 8). Wins over
     /// the `ShellProvider`/`<title>` node sources while the document is live.
@@ -955,6 +961,7 @@ impl Tab {
             last_title: None,
             last_url: None,
             url_override: None,
+            refresh_at: None,
             js_title: None,
             js_status: None,
             js: None,
@@ -1129,6 +1136,10 @@ impl Tab {
         // A real navigation owns the URL again: any pushState address-bar
         // override from the outgoing document dies with it.
         self.url_override = None;
+        // …and so does any delayed navigation the outgoing document armed
+        // (its `Refresh:` header / meta refresh). A fresh one is armed below,
+        // after the new document is loaded.
+        self.refresh_at = None;
         // `javascript:` is never fetched: the text after the scheme is a
         // program for the current page's JS world (address bar, `<a href>`,
         // or a page's own `location.href = "javascript:…"`). Checked on the
@@ -1230,6 +1241,11 @@ impl Tab {
                 }
                 let html = render_document(&doc_fetch);
                 self.load_html(&doc_fetch.url, &html, history);
+                // Arm a `Refresh:`-header / meta-refresh navigation (task:
+                // Anubis `metarefresh` gates) after the new document exists,
+                // so a script-added `<meta http-equiv=refresh>` is honoured
+                // too. Header first (it wins when both are present).
+                self.schedule_refresh(doc_fetch.refresh.clone());
                 info!(
                     "loaded {} in {} ms",
                     doc_fetch.url,
@@ -2075,6 +2091,88 @@ impl Tab {
         self.navigate_post(resolved.as_str(), history, None)
     }
 
+    /// Arm the delayed navigation a freshly loaded document asks for: the
+    /// response's `Refresh:` header (already parsed + resolved by `netmod`, so
+    /// `header` is the winning directive when present) or, failing that, the
+    /// first `<meta http-equiv="refresh">` in the live document. The meta tag's
+    /// `content` goes through the very same `netmod::parse_refresh`, resolved
+    /// against the document URL. Task: Anubis `metarefresh` gates — Anubis
+    /// randomly picks between the header and the tag, so both must be followed.
+    /// The deadline is `now + delay`; `0` fires on the next poll iteration,
+    /// never inline (a refresh is a queued navigation, like `location.href=`).
+    fn schedule_refresh(&mut self, header: Option<netmod::RefreshSpec>) {
+        match header.or_else(|| self.document_meta_refresh()) {
+            Some(spec) => {
+                debug!("refresh armed: navigate to {} in {:?}", spec.url, spec.delay);
+                self.refresh_at = Some((Instant::now() + spec.delay, spec.url));
+            }
+            None => self.refresh_at = None,
+        }
+    }
+
+    /// The first usable `<meta http-equiv="refresh" content="…">` in the live
+    /// document, resolved against the document URL. `http-equiv` matches
+    /// case-insensitively (as browsers do); an unparseable `content` or one
+    /// without a target reloads the current URL.
+    fn document_meta_refresh(&self) -> Option<netmod::RefreshSpec> {
+        let doc = self.doc.as_ref()?;
+        let base = doc.url().clone();
+        let ids = doc.query_selector_all("meta").ok()?;
+        for id in ids {
+            let Some(node) = doc.get_node(id) else { continue };
+            let Some(element) = node.element_data() else { continue };
+            let equiv = element
+                .attr(blitz_dom::local_name!("http-equiv"))
+                .unwrap_or_default();
+            if !equiv.trim().eq_ignore_ascii_case("refresh") {
+                continue;
+            }
+            let Some(content) = element.attr(blitz_dom::local_name!("content")) else {
+                continue;
+            };
+            let Some((seconds, target)) = netmod::parse_refresh(content) else {
+                continue;
+            };
+            let url = match target {
+                Some(target) => base.join(&target).unwrap_or_else(|_| base.clone()),
+                None => base.clone(),
+            };
+            return Some(netmod::RefreshSpec {
+                delay: Duration::from_secs(seconds),
+                url,
+            });
+        }
+        None
+    }
+
+    /// Follow the delayed navigation a loaded document armed, once its deadline
+    /// has passed. Called from [`Tab::drain_nav_hook`] (the poll loop and the
+    /// headless harness) after the queued JS navigations, never inline with the
+    /// load that armed it — a page that refreshes to itself spins the loop like
+    /// any browser's refresh loop; it cannot grow the stack.
+    fn follow_due_refresh(&mut self) -> bool {
+        let Some((deadline, url)) = self.refresh_at.clone() else {
+            return false;
+        };
+        if Instant::now() < deadline {
+            return false;
+        }
+        self.refresh_at = None;
+        info!("following delayed refresh → {url}");
+        // A refresh is a real navigation: it pushes a history entry (browsers
+        // do the same), and the destination's own `Refresh:` (if any) replaces
+        // the deadline we just cleared.
+        self.navigate(url.as_str(), NavHistory::Fresh)
+    }
+
+    /// How long the poll loop may sleep before the armed refresh deadline,
+    /// folded into the timer/media tick caps (see `timer_poll_tick`).
+    fn refresh_sleep_hint(&self) -> Option<Duration> {
+        self.refresh_at
+            .as_ref()
+            .map(|(deadline, _)| deadline.saturating_duration_since(Instant::now()))
+    }
+
     /// Fold the JS host cell's side effects (console output, notes) and these
     /// script errors into the tab's pending status text, draining what was
     /// read so the next batch only reports what is new — **and** ship every
@@ -2265,15 +2363,20 @@ impl Tab {
 
     /// Poll timeout capped by the earliest JS timer deadline: a page that
     /// armed `setTimeout(fn, 10)` must not wait for the next `IDLE_TICK`.
+    /// A pending `Refresh:`/meta-refresh navigation caps it the same way.
     fn timer_poll_tick(&self, base: Duration) -> Duration {
-        match self
+        let mut tick = base;
+        if let Some(deadline) = self
             .js
             .as_ref()
             .and_then(|runtime| runtime.next_timer_deadline())
         {
-            Some(deadline) => base.min(deadline.saturating_duration_since(Instant::now())),
-            None => base,
+            tick = tick.min(deadline.saturating_duration_since(Instant::now()));
         }
+        if let Some(hint) = self.refresh_sleep_hint() {
+            tick = tick.min(hint);
+        }
+        tick
     }
 
     /// Timer step (task: real timers): execute every JS timer callback due
@@ -3623,7 +3726,12 @@ impl Tab {
         }
         // 4. The page's own navigation request (`location.href=`/`assign`/
         //    `replace`/`reload` from scripts, timers, or event handlers).
-        self.follow_pending_js_nav()
+        if self.follow_pending_js_nav() {
+            return true;
+        }
+        // 5. A `Refresh:` header / `<meta http-equiv="refresh">` deadline that
+        //    has come due (task: Anubis `metarefresh` gates).
+        self.follow_due_refresh()
     }
 
     /// Apply the URL-only address-bar change `history.pushState`/`replaceState`
@@ -3721,12 +3829,18 @@ impl Tab {
     }
 
     /// How long the harness may sleep before its next pump without missing
-    /// a JS timer deadline (`None` = nothing scheduled).
+    /// a JS timer deadline (`None` = nothing scheduled) — nor a pending
+    /// `Refresh:`/meta-refresh navigation deadline.
     pub(crate) fn timer_sleep_hint(&self) -> Option<Duration> {
-        self.js
+        let timer = self
+            .js
             .as_ref()
             .and_then(|runtime| runtime.next_timer_deadline())
-            .map(|deadline| deadline.saturating_duration_since(Instant::now()))
+            .map(|deadline| deadline.saturating_duration_since(Instant::now()));
+        match (timer, self.refresh_sleep_hint()) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        }
     }
 
     /// The live document, for harness-side DOM/serializer access.
@@ -5080,6 +5194,7 @@ mod tests {
             url: Url::parse(raw).expect("data url"),
             status: 200,
             body: body.as_bytes().to_vec(),
+            refresh: None,
         }
     }
 
@@ -5136,6 +5251,7 @@ mod tests {
             url: Url::parse("https://example.com/a.js").unwrap(),
             status: 200,
             body: script.as_bytes().to_vec(),
+            refresh: None,
         };
         assert_eq!(render_document(&fetched), script);
     }
