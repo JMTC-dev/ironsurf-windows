@@ -2,6 +2,7 @@
 
 use blitz_traits::node_id::NodeId;
 use std::cell::RefCell;
+use thin_vec::ThinVec;
 
 use debug_timer::debug_timer;
 use kurbo::{Affine, Rect};
@@ -261,17 +262,20 @@ impl BaseDocument {
                 //if damage.contains(CONSTRUCT_DESCENDENT) {
                 let layout_children = doc.nodes[node_id].layout_children.borrow_mut().take();
                 if let Some(layout_children) = layout_children {
+                    // Anonymous blocks and pseudo-elements can be removed from the
+                    // slab between render passes; drop stale IDs from the list (heal
+                    // it) so they never get dereferenced again.
+                    let mut healed = ThinVec::new();
                     for child_id in layout_children.iter().copied() {
-                        // Anonymous blocks and pseudo-elements can be removed from the
-                        // slab between render passes; skip stale IDs.
                         if !doc.nodes.contains_key(child_id) {
                             continue;
                         }
+                        healed.push(child_id);
                         resolve_layout_children_recursive(doc, child_id);
                         doc.nodes[child_id].layout_parent.set(Some(node_id));
                     }
 
-                    *doc.nodes[node_id].layout_children.borrow_mut() = Some(layout_children);
+                    *doc.nodes[node_id].layout_children.borrow_mut() = Some(healed);
                 }
 
                 // damage.remove(CONSTRUCT_DESCENDENT);

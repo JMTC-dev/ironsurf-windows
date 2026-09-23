@@ -1076,6 +1076,14 @@ impl BaseDocument {
         if let Some(parent_id) = node.as_ref().and_then(|node| node.parent) {
             let parent = &mut self.nodes[parent_id];
             parent.children.retain(|id| *id != node_id);
+            // A dropped pseudo-element can also be referenced by its owning
+            // element's stale `layout_children` list (from a pass that has not
+            // been rebuilt yet — e.g. when the pseudo-element is destroyed by a
+            // later flush while the owner is only walked as an inline child).
+            // Scrub it so the stale id is never dereferenced.
+            if let Some(layout_children) = parent.layout_children.get_mut() {
+                layout_children.retain(|id| *id != node_id);
+            }
         }
 
         node
@@ -3226,5 +3234,149 @@ mod font_face_override_tests {
             "registered family should report the CSS-declared name, \
              not the font file's internal `name` table entry",
         );
+    }
+}
+
+/// Regression tests for the `invalid SlotMap key used` crash observed on real
+/// pages (bleepingcomputer.com): a slab entry (pseudo-element or anonymous
+/// block) can be dropped between render passes while a stale
+/// `layout_children` list still references it. Traversals must skip stale ids
+/// and heal the stale lists instead of dereferencing them.
+#[cfg(test)]
+mod stale_layout_children_tests {
+    use super::*;
+    use crate::{Attribute, QualName, qual_name};
+    use blitz_traits::shell::ColorScheme;
+    use style::selector_parser::RestyleDamage;
+
+    /// Build `<html><body style="margin:0"><div style="width:300px">
+    /// <span>some text</span></div></body></html>` and resolve once.
+    /// Returns (document, div, span).
+    fn make_doc() -> (BaseDocument, NodeId, NodeId) {
+        let mut doc = BaseDocument::new(DocumentConfig {
+            viewport: Some(Viewport::new(400, 300, 1.0, ColorScheme::Light)),
+            ..Default::default()
+        });
+        let root_id = doc.root_node().id;
+        let style = |value: &str| Attribute {
+            name: qual_name!("style"),
+            value: value.to_string(),
+        };
+
+        let mut mutator = doc.mutate();
+        let html = mutator.create_element(qual_name!("html"), vec![]);
+        let body = mutator.create_element(qual_name!("body"), vec![style("margin:0")]);
+        let div = mutator.create_element(qual_name!("div"), vec![style("width:300px")]);
+        let span = mutator.create_element(qual_name!("span"), vec![]);
+        let text = mutator.create_text_node("some text");
+        mutator.append_children(span, &[text]);
+        mutator.append_children(div, &[span]);
+        mutator.append_children(body, &[div]);
+        mutator.append_children(html, &[body]);
+        mutator.append_children(root_id, &[html]);
+        drop(mutator);
+
+        doc.resolve(0.0);
+        (doc, div, span)
+    }
+
+    fn layout_child_ids(doc: &BaseDocument, node_id: NodeId) -> Vec<NodeId> {
+        doc.nodes[node_id]
+            .layout_children
+            .borrow()
+            .as_ref()
+            .map(|list| list.iter().copied().collect::<Vec<_>>())
+            .unwrap_or_default()
+    }
+
+    /// Make `owner`'s `layout_children` list reference `stale`, simulating a
+    /// stale id left behind by a pass that no longer matches the slab.
+    fn inject_stale(doc: &mut BaseDocument, owner: NodeId, stale: NodeId) {
+        let mut layout_children = doc.nodes[owner].layout_children.borrow_mut();
+        let list = layout_children.get_or_insert_with(thin_vec::ThinVec::new);
+        list.push(stale);
+    }
+
+    /// The next render pass must survive a stale id lingering in a
+    /// `layout_children` list: stale entries are skipped and healed, never
+    /// dereferenced (this used to panic with `invalid SlotMap key used`).
+    #[test]
+    fn resolve_recovers_from_stale_layout_children() {
+        let (mut doc, div, span) = make_doc();
+
+        // Add another inline span so the div's `layout_children` list
+        // references it after a resolve pass.
+        let ghost = {
+            let mut mutator = doc.mutate();
+            let ghost = mutator.create_element(qual_name!("span"), vec![]);
+            let text = mutator.create_text_node("ghost");
+            mutator.append_children(ghost, &[text]);
+            mutator.append_children(div, &[ghost]);
+            drop(mutator);
+            ghost
+        };
+        doc.resolve(0.0);
+
+        // Drop the ghost node with its slab slot freed, mirroring what happens
+        // when a pseudo-element/anonymous block is destroyed between passes.
+        // The DOM parent list is scrubbed the way the mutator would (so that
+        // only the stale `layout_children` list is left behind).
+        let _ = doc.drop_node_ignoring_parent(ghost);
+        doc.nodes[div].children.retain(|id| *id != ghost);
+        inject_stale(&mut doc, div, ghost);
+
+        // The next pass must not panic and must heal the stale list.
+        doc.nodes[div].insert_damage(RestyleDamage::RELAYOUT);
+        doc.resolve(0.0);
+
+        let ids = layout_child_ids(&doc, div);
+        assert!(
+            !ids.contains(&ghost),
+            "stale id should have been healed away: {ids:?}"
+        );
+
+        // And the pass after that stays healthy too.
+        doc.resolve(0.0);
+    }
+
+    /// DOM removal scrubs the owner's stale `layout_children` list so that a
+    /// removed node never lingers as a stale reference.
+    #[test]
+    fn mutator_remove_node_scrubs_stale_layout_children() {
+        let (mut doc, div, span) = make_doc();
+        inject_stale(&mut doc, div, span);
+        {
+            let mut mutator = doc.mutate();
+            mutator.remove_node(span);
+            drop(mutator);
+        }
+        let ids = layout_child_ids(&doc, div);
+        assert!(
+            !ids.contains(&span),
+            "removed node should be scrubbed from layout_children: {ids:?}"
+        );
+        // A subsequent pass must not panic on the removed node.
+        doc.resolve(0.0);
+    }
+
+    /// `remove_and_drop_pe` (the pseudo-element destruction path) scrubs both
+    /// the DOM children list and the stale `layout_children` list of the
+    /// owning element.
+    #[test]
+    fn remove_and_drop_pe_scrubs_stale_layout_children() {
+        let (mut doc, div, span) = make_doc();
+        inject_stale(&mut doc, div, span);
+        let removed = doc.remove_and_drop_pe(span);
+        assert!(removed.is_some(), "span should have been removed");
+        let ids = layout_child_ids(&doc, div);
+        assert!(
+            !ids.contains(&span),
+            "dropped node should be scrubbed from layout_children: {ids:?}"
+        );
+        assert!(
+            !doc.nodes[div].children.iter().any(|id| *id == span),
+            "dropped node should be scrubbed from DOM children"
+        );
+        doc.resolve(0.0);
     }
 }

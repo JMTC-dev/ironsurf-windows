@@ -513,6 +513,12 @@ impl DocumentMutator<'_> {
             // Mark ancestors dirty so the style traversal visits this subtree.
             parent.mark_ancestors_dirty();
             parent.children.retain(|id| *id != node_id);
+            // The removed node may also be referenced by the parent's stale
+            // `layout_children` list until it is rebuilt; scrub it so the stale
+            // id is never dereferenced.
+            if let Some(layout_children) = parent.layout_children.get_mut() {
+                layout_children.retain(|id| *id != node_id);
+            }
             self.maybe_record_node(parent_id);
         }
     }
@@ -553,6 +559,11 @@ impl DocumentMutator<'_> {
             }
 
             parent.children.retain(|id| *id != node_id);
+            // Same scrub as in `remove_node`: keep the parent's stale
+            // `layout_children` list from holding a dropped id.
+            if let Some(layout_children) = parent.layout_children.get_mut() {
+                layout_children.retain(|id| *id != node_id);
+            }
             self.maybe_record_node(parent_id);
         }
 

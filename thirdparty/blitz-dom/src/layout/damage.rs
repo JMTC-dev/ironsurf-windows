@@ -38,6 +38,13 @@ impl BaseDocument {
         node_id: NodeId,
         damage_from_parent: RestyleDamage,
     ) -> RestyleDamage {
+        // Anonymous blocks and pseudo-elements can be removed from the slab
+        // between render passes; a stale id can still be referenced by a stale
+        // `layout_children` list until it is rebuilt. Skip stale ids entirely.
+        if !self.nodes.contains_key(node_id) {
+            return RestyleDamage::empty();
+        }
+
         let mut damage = if let Some(data) = self.nodes[node_id]
             .stylo_element_data_opt_mut()
             .and_then(|s| s.get_mut())
@@ -61,15 +68,23 @@ impl BaseDocument {
 
         let damage_for_children = RestyleDamage::empty();
         let children = std::mem::take(&mut self.nodes[node_id].children);
-        let layout_children = std::mem::take(self.nodes[node_id].layout_children.get_mut());
+        let mut layout_children = std::mem::take(self.nodes[node_id].layout_children.get_mut());
         let use_layout_children = self.nodes[node_id].should_traverse_layout_children();
         if use_layout_children {
             let layout_children = layout_children.as_ref().unwrap();
             for child in layout_children.iter() {
+                // Stale ids (dropped anonymous blocks/pseudo-elements) may
+                // linger in the list until the node is reconstructed.
+                if !self.nodes.contains_key(*child) {
+                    continue;
+                }
                 damage |= self.propagate_damage_flags(*child, damage_for_children);
             }
         } else {
             for child in children.iter() {
+                if !self.nodes.contains_key(*child) {
+                    continue;
+                }
                 damage |= self.propagate_damage_flags(*child, damage_for_children);
             }
             if let Some(before_id) = self.nodes[node_id].before() {
@@ -78,6 +93,12 @@ impl BaseDocument {
             if let Some(after_id) = self.nodes[node_id].after() {
                 damage |= self.propagate_damage_flags(after_id, damage_for_children);
             }
+        }
+
+        // Heal the stale `layout_children` list as above.
+        if let Some(layout_children) = layout_children.as_mut() {
+            let nodes = &self.nodes;
+            layout_children.retain(|id| nodes.contains_key(*id));
         }
 
         let node = &mut self.nodes[node_id];
@@ -135,6 +156,11 @@ impl BaseDocument {
     /// on all nodes which may carry them, using the `damaged_descendants`
     /// flags to skip clean subtrees (mirroring `propagate_damage_flags`).
     pub(crate) fn clear_damage_and_dirty_flags(&mut self, node_id: NodeId) {
+        // Stale ids can be referenced by stale `layout_children` lists (see
+        // `propagate_damage_flags`); skip them.
+        if !self.nodes.contains_key(node_id) {
+            return;
+        }
         {
             let node = &self.nodes[node_id];
             let has_damage = node.damage().is_some_and(|d| !d.is_empty());
@@ -144,7 +170,7 @@ impl BaseDocument {
         }
 
         let children = std::mem::take(&mut self.nodes[node_id].children);
-        let layout_children = std::mem::take(self.nodes[node_id].layout_children.get_mut());
+        let mut layout_children = std::mem::take(self.nodes[node_id].layout_children.get_mut());
         for child in children.iter() {
             self.clear_damage_and_dirty_flags(*child);
         }
@@ -158,6 +184,14 @@ impl BaseDocument {
         }
         if let Some(after_id) = self.nodes[node_id].after() {
             self.clear_damage_and_dirty_flags(after_id);
+        }
+
+        // Heal the stale `layout_children` list: anonymous blocks and
+        // pseudo-elements removed from the slab are dropped so that later
+        // traversals of this list never dereference a stale id.
+        if let Some(layout_children) = layout_children.as_mut() {
+            let nodes = &self.nodes;
+            layout_children.retain(|id| nodes.contains_key(*id));
         }
 
         let node = &mut self.nodes[node_id];
