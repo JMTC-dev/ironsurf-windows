@@ -418,12 +418,14 @@ Pure disk layer; no engine dependency. `thiserror` error type `StoreError`.
 Layout under a data root (`$IRONSURF_DATA_DIR` or `~/.local/share/ironsurf`):
 
 ```
+history.jsonl                         # SHARED browsing history (task: browsing history):
+                                      # one JSONL line per visit, newest appended last;
+                                      # ONE log at the data root, never per-container
 containers.json                       # registry (Vec<Container>), written atomically
 profiles/<container-name-slug>-<id>/  # tab data path; owned by container
   cookies.json                        # our persistent jar (see below)
   net-cache/                          # bounded response cache (our layer)
   local-storage/                      # DOM localStorage: one JSON area file per origin
-  history.jsonl
 ```
 
 ```rust
@@ -447,7 +449,23 @@ impl ContainerStore {
     pub fn cookie_jar(&self) -> CookieJar;         // loads cookies.json
     pub fn cache(&self) -> NetCache;
     pub fn local_storage(&self) -> LocalStorage;   // areas under local-storage/ (task: per-origin DOM storage)
-    pub fn append_history(&self, url: &str, title: Option<&str>) -> Result<(), StoreError>;
+}
+
+// Task: browsing history. History is SHARED across every container — one
+// append-only JSONL log at the data root, opened by path, deliberately NOT
+// through ContainerStore (this browser does not claim per-container history).
+pub struct HistoryEntry { pub url: String, pub title: Option<String>, pub at_unix: i64 } // line-per-entry Serialize
+pub struct History { path: PathBuf }                   // <root>/history.jsonl
+impl History {
+    pub fn open(root: impl AsRef<Path>) -> Self;       // touches nothing until first write
+    pub fn path(&self) -> &Path;
+    // Appends one visit; a consecutive repeat of the same URL refreshes the
+    // newest line instead of doubling it (reload/title bump); trims to the
+    // newest HISTORY_CAP (5000) lines. A torn last line (crash mid-append)
+    // is tolerated on read and repaired by the next trim.
+    pub fn record(&self, url: &str, title: Option<&str>) -> Result<(), StoreError>;
+    pub fn entries(&self) -> Vec<HistoryEntry>;        // newest first; missing/undecodable log = empty
+    pub fn clear(&self) -> Result<usize, StoreError>;  // deletes the log whole; visits erased
 }
 
 pub struct Cookie { pub name: String, pub value: String, pub domain: String,
@@ -1341,6 +1359,14 @@ Process/tab management (`src/tabs.rs`):
   *inspect element* (opening the panel + Inspector pane if needed, toggling off when armed); the
   same chord with the picker armed disarms it. `Esc` also disarms the picker before it
   unfocuses.
+- **Ctrl-Alt-T reopens the last closed tab** (task: browsing history): `close_tab` pushes
+  (url, title, container) onto an in-memory stack (`CLOSED_TABS_MAX` = 50, oldest first,
+  blank tabs not worth reopening) before killing the process; the chord respawns at the
+  address in the container it died in and focuses it. Deliberate deviation from the
+  original Ctrl-Shift-T spec: that chord belongs to the Console pane. **Ctrl-Alt-H**
+  toggles the History menu (Ctrl-Shift-H is the user's *history* pane in DevTools). Both
+  chords resolve ahead of the plain-Ctrl table, both X11 spellings (letter and
+  control-char) accepted, plain Ctrl-T (new tab) untouched.
 - **Text selection & copy/paste — the shell owns the session clipboard**: copy chords are
   never consumed (Ctrl-C/V/X/A always reach the tab — `keymap::clipboard_chords_always_reach_the_page`),
   every `FromTab::ClipboardText` (page Ctrl+C, editor copy/cut) is filed on the shell's

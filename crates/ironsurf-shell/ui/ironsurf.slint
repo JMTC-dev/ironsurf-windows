@@ -28,6 +28,15 @@ export struct ContainerInfo {
     isDefault: bool,
 }
 
+/// One browsing-history row (task: browsing history), reduced from the shared
+/// `<root>/history.jsonl` by `Core::history_state`: newest visit first, and
+/// `title` falls back to the URL in Rust when the page had no title, so a row
+/// always reads as something.
+export struct HistoryItem {
+    title: string,
+    url: string,
+}
+
 /// One context-menu row (labels only; Rust keeps the matching actions and
 /// maps the picked index back onto them).
 export struct MenuItem {
@@ -613,6 +622,16 @@ export component AppWindow inherits Window {
     in property <string> archive-status: "";
     in property <string> archive-error: "";
 
+    // Browsing-history menu (task: browsing history): opened by the ☰ button
+    // at the right-hand end of the toolbar, next to the container dropdown.
+    // `history-items` is the shared visit log (newest first — the log lives
+    // at the data root and every container reads and writes the SAME file);
+    // `history-status` is the one-line count under the header. Clearing is
+    // all-or-nothing: it wipes the shared log, never one container's slice.
+    in property <bool> history-menu-open: false;
+    in property <[HistoryItem]> history-items;
+    in property <string> history-status: "";
+
     // ------------------------------------------------------------------
     // intents surfaced to Rust
     // ------------------------------------------------------------------
@@ -698,6 +717,14 @@ export component AppWindow inherits Window {
     callback close-archive-menu();
     callback archive-set-enabled(on: bool);
     callback archive-apply-dir(text: string);
+
+    // History-menu intents (task: browsing history): a row click opens that
+    // URL in a new tab; Clear wipes the whole shared log. Row indices are
+    // rows of `history-items`, which Rust caps at a display window.
+    callback toggle-history-menu();
+    callback close-history-menu();
+    callback history-pick(idx: int);
+    callback history-clear();
 
     // Console severity: icon + colour (error red, warn yellow, info/log grey).
     function devtools-level-icon(level: string) -> string {
@@ -806,6 +833,11 @@ export component AppWindow inherits Window {
                     }
                     cb := TouchArea { clicked => { root.open-manager(); } }
                 }
+
+                // browsing history (task: browsing history) — the rightmost
+                // control of the top bar, right next to the container
+                // dropdown; same house pattern as the menu buttons to its left
+                MiniButton { label: "\u{2630}"; clicked => { root.toggle-history-menu(); } }
             }
         }
 
@@ -1912,6 +1944,106 @@ export component AppWindow inherits Window {
 
                 Text {
                     text: "While on, every page (saved as <host>/index.html), script, style, image, and media file the tabs load is written under <folder>/<timestamp of the tab's start>/<host>/… . Each tab process gets its own timestamp folder, so nothing an earlier run saved is ever overwritten by a later one. Folders are created on demand; failures are logged, never fatal.";
+                    color: #888888;
+                    wrap: word-wrap;
+                }
+            }
+        }
+    }
+
+    // ------------------------------------------------------------------------
+    // Browsing-history overlay (task: browsing history)
+    //
+    // The same right-docked Rectangle as the other four menus (never a
+    // PopupWindow: LinuxKMS has none), opened by the ☰ toolbar button and
+    // never stacked — Rust closes it when any other menu opens, and closes
+    // the others when this one opens. The log it lists is shared by every
+    // container; picking a row opens that URL in a new tab, Clear empties
+    // the whole shared log at once.
+    // ------------------------------------------------------------------------
+    Rectangle {
+        x: 0; y: 0;
+        width: root.width; height: root.height;
+        visible: root.history-menu-open;
+        background: #00000099;
+        history-scrim := TouchArea { clicked => { root.close-history-menu(); } }
+
+        history-panel := Rectangle {
+            TouchArea {} // swallow clicks over the panel
+            x: root.width - self.width;
+            width: Math.min(420px, root.width);
+            height: root.height;
+            background: #1e1e1e;
+
+            VerticalLayout {
+                padding: 12px;
+                spacing: 6px;
+
+                HorizontalLayout {
+                    spacing: 8px;
+                    height: 26px;
+                    Text { text: "\u{2630} History"; color: #f0f0f0; font-weight: 600; vertical-alignment: center; }
+                    Rectangle { horizontal-stretch: 1; }
+                    MiniButton { label: "✕"; clicked => { root.close-history-menu(); } }
+                }
+
+                // one-line summary (shared log: every container contributes)
+                Text {
+                    text: root.history-status;
+                    color: #a8b8c8;
+                    wrap: word-wrap;
+                }
+
+                hist-list := ListView {
+                    vertical-stretch: 1;
+                    for hi[i] in root.history-items: Rectangle {
+                        height: 40px;
+                        width: parent.width;
+                        hbg := Rectangle { background: hba.has-hover ? #2c2c2c : transparent; border-radius: 4px; }
+                        // declared before the text ⇒ bottom z-order: the
+                        // click-transparent Texts pass their clicks here
+                        hba := TouchArea {
+                            clicked => { root.history-pick(i); }
+                        }
+                        VerticalLayout {
+                            x: 6px; y: 2px;
+                            width: parent.width - 12px;
+                            spacing: 0px;
+                            Text {
+                                text: hi.title;
+                                color: #e8e8e8;
+                                font-weight: 600;
+                                horizontal-alignment: left;
+                                overflow: elide;
+                            }
+                            Text {
+                                text: hi.url;
+                                color: #8a8a8a;
+                                font-size: 11px;
+                                horizontal-alignment: left;
+                                overflow: elide;
+                            }
+                        }
+                    }
+                }
+
+                if root.history-items.length == 0: Text {
+                    text: "No browsing history — visits land here as tabs navigate, shared by every container.";
+                    color: #888888;
+                    wrap: word-wrap;
+                }
+
+                Rectangle { vertical-stretch: 1; }
+
+                HorizontalLayout {
+                    height: 28px;
+                    spacing: 6px;
+                    MiniButton { label: "Clear history"; clicked => { root.history-clear(); } }
+                    Rectangle { horizontal-stretch: 1; }
+                }
+
+                Text {
+                    text: "History is shared by all containers: one visit in one container is listed (and can be cleared) from all of them. Ctrl-Alt-T reopens the last closed tab.";
                     color: #888888;
                     wrap: word-wrap;
                 }

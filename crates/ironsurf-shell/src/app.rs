@@ -34,7 +34,7 @@ use crate::keymap::{self, Shortcut};
 use crate::state::{InspectorUi, TabState};
 use crate::tabs::{PumpedMessage, TabProc};
 use crate::uisettings::UiSettings;
-use crate::{AppWindow, ContainerInfo, MenuItem, TabInfo};
+use crate::{AppWindow, ContainerInfo, HistoryItem, MenuItem, TabInfo};
 // The Slint-side row structs the DevTools panel renders (`state`'s own
 // view-models of the same name are converted into these).
 use crate::{ConsoleRow, CrumbItem, InspectRow, NetRow, Tok};
@@ -397,7 +397,27 @@ pub struct Core {
     /// Escape, by a click in the page (which hands keyboard focus back to it),
     /// by a switch to another tab, and by that tab going away.
     url_draft: Cell<Option<TabId>>,
+    /// The **reopen closed tab** stack (task: browsing history): closed tabs,
+    /// oldest first, capped at [`CLOSED_TABS_MAX`]; Ctrl-Alt-T pops the newest
+    /// and reopens it in the container it lived in. Deliberately in-memory —
+    /// closed tabs belong to the session, while visits themselves persist in
+    /// the history log shared by every container.
+    closed_tabs: RefCell<Vec<ClosedTabRecord>>,
 }
+
+/// Everything Ctrl-Alt-T needs to recreate a closed tab (task: browsing
+/// history): where it pointed and which container held it.
+struct ClosedTabRecord {
+    url: String,
+    container: ContainerId,
+}
+
+/// How many closed tabs Ctrl-Alt-T can walk back through.
+const CLOSED_TABS_MAX: usize = 50;
+
+/// How many entries the History menu lists (newest first). Clearing is
+/// all-or-nothing on the whole shared log regardless of this display window.
+const HISTORY_MENU_ROWS: usize = 200;
 
 /// The assembled application: core + the timers that drive it (owned so
 /// they are never dropped while the window runs).
@@ -466,6 +486,7 @@ impl App {
             archive_server_sink: RefCell::new(None),
             archive_server_broadcast: RefCell::new(None),
             url_draft: Cell::new(None),
+            closed_tabs: RefCell::new(Vec::new()),
         });
 
         core.attach_callbacks(ui);
@@ -748,6 +769,16 @@ impl Core {
             return;
         }
         info!("closing tab {} ({} still open)", procs[idx].tab.id.0, procs.len() - 1);
+        // Push the tab onto the **reopen closed tab** stack (task: browsing
+        // history) — only if it had an address: a blank tab that never
+        // navigated is not worth bringing back.
+        if let Some(url) = procs[idx].state.url.clone().filter(|u| reopenable(u)) {
+            let mut closed = self.closed_tabs.borrow_mut();
+            closed.push(ClosedTabRecord { url, container: procs[idx].tab.container });
+            if closed.len() > CLOSED_TABS_MAX {
+                closed.remove(0);
+            }
+        }
         let mut proc = procs.remove(idx);
         proc.tab.destroy();
         let empty = procs.is_empty();
@@ -1096,6 +1127,18 @@ impl Core {
                     ui.set_focus_page_token(t);
                 }
                 self.sync_ui();
+                return;
+            }
+            Some(Shortcut::ReopenClosedTab) => {
+                // Ctrl-Alt-T (task: browsing history): pop the most recently
+                // closed tab and reopen its address in its old container.
+                self.reopen_closed_tab();
+                return;
+            }
+            Some(Shortcut::HistoryMenu) => {
+                // Ctrl-Alt-H (task: browsing history): the same menu as the ☰
+                // toolbar button, for keyboard-first users.
+                self.toggle_history_menu();
                 return;
             }
             None => {}
@@ -2029,6 +2072,7 @@ impl Core {
             ui.set_us_menu_open(false);
             ui.set_ua_menu_open(false);
             ui.set_archive_menu_open(false);
+            ui.set_history_menu_open(false);
             let active_container = self
                 .active_proc_index()
                 .map(|i| self.procs.borrow()[i].tab.container)
@@ -2242,6 +2286,7 @@ impl Core {
             ui.set_manager_open(false);
             ui.set_ua_menu_open(false);
             ui.set_archive_menu_open(false);
+            ui.set_history_menu_open(false);
             ui.set_us_editing(false);
             ui.set_us_editing_existing(false);
             ui.set_us_error(SharedString::default());
@@ -2460,6 +2505,7 @@ impl Core {
             ui.set_manager_open(false);
             ui.set_us_menu_open(false);
             ui.set_archive_menu_open(false);
+            ui.set_history_menu_open(false);
             ui.set_ua_error(SharedString::default());
             let current = container_user_agent(&self.store.borrow(), self.active_container());
             // Prefill the draft with exactly what the container holds (a
@@ -2604,6 +2650,7 @@ impl Core {
             ui.set_manager_open(false);
             ui.set_us_menu_open(false);
             ui.set_ua_menu_open(false);
+            ui.set_history_menu_open(false);
             ui.set_archive_error(SharedString::default());
             ui.set_archive_dir_text(self.archive_root_text().as_str().into());
         }
@@ -2617,6 +2664,111 @@ impl Core {
     fn toggle_archive_menu(&self) {
         let open = self.ui().is_some_and(|ui| ui.get_archive_menu_open());
         self.archive_menu(!open);
+    }
+
+    // ---- browsing history & reopen closed tab (task: browsing history) ----
+
+    /// Rebuild the History menu's rows and status line from the shared log.
+    /// Rows are the newest [`HISTORY_MENU_ROWS`] visits, each titled by page
+    /// title falling back to the URL (Rust side, so a row always reads as
+    /// something); the status line counts the **whole** log, which every
+    /// container contributes to and reads from alike.
+    fn history_state(&self, ui: &AppWindow) {
+        let entries = ironsurf_storage::History::open(self.store.borrow().root()).entries();
+        let rows: Vec<HistoryItem> = entries
+            .iter()
+            .take(HISTORY_MENU_ROWS)
+            .map(|e| {
+                let title = e
+                    .title
+                    .as_deref()
+                    .filter(|t| !t.is_empty())
+                    .unwrap_or(&e.url);
+                HistoryItem { title: title.into(), url: e.url.as_str().into() }
+            })
+            .collect();
+        let n = entries.len();
+        ui.set_history_items(ModelRc::from(Rc::new(VecModel::from(rows))));
+        ui.set_history_status(
+            if n > HISTORY_MENU_ROWS {
+                format!("{n} visits shared by every container \u{2014} newest {HISTORY_MENU_ROWS} listed")
+            } else {
+                format!("{n} visit{} shared by every container", if n == 1 { "" } else { "s" })
+            }
+            .into(),
+        );
+    }
+
+    /// Open/close the History overlay. Opening closes the manager, the
+    /// userscript menu, the UA switcher, and the archive menu (two full-window
+    /// overlays never stack; each of those four closes this one from its own
+    /// open leg). Pinned to the right edge like its neighbours.
+    fn history_menu(&self, open: bool) {
+        let Some(ui) = self.ui() else { return };
+        debug!("history menu {}", if open { "opened" } else { "closed" });
+        if open {
+            ui.set_manager_open(false);
+            ui.set_us_menu_open(false);
+            ui.set_ua_menu_open(false);
+            ui.set_archive_menu_open(false);
+            self.history_state(&ui);
+        }
+        ui.set_history_menu_open(open);
+    }
+
+    /// The ☰ toolbar button and Ctrl-Alt-H: flip the overlay.
+    fn toggle_history_menu(&self) {
+        let open = self.ui().is_some_and(|ui| ui.get_history_menu_open());
+        self.history_menu(!open);
+    }
+
+    /// A History row was clicked: open that address in a **new** tab of the
+    /// container new tabs open in (history itself stays shared — the row came
+    /// from the global log regardless of who visited it).
+    fn history_pick(&self, idx: usize) {
+        let url = self
+            .ui()
+            .and_then(|ui| ui.get_history_items().row_data(idx).map(|it| it.url.to_string()))
+            .filter(|u| !u.is_empty());
+        let Some(url) = url else {
+            warn!("history row {idx} is gone \u{2014} nothing opened");
+            return;
+        };
+        self.history_menu(false);
+        let container = self.new_tab_container();
+        info!("history: opening {url} in a new tab (container {})", container.0);
+        self.open_tab(container, Some(&url));
+    }
+
+    /// Clear: delete the **entire shared log** at once (there is no
+    /// per-container slice to clear — that is the point of the task), then
+    /// re-read so the open menu shows itself empty. The reopen stack is
+    /// untouched: those tabs really were open in this session.
+    fn history_clear(&self) {
+        let history = ironsurf_storage::History::open(self.store.borrow().root());
+        match history.clear() {
+            Ok(n) => info!("history menu: cleared {n} shared history entries"),
+            Err(err) => warn!("clearing browsing history failed: {err}"),
+        }
+        if let Some(ui) = self.ui() {
+            self.history_state(&ui);
+        }
+    }
+
+    /// Ctrl-Alt-T: reopen the most recently closed tab (task: browsing
+    /// history). The stack remembers URL and container per close; an empty
+    /// stack (or every address dropped as blank) is a no-op.
+    fn reopen_closed_tab(&self) {
+        let Some(record) = self.closed_tabs.borrow_mut().pop() else {
+            debug!("reopen closed tab: nothing to reopen");
+            return;
+        };
+        info!(
+            "reopen closed tab: {} (container {})",
+            record.url,
+            record.container.0
+        );
+        self.open_tab(record.container, Some(&record.url));
     }
 
     /// The CheckBox: persist **at once**, rebroadcast to every live tab, and
@@ -3093,22 +3245,31 @@ impl Core {
                     .unwrap_or(false)
             };
             dirty |= changed;
-            // Container history: one line per navigation (best effort).
+            // Browsing history (task: browsing history): one line per
+            // navigation, written to the log **shared by every container**
+            // (`<root>/history.jsonl` — never per profile), best effort.
             if let FromTab::UrlChanged { url: Some(url) } = &msg {
-                let entry = {
+                // Blank tabs and IronSurf's own pages are plumbing, not visits.
+                if !worth_recording(url) {
+                    continue;
+                }
+                let title = {
                     let procs = self.procs.borrow();
-                    procs
-                        .iter()
-                        .find(|p| p.tab.id == tid)
-                        .map(|p| (p.tab.container, p.state.title.clone()))
+                    procs.iter().find(|p| p.tab.id == tid).map(|p| p.state.title.clone())
                 };
-                if let Some((container, title)) = entry {
-                    let store = self.store.borrow();
-                    let cs = ironsurf_storage::ContainerStore::open(&store, container);
-                    if let Err(err) = cs.append_history(&url, Some(&title)) {
+                if let Some(title) = title {
+                    let history = ironsurf_storage::History::open(self.store.borrow().root());
+                    let title = if title.is_empty() { None } else { Some(title.as_str()) };
+                    if let Err(err) = history.record(url, title) {
                         warn!("history entry for {url} not written: {err}");
                     } else {
-                        debug!("history: recorded {url} in container {}", container.0);
+                        debug!("history: recorded {url} (shared log)");
+                    }
+                    // Keep an open History menu current as visits land.
+                    if let Some(ui) = self.ui() {
+                        if ui.get_history_menu_open() {
+                            self.history_state(&ui);
+                        }
                     }
                 }
             }
@@ -3632,6 +3793,21 @@ impl Core {
             let c = self.clone();
             ui.on_archive_apply_dir(move |text| c.archive_apply_dir(text.as_str()));
         }
+
+        // Browsing history (task: browsing history): the ☰ toolbar toggle, the
+        // scrim/✕ close, a row pick (reopen the visit in a new tab), and Clear
+        // (wipe the log shared by every container) — all pure Core state.
+        bind0!(on_toggle_history_menu, |c: &Rc<Core>| c.toggle_history_menu());
+        bind0!(on_close_history_menu, |c: &Rc<Core>| c.history_menu(false));
+        bind0!(on_history_clear, |c: &Rc<Core>| c.history_clear());
+        {
+            let c = self.clone();
+            ui.on_history_pick(move |idx| {
+                if idx >= 0 {
+                    c.history_pick(idx as usize);
+                }
+            });
+        }
     }
 }
 
@@ -3806,6 +3982,20 @@ pub const MOVE_INTERVAL: Duration = Duration::from_millis(33);
 
 /// May a hover move be forwarded now? `last` is when the previous one went out
 /// (`None` = none sent yet, so the first always passes).
+/// Whether an address counts as a visit worth the shared history log: not
+/// empty, not `about:blank`, and not one of IronSurf's own `ironsurf://`
+/// pages (the welcome screen is chrome, not browsing).
+fn worth_recording(url: &str) -> bool {
+    !url.is_empty() && url != "about:blank" && !url.starts_with("ironsurf://")
+}
+
+/// Whether closing a tab leaves something worth reopening: any real address,
+/// including the internal start page (closing a fresh welcome tab and
+/// Ctrl-Alt-T'ing it back is a normal thing to do).
+fn reopenable(url: &str) -> bool {
+    !url.is_empty() && url != "about:blank"
+}
+
 pub fn move_due(now: Instant, last: Option<Instant>) -> bool {
     match last {
         Some(t) => now.duration_since(t) >= MOVE_INTERVAL,

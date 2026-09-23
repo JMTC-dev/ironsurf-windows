@@ -1,7 +1,7 @@
 //! IronSurf disk layer: container registry (including each container's
 //! optional per-container User-Agent), global userscripts, per-container
 //! profile stores, an RFC6265-subset cookie jar, a bounded LRU network cache,
-//! and history.
+//! and browsing history.
 //!
 //! No engine dependency — pure files under a data root:
 //!
@@ -9,11 +9,11 @@
 //! $IRONSURF_DATA_DIR (or ~/.local/share/ironsurf)
 //!   containers.json                       # registry, written atomically
 //!   userscripts.json                      # global userscript list, atomic
+//!   history.jsonl                         # browsing history, SHARED by every container
 //!   profiles/<name-slug>-<id>/            # one dir per container (Servo data path)
 //!     cookies.json
 //!     net-cache/
 //!     local-storage/                      # reserved for engine state
-//!     history.jsonl
 //! ```
 //!
 //! Container isolation: every [`ContainerStore`] is bound to exactly one
@@ -22,6 +22,7 @@
 
 mod cache;
 mod cookies;
+mod history;
 mod local_storage;
 mod registry;
 
@@ -29,14 +30,16 @@ pub use cache::{
     fresh_until, CachedEntry, NetCache, DEFAULT_MAX_ENTRIES, DEFAULT_MAX_TOTAL_BYTES,
 };
 pub use cookies::{Cookie, CookieJar};
+pub use history::{History, HistoryEntry, MAX_HISTORY_ENTRIES};
 pub use local_storage::{storage_origin_key, LocalStorage, MAX_LOCAL_STORAGE_BYTES};
 pub use registry::{Store, StoreError, MAX_USERSCRIPT_CODE_BYTES, MAX_USERSCRIPT_NAME_CHARS};
 
 use ironsurf_common::ContainerId;
 use std::path::{Path, PathBuf};
 
-/// Per-container disk store: cookies, cache, history — all scoped to one
-/// container's profile directory.
+/// Per-container disk store: cookies, cache, and local storage — all scoped
+/// to one container's profile directory. Browsing history is **not** here: it
+/// is shared by every container and lives at the data root — see [`History`].
 pub struct ContainerStore {
     container: ContainerId,
     profile_dir: PathBuf,
@@ -88,27 +91,6 @@ impl ContainerStore {
     /// key is the document origin — see [`local_storage`].
     pub fn local_storage(&self) -> LocalStorage {
         LocalStorage::open(self.profile_dir.join(local_storage::LOCAL_STORAGE_DIR))
-    }
-
-    /// Append one navigation to this container's `history.jsonl`.
-    pub fn append_history(&self, url: &str, title: Option<&str>) -> Result<(), StoreError> {
-        use std::io::Write;
-        let entry = serde_json::json!({
-            "url": url,
-            "title": title,
-            "at": crate::now_unix(),
-        });
-        let mut line = entry.to_string();
-        line.push('\n');
-        let path = self.profile_dir.join("history.jsonl");
-        let mut f = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&path)
-            .map_err(|e| StoreError::io(&path, e))?;
-        f.write_all(line.as_bytes())
-            .map_err(|e| StoreError::io(&path, e))?;
-        Ok(())
     }
 
     fn cookies_path(&self) -> PathBuf {

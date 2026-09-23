@@ -5,8 +5,8 @@
 //! private-use code points from the Slint key table). We map those to the
 //! DOM `key`/`code` strings the tab hands to Servo, and we detect browser
 //! chords (Ctrl-L / F6 / Ctrl-W / Ctrl-R / Ctrl-T / Ctrl-Tab / Alt-1…Alt-9 /
-//! Esc / Ctrl-+ / Ctrl-- / Ctrl-0 / F12 / Ctrl-I / Ctrl-F) here so the logic
-//! stays pure and testable.
+//! Esc / Ctrl-+ / Ctrl-- / Ctrl-0 / F12 / Ctrl-I / Ctrl-F / Ctrl-Alt-T /
+//! Ctrl-Alt-H) here so the logic stays pure and testable.
 
 use ironsurf_common::{KeyEvent, Modifiers};
 
@@ -46,6 +46,14 @@ pub enum Shortcut {
     Inspector,
     /// Ctrl-`F`: open the find-in-page bar (and focus its text entry).
     Find,
+    /// Ctrl-Alt-`T`: reopen the last closed tab (task: browsing history). The
+    /// stack it pops is the shell's own — each close pushes URL + container,
+    /// each press pops the newest.
+    ReopenClosedTab,
+    /// Ctrl-Alt-`H`: toggle the browsing-History menu (task: browsing
+    /// history) — the same menu as the ☰ toolbar button, and the only place
+    /// the shared history log is listed and cleared.
+    HistoryMenu,
     /// Esc: return keyboard focus to the page.
     PageFocus,
 }
@@ -160,6 +168,18 @@ pub fn shortcut_for(text: &str, ctrl: bool, alt: bool, meta: bool) -> Option<Sho
     // U+F704 + 5 = U+F709 in the same private-use table as F12 above.
     if c == '\u{F709}' && !ctrl && !alt && !meta {
         return Some(Shortcut::FocusUrl);
+    }
+    // Ctrl-Alt-`T` / Ctrl-Alt-`H` (task: browsing history): reopen the last
+    // closed tab, and toggle the History menu. Caught ahead of the plain-Ctrl
+    // letter chords below, so plain Ctrl-`T` (new tab) and bare letters are
+    // untouched; both spellings X11 backends hand over (letter, control char)
+    // are accepted.
+    if ctrl && alt && !meta {
+        return match c {
+            't' | 'T' | '\u{14}' => Some(Shortcut::ReopenClosedTab),
+            'h' | 'H' => Some(Shortcut::HistoryMenu),
+            _ => None,
+        };
     }
     // Alt-digit: switch to the N-th tab. Resolution against the live tab list
     // happens in the shell, so the chord stays valid as tabs open and close.
@@ -293,6 +313,21 @@ mod tests {
         );
         assert_eq!(shortcut_for("r", true, false, false), Some(Shortcut::Reload));
         assert_eq!(shortcut_for("t", true, false, false), Some(Shortcut::NewTab));
+        // browsing history (task): Ctrl-Alt-T reopens the last closed tab,
+        // Ctrl-Alt-H toggles the History menu, both spellings each backend
+        // delivers; plain Ctrl-T keeps making a new tab.
+        assert_eq!(shortcut_for("t", true, true, false), Some(Shortcut::ReopenClosedTab));
+        assert_eq!(shortcut_for("\u{14}", true, true, false), Some(Shortcut::ReopenClosedTab));
+        assert_eq!(shortcut_for("h", true, true, false), Some(Shortcut::HistoryMenu));
+        assert_eq!(shortcut_for("H", true, true, false), Some(Shortcut::HistoryMenu));
+        // \u{08} (Backspace, and Alt-Backspace's word-delete) belongs to the
+        // text being edited, never to the History chord.
+        assert_eq!(shortcut_for("\u{08}", true, true, false), None);
+        // Meta spellings and bare Alt stay with the window manager / page.
+        assert_eq!(shortcut_for("t", true, true, true), None);
+        assert_eq!(shortcut_for("t", false, true, false), None);
+        // Alt-T is not a tab digit either (see the Alt-digit chord tests).
+        assert_eq!(shortcut_for("a", true, true, false), None);
         assert_eq!(
             shortcut_for("\t", true, false, false),
             Some(Shortcut::CycleTab)

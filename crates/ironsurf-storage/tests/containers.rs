@@ -176,26 +176,28 @@ fn cookie_jars_are_isolated_between_containers() {
     assert_eq!(ca.cookie_jar().cookie_header(&url, 1_000).as_deref(), Some("who=A"));
 }
 
+// Browsing history is no longer per container (task: browsing history): it
+// lives at the data root, shared by every container. The old assertion that
+// each profile kept its own `history.jsonl` is replaced by the reverse —
+// profile dirs never hold history any more; see tests/history.rs for the
+// shared log itself.
 #[test]
-fn history_is_per_container_jsonl() {
+fn profiles_hold_no_history() {
     use ironsurf_storage::ContainerStore;
 
     let tmp = tempfile::tempdir().unwrap();
     let mut store = open(tmp.path());
     let a = store.create_container("A", "#ff0000").unwrap();
     let b = store.default_container_id();
-
-    let ca = ContainerStore::open(&store, a);
-    let cb = ContainerStore::open(&store, b);
-    ca.append_history("https://example.com/one", Some("One"))
+    ironsurf_storage::History::open(tmp.path())
+        .record("https://example.com/one", Some("One"))
         .unwrap();
-    ca.append_history("https://example.com/two", None).unwrap();
-
-    let la = std::fs::read_to_string(ca.profile_dir().join("history.jsonl")).unwrap();
-    assert_eq!(la.lines().count(), 2);
-    let first: serde_json::Value = serde_json::from_str(la.lines().next().unwrap()).unwrap();
-    assert_eq!(first["url"], "https://example.com/one");
-    assert_eq!(first["title"], "One");
-
-    assert!(!cb.profile_dir().join("history.jsonl").exists());
+    for id in [a, b] {
+        let cs = ContainerStore::open(&store, id);
+        assert!(
+            !cs.profile_dir().join("history.jsonl").exists(),
+            "history must not live under profiles/ any more"
+        );
+    }
+    assert!(tmp.path().join("history.jsonl").exists());
 }
