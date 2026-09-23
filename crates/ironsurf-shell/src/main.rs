@@ -186,7 +186,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     // The smoke contract is an about:blank boot no matter what URL was given.
     app.start(if smoke { Some("about:blank") } else { url.as_deref() });
 
-    ui.window().set_size(slint::LogicalSize::new(1024.0, 768.0));
+    // 1040 wide, not 1024: the toolbar's natural (preferred) width is ≈1030
+    // with a default container name — at 1024 the rightmost ☰ History button
+    // hung a few pixels off the right edge and was partly clipped.
+    ui.window().set_size(slint::LogicalSize::new(1040.0, 768.0));
     ui.window().show()?;
 
     if smoke {
