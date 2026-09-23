@@ -571,6 +571,15 @@ pub struct InspectorUi {
     /// `ToTab::InspectPickAt`) and no snapshot has landed since — the pane
     /// shows its honest empty state instead of a blank rectangle.
     pending: bool,
+    /// The node the **page** selected and the tree still owes a scroll to (⌖
+    /// pick, context-menu *Inspect Element*). Held as a node id and never as a
+    /// row number: the rows a request lands on are the ones painted next, and
+    /// they move when a subtree folds or the document is re-walked.
+    reveal: Option<u64>,
+    /// Counts reveal requests. The pane watches the count rather than the row,
+    /// so asking for the row it already shows (pick, scroll away, pick again)
+    /// still moves the tree.
+    reveal_token: u64,
 }
 
 impl InspectorUi {
@@ -597,6 +606,13 @@ impl InspectorUi {
         self.selected = carried
             .or(snap.selected)
             .or_else(|| snap.nodes.first().map(|n| n.id));
+        // A selection the *tab* moved is news from the page — the answer to
+        // `InspectPickAt` ships the hit node in `selected` — so the tree follows
+        // it. The pane's own pick (`carried`) is not: the reader is on that row.
+        if carried.is_none() && snap.selected.is_some() && self.selected == snap.selected {
+            self.reveal = self.selected;
+            self.reveal_token = self.reveal_token.wrapping_add(1);
+        }
     }
 
     /// Forget the tree — the pane closed, or the tab it described is gone. The
@@ -606,6 +622,9 @@ impl InspectorUi {
         self.selected = None;
         self.collapsed.clear();
         self.pending = true;
+        // Nothing to scroll to. `reveal_token` keeps counting, so a request on
+        // the next document is always a change the pane has not seen before.
+        self.reveal = None;
     }
 
     /// ⌖ armed for this tab?
@@ -636,10 +655,59 @@ impl InspectorUi {
     /// stale", never a guess, so it is ignored; a real selection unfolds every
     /// collapsed ancestor, or the row the reader clicked would stay hidden.
     pub fn select(&mut self, node: u64) {
-        let Some(index) = self.index_of(node) else { return };
+        if !self.select_known(node) {
+            return;
+        }
+        // Clicking a row *is* arriving at it: no scroll is owed.
+        self.reveal = None;
+    }
+
+    /// The page selected `node` (⌖ pick, the context menu's *Inspect Element*,
+    /// or a snapshot that came back naming one): select it **and** ask the pane
+    /// to bring its row into view, so a selection made down the page is not lost
+    /// above or below the fold.
+    pub fn select_from_page(&mut self, node: u64) {
+        if !self.select_known(node) {
+            return;
+        }
+        self.reveal = Some(node);
+        self.reveal_token = self.reveal_token.wrapping_add(1);
+    }
+
+    /// Highlight `node` and unfold every collapsed ancestor. `false` when the
+    /// tree has no such id — a stale snapshot, which is never guessed at.
+    fn select_known(&mut self, node: u64) -> bool {
+        let Some(index) = self.index_of(node) else { return false };
         self.selected = Some(node);
         for a in self.ancestor_ids(index) {
             self.collapsed.retain(|c| *c != a);
+        }
+        true
+    }
+
+    /// The scroll the pane owes the page: `(row, token)`, where `row` is the row
+    /// the pending page-side selection occupies in [`Self::rows`] and `token`
+    /// counts requests. `None` when nothing is owed — no request, the reader
+    /// selected elsewhere since, or the node is folded out of the tree.
+    pub fn reveal_request(&self) -> Option<(usize, u64)> {
+        let node = self.reveal.filter(|n| Some(*n) == self.selected)?;
+        Some((self.row_index_of(node)?, self.reveal_token))
+    }
+
+    /// Which row of the painted tree `node` sits in, `None` while it is folded
+    /// away or no tree has arrived. Asked of [`Self::rows`] itself, so the index
+    /// and the pane's row count cannot disagree.
+    pub fn row_index_of(&self, node: u64) -> Option<usize> {
+        self.rows().iter().position(|r| r.node == node)
+    }
+
+    /// Offer an owed scroll again. The pane moves on a *change* in the request,
+    /// and a tree that has only just come on screen — the Inspector pane opened,
+    /// the panel reopened — never saw the request the page made, so it has to be
+    /// asked for a second time.
+    pub fn rearm_reveal(&mut self) {
+        if self.reveal.is_some() {
+            self.reveal_token = self.reveal_token.wrapping_add(1);
         }
     }
 
@@ -656,6 +724,9 @@ impl InspectorUi {
         if !has_children {
             return false;
         }
+        // Folding is the reader arranging the tree themselves; a scroll the page
+        // asked for before would only drag them back to where they left it.
+        self.reveal = None;
         match self.collapsed.iter().position(|c| *c == node) {
             Some(i) => {
                 self.collapsed.remove(i);
@@ -1471,6 +1542,44 @@ mod tests {
         ui.set_pick(true);
         ui.clear_tree();
         assert!(ui.pending() && ui.snapshot().is_none() && ui.pick());
+    }
+
+    #[test]
+    fn a_page_side_selection_is_a_row_the_pane_owes_a_scroll_to() {
+        // The view-model has no geometry, so what it owes a scroll is a *row*, and
+        // a count that says which request it is (see `reveal_request`).
+        let mut ui = ui_with_tree();
+        let body = ui.row_index_of(6).expect("node 6 has a row");
+        let owed = ui.reveal_request().expect("the snapshot named a selection");
+        assert_eq!(owed.0, body, "the row of the node the page named");
+
+        // Picking the same node again is a request all over again: same row, later
+        // count, or a pane already showing it would sit still.
+        ui.select_from_page(6);
+        let again = ui.reveal_request().expect("still owed");
+        assert_eq!((again.0, owed.1 < again.1), (body, true), "same row, count gone up");
+
+        // A row click is the reader arriving where they wanted, and a fold is the
+        // reader arranging the tree: in both cases the page's request is dropped,
+        // so the pane never drags anyone back to where the page once pointed.
+        ui.select(7);
+        assert_eq!(ui.reveal_request(), None, "a row click owes no scroll");
+        ui.select_from_page(6);
+        assert!(ui.toggle_fold(6), "body folds");
+        assert_eq!(ui.reveal_request(), None, "and the request goes with the fold");
+        assert_eq!(ui.row_index_of(7), None, "folding takes the subtree's rows away");
+        ui.toggle_fold(6);
+
+        // Rearming the pane — the tree has just come on screen — asks for nothing
+        // while nothing is owed, and another turn of the same row when it is.
+        let quiet = ui.reveal_request();
+        ui.rearm_reveal();
+        assert_eq!(quiet, None, "a fold, then nothing owed");
+        assert_eq!(ui.reveal_request(), quiet, "so rearming asks for nothing");
+        ui.select_from_page(6);
+        let t = ui.reveal_request().expect("owed").1;
+        ui.rearm_reveal();
+        assert_eq!(ui.reveal_request(), Some((body, t + 1)), "a second ask for the same row");
     }
 
     #[test]

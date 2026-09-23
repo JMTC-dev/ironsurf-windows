@@ -50,6 +50,10 @@ fn main() {
     // `ToTab::SetInspect` this fake receives, so a test can prove the shell asks
     // for a document once when the pane opens and never on a redraw.
     let mut inspect_streamed = 0u32;
+    // ⌖ *inspect element* is the tab's own business: while it is armed, the next
+    // left click in the page names a node and is answered with `InspectPicked`
+    // (the same scripted hit as `ToTab::InspectPickAt`), then the mode is off.
+    let mut inspect_pick = false;
     // User-Agent-switcher harness (task: per-container UA): the launch
     // `--user-agent` is this fake tab's *initial* current value (exactly how
     // the real tab seeds its UA cell), and with `--expect-user-agent` every
@@ -356,6 +360,17 @@ fn main() {
                         },
                     });
                 }
+                if inspect_pick && p.button == MouseButton::Left && p.kind == PointerKind::Up {
+                    inspect_pick = false;
+                    let hit = inspect_base(tab_id) + 6;
+                    emit(FromTab::StatusText {
+                        text: Some(format!("picked-at:{},{}", p.x, p.y)),
+                    });
+                    emit(FromTab::InspectSnapshot {
+                        snapshot: fake_document(&url, tab_id, Some(hit)),
+                    });
+                    emit(FromTab::InspectPicked { node: hit });
+                }
                 if cursor
                     && p.button == MouseButton::Left
                     && matches!(p.kind, PointerKind::Move | PointerKind::Out)
@@ -449,9 +464,12 @@ fn main() {
                     )),
                 });
             }
-            ToTab::SetInspectPick { enabled } => emit(FromTab::StatusText {
-                text: Some(format!("pick:{}", if enabled { "on" } else { "off" })),
-            }),
+            ToTab::SetInspectPick { enabled } => {
+                inspect_pick = enabled;
+                emit(FromTab::StatusText {
+                    text: Some(format!("pick:{}", if enabled { "on" } else { "off" })),
+                });
+            }
             ToTab::InspectSelect { node } => emit(FromTab::StatusText {
                 text: Some(format!("select:{}", node.map(|n| n.to_string()).unwrap_or("-".into()))),
             }),

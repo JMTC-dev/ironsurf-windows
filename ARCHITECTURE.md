@@ -1245,7 +1245,12 @@ UI (`crates/ironsurf-shell/ui/ironsurf.slint`):
   highlights the row (selected row background + the breadcrumb rewritten); `+/−` folds a subtree,
   `Enter`/click on the twisty folds it too, and selection from the page (⌖ pick, or the context
   menu's **Inspect Element** → `ToTab::InspectPickAt`) moves the tree: the selected row and every
-  collapsed ancestor are expanded and made visible. Right-clicking the page keeps its
+  collapsed ancestor are expanded and made visible — and *made visible* means scrolled: only the
+  pane knows its own height, so the view-model hands it the row of the page-side pick with a
+  counter that only rises (the same node picked twice must move again), the tree pans by the
+  smallest amount that shows that row, and because a ListView scrolls only as far as it has
+  realized its rows the pane re-asks in strides until the offset the tree reports agrees. A row
+  click, a fold and the wheel are the reader's own doing and never scroll anything. Right-clicking the page keeps its
   **Inspect Element** row (already there, now wired to select the hit node and open the pane).
 - JS dialog overlay (`window.alert`/`confirm`/`prompt`): a centred modal Rectangle (title =
   the requesting tab, message, prompt LineEdit prefilled with the page's default, Cancel —

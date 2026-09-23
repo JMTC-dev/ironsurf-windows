@@ -129,6 +129,140 @@ component MiniButton inherits Rectangle {
     }
 }
 
+/// Scrolls the Inspector tree to the row the **page** selected (⌖ pick, right-click
+/// → *Inspect Element*). A built-in element — here, the tree's `ListView` — cannot
+/// declare properties, functions or change callbacks of its own, so this watcher
+/// sits beside the tree, is handed its geometry, and writes the scroll offset back.
+///
+/// The move is the smallest one that shows the row: a row already on screen does
+/// not move at all, one below the fold lands at the bottom edge, one above it at
+/// the top edge, and the pan never runs past either end of the tree. Because a
+/// `ListView` can only be scrolled as far as it has realized its rows, one write
+/// is not always enough — see the retry on `shown-from` below.
+component InspectorReveal inherits Rectangle {
+    /// The row to reveal (`-1` = the page owes nothing). Not called `row`: that
+    /// name belongs to the layout system.
+    in property <int> reveal-row: -1;
+    /// Counts reveal requests: the row alone is not enough, because the page can
+    /// select the same node twice and the tree has to move both times.
+    in property <int> token: 0;
+    /// The tree's row height (the height of its delegate).
+    in property <length> row-height: 22px;
+    /// How much tree is on screen, how tall all of it is, and how far it is
+    /// scrolled at the moment (a positive number of pixels from its top).
+    in property <length> window-height: 0px;
+    in property <length> content-height: 0px;
+    in property <length> shown-from: 0px;
+    /// Where the page asked for the top of the tree, or negative once the reveal
+    /// is over — which is also the point at which the tree belongs to the reader.
+    in-out property <length> goal: -1px;
+    /// How many turns of the ask a reveal may still take, how many times it may
+    /// insist on an offset the tree has already been told, and that offset — see
+    /// the note where they are used.
+    in-out property <int> turns: 0;
+    in-out property <int> insist: 0;
+    in-out property <length> hold: -1px;
+    in-out property <int> hold-turns: 0;
+    /// The new `viewport-y` of the tree.
+    callback scrolled(offset: length);
+    /// Where the tree ended up (a positive number of pixels from its top), every
+    /// time it moves — including when it was snapped short of what was asked. The
+    /// pane mirrors this out so the shell can tell whether a reveal was honoured.
+    callback observed(offset: length);
+
+    pure function clamp(v: length, lo: length, hi: length) -> length {
+        return Math.max(lo, Math.min(v, hi));
+    }
+
+    // The smallest move that shows the row from where the tree stands: land its
+    // bottom on the bottom edge, or its top on the top edge when that is nearer,
+    // and do not move at all when it is already on screen.
+    function show-from-here() -> length {
+        let row-top = reveal-row * row-height;
+        let row-bottom = row-top + row-height;
+        return row-bottom > shown-from + window-height ? row-bottom - window-height
+                 : row-top < shown-from ? row-top
+                 : shown-from;
+    }
+
+    function ask() {
+        // Nothing owed, and no size to place a row in yet (a `ListView` is
+        // measured on the first draw): an offset worked out now would be wrong.
+        if (goal < 0px || window-height <= 0px) {
+            return;
+        }
+        let last = Math.max(0px, content-height - window-height);
+        // The pan goes in strides, and every position the tree reaches is another
+        // turn of the ask — see the note on the turns below.
+        let stride = Math.max(row-height, window-height * 0.5);
+        let to = clamp(clamp(goal, shown-from - stride, shown-from + stride), 0px, last);
+        turns -= 1;
+        if (to == shown-from) {
+            // There it is — or there was nowhere further to go. Either way the
+            // tree goes back to the reader, and nothing moves unasked after this.
+            goal = -1px;
+        } else {
+            scrolled(-to);
+        }
+    }
+
+    changed token => {
+        if (reveal-row >= 0 && window-height > 0px) {
+            goal = show-from-here();
+            turns = 8;
+            insist = 4;
+            ask();
+        }
+    }
+
+    // A `ListView` can only be scrolled as far as it has *realized*, and it says
+    // so by putting the offset back: a long ask snaps short of the row, and the
+    // rows the tree realized on the way make the next ask reach further. So every
+    // position the tree reports — including one it was snapped back to — is
+    // another turn of the ask, and a reveal that cannot land runs out of turns
+    // instead of pushing forever.
+    //
+    // Even an offset the tree accepted is not always kept: the first layout after
+    // a long pan often puts the tree back a row or two short, because that layout
+    // is what tells the tree how far it can go. So a finished reveal leaves a
+    // `hold` — the offset the page asked the reader to be shown — and the first
+    // few reports of the tree's position after it are checked against that:
+    // agreement, and the tree is the reader's again; disagreement, and the pane
+    // asks once more, for as little as it has `insist` left. That is the difference
+    // between a row that arrives and a row that almost did.
+    changed shown-from => {
+        observed(shown-from);
+        if (goal >= 0px) {
+            if (turns <= 0) {
+                goal = -1px;
+            } else if (shown-from == goal) {
+                // The tree agrees with the page. Keep the number a moment in case
+                // it changes its mind, and stop asking either way.
+                hold = shown-from;
+                hold-turns = 2;
+                goal = -1px;
+            } else {
+                // A snap-back, or the next stride of the pan.
+                ask();
+            }
+        } else if (hold >= 0px && hold-turns > 0) {
+            hold-turns -= 1;
+            if (shown-from != hold) {
+                if (insist <= 0) {
+                    hold = -1px;
+                } else {
+                    insist -= 1;
+                    scrolled(-hold);
+                }
+            } else {
+                // Confirmed: the tree is where the page wanted it, and it is on its
+                // own from here.
+                hold = -1px;
+            }
+        }
+    }
+}
+
 /// URL bar wrapper: bumps `focus-token` (from Rust / Ctrl-L / F6) to grab
 /// focus and highlight the whole address, so typing replaces it outright.
 component UrlBar inherits Rectangle {
@@ -417,6 +551,16 @@ export component AppWindow inherits Window {
     in property <string> inspector-hint: "";
     in property <[InspectRow]> inspector-rows;
     in property <[CrumbItem]> inspector-crumb;
+    // Where the tree should scroll to. Selecting *on the page* (⌖ pick, right-click
+    // → Inspect Element) names a node that can sit far below the fold, so Rust puts
+    // its row here: `inspector-reveal-row` is the row (`-1` = nothing owed) and
+    // `inspector-reveal-token` counts the requests, which is what the tree watches —
+    // picking the same node again after scrolling away has to move too.
+    in property <int> inspector-reveal-row: -1;
+    in property <int> inspector-reveal-token: 0;
+    /// How far the Inspector tree is scrolled, as the tree itself reported it:
+    /// what the pane did with a request.
+    out property <length> inspector-shown-from: 0px;
 
     // Userscript menu (task: userscript menu): toggled by the "</>" toolbar
     // button. Rust owns the open flag, re-pushes `us-scripts` from the Store
@@ -973,56 +1117,81 @@ export component AppWindow inherits Window {
                                     vertical-alignment: center; overflow: elide;
                                 }
                             }
-                            if !root.inspector-empty: ListView {
+                            if !root.inspector-empty: Rectangle {
                                 vertical-stretch: 1;
-                                for dr[i] in root.inspector-rows: Rectangle {
-                                    height: 22px;
-                                    dr-bg := Rectangle {
-                                        background: dr-ta.has-hover ? #262626
-                                                  : dr.selected ? #33260f
-                                                  : Math.mod(i, 2) == 0 ? transparent : #1b1b1b;
-                                    }
-                                    // the row itself selects the node; the twisty is
-                                    // declared above it and keeps its own click
-                                    dr-ta := TouchArea {
-                                        clicked => { root.devtools-select-node(dr.node); }
-                                    }
-                                    dr-tw := TouchArea {
-                                        x: 6px + dr.depth * 12px;
-                                        width: 16px;
-                                        height: parent.height;
-                                        visible: dr.twisty != "";
-                                        clicked => { root.devtools-toggle-fold(dr.node); }
-                                    }
-                                    Text {
-                                        x: 6px + dr.depth * 12px;
-                                        width: 16px; height: parent.height;
-                                        text: dr.twisty;
-                                        color: #9a9a9a;
-                                        horizontal-alignment: center;
-                                        vertical-alignment: center;
-                                    }
-                                    // Tokens run end to end into one markup string. A
-                                    // Text in a layout has no upper width bound, so with
-                                    // nothing else asking for the leftover, a wide row
-                                    // splits that leftover *equally over every token*
-                                    // and the markup reads `<   div   >`. The stretchy
-                                    // tail claims the rest of the row; and only the last
-                                    // token may elide, so an over-long row truncates at
-                                    // its tail instead of every token becoming `…`.
-                                    dr-toks := HorizontalLayout {
-                                        x: 22px + dr.depth * 12px;
-                                        width: Math.max(0px, parent.width - 22px - dr.depth * 12px);
-                                        height: parent.height;
-                                        spacing: 0px;
-                                        for dt[i] in dr.toks: dr-tok := Text {
-                                            text: dt.text;
-                                            color: root.inspect-kind-color(dt.kind);
-                                            font-italic: dr.italic;
-                                            vertical-alignment: center;
-                                            overflow: i == dr.toks.length - 1 ? elide : clip;
+                                insp-tree := ListView {
+                                    x: 0px; y: 0px; width: parent.width; height: parent.height;
+                                    for dr[i] in root.inspector-rows: Rectangle {
+                                        height: 22px;
+                                        dr-bg := Rectangle {
+                                            background: dr-ta.has-hover ? #262626
+                                                      : dr.selected ? #33260f
+                                                      : Math.mod(i, 2) == 0 ? transparent : #1b1b1b;
                                         }
-                                        dr-tail := Rectangle { horizontal-stretch: 1; }
+                                        // the row itself selects the node; the twisty is
+                                        // declared above it and keeps its own click
+                                        dr-ta := TouchArea {
+                                            clicked => { root.devtools-select-node(dr.node); }
+                                        }
+                                        dr-tw := TouchArea {
+                                            x: 6px + dr.depth * 12px;
+                                            width: 16px;
+                                            height: parent.height;
+                                            visible: dr.twisty != "";
+                                            clicked => { root.devtools-toggle-fold(dr.node); }
+                                        }
+                                        Text {
+                                            x: 6px + dr.depth * 12px;
+                                            width: 16px; height: parent.height;
+                                            text: dr.twisty;
+                                            color: #9a9a9a;
+                                            horizontal-alignment: center;
+                                            vertical-alignment: center;
+                                        }
+                                        // Tokens run end to end into one markup string. A
+                                        // Text in a layout has no upper width bound, so with
+                                        // nothing else asking for the leftover, a wide row
+                                        // splits that leftover *equally over every token*
+                                        // and the markup reads `<   div   >`. The stretchy
+                                        // tail claims the rest of the row; and only the last
+                                        // token may elide, so an over-long row truncates at
+                                        // its tail instead of every token becoming `…`.
+                                        dr-toks := HorizontalLayout {
+                                            x: 22px + dr.depth * 12px;
+                                            width: Math.max(0px, parent.width - 22px - dr.depth * 12px);
+                                            height: parent.height;
+                                            spacing: 0px;
+                                            for dt[i] in dr.toks: dr-tok := Text {
+                                                text: dt.text;
+                                                color: root.inspect-kind-color(dt.kind);
+                                                font-italic: dr.italic;
+                                                vertical-alignment: center;
+                                                overflow: i == dr.toks.length - 1 ? elide : clip;
+                                            }
+                                            dr-tail := Rectangle { horizontal-stretch: 1; }
+                                        }
+                                    }
+                                }
+
+                                // …and the thing that takes the reader to a
+                                // selection made on the page: it names the tree
+                                // above as its sibling. `viewport-y` is written,
+                                // never bound, so the wheel owns the tree again
+                                // afterwards.
+                                InspectorReveal {
+                                    width: 0px;
+                                    height: 0px;
+                                    reveal-row: root.inspector-reveal-row;
+                                    token: root.inspector-reveal-token;
+                                    window-height: insp-tree.height;
+                                    content-height: insp-tree.viewport-height;
+
+                                    shown-from: -insp-tree.viewport-y;
+                                    scrolled(offset) => {
+                                        insp-tree.viewport-y = offset;
+                                    }
+                                    observed(offset) => {
+                                        root.inspector-shown-from = offset;
                                     }
                                 }
                             }

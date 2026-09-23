@@ -1088,6 +1088,11 @@ impl Core {
         let (id, open) = (p.tab.id, p.devtools_open);
         drop(procs);
         info!("DevTools {} on tab {id}", if open { "opened" } else { "closed" });
+        // Opening the panel puts the tree on screen for the first time since any
+        // page-side selection, so it is asked to scroll there again.
+        if open {
+            self.rearm_reveal(i);
+        }
         self.sync_ui();
         // The Inspector pane is one of the panes, so F12 is also the moment this
         // tab starts or stops walking its document.
@@ -1118,6 +1123,10 @@ impl Core {
             }
             procs[i].devtools_view = view;
         }
+        // Same for coming back to the Inspector pane: see `rearm_reveal`.
+        if view == DevToolsView::Inspector {
+            self.rearm_reveal(i);
+        }
         self.sync_ui();
         // Moving to or from the Inspector pane starts and stops this tab's
         // snapshot stream; the other two panes never ask for a document.
@@ -1125,6 +1134,13 @@ impl Core {
     }
 
     // ---- DevTools **Inspector** pane ---------------------------------------
+
+    /// The tree has just come on screen, and a `ListView` that did not exist
+    /// when the page selected a node cannot have scrolled to it: an owed scroll
+    /// is offered to the pane again (see [`InspectorUi::rearm_reveal`]).
+    fn rearm_reveal(&self, i: usize) {
+        self.with_inspector(i, |ui| ui.rearm_reveal());
+    }
 
     /// This tab's Inspector view-model, created on first use and stamped with the
     /// tab it belongs to (a node id means nothing outside its own document, which
@@ -1384,7 +1400,9 @@ impl Core {
         let Some(i) = self.procs.borrow().iter().position(|p| p.tab.id == tid) else { return };
         debug!("tab {tid} ⌖ picked node {node}");
         self.disarm_inspect_pick(i);
-        self.with_inspector(i, |ui| ui.select(node));
+        // The pick happened *in the page*, so the tree follows it: select the row
+        // and ask for it to be scrolled into view (`select_from_page`).
+        self.with_inspector(i, |ui| ui.select_from_page(node));
         if self.active_tab_id() == Some(tid) {
             self.sync_ui();
         }
@@ -1625,6 +1643,19 @@ impl Core {
                 .unwrap_or_default();
             sync_model(&self.dt_inspect, &rows);
             sync_model(&self.dt_crumb, &crumb);
+        }
+        // …and which row the tree owes a scroll to. This is pushed outside the
+        // stamp guard above because picking the *same* node twice leaves the tree
+        // identical (no stamp change) and still has to move: the request carries
+        // a count that only ever goes up, so the same row asked for again is a
+        // change. Setting the row first means the pane computes the offset from
+        // the rows it was just given. `-1` says nothing is owed.
+        match model.and_then(|ui| ui.reveal_request()) {
+            Some((row, token)) => {
+                ui.set_inspector_reveal_row(row as i32);
+                ui.set_inspector_reveal_token(token as i32);
+            }
+            None => ui.set_inspector_reveal_row(-1),
         }
     }
 
