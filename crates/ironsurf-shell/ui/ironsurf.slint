@@ -531,6 +531,13 @@ export component AppWindow inherits Window {
     // while the panel is open.
     in property <bool> devtools-open: false;
     in property <int> devtools-view: 0; // 0 = Console, 1 = Network
+    // How tall the panel is. Rust owns the number **per tab** and pushes the
+    // active tab's, so one tab can sit tall while another stays short, and a
+    // drag on this tab never resizes that one. What Rust sends is already
+    // folded into the page area it docks into (see `clamp_devtools_height`),
+    // so the panel paints exactly this; `devtools-edge` is how the reader
+    // changes it.
+    in property <length> devtools-height: 240px;
     in property <int> console-count: 0;
     in property <int> network-count: 0;
     in property <[ConsoleRow]> console-rows;
@@ -645,6 +652,14 @@ export component AppWindow inherits Window {
     callback devtools-toggle-pick();
     callback devtools-select-node(node: int);
     callback devtools-toggle-fold(node: int);
+    /// The panel's top edge is being dragged: 0 = the press, 1 = a move, 2 = the
+    /// release, with `travel` how far the pointer has come from the point it was
+    /// grabbed at — positive **up**, the direction that makes the panel taller.
+    /// The height itself stays Rust's business (it is per tab, and the floor and
+    /// ceiling are its call), so the press is where Rust notes where the panel
+    /// stood and every move is measured off that note rather than off the last
+    /// one: clamping at a bound cannot then leak travel into a drift.
+    callback devtools-edge(kind: int, travel: length);
     // JS-dialog intents: `OK` (accepted, `dialog-input` carries the prompt
     // text) or `Cancel`/Esc (dismissed). The scrim deliberately does nothing
     // — a modal is dismissed by an answer, never by clicking past it.
@@ -922,16 +937,22 @@ export component AppWindow inherits Window {
                 // has no popups). Declared after the page's `ta` ⇒ on top of
                 // it: the scrim swallows page clicks and wheel events while
                 // the panel is open, and the ListView scrolls instead.
-                Rectangle {
+                dt-panel := Rectangle {
                     visible: root.devtools-open;
                     x: 0;
                     y: parent.height - self.height;
                     width: parent.width;
-                    height: Math.min(240px, parent.height * 0.65);
+                    // The height Rust holds for this tab — see `devtools-height`.
+                    // It is a number, not a share, because the reader set it by
+                    // dragging and a share would move it under their hand every
+                    // time the window did.
+                    height: root.devtools-height;
                     background: #171717;
                     clip: true;
                     dt-scrim := TouchArea { }
-                    // separator from the page above
+                    // separator from the page above — and the line the reader
+                    // grabs to resize the panel (`dt-edge`, declared after the
+                    // panel, lies exactly over it)
                     Rectangle { x: 0; y: 0; width: parent.width; height: 1px; background: #4a4a4a; }
 
                     VerticalLayout {
@@ -1204,6 +1225,51 @@ export component AppWindow inherits Window {
                                     color: #6a6a6a; font-italic: true;
                                     vertical-alignment: center;
                                 }
+                            }
+                        }
+                    }
+                }
+
+                // ---- panel resize handle ----------------------------------
+                // The DevTools panel's top edge, draggable: hold it and pull the
+                // panel up to make it taller, push it down to make it shorter.
+                // The strip straddles the edge — 4 px of page above (where the
+                // panel has nothing of its own to steal a click from) and 4 px of
+                // its own separator band, which stops exactly where the header
+                // buttons begin — and being declared after the panel puts it
+                // above the panel's scrim, so it gets the press.
+                //
+                // `pressed-y - mouse-y` is the pointer's travel since the grab:
+                // a TouchArea is handed every move while it holds the pointer,
+                // even ones long outside itself, and the panel that grows and
+                // shrinks underneath carries the strip along with it. Measuring
+                // from the press instead of from the last move is what lets Rust
+                // clamp at a floor or ceiling without the pointer's travel
+                // leaking into a drift; see `devtools-edge`.
+                dt-edge := Rectangle {
+                    x: 0px;
+                    y: dt-panel.y - 4px;
+                    width: parent.width;
+                    height: 8px;
+                    visible: root.devtools-open;
+                    // Where the grab happened, in the *page area's* frame. This
+                    // strip rides the panel up as the panel grows, so travel read
+                    // off the strip's own frame loses exactly the height the drag
+                    // has won so far and the panel follows at half the pointer's
+                    // speed; adding the strip's own y back in measures the drag in
+                    // a frame that does not move, which is the only frame a drag
+                    // can be measured in.
+                    property <length> grab-y: 0px;
+                    dt-edge-ta := TouchArea {
+                        mouse-cursor: dt-edge-ta.pressed ? MouseCursor.grabbing : MouseCursor.ns-resize;
+                        pointer-event(ev) => {
+                            if (ev.kind == PointerEventKind.down) {
+                                dt-edge.grab-y = dt-edge.y + dt-edge-ta.mouse-y;
+                                root.devtools-edge(0, 0px);
+                            } else if (ev.kind == PointerEventKind.move && dt-edge-ta.pressed) {
+                                root.devtools-edge(1, dt-edge.grab-y - (dt-edge.y + dt-edge-ta.mouse-y));
+                            } else if (ev.kind == PointerEventKind.up || ev.kind == PointerEventKind.cancel) {
+                                root.devtools-edge(2, 0px);
                             }
                         }
                     }

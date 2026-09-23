@@ -132,6 +132,14 @@ struct Proc {
     inspector_target: Option<TabId>,
     /// Which pane the panel shows for this tab (Console / Network / Inspector).
     devtools_view: DevToolsView,
+    /// How tall this tab's DevTools panel is, in logical pixels, as the reader
+    /// left it by dragging the panel's top edge. `None` = never dragged, so the
+    /// panel keeps the height it was given (`default_devtools_height`); per tab
+    /// like the pane and the zoom, so resizing this tab's panel leaves the other
+    /// tabs' alone. A height the window outgrew is re-fitted on the way to the
+    /// UI (see `clamp_devtools_height`), never here, so the reader's own number
+    /// survives a shrink-then-grow.
+    devtools_height: Option<f32>,
     /// Find-in-page bar open for *this* tab (Ctrl-`F`). Per tab like the panel:
     /// switching tabs switches the bar to the other tab's search, and the
     /// numbers beside it come from that tab (`state.find`).
@@ -170,6 +178,54 @@ pub enum DevToolsView {
     /// third pane, `devtools-view` index 2).
     Inspector,
 }
+
+/// The DevTools panel's height in logical pixels: what a panel nobody has
+/// dragged comes with, the thinnest a reader can drag it to, and the most of
+/// the page area an untouched panel and a dragged one may take. The two
+/// fractions differ on purpose: 65 % is a sane default on a tall page, while a
+/// reader who drags to the top of the range is asking for the panel, so only a
+/// tenth of the page has to stay legible.
+pub const DEVTOOLS_DEFAULT_HEIGHT: f32 = 240.;
+pub const DEVTOOLS_MIN_HEIGHT: f32 = 80.;
+const DEVTOOLS_DEFAULT_FRACTION: f32 = 0.65;
+const DEVTOOLS_MAX_FRACTION: f32 = 0.9;
+
+/// The height of a panel nobody has dragged, for a page area `page_height`
+/// tall: `DEVTOOLS_DEFAULT_HEIGHT`, or the share of the area it fits in —
+/// which is what the panel measured before it could be dragged at all.
+pub fn default_devtools_height(page_height: f32) -> f32 {
+    if page_height <= 0.0 {
+        return DEVTOOLS_DEFAULT_HEIGHT; // not laid out yet: keep the number
+    }
+    DEVTOOLS_DEFAULT_HEIGHT.min(page_height * DEVTOOLS_DEFAULT_FRACTION)
+}
+
+/// A height the reader dragged to, folded into what a page area `page_height`
+/// tall can show: never thinner than `DEVTOOLS_MIN_HEIGHT`, never so tall that
+/// the page is left under a tenth of itself, and never over the area itself.
+pub fn clamp_devtools_height(requested: f32, page_height: f32) -> f32 {
+    if page_height <= 0.0 {
+        return requested.max(DEVTOOLS_MIN_HEIGHT);
+    }
+    let floor = DEVTOOLS_MIN_HEIGHT.min(page_height);
+    let cap = (page_height * DEVTOOLS_MAX_FRACTION).max(floor);
+    requested.clamp(floor, cap)
+}
+
+/// The height a tab's panel paints at: the height that tab's own drag left it at
+/// (`Some`), or the height a panel nobody pulled comes with, and either way
+/// fitted to the page area it docks into by [`clamp_devtools_height`].
+pub fn desired_devtools_height(stored: Option<f32>, page_height: f32) -> f32 {
+    let want = stored.unwrap_or_else(|| default_devtools_height(page_height));
+    clamp_devtools_height(want, page_height)
+}
+
+/// Which of the three moments of a drag on the panel's top edge a
+/// `devtools-edge` callback reports. The Slint side sends these as plain
+/// integers, like every other index across the boundary.
+pub const DEVTOOLS_EDGE_PRESS: i32 = 0;
+pub const DEVTOOLS_EDGE_MOVE: i32 = 1;
+pub const DEVTOOLS_EDGE_RELEASE: i32 = 2;
 
 impl DevToolsView {
     pub fn index(self) -> i32 {
@@ -299,6 +355,10 @@ pub struct Core {
     dt_inspect: Rc<VecModel<InspectRow>>,
     dt_crumb: Rc<VecModel<CrumbItem>>,
     dt_inspect_stamp: RefCell<Option<(usize, Option<u64>, usize, Option<u64>, usize)>>,
+    /// The panel's height as it stood the moment its top edge was grabbed, which
+    /// is what every move of that one drag is measured off (see
+    /// `Core::devtools_edge`); `None` between drags.
+    dt_edge_start: Cell<Option<f32>>,
     /// Script id of each userscript-menu row, in `us-scripts` model order:
     /// the overlay mutates by row index, the Store (and the wire) speak ids.
     /// Refreshed from the Store whenever the menu list is re-pushed.
@@ -396,6 +456,7 @@ impl App {
             dt_inspect: Rc::new(VecModel::default()),
             dt_crumb: Rc::new(VecModel::default()),
             dt_inspect_stamp: RefCell::new(None),
+            dt_edge_start: Cell::new(None),
             us_ids: RefCell::new(Vec::new()),
             us_edit_id: RefCell::new(None),
             archive_dir: RefCell::new(archive_root),
@@ -477,6 +538,18 @@ impl Core {
             .borrow()
             .iter()
             .map(|p| (p.devtools_open, p.devtools_view))
+            .collect()
+    }
+
+    /// The height each tab's own drag left its DevTools panel at, in strip
+    /// order: `None` while nobody has pulled that tab's top edge. What the
+    /// window paints is the active one of these fitted to the page area (see
+    /// `desired_devtools_height`), so this is what survives switching tabs.
+    pub fn devtools_heights(&self) -> Vec<Option<f32>> {
+        self.procs
+            .borrow()
+            .iter()
+            .map(|p| p.devtools_height)
             .collect()
     }
 
@@ -612,6 +685,7 @@ impl Core {
                         inspector: None,
                         inspector_target: None,
                         devtools_view: DevToolsView::default(),
+                        devtools_height: None,
                         find_open: false,
                     });
                     self.active.set(procs.len() - 1);
@@ -1133,6 +1207,78 @@ impl Core {
         self.sync_inspect_stream(i);
     }
 
+    /// The height tab `i`'s DevTools panel paints: the height its own drag left
+    /// it at, or the default for a panel nobody pulled — either way fitted to
+    /// the page area it docks into, which a window resize changes under a height
+    /// that is stored as a number.
+    fn desired_devtools_height(&self, i: usize) -> f32 {
+        let stored = self.procs.borrow().get(i).and_then(|p| p.devtools_height);
+        desired_devtools_height(stored, self.page_size().1)
+    }
+
+    /// Hand the window a panel height when it is not the height it already has —
+    /// compared rather than written blind, because that length is what the panel
+    /// binds its own geometry to and a write every tick would relayout the window
+    /// for nothing.
+    fn push_devtools_height(&self, ui: &AppWindow, stored: Option<f32>) {
+        let want = desired_devtools_height(stored, self.page_size().1);
+        if (ui.get_devtools_height() - want).abs() > 0.01 {
+            ui.set_devtools_height(want);
+        }
+    }
+
+    /// Refit the active tab's panel to the page area it docks into, on a tick
+    /// with nothing to report: the one thing a tab that has fallen silent still
+    /// has to notice is that the window — and therefore the area above its panel
+    /// — changed size under a height remembered as a number.
+    fn sync_devtools_height(&self) {
+        let (Some(ui), Some(i)) = (self.ui(), self.active_proc_index()) else { return };
+        let stored = self.procs.borrow().get(i).and_then(|p| p.devtools_height);
+        self.push_devtools_height(&ui, stored);
+    }
+
+    /// A drag on the DevTools panel's top edge: `kind` says which moment it is
+    /// (`DEVTOOLS_EDGE_PRESS`/`_MOVE`/`_RELEASE`) and `travel` is how far the
+    /// pointer has come from the point it was grabbed at, positive **up** — the
+    /// direction that makes the panel taller, since the panel is docked to the
+    /// bottom of the page area.
+    ///
+    /// The height is Rust's, per tab: the press notes where the panel stood and
+    /// every move is applied to that note, never to the last height. A panel
+    /// held at the floor or the ceiling then cannot drift out of place when the
+    /// pointer wanders back the other way, and a tab nobody dragged keeps its
+    /// default height no matter what the tab beside it was pulled into.
+    fn devtools_edge(&self, kind: i32, travel: f32) {
+        let Some(i) = self.active_proc_index() else { return };
+        match kind {
+            DEVTOOLS_EDGE_PRESS => {
+                let start = self.desired_devtools_height(i);
+                self.dt_edge_start.set(Some(start));
+                debug!("DevTools edge grabbed on tab {i} at {start:.0}px");
+            }
+            DEVTOOLS_EDGE_MOVE => {
+                let start =
+                    self.dt_edge_start.get().unwrap_or_else(|| self.desired_devtools_height(i));
+                let want = clamp_devtools_height(start + travel, self.page_size().1);
+                self.procs.borrow_mut()[i].devtools_height = Some(want);
+                // The panel follows the pointer move for move — and a drag is
+                // what makes a never-dragged panel have a height of its own, so
+                // this is the one place the height is written rather than
+                // noticed to be different.
+                if let Some(ui) = self.ui() {
+                    self.push_devtools_height(&ui, Some(want));
+                }
+            }
+            _ => {
+                let h = self.procs.borrow().get(i).and_then(|p| p.devtools_height);
+                self.dt_edge_start.set(None);
+                if let Some(h) = h {
+                    info!("DevTools panel of tab {i} resized to {h:.0}px");
+                }
+            }
+        }
+    }
+
     // ---- DevTools **Inspector** pane ---------------------------------------
 
     /// The tree has just come on screen, and a `ListView` that did not exist
@@ -1552,6 +1698,8 @@ impl Core {
         };
         ui.set_devtools_open(p.devtools_open);
         ui.set_devtools_view(p.devtools_view.index());
+        // The height belongs to this tab too, so it switches with the pane.
+        self.push_devtools_height(ui, p.devtools_height);
 
         // The models are shared (`Rc<VecModel>` installed once): appending the
         // few rows that arrived keeps the list's scroll position, which a fresh
@@ -1943,9 +2091,10 @@ impl Core {
             let old = {
                 let mut procs = self.procs.borrow_mut();
                 let zoom = procs[at].zoom;
-                let (devtools_open, devtools_view, find_open) = (
+                let (devtools_open, devtools_view, devtools_height, find_open) = (
                     procs[at].devtools_open,
                     procs[at].devtools_view,
+                    procs[at].devtools_height,
                     procs[at].find_open,
                 );
                 std::mem::replace(
@@ -1961,6 +2110,7 @@ impl Core {
                         inspector: None,
                         inspector_target: None,
                         devtools_view,
+                        devtools_height,
                         find_open,
                     },
                 )
@@ -2829,6 +2979,9 @@ impl Core {
         let msgs: Vec<PumpedMessage> = self.rx.borrow_mut().try_iter().collect();
         if msgs.is_empty() {
             self.check_resize();
+            // A page area that shrank under a dragged panel is the one thing a
+            // tab with nothing to say still has to be told about.
+            self.sync_devtools_height();
             return;
         }
         let active = self.active_tab_id();
@@ -3402,6 +3555,13 @@ impl Core {
         {
             let c = self.clone();
             ui.on_devtools_toggle_fold(move |node| c.inspector_toggle_fold(node));
+        }
+        // Dragging the panel's top edge reports itself (press / move / release
+        // plus the pointer's travel since the grab); the height, its bounds and
+        // which tab it belongs to are all decided here. See `devtools_edge`.
+        {
+            let c = self.clone();
+            ui.on_devtools_edge(move |kind, travel| c.devtools_edge(kind, travel));
         }
 
         // Userscript menu (task: userscript menu): the toolbar toggle, the
@@ -4009,5 +4169,39 @@ mod tests {
         // Slint cannot draw a vertical I-beam; the horizontal one stands in.
         assert_eq!(slint_cursor(ironsurf_common::CursorIcon::VerticalText), MouseCursor::Text);
         assert_eq!(slint_cursor(ironsurf_common::CursorIcon::NwseResize), MouseCursor::NwseResize);
+    }
+
+    // ---- DevTools panel height (task: drag the panel's top edge) -----------
+
+    fn near(a: f32, b: f32) -> bool {
+        (a - b).abs() < 0.01
+    }
+
+    #[test]
+    fn an_untouched_panel_is_240_tall_or_the_pages_it_fits_in() {
+        assert!(near(default_devtools_height(768.), 240.)); // 65 % would be taller
+        assert!(near(default_devtools_height(300.), 195.)); // a short area wins
+        // A window that was never laid out must not collapse the panel to nil.
+        assert!(near(default_devtools_height(0.), DEVTOOLS_DEFAULT_HEIGHT));
+    }
+
+    #[test]
+    fn a_dragged_height_is_kept_inside_the_page_area() {
+        assert!(near(clamp_devtools_height(300., 768.), 300.)); // in range: as asked
+        assert!(near(clamp_devtools_height(40., 768.), DEVTOOLS_MIN_HEIGHT)); // floor
+        assert!(near(clamp_devtools_height(9000., 768.), 768. * 0.9)); // ceiling
+        // An area too short for even the floor gets the area: a panel may never
+        // be taller than the page it docks into.
+        assert!(near(clamp_devtools_height(500., 40.), 40.));
+    }
+
+    #[test]
+    fn a_panel_paints_its_own_drag_or_the_default_never_anothers() {
+        assert!(near(desired_devtools_height(None, 768.), 240.));
+        assert!(near(desired_devtools_height(Some(500.), 768.), 500.));
+        // A drag outlives the window size that made it possible, but only as a
+        // memory: what paints is the fit, so a shrunk area is never overflowed.
+        let fitted = desired_devtools_height(Some(500.), 300.);
+        assert!(fitted <= 300. * 0.9 + 0.01 && fitted >= DEVTOOLS_MIN_HEIGHT - 0.01);
     }
 }

@@ -1232,7 +1232,12 @@ UI (`crates/ironsurf-shell/ui/ironsurf.slint`):
   an **Inspector** (HTML tree, see §Developer tools). `Clear` empties the visible pane's feed
   (Console / Network only); ⌖ toggles *inspect element* (`Ctrl-Shift-C`) for the whole tab.
   Fed by the per-tab bounded logs (`TabState::console` / `network`) and the tab's
-  `InspectSnapshot`, re-pushed on every drain tick while open.
+  `InspectSnapshot`, re-pushed on every drain tick while open. Its **top edge is draggable**
+  (`MouseCursor.ns-resize`): the height is a shell-owned number per tab (`devtools-height`,
+  240 px default, 80 px floor, ≤90 % of the page area once dragged), reported as
+  `devtools-edge(kind, travel)` — press/move/release with travel positive up, measured off the
+  press so a clamped drag cannot drift) and *stored* as that number, not a share: a window
+  resize re-fits what paints, the reader's own number survives a shrink-then-grow.
 - **Inspector pane** (third DevTools tab): breadcrumb row (the selected node's ancestor chain,
   `html › body › div#main`, rightmost first, each clickable) over a ListView of the tree. Each
   row is `depth × 12px` indented, shows a `+/−` twisty on elements with children, then syntax
