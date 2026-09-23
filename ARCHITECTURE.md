@@ -604,13 +604,20 @@ Lifecycle:
    `FromTab::Frame` (throttle ≤ 30 fps). Emit `TitleChanged`/`UrlChanged` on change (compare
    against cached last values).
 4. Frames: `render_to_buffer::<VelloCpuImageRenderer, _>(|scene| { white bg fill;
-   paint_scene(scene, doc.as_mut(), scale, w, h, 0, 0); }, w, h)` → `FromTab::Frame`
+   paint_scene(scene, doc.as_mut(), doc_scale, w, h, 0, 0); }, w, h)` → `FromTab::Frame`.
+   `doc_scale` is the **document's** total scale (`viewport().scale_f64()` = hidpi × zoom),
+   never the shell's hidpi factor alone: blitz's layout geometry is CSS px but its parley
+   inline layer (glyph runs, selection rects, inline backgrounds) is already device px, so
+   the two layers only agree once the CSS→device multiplier is the total. Find/Inspector
+   highlights are measured with that same number.
    (RGBA8 straight alpha; verify buffer layout against the anyrender_vello_cpu source — if it
    ever emits premultiplied/BGR, convert; the spike test proves pixel sanity).
 5. Resize: `ToTab::Resize` → store new `Viewport`, rebuild/resize document viewport, resolve,
    repaint. Zoom: `ToTab::SetZoom { zoom }` → store the factor, `document.set_viewport` with
    `Viewport::zoom = zoom` (blitz multiplies hidpi × zoom into its total scale), resolve,
-   repaint; the tab divides incoming pointer coordinates and pixel scroll deltas by the zoom
+   repaint (with the document's total scale, per Frames above — a hidpi-only paint scale
+   leaves every block box in CSS numbers while text runs stay device-sized, so a selection
+   highlight lands on the wrong element); the tab divides incoming pointer coordinates and pixel scroll deltas by the zoom
    (logical px → CSS px), keeps the factor across navigations (fresh documents inherit it),
    and clamps nonsense values. The shell owns the chord policy — Ctrl-`+`/`=`, Ctrl-`-`,
    Ctrl-`0` step the per-tab factor (×÷1.1, clamped 30–500%, whole-percent levels) and show

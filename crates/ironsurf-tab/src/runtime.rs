@@ -2543,13 +2543,30 @@ impl Tab {
             return;
         }
         let scale = self.scale;
+        // Paint converts geometry, so it needs blitz's **total** scale (hidpi ×
+        // zoom), not the hidpi factor: DOM boxes stay in CSS px while parley's
+        // inline layout (glyph runs, selection rects, inline backgrounds) is
+        // already in device px. Handing `paint_scene` the hidpi-only scale left
+        // every block box at its CSS numbers once zoom ≠ 1 — the page painted
+        // into the top-left of the canvas — and, worse, every inline text run
+        // was translated by `pos × hidpi` while its own glyph/selection rects
+        // were device-sized. The two spaces disagreed by `(zoom − 1) × pos`, so
+        // a highlight dragged in one paragraph landed on the paragraph above it
+        // (and at 50 %/125 % on whichever element happened to share the
+        // squashed-up row). Devtools only made this visible: its Inspector
+        // marker (`inspect_highlights`) measures CSS rects the same way.
+        let paint_scale = self
+            .doc
+            .as_ref()
+            .map(|doc| doc.viewport().scale_f64())
+            .unwrap_or(f64::from(scale));
         // Find-in-page highlights are measured here — before the paint closure
         // takes the document mutably — and drawn **last**, over the finished
         // page, so the text underneath them stays readable.
-        let highlights = self.find_highlights(f64::from(scale));
+        let highlights = self.find_highlights(paint_scale);
         // …and the Inspector's marker for the selected/hovered element, measured
         // in the same space and painted over everything else.
-        let inspected = self.inspect_highlights(f64::from(scale));
+        let inspected = self.inspect_highlights(paint_scale);
         let buffer = render_to_buffer::<VelloCpuImageRenderer, _>(
             |scene| {
                 scene.fill(
@@ -2566,7 +2583,7 @@ impl Tab {
                 paint_scene(
                     scene,
                     self.doc.as_mut().expect("doc"),
-                    scale as f64,
+                    paint_scale,
                     width,
                     height,
                     0,
@@ -6348,6 +6365,270 @@ mod tests {
                 _ => None,
             })
             .collect()
+    }
+
+    /// The selection highlight is painted where the selected text actually is,
+    /// at every page-zoom level. The highlight rectangles come out of parley
+    /// in *layout* units, which are device pixels once page zoom scales the
+    /// text layout — painting them straight into device space (without
+    /// dividing by the layout scale) draws them 2× too far/wide at 200 %
+    /// (covering the words to the right of the selection, even the next
+    /// paragraph) and half-size at 50 %. Pin the geometry: the highlight box
+    /// at 200 % must be exactly twice the box at 100 % (same CSS layout, twice
+    /// the device pixels), and likewise at 50 %.
+    #[test]
+    fn selection_highlight_tracks_the_text_at_every_zoom() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join("hl.html"),
+            r#"<!doctype html>
+<html><head><title>H</title></head>
+<body style="margin:0">
+  <p style="margin:0;font-size:24px">AAA BBB CCC DDD EEE</p>
+</body></html>"#,
+        )
+        .expect("write");
+        let (mut tab, sink) = selection_tab(dir.path());
+        tab.navigate(
+            url::Url::from_file_path(dir.path().join("hl.html"))
+                .expect("file url")
+                .as_str(),
+            NavHistory::Fresh,
+        );
+
+        /// `f64::abs_diff` is unstable and `abs_diff` on ints is unsigned
+        /// only — a tiny helper for "within N" comparisons.
+        fn within(a: f64, b: f64, eps: f64) -> bool {
+            (a - b).abs() <= eps
+        }
+
+        /// A box scaled by `k` (a 5-tuple's pixel-count field is dropped).
+        fn scale_box(b: Box5, k: f64) -> (f64, f64, f64, f64) {
+            (b.0 as f64 * k, b.1 as f64 * k, b.2 as f64 * k, b.3 as f64 * k)
+        }
+
+        fn near(a: (f64, f64, f64, f64), b: Box5, eps: f64) -> bool {
+            let b = scale_box(b, 1.0);
+            [
+                within(a.0, b.0, eps),
+                within(a.1, b.1, eps),
+                within(a.2, b.2, eps),
+                within(a.3, b.3, eps),
+            ]
+            .iter()
+            .all(|v| *v)
+        }
+
+        // The highlight rectangles blitz-paint fills with SELECTION_COLOR
+        // (180, 213, 255); the page has nothing else of that colour.
+        fn highlight_box(tab: &mut Tab, sink: &Arc<std::sync::Mutex<Vec<u8>>>) -> Box5 {
+            tab.paint_now();
+            let frame = emitted(sink)
+                .into_iter()
+                .rev()
+                .find_map(|m| match m {
+                    FromTab::Frame { width, height, rgba, .. } => Some((width, height, rgba)),
+                    _ => None,
+                })
+                .expect("frame");
+            let (w, h, rgba) = (frame.0 as usize, frame.1 as usize, frame.2);
+            let hit = |p: &[u8]| {
+                (p[0] as i32 - 180).abs() <= 6
+                    && (p[1] as i32 - 213).abs() <= 6
+                    && (p[2] as i32 - 255).abs() <= 6
+            };
+            let mut box_: Option<(usize, usize, usize, usize)> = None;
+            let mut n = 0usize;
+            for y in 0..h {
+                for x in 0..w {
+                    if hit(&rgba[(y * w + x) * 4..]) {
+                        n += 1;
+                        box_ = Some(match box_ {
+                            Some((x0, y0, x1, y1)) => {
+                                (x0.min(x), y0.min(y), x1.max(x), y1.max(y))
+                            }
+                            None => (x, y, x, y),
+                        });
+                    }
+                }
+            }
+            let (x0, y0, x1, y1) = box_.expect("a highlight was painted");
+            // +1: the box covers its last painted pixel inclusive.
+            (x0 as u32, y0 as u32, (x1 + 1) as u32, (y1 + 1) as u32, n as u32)
+        }
+
+        type Box5 = (u32, u32, u32, u32, u32);
+
+        // Drag-selects "AAA BBB …" at `zoom`, keeping the CSS viewport 800 px
+        // wide (window px = CSS px × zoom, so a 200 % window is 1600 px) and
+        // returning the painted highlight box + covered pixel count. The tab
+        // divides pointer coords by the zoom, so logical x = CSS x × zoom.
+        let at_zoom = |tab: &mut Tab, sink: &Arc<std::sync::Mutex<Vec<u8>>>, zoom: f32, win: u32| -> Box5 {
+            tab.handle_to_tab(ToTab::SetZoom { zoom });
+            tab.handle_to_tab(ToTab::Resize { width: win, height: 600, scale: 1.0 });
+            // CSS y 12 is inside the line box whatever the zoom; CSS x 100 is
+            // just past "AAA BBB" (7 chars ≈ 93 px), so the same words are
+            // selected at every zoom.
+        tab.handle_to_tab(ptr(2.0 * zoom, 12.0 * zoom, PointerKind::Down));
+            tab.handle_to_tab(ptr(100.0 * zoom, 12.0 * zoom, PointerKind::Move));
+            tab.handle_to_tab(ptr(100.0 * zoom, 12.0 * zoom, PointerKind::Up));
+            let sel = tab.document_mut().expect("doc").get_selected_text();
+            assert!(
+                sel.as_deref().is_some_and(|s| s.starts_with("AAA BB") && s.len() < 12),
+                "the drag selects the same words at zoom {zoom}: {sel:?}"
+            );
+            highlight_box(tab, sink)
+        };
+
+        let b100 = at_zoom(&mut tab, &sink, 1.0, 800);
+        let b200 = at_zoom(&mut tab, &sink, 2.0, 1600);
+        let b50 = at_zoom(&mut tab, &sink, 0.5, 400);
+        println!(
+            "100% box={b100:?} · 200% box={b200:?} · 50% box={b50:?} (last field = painted px count)"
+        );
+        assert!(
+            near(scale_box(b100, 2.0), b200, 2.0),
+            "200% highlight must be 100%'s box doubled: {b100:?} vs {b200:?}"
+        );
+        assert!(
+            near(scale_box(b100, 0.5), b50, 2.0),
+            "50% highlight must be 100%'s box halved: {b100:?} vs {b50:?}"
+        );
+    }
+
+    /// The report in full: a highlight dragged in the **second** paragraph
+    /// paints on the second paragraph — never on the first, and never across
+    /// a sibling element — at 100 %, 200 % and 50 %, with the Inspector pane
+    /// open as well.
+    ///
+    /// The failure was a space mismatch in the paint: block boxes were
+    /// converted from CSS px with the tab's *hidpi* factor, while parley's
+    /// inline layer (glyph runs, selection rects, inline backgrounds) had
+    /// already been laid out at blitz's **total** scale (hidpi × zoom). At
+    /// zoom ≠ 1 the two layers disagreed by `(zoom − 1) × position`, so the
+    /// highlight of a drag in paragraph two landed on paragraph one (at 50 %,
+    /// on whichever element happened to share the row). Opening devtools only
+    /// made it obvious — its Inspector marker measures CSS rects in the same
+    /// pass, so the wrong-element highlight became impossible to miss.
+    #[test]
+    fn a_highlight_paints_on_the_paragraph_you_dragged_at_every_zoom() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join("two.html"),
+            r#"<!doctype html>
+<html><head><title>T</title></head>
+<body style="margin:0">
+  <p style="margin:0;font-size:24px;color:#111">AAA BBB CCC DDD EEE</p>
+  <p style="margin:8px 0 0;font-size:24px;color:#0a0">111 222 333 444 555</p>
+</body></html>"#,
+        )
+        .expect("write");
+        let (mut tab, sink) = selection_tab(dir.path());
+        tab.navigate(
+            url::Url::from_file_path(dir.path().join("two.html"))
+                .expect("file url")
+                .as_str(),
+            NavHistory::Fresh,
+        );
+
+        fn frame(tab: &mut Tab, sink: &Arc<std::sync::Mutex<Vec<u8>>>) -> (u32, u32, Vec<u8>) {
+            tab.paint_now();
+            emitted(sink)
+                .into_iter()
+                .rev()
+                .find_map(|m| match m {
+                    FromTab::Frame { width, height, rgba, .. } => Some((width, height, rgba)),
+                    _ => None,
+                })
+                .expect("frame")
+        }
+
+        /// Rows + horizontal extent of a colour class, so each paragraph can
+        /// be located by the colour of *its own* text.
+        fn extent(rgba: &[u8], w: usize, h: usize, on: impl Fn(&[u8]) -> bool) -> Option<(usize, usize, usize, usize)> {
+            let mut box_: Option<(usize, usize, usize, usize)> = None;
+            for y in 0..h {
+                for x in 0..w {
+                    if on(&rgba[(y * w + x) * 4..]) {
+                        box_ = Some(match box_ {
+                            Some((x0, y0, x1, y1)) => (x0.min(x), y0.min(y), x1.max(x), y1.max(y)),
+                            None => (x, y, x, y),
+                        });
+                    }
+                }
+            }
+            box_
+        }
+
+        // Each paragraph is painted in its own colour, so "where is paragraph
+        // two" never needs guessing from row bands.
+        let black = |p: &[u8]| p[0] < 90 && p[1] < 90 && p[2] < 90;
+        let green = |p: &[u8]| p[1] as i32 > p[0] as i32 + 20 && p[1] as i32 > p[2] as i32 + 20;
+        // SELECTION_COLOR (180, 213, 255) — nothing else on the page, nor the
+        // Inspector's orange/yellow markers, comes near it.
+        let highlight = |p: &[u8]| {
+            (p[0] as i32 - 180).abs() <= 6
+                && (p[1] as i32 - 213).abs() <= 6
+                && (p[2] as i32 - 255).abs() <= 6
+        };
+
+        for (zoom, win, devtools) in [
+            (1.0f32, 800u32, false),
+            (2.0, 1600, false),
+            (0.5, 400, false),
+            (2.0, 1600, true),
+        ] {
+            tab.handle_to_tab(ToTab::SetZoom { zoom });
+            tab.handle_to_tab(ToTab::Resize { width: win, height: 600, scale: 1.0 });
+            if devtools {
+                tab.handle_to_tab(ToTab::SetInspect { open: true });
+            }
+            // A plain click collapses the previous drag's selection so the
+            // next frame shows where the text itself sits.
+            tab.handle_to_tab(ptr(300.0 * zoom, 12.0 * zoom, PointerKind::Down));
+            tab.handle_to_tab(ptr(300.0 * zoom, 12.0 * zoom, PointerKind::Up));
+            let (fw, fh, rgba) = frame(&mut tab, &sink);
+            let (w, h) = (fw as usize, fh as usize);
+            let p1 = extent(&rgba, w, h, black).expect("paragraph one is painted dark");
+            let p2 = extent(&rgba, w, h, green).expect("paragraph two is painted green");
+            assert!(
+                p1.3 < p2.1,
+                "paragraph two sits below paragraph one at zoom {zoom}: {p1:?} vs {p2:?}"
+            );
+
+            // Drag across "111 222" inside the second paragraph: CSS y 51 is
+            // inside its line box whatever the zoom (the CSS viewport stays
+            // 800 px wide because window px = CSS px × zoom).
+            tab.handle_to_tab(ptr(2.0 * zoom, 51.0 * zoom, PointerKind::Down));
+            tab.handle_to_tab(ptr(96.0 * zoom, 51.0 * zoom, PointerKind::Move));
+            tab.handle_to_tab(ptr(96.0 * zoom, 51.0 * zoom, PointerKind::Up));
+
+            let sel = tab.document_mut().expect("doc").get_selected_text();
+            assert!(
+                sel.as_deref().is_some_and(|s| s.starts_with("111")),
+                "the drag selects paragraph two's own words at zoom {zoom}: {sel:?}"
+            );
+
+            let (fw, fh, rgba) = frame(&mut tab, &sink);
+            let sel_box = extent(&rgba, fw as usize, fh as usize, highlight)
+                .expect("the drag paints a highlight");
+            assert!(
+                sel_box.1 > p1.3,
+                "the highlight stays below paragraph one's ink at zoom {zoom}                  (devtools {devtools}): sel {sel_box:?}, paragraph one {p1:?}",
+            );
+            assert!(
+                sel_box.3 < p2.3 + 14,
+                "the highlight does not spill below paragraph two's ink at zoom {zoom}                  (devtools {devtools}): sel {sel_box:?}, paragraph two {p2:?}",
+            );
+            assert!(
+                sel_box.0 + 6 >= p2.0,
+                "the highlight starts no earlier than paragraph two's own text at zoom {zoom}                  (devtools {devtools}): sel {sel_box:?}, paragraph two {p2:?}",
+            );
+            assert!(
+                sel_box.2 <= p2.2 + 6,
+                "the highlight ends no later than paragraph two's own text at zoom {zoom}                  (devtools {devtools}): sel {sel_box:?}, paragraph two {p2:?}",
+            );
+        }
     }
 
     /// A mouse drag selects page text; the selection survives to the context
