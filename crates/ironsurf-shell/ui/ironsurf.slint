@@ -37,6 +37,15 @@ export struct HistoryItem {
     url: string,
 }
 
+/// One URL-bar autocomplete candidate (task: URL bar autocomplete): the same
+/// shape as a history row, but a *filtered, ranked* subset of the visit log
+/// for what the user has typed so far (`title` falls back to the URL in Rust,
+/// exactly like `HistoryItem`).
+export struct SuggestItem {
+    title: string,
+    url: string,
+}
+
 /// One context-menu row (labels only; Rust keeps the matching actions and
 /// maps the picked index back onto them).
 export struct MenuItem {
@@ -274,15 +283,53 @@ component InspectorReveal inherits Rectangle {
 
 /// URL bar wrapper: bumps `focus-token` (from Rust / Ctrl-L / F6) to grab
 /// focus and highlight the whole address, so typing replaces it outright.
+///
+/// While the autocomplete dropdown is open (task: URL bar autocomplete) the
+/// arrow keys, Enter and Escape belong to the dropdown rather than to the
+/// entry: Rust opens it (and keeps re-ranking it from the visit log on every
+/// keystroke via `edited`), owns the highlighted row, and is the only thing
+/// that closes it again. Enter with no highlighted row falls through to the
+/// entry's default — plain `submitted` of the draft, unchanged behaviour.
 component UrlBar inherits Rectangle {
     in property <int> focus-token: 0;
     in-out property<string> text <=> edit.text;
     callback submitted(text: string);
+    callback edited(text: string);
+    callback suggest-move(delta: int);
+    callback suggest-pick(idx: int);
+    callback suggest-close();
+    // the entry's live focus state, so AppWindow can gate the dropdown on it:
+    // clicking into the page hides the panel even before Rust clears the flag
+    out property <bool> edit-focus: edit.has-focus;
+    in property <bool> suggest-open: false;
+    in property <int> suggest-selected: -1;
     edit := LineEdit {
         width: parent.width;
         height: parent.height;
         placeholder-text: "Search or enter address — Ctrl-L or F6 to focus";
         accepted(txt) => { root.submitted(txt); }
+        edited(txt) => { root.edited(txt); }
+        key-pressed(ev) => {
+            if (root.suggest-open) {
+                if (ev.text == Key.DownArrow) {
+                    root.suggest-move(1);
+                    return EventResult.accept;
+                }
+                if (ev.text == Key.UpArrow) {
+                    root.suggest-move(-1);
+                    return EventResult.accept;
+                }
+                if (ev.text == Key.Return && root.suggest-selected >= 0) {
+                    root.suggest-pick(root.suggest-selected);
+                    return EventResult.accept;
+                }
+                if (ev.text == Key.Escape) {
+                    root.suggest-close();
+                    return EventResult.accept;
+                }
+            }
+            return EventResult.reject;
+        }
     }
     // armed on token bumps only (> 0), so clicking out of the bar does not
     // yank focus back
@@ -632,6 +679,17 @@ export component AppWindow inherits Window {
     in property <[HistoryItem]> history-items;
     in property <string> history-status: "";
 
+    // URL bar autocomplete (task: URL bar autocomplete): while the address-bar
+    // draft still matches visits in the shared log, Rust keeps `suggest-items`
+    // ranked (URL prefix → URL substring → title match, recency breaking
+    // ties, ≤ 8 rows), `suggest-selected` highlighted, and `suggest-open`
+    // true; the entry itself routes ↑/↓/Enter/Esc to the panel while it is
+    // open (see `UrlBar`). The panel is the only surface that ever shows
+    // these rows — nothing here rewrites the draft behind the user's back.
+    in property <bool> suggest-open: false;
+    in property <[SuggestItem]> suggest-items;
+    in property <int> suggest-selected: -1;
+
     // ------------------------------------------------------------------
     // intents surfaced to Rust
     // ------------------------------------------------------------------
@@ -725,6 +783,14 @@ export component AppWindow inherits Window {
     callback close-history-menu();
     callback history-pick(idx: int);
     callback history-clear();
+    // URL bar autocomplete (task: URL bar autocomplete): `url-edited` fires on
+    // every keystroke in the bar (Rust re-ranks the dropdown from the shared
+    // visit log), the rest come from the panel's rows and the entry's routed
+    // keys.
+    callback url-edited(text: string);
+    callback suggest-move(delta: int);
+    callback suggest-pick(idx: int);
+    callback suggest-close();
 
     // Console severity: icon + colour (error red, warn yellow, info/log grey).
     function devtools-level-icon(level: string) -> string {
@@ -795,6 +861,12 @@ export component AppWindow inherits Window {
                     horizontal-stretch: 1;
                     focus-token: root.focus-url-token;
                     submitted(txt) => { root.navigate(txt); }
+                    edited(txt) => { root.url-edited(txt); }
+                    suggest-open: root.suggest-open;
+                    suggest-selected: root.suggest-selected;
+                    suggest-move(d) => { root.suggest-move(d); }
+                    suggest-pick(i) => { root.suggest-pick(i); }
+                    suggest-close() => { root.suggest-close(); }
                 }
 
                 MiniButton { label: "＋"; clicked => { root.new-tab(); } }
@@ -2046,6 +2118,67 @@ export component AppWindow inherits Window {
                     text: "History is shared by all containers: one visit in one container is listed (and can be cleared) from all of them. Ctrl-Alt-T reopens the last closed tab.";
                     color: #888888;
                     wrap: word-wrap;
+                }
+            }
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // URL bar autocomplete dropdown (task: URL bar autocomplete)
+    // ------------------------------------------------------------------
+    // Floats directly under the address bar, the same width, listing the
+    // ranked visits Rust keeps in `suggest-items` (≤ 8 rows) while the draft
+    // matches them and the entry still has focus — clicking away into the
+    // page or a menu hides it even before Rust clears `suggest-open`. The
+    // highlighted row takes the same accent the tab strip uses; a click on a
+    // row is a pick (Rust navigates and closes), and ↑/↓/Enter/Esc reach the
+    // panel through the entry itself (see `UrlBar`).
+    Rectangle {
+        visible: root.suggest-open && root.suggest-items.length > 0 && url-bar.edit-focus;
+        x: url-bar.absolute-position.x;
+        y: url-bar.absolute-position.y + url-bar.height;
+        width: url-bar.width;
+        height: root.suggest-items.length * 30px + 10px;
+        background: #262626f2;
+        border-radius: 6px;
+        border-width: 1px;
+        border-color: #3d3d3d;
+
+        VerticalLayout {
+            x: 5px;
+            width: parent.width - 10px;
+            y: 5px;
+            height: parent.height - 10px;
+            spacing: 0px;
+
+            for s[i] in root.suggest-items: Rectangle {
+                height: 30px;
+                background: root.suggest-selected == i ? #3a3a3a : (scta.has-hover ? #313131 : transparent);
+                scta := TouchArea {
+                    mouse-cursor: MouseCursor.pointer;
+                    clicked => { root.suggest-pick(i); }
+                }
+                sgt := Text {
+                    x: 8px;
+                    width: parent.width - 16px;
+                    y: 2px;
+                    height: 15px;
+                    text: s.title;
+                    color: root.suggest-selected == i ? #f0f0f0 : #cfcfcf;
+                    font-size: 12px;
+                    vertical-alignment: center;
+                    overflow: elide;
+                }
+                sgu := Text {
+                    x: 8px;
+                    width: parent.width - 16px;
+                    y: 16px;
+                    height: 13px;
+                    text: s.url;
+                    color: #8a8a8a;
+                    font-size: 10px;
+                    vertical-alignment: center;
+                    overflow: elide;
                 }
             }
         }

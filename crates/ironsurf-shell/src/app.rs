@@ -34,7 +34,7 @@ use crate::keymap::{self, Shortcut};
 use crate::state::{InspectorUi, TabState};
 use crate::tabs::{PumpedMessage, TabProc};
 use crate::uisettings::UiSettings;
-use crate::{AppWindow, ContainerInfo, HistoryItem, MenuItem, TabInfo};
+use crate::{AppWindow, ContainerInfo, HistoryItem, MenuItem, SuggestItem, TabInfo};
 // The Slint-side row structs the DevTools panel renders (`state`'s own
 // view-models of the same name are converted into these).
 use crate::{ConsoleRow, CrumbItem, InspectRow, NetRow, Tok};
@@ -419,6 +419,11 @@ const CLOSED_TABS_MAX: usize = 50;
 /// all-or-nothing on the whole shared log regardless of this display window.
 const HISTORY_MENU_ROWS: usize = 200;
 
+/// Rows the URL bar dropdown shows at most (task: URL bar autocomplete) —
+/// Chrome's own count; the rest of the visit log stays reachable through the
+/// History menu.
+const SUGGEST_ROWS: usize = 8;
+
 /// The assembled application: core + the timers that drive it (owned so
 /// they are never dropped while the window runs).
 pub struct App {
@@ -753,6 +758,9 @@ impl Core {
         if let Some(ui) = self.ui() {
             let t = ui.get_focus_url_token() + 1;
             ui.set_focus_url_token(t);
+            // A fresh focus of the bar starts with no dropdown: suggestions
+            // appear as soon as the user types (task: URL bar autocomplete).
+            self.suggest_close(&ui);
         }
         self.url_draft.set(self.active_tab_id());
     }
@@ -958,6 +966,11 @@ impl Core {
             debug!("activate tab {} (index {idx})", procs[idx].tab.id.0);
         }
         self.active.set(idx);
+        // The dropdown belongs to the bar's draft, which the activation just
+        // replaced with the new tab's address (task: URL bar autocomplete).
+        if let Some(ui) = self.ui() {
+            self.suggest_close(&ui);
+        }
         self.set_visible_except();
         // The find bar follows the activation like the DevTools panel does: the
         // new tab's own query (and its own open flag) replace the old one's.
@@ -1012,6 +1025,11 @@ impl Core {
     }
 
     fn navigate(&self, text: &str) {
+        // The draft became an address — the dropdown has served its purpose
+        // (task: URL bar autocomplete).
+        if let Some(ui) = self.ui() {
+            self.suggest_close(&ui);
+        }
         let Some(url) = classify_input(text) else {
             debug!("address bar: {text:?} is not a URL/search term, ignored");
             return;
@@ -2755,6 +2773,107 @@ impl Core {
         }
     }
 
+    // ---- URL bar autocomplete (task: URL bar autocomplete suggestions) ----
+
+    /// Recompute the address-bar dropdown from the shared visit log: rows
+    /// whose URL or title contains what has been typed so far, best match
+    /// first — URL prefix, then URL substring, then title — with visiting
+    /// recency breaking ties (the log is newest-first and the sort is
+    /// stable). Repeats of a URL collapse to their newest visit, and a row
+    /// that IS the full address (typed out exactly) drops out — once there
+    /// is nothing left to complete, the dropdown closes itself. The draft is
+    /// never rewritten behind the user: the text stays as typed until a row
+    /// is picked.
+    fn suggest_refresh(&self, text: &str) {
+        let Some(ui) = self.ui() else { return };
+        let query = text.trim().to_lowercase();
+        if query.is_empty() {
+            self.suggest_close(&ui);
+            return;
+        }
+        let entries = ironsurf_storage::History::open(self.store.borrow().root()).entries();
+        let mut seen: Vec<String> = Vec::new();
+        let mut rows: Vec<(u8, SuggestItem)> = Vec::new();
+        for e in entries.iter() {
+            let url_l = e.url.to_lowercase();
+            // Newest visit wins — the log is newest-first, so once a URL has
+            // been taken its older rows are dropped — and typing an address
+            // out exactly leaves nothing to suggest about it.
+            if seen.contains(&url_l) || url_l == query {
+                continue;
+            }
+            let title = e
+                .title
+                .as_deref()
+                .filter(|t| !t.is_empty())
+                .unwrap_or(&e.url);
+            let rank = if url_l.starts_with(&query) {
+                0
+            } else if url_l.contains(&query) {
+                1
+            } else if title.to_lowercase().contains(&query) {
+                2
+            } else {
+                continue;
+            };
+            seen.push(url_l);
+            rows.push((rank, SuggestItem { title: title.into(), url: e.url.as_str().into() }));
+        }
+        rows.sort_by_key(|(rank, _)| *rank);
+        rows.truncate(SUGGEST_ROWS);
+        if rows.is_empty() {
+            self.suggest_close(&ui);
+            return;
+        }
+        let items: Vec<SuggestItem> = rows.into_iter().map(|(_, row)| row).collect();
+        ui.set_suggest_items(ModelRc::from(Rc::new(VecModel::from(items))));
+        ui.set_suggest_selected(0);
+        ui.set_suggest_open(true);
+    }
+
+    /// Move the highlight (task: URL bar autocomplete): ↑/↓ wrap around —
+    /// stepping down from "nothing selected yet" lands on the best match,
+    /// stepping up from there lands on the last row.
+    fn suggest_move(&self, delta: i32) {
+        let Some(ui) = self.ui() else { return };
+        let n = ui.get_suggest_items().row_count() as i32;
+        if n == 0 {
+            self.suggest_close(&ui);
+            return;
+        }
+        let cur = ui.get_suggest_selected();
+        let next = if delta < 0 { (cur - 1).rem_euclid(n) } else { (cur + 1).rem_euclid(n) };
+        ui.set_suggest_selected(next);
+    }
+
+    /// Commit a row — Enter on the highlighted row, or a click on any row:
+    /// close the dropdown and navigate exactly like typing the address.
+    fn suggest_pick(&self, idx: i32) {
+        let Some(ui) = self.ui() else { return };
+        let row = ui.get_suggest_items().row_data(idx.max(0) as usize);
+        match row {
+            Some(item) if !item.url.as_str().is_empty() => {
+                info!("url autocomplete: picked row {idx} → {}", item.url);
+                self.navigate(item.url.as_str());
+            }
+            // The list was rebuilt under the pick (the log moved between the
+            // key press and the callback): do nothing rather than navigate to
+            // a row the user was never shown.
+            _ => warn!("url autocomplete row {idx} is gone — nothing picked"),
+        }
+    }
+
+    /// Dismiss the dropdown (Esc, a draft matching nothing, navigation, a tab
+    /// switch, a fresh focus of the bar). Idempotent: the writes are guarded
+    /// so housekeeping paths may call it freely.
+    fn suggest_close(&self, ui: &AppWindow) {
+        if !ui.get_suggest_open() && ui.get_suggest_selected() < 0 {
+            return;
+        }
+        ui.set_suggest_open(false);
+        ui.set_suggest_selected(-1);
+    }
+
     /// Ctrl-Alt-T: reopen the most recently closed tab (task: browsing
     /// history). The stack remembers URL and container per close; an empty
     /// stack (or every address dropped as blank) is a no-op.
@@ -3808,6 +3927,28 @@ impl Core {
                 }
             });
         }
+        // URL bar autocomplete (task: URL bar autocomplete suggestions): every
+        // keystroke in the bar re-ranks the dropdown from the shared visit log
+        // (`edited` fires on user input only, so pushes of a tab's own address
+        // never trigger it), and the entry's routed ↑/↓/Enter/Esc plus the
+        // panel's row clicks come straight back here.
+        {
+            let c = self.clone();
+            ui.on_url_edited(move |text| c.suggest_refresh(text.as_str()));
+        }
+        {
+            let c = self.clone();
+            ui.on_suggest_move(move |delta| c.suggest_move(delta));
+        }
+        {
+            let c = self.clone();
+            ui.on_suggest_pick(move |idx| c.suggest_pick(idx));
+        }
+        bind0!(on_suggest_close, |c: &Rc<Core>| {
+            if let Some(ui) = c.ui() {
+                c.suggest_close(&ui);
+            }
+        });
     }
 }
 
