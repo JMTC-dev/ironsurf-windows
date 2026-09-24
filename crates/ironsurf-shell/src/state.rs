@@ -85,6 +85,10 @@ pub struct TabState {
     pub network: Vec<NetEvent>,
     /// The find bar's numbers, straight from the tab (see [`FindState`]).
     pub find: FindState,
+    /// **Reader view** (task: reader mode): the tab reports the page on
+    /// screen is its cleaned-up text-and-images rendering. The 📄 toolbar
+    /// button holds while this is set; every real navigation clears it.
+    pub reader: bool,
 }
 
 impl TabState {
@@ -172,6 +176,17 @@ impl TabState {
                     false
                 } else {
                     self.find = next;
+                    true
+                }
+            }
+            // Reader view (task: reader mode): mirrors the tab's authoritative
+            // answer — the button state follows the tab, never the other way
+            // around (a refusal to read an empty page moves nothing).
+            FromTab::ReaderState { enabled } => {
+                if *enabled == self.reader {
+                    false
+                } else {
+                    self.reader = *enabled;
                     true
                 }
             }

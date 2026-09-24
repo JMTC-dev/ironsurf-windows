@@ -1,7 +1,7 @@
 //! Headless ACID-test harness mode (ACID3 work, step 1).
 //!
 //! `ironsurf-tab --headless --url URL [--wait MS] [--body-out FILE]
-//! [--shot FILE.ppm] [--size WxH] [--no-sandbox implied]`
+//! [--shot FILE.ppm] [--size WxH] [--reader] [--no-sandbox implied]`
 //!
 //! One-shot, terminal-driven invocation of the *same* machinery
 //! [`runtime::run`] uses — same fetch/`netmod`/policy objects (via
@@ -61,6 +61,11 @@ pub struct HeadlessArgs {
     pub wait: Duration,
     pub body_out: Option<PathBuf>,
     pub shot: Option<PathBuf>,
+    /// Turn **reader view** on before the capture (`--reader`): the tab swaps
+    /// its document for the cleaned-up text-and-images rendering (task:
+    /// reader mode), so `--body-out`/`--shot` show what the reader mode of
+    /// the page looks like, not the original.
+    pub reader: bool,
     /// Find-in-page query to run before the shot (`--find QUERY`): lets the
     /// highlights a live search paints be inspected as pixels.
     pub find: Option<String>,
@@ -112,6 +117,7 @@ impl HeadlessArgs {
         let mut body_out = None;
         let mut shot = None;
         let mut size = (1024u32, 768u32);
+        let mut reader = false;
         let mut find = None;
         let mut find_jumps: usize = 0;
         let mut clicks = Vec::new();
@@ -143,6 +149,7 @@ impl HeadlessArgs {
                 }
                 "--body-out" => body_out = Some(PathBuf::from(value("body-out")?)),
                 "--shot" => shot = Some(PathBuf::from(value("shot")?)),
+                "--reader" => reader = true,
                 "--find" => find = Some(value("find")?),
                 "--find-jumps" => {
                     find_jumps = value("find-jumps")?
@@ -233,6 +240,7 @@ impl HeadlessArgs {
             wait: Duration::from_millis(wait_ms),
             body_out,
             shot,
+            reader,
             find,
             find_jumps,
             clicks,
@@ -356,6 +364,13 @@ pub fn run(args: &[String]) -> Result<(), Box<dyn Error>> {
     if let Some(path) = &args.inspect_out {
         let snapshot = tab.inspect_dump();
         dump_inspect_snapshot(path, snapshot.as_ref())?;
+    }
+
+    // Reader view (`--reader`): exactly the command the shell's 📄 button and
+    // Ctrl-Alt-`R` send — the captures below then show the reader rendering
+    // of the document the page had become (task: reader mode).
+    if args.reader {
+        tab.handle_to_tab(ToTab::SetReader { enabled: true });
     }
 
     // A scripted search (`--find`): exactly the command the shell sends when the

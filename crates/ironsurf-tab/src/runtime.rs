@@ -106,6 +106,7 @@ use crate::media::widget::VideoWidget;
 use crate::media::MediaError;
 use crate::logging::{ConsoleQueue, CssScanState};
 use crate::netmod::{self, BlitzNetProvider, MainDocPost, NetPolicy};
+use crate::reader;
 use crate::select;
 
 /// Default page size until the shell sends `ToTab::Resize` (physical px).
@@ -567,6 +568,19 @@ pub struct Tab {
     history: Vec<Url>,
     history_index: usize,
     last_url: Option<String>,
+    /// **Reader view** (task: reader mode): the page currently on screen is
+    /// the cleaned-up text-and-images rendering, not the real document.
+    /// Set by [`Tab::set_reader`]; every real navigation clears it.
+    reader_active: bool,
+    /// One-shot guard while [`Tab::set_reader`] renders through `load_html`:
+    /// the reader document must not overwrite the source it was made from.
+    reader_rendering: bool,
+    /// The source the current document was **loaded** from — `(url, raw
+    /// html)`, recorded by `load_html` outside reader renders. It is the
+    /// reader mode fallback (content scripts cleared out of the live DOM
+    /// still stands in the bytes) and what toggling reader back off
+    /// re-renders (no network, same history entry).
+    last_source: Option<(String, String)>,
     /// `history.pushState`/`replaceState` re-pointed the address bar past
     /// the document's own URL (task: infosec.exchange); wins over
     /// `doc.url()` in `check_meta` until the NEXT real navigation.
@@ -1026,6 +1040,9 @@ impl Tab {
             history_index: 0,
             last_title: None,
             last_url: None,
+            reader_active: false,
+            reader_rendering: false,
+            last_source: None,
             url_override: None,
             refresh_at: None,
             js_title: None,
@@ -1252,6 +1269,12 @@ impl Tab {
         // A real navigation owns the URL again: any pushState address-bar
         // override from the outgoing document dies with it.
         self.url_override = None;
+        // …and reader view (task: reader mode) dies with it: the mode is a
+        // rendering of one document, not a place navigation keeps.
+        if self.reader_active {
+            self.reader_active = false;
+            self.emit(FromTab::ReaderState { enabled: false });
+        }
         // …and so does any delayed navigation the outgoing document armed
         // (its `Refresh:` header / meta refresh). A fresh one is armed below,
         // after the new document is loaded.
@@ -1468,6 +1491,69 @@ impl Tab {
     /// Build a fresh `HtmlDocument` for an already-parsed document, run its
     /// scripts, drive it to a first paint; then emit the metadata deltas
     /// (url/title/history).
+    /// **Reader view** (task: reader mode, Ctrl-Alt-`R` / the 📄 button):
+    /// swap the live document for a cleaned-up rendering of it as text and
+    /// images only — or swap the real document back.
+    ///
+    /// Not a navigation: the reader document replaces the current history
+    /// entry at the same address, and the source is the **live DOM** at the
+    /// moment of the request — everything JavaScript and XHR had loaded in —
+    /// with the fetched bytes as the fallback when scripts had *cleared*
+    /// richer content out of the DOM (see [`reader::extract_best`]).
+    /// Toggling off re-renders the remembered source with no network, so the
+    /// page's scripts run again. Every real navigation leaves reader mode
+    /// (see [`navigate_post`](Tab::navigate_post)); the shell gets the
+    /// authoritative state as [`FromTab::ReaderState`] either way, including
+    /// the refusal when the page holds nothing readable.
+    fn set_reader(&mut self, enabled: bool) {
+        if enabled == self.reader_active {
+            // already in (or out of) the requested view: just confirm it.
+            self.emit(FromTab::ReaderState { enabled: self.reader_active });
+            return;
+        }
+        if !enabled {
+            self.reader_active = false;
+            // The real document comes back from the remembered source: same
+            // URL, same history entry, scripts run again.
+            if let (Some((src_url, src)), false) = (self.last_source.clone(), self.history.is_empty())
+            {
+                if let Ok(url) = Url::parse(&src_url) {
+                    let idx = self.history_index.min(self.history.len() - 1);
+                    self.reader_rendering = true;
+                    self.load_html(&url, &src, NavHistory::Session(idx));
+                    self.reader_rendering = false;
+                }
+            }
+            self.emit(FromTab::ReaderState { enabled: false });
+            return;
+        }
+        // On: the live DOM is the source of truth, the fetched bytes the
+        // richer candidate (a failing client-side app can empty the page).
+        let live = self.doc.as_deref();
+        let source = self
+            .last_source
+            .as_ref()
+            .map(|(u, s)| (u.as_str(), s.as_str()));
+        let extracted = reader::extract_best(live, source);
+        let (Some(rd), Some(url)) = (extracted, self.history.get(self.history_index).cloned())
+        else {
+            self.emit(FromTab::StatusText {
+                text: Some("reader mode: nothing readable found on this page".to_string()),
+            });
+            self.emit(FromTab::ReaderState { enabled: false });
+            return;
+        };
+        self.reader_active = true;
+        self.reader_rendering = true;
+        self.load_html(&url, &rd.html, NavHistory::Session(self.history_index));
+        self.reader_rendering = false;
+        info!(
+            "reader mode on for {url}: {} text chars, {} images",
+            rd.text_len, rd.images
+        );
+        self.emit(FromTab::ReaderState { enabled: true });
+    }
+
     fn load_html(&mut self, url: &Url, html: &str, history: NavHistory) {
         // A fresh doc must not inherit the previous doc's flushed title —
         // and the previous doc's JS world dies here too: replacing `self.js`
@@ -1513,6 +1599,12 @@ impl Tab {
             ]),
             ..Default::default()
         };
+        // Remember what this document was loaded from (task: reader mode) —
+        // except when the reader itself is re-rendering: then the recorded
+        // source (what the reader was built from) must survive the swap.
+        if !self.reader_rendering {
+            self.last_source = Some((url.as_str().to_owned(), html.to_owned()));
+        }
         let parsed = Instant::now();
         let mut document = HtmlDocument::from_html(html, config);
         // `<form>` groundwork (task: `<form>`): seed textarea editors from
@@ -3353,6 +3445,7 @@ impl Tab {
             ToTab::SetInspectPick { enabled } => self.set_inspect_pick(enabled),
             ToTab::InspectSelect { node } => self.inspect_select(node),
             ToTab::InspectPickAt { x, y } => self.inspect_pick_at(x, y),
+            ToTab::SetReader { enabled } => self.set_reader(enabled),
             ToTab::DialogResponse { dialog_id, .. } => {
                 // A reply with no modal open: it either raced the tab-side
                 // cancel (shell quit mid-dialog) or is stale — nothing to

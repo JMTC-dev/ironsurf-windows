@@ -248,6 +248,15 @@ pub enum FromTab {
         /// Port the server listens on now (`0` = the server is stopped).
         port: u16,
     },
+    /// **Reader mode** (task: reader view): the tab's current view state,
+    /// reported every time it changes — after a successful
+    /// [`ToTab::SetReader`], after the request was refused (no article
+    /// content found: the mode stays off and this is the answer), and on any
+    /// real navigation, which always leaves reader mode (`false`). The shell
+    /// paints the 📄 toolbar button from this, never from its own request.
+    ReaderState {
+        enabled: bool,
+    },
     Closed,
     Error {
         message: String,
@@ -419,6 +428,20 @@ pub enum ToTab {
     InspectPickAt {
         x: f32,
         y: f32,
+    },
+    /// **Reader mode** (task: reader view, Ctrl-Alt-`R` / the 📄 toolbar
+    /// button): render the CURRENT page as cleaned-up text and images only.
+    /// The source is the document as it stands the moment the request lands
+    /// — including everything JavaScript and XHR already put into the live
+    /// DOM — with a fallback to the fetched source when the running scripts
+    /// had cleared richer content out of the DOM. The reader document
+    /// replaces the live one **in this history entry** (no navigation,
+    /// no network); `false` restores the real document (scripts run again).
+    /// A real navigation always exits reader mode. The tab answers every
+    /// request with [`FromTab::ReaderState`] — the authoritative state, which
+    /// stays `false` when the page holds nothing readable.
+    SetReader {
+        enabled: bool,
     },
     Destroy,
 }

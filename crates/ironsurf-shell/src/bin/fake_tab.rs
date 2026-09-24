@@ -230,6 +230,7 @@ fn main() {
     // Find in page (task: find bar): the live query and the 1-based position of
     // the active hit, exactly as the real tab keeps them.
     let mut find_query = String::new();
+    let mut reader_on = false;
     let mut find_at: usize = 0;
 
     // Last scripted cursor (`--cursor`); `None` = nothing reported yet.
@@ -286,6 +287,14 @@ fn main() {
                         default: Some("ada".into()),
                     });
                 }
+            }
+            // Reader view (task: reader mode): the fake has no real document
+            // to clean up, so it plays along — it always has something
+            // "readable" and confirms the requested state back, which is
+            // exactly what drives the shell's 📄 button.
+            ToTab::SetReader { enabled } => {
+                reader_on = enabled;
+                emit(FromTab::ReaderState { enabled: reader_on });
             }
             // Find in page (task: find bar): the fake searches its own canned
             // page text — the shell cannot tell the difference from the real

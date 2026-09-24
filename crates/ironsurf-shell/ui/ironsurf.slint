@@ -141,12 +141,15 @@ export struct UaRow {
 component MiniButton inherits Rectangle {
     in property <string> label: "";
     in property <bool> enabled: true;
+    /// Held-in look for toggle-style buttons (reader view's 📄): the button
+    /// stays dark-blue while the mode it toggles is on.
+    in property <bool> checked: false;
     in property <color> tint: #262626;
     callback clicked();
     width: Math.max(22px, lbl.preferred-width + 12px);
     height: 24px;
     bg := Rectangle {
-        background: ta.has-hover ? (root.enabled ? #3d3d3d : #2c2c2c) : root.tint;
+        background: ta.has-hover ? (root.enabled ? #3d3d3d : #2c2c2c) : (root.checked ? #35567d : root.tint);
         border-radius: 4px;
     }
     lbl := Text {
@@ -522,6 +525,13 @@ export component AppWindow inherits Window {
     in property <[ContainerInfo]> containers;
     in property <image> page-image;
     // two-way alias: Rust pushes URLs here and they propagate to the URL bar
+    // reader view (task: reader mode): mirrors the active tab's reader state
+    // onto the 📄 toolbar button; the chord and the button both fire
+    // `reader-toggled`, and the tab's `ReaderState` answer moves the state
+    // back (it also refuses, so the button never lies about a no-op).
+    in property <bool> reader-on: false;
+    callback reader-toggled();
+
     in-out property<string> url-text <=> url-bar.text;
     in property <string> status-text;
     in property <string> sec-glyph: "";
@@ -944,6 +954,12 @@ export component AppWindow inherits Window {
                 }
 
                 MiniButton { label: "＋"; clicked => { root.new-tab(); } }
+
+                // reader view (task: reader mode): the 📄 — paper with text —
+                // swaps the page for its cleaned-up text-and-images rendering
+                // and stays held-in while it is on; Ctrl-Alt-`R` is the same
+                // command.
+                MiniButton { label: "\u{1F4C4}"; checked: root.reader-on; clicked => { root.reader-toggled(); } }
 
                 // userscript menu (task: userscript menu)
                 MiniButton { label: "</>"; clicked => { root.toggle-us-menu(); } }

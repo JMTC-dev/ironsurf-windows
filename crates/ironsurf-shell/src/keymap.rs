@@ -50,6 +50,10 @@ pub enum Shortcut {
     /// stack it pops is the shell's own — each close pushes URL + container,
     /// each press pops the newest.
     ReopenClosedTab,
+    /// Ctrl-Alt-`R`: toggle **reader view** on the active tab (task: reader
+    /// mode) — the same command as the 📄 toolbar button. The tab answers
+    /// with `FromTab::ReaderState`, which moves the button.
+    ToggleReader,
     /// Ctrl-Alt-`H`: toggle the browsing-History menu (task: browsing
     /// history) — the same menu as the ☰ toolbar button, and the only place
     /// the shared history log is listed and cleared.
@@ -180,15 +184,16 @@ pub fn shortcut_for(text: &str, ctrl: bool, alt: bool, meta: bool) -> Option<Sho
     if c == '\u{F709}' && !ctrl && !alt && !meta {
         return Some(Shortcut::FocusUrl);
     }
-    // Ctrl-Alt-`T` / Ctrl-Alt-`H` (task: browsing history): reopen the last
-    // closed tab, and toggle the History menu. Caught ahead of the plain-Ctrl
-    // letter chords below, so plain Ctrl-`T` (new tab) and bare letters are
-    // untouched; both spellings X11 backends hand over (letter, control char)
-    // are accepted.
+    // Ctrl-Alt-`T` / Ctrl-Alt-`H` / Ctrl-Alt-`R` (tasks: browsing history,
+    // reader mode): reopen the last closed tab, toggle the History menu, and
+    // toggle reader view. Caught ahead of the plain-Ctrl letter chords below,
+    // so plain Ctrl-`T` (new tab) and Ctrl-`R` (reload) are untouched; both
+    // spellings X11 backends hand over (letter, control char) are accepted.
     if ctrl && alt && !meta {
         return match c {
             't' | 'T' | '\u{14}' => Some(Shortcut::ReopenClosedTab),
             'h' | 'H' => Some(Shortcut::HistoryMenu),
+            'r' | 'R' => Some(Shortcut::ToggleReader),
             _ => None,
         };
     }
@@ -311,6 +316,18 @@ pub fn to_ipc_key(text: &str, ctrl: bool, shift: bool, alt: bool, meta: bool, re
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Ctrl-Alt-`R` (task: reader mode): the reader toggle. Plain Ctrl-`R`
+    // must keep meaning reload — including in its control-char spelling —
+    // and Ctrl-Alt-`R` arrives as the letter (the control-char form is
+    // Ctrl-`R`'s alone, so it is deliberately not claimed here).
+    #[test]
+    fn ctrl_alt_r_toggles_reader() {
+        assert_eq!(shortcut_for("r", true, true, false), Some(Shortcut::ToggleReader));
+        assert_eq!(shortcut_for("R", true, true, false), Some(Shortcut::ToggleReader));
+        assert_eq!(shortcut_for("r", true, false, false), Some(Shortcut::Reload));
+        assert_eq!(shortcut_for("\u{12}", true, false, false), Some(Shortcut::Reload));
+    }
 
     #[test]
     fn chords_are_detected_in_letter_and_control_char_forms() {

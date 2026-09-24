@@ -1245,6 +1245,13 @@ impl Core {
                 self.toggle_download_menu();
                 return;
             }
+            Some(Shortcut::ToggleReader) => {
+                // Ctrl-Alt-R (task: reader mode): the 📄 button's chord — the
+                // tab decides what to make of it and answers with
+                // `ReaderState`, which moves the button (or doesn't).
+                self.toggle_reader();
+                return;
+            }
             Some(Shortcut::SavePage) => {
                 // Ctrl-S (task: save-page selector): the "Save page" dialog —
                 // pick the folder (default `~/Downloads`) and the name, and
@@ -1840,6 +1847,20 @@ impl Core {
     /// query that tab was last searching (its own, per tab — the tab process
     /// never dropped its highlights, so reopening the bar finds the page exactly
     /// where the reader left it).
+    /// Toggle **reader view** (task: reader mode) on the active tab: the
+    /// command behind both the 📄 toolbar button and Ctrl-Alt-`R`. Sent
+    /// inverted against the state the tab last reported — the tab is
+    /// authoritative, and its `FromTab::ReaderState` answer (including a
+    /// refusal: nothing readable) is what updates `TabState::reader` and
+    /// repaints the button.
+    fn toggle_reader(&self) {
+        let enabled = self
+            .active_proc_index()
+            .is_some_and(|i| !self.procs.borrow()[i].state.reader);
+        info!("reader mode: toggling {enabled} on tab {}", self.active_tab_id().map(|id| id.0).unwrap_or(0));
+        self.send_active(ToTab::SetReader { enabled });
+    }
+
     fn open_find(&self) {
         let Some(i) = self.active_proc_index() else {
             debug!("find bar dropped: no active tab");
@@ -4425,6 +4446,7 @@ impl Core {
         if let Some(p) = procs.get(active) {
             ui.set_can_back(p.state.can_back);
             ui.set_can_fwd(p.state.can_forward);
+            ui.set_reader_on(p.state.reader);
             // An address being typed belongs to exactly one tab: switching
             // tabs (or that tab going away) drops the draft, so the strip can
             // never leave a stale address in the bar. While it is live the
@@ -4486,6 +4508,7 @@ impl Core {
         bind0!(on_go_back, |c: &Rc<Core>| c.send_active(ToTab::Back));
         bind0!(on_go_forward, |c: &Rc<Core>| c.send_active(ToTab::Forward));
         bind0!(on_reload, |c: &Rc<Core>| c.send_active(ToTab::Reload));
+        bind0!(on_reader_toggled, |c: &Rc<Core>| c.toggle_reader());
         bind0!(on_new_tab, |c: &Rc<Core>| {
             let cid = c.new_tab_container();
             c.open_tab(cid, Some(&default_url()));
