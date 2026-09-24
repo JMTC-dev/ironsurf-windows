@@ -140,6 +140,12 @@ pub enum FromTab {
     // something and after a load re-ran a live query; `query` names the text the
     // numbers describe, so a stale reply the bar has typed past is recognisable.
     FindResult       { query: String, matches: usize, active: usize },
+    // **Reader view**: the tab reports whether the document on screen is its
+    // cleaned-up text-and-images rendering (task: reader mode). Sent for every
+    // `ToTab::SetReader` — including the **refusal** (`enabled: false` when the
+    // page holds nothing readable) — and on every real navigation that drops
+    // reader mode, so the shell's 📄 button state always mirrors the tab.
+    ReaderState      { enabled: bool },
     // **DevTools Inspector**: the document tree as one flat pre-order list, sent when the pane
     // opens ([`ToTab::SetInspect`]), after every navigation while it stays open, whenever the tab
     // itself changed what is selected, and whenever the markup changed under a live inspector
@@ -231,6 +237,15 @@ pub enum ToTab {
     SetFind          { query: String },
     FindNext,                             // next hit (wrapping), scrolls into view
     FindPrevious,                          // previous hit (wrapping)
+    // **Reader view** on/off (task: reader mode; the 📄 toolbar button and
+    // Ctrl-Alt-`R`). `true` swaps the live document for a cleaned-up text-and-
+    // images rendering of it — sourced from the **live DOM** (everything JS/XHR
+    // loaded in counts) with the fetched bytes as fallback when scripts had
+    // cleared richer content, richer wins, live ties — and answers
+    // `FromTab::ReaderState`; `false` re-renders the remembered source with no
+    // network. Not a navigation: the history entry keeps its address, and any
+    // real navigation leaves reader mode (and says so).
+    SetReader        { enabled: bool },
     // DevTools **Inspector** pane open/closed for this tab: `true` snapshots the document now and
     // keeps the shell's tree current (one tree walk per change, never one per frame); `false`
     // stops snapshotting and drops the on-page highlight.
@@ -1373,7 +1388,11 @@ Process/tab management (`src/tabs.rs`):
   original Ctrl-Shift-T spec: that chord belongs to the Console pane. **Ctrl-Alt-H**
   toggles the History menu (Ctrl-Shift-H is the user's *history* pane in DevTools). Both
   chords resolve ahead of the plain-Ctrl table, both X11 spellings (letter and
-  control-char) accepted, plain Ctrl-T (new tab) untouched.
+  control-char) accepted, plain Ctrl-T (new tab) untouched. **Ctrl-Alt-R** (task:
+  reader mode) toggles **reader view** on the active tab — letter spellings only,
+  so plain Ctrl-R (reload, in both its spellings) is untouched; it is the same
+  command as the 📄 toolbar button beside ＋, and the tab's `ReaderState` answer
+  is what moves the button.
 - **Text selection & copy/paste — the shell owns the session clipboard**: copy chords are
   never consumed (Ctrl-C/V/X/A always reach the tab — `keymap::clipboard_chords_always_reach_the_page`),
   every `FromTab::ClipboardText` (page Ctrl+C, editor copy/cut) is filed on the shell's
