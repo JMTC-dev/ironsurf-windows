@@ -257,6 +257,16 @@ pub enum FromTab {
     ReaderState {
         enabled: bool,
     },
+    /// **Scroll geometry** of the tab's document viewport — what a scroll bar
+    /// drawn over the page needs to know, and nothing else can: only the tab
+    /// has laid the page out. Emitted whenever the geometry **changes** (an
+    /// offset moves, a resize / zoom / navigation changes the scrollable
+    /// range), never on a timer, and never for an offset that did not move.
+    /// The shell draws the overlay scroll bar from it and hides it a few
+    /// seconds after the last movement.
+    ScrollState {
+        state: ScrollState,
+    },
     Closed,
     Error {
         message: String,
@@ -1005,6 +1015,48 @@ pub struct ScrollEvent {
     pub delta_y: f32,
 }
 
+/// The document viewport's vertical scroll geometry, in **CSS px** (the space
+/// the page is laid out in: window height and offsets divided by the tab's
+/// total scale, zoom included), as reported by the tab in
+/// [`FromTab::ScrollState`].
+///
+/// The three numbers describe the whole scroll range without naming the
+/// document: `range` is how far the page still goes **below** the offset's
+/// ceiling — `0 ≤ y ≤ range` — and the window itself is `viewport_h` tall, so
+/// the content spans `viewport_h + range`. The shell turns that into a thumb:
+/// `height ∝ viewport_h / (viewport_h + range)`, position `∝ y / range` — the
+/// thumb's bottom edge lands exactly at the track's end at `y == range`.
+///
+/// `range` includes the engine's overscroll (a document that scrolls lets the
+/// user bring its last lines up to mid-window, so it runs half a window past
+/// the content bottom); a document that fits its window has `range == 0` and
+/// never scrolls — and gets no bar.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct ScrollState {
+    /// Current scroll offset from the top, CSS px (`0` = at the top).
+    pub y: f32,
+    /// Largest offset this document answers, CSS px (`0` = it fits, no scroll).
+    pub range: f32,
+    /// Viewport (window) height, CSS px.
+    pub viewport_h: f32,
+}
+
+impl ScrollState {
+    /// Whether this document scrolls at all (`range > 0`), i.e. whether a
+    /// scroll bar over its page could say anything true.
+    pub fn is_scrollable(&self) -> bool {
+        self.range > 0.0
+    }
+
+    /// Same geometry within `eps` CSS px — the tolerance the tab reports with,
+    /// so sub-pixel layout jitter never produces a message.
+    pub fn same_within(&self, other: &Self, eps: f32) -> bool {
+        (self.y - other.y).abs() <= eps
+            && (self.range - other.range).abs() <= eps
+            && (self.viewport_h - other.viewport_h).abs() <= eps
+    }
+}
+
 /// Keyboard modifier state as a bitflags-style `u8` newtype.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct Modifiers(pub u8);
@@ -1468,6 +1520,12 @@ mod tests {
                 initiator: Some("document".into()),
             },
         });
+        frame_round_trip(FromTab::ScrollState {
+            state: ScrollState { y: 0.0, range: 0.0, viewport_h: 600.0 },
+        });
+        frame_round_trip(FromTab::ScrollState {
+            state: ScrollState { y: 1234.5, range: 2000.0, viewport_h: 600.0 },
+        });
         frame_round_trip(FromTab::CursorChanged { cursor: CursorIcon::Default });
         frame_round_trip(FromTab::CursorChanged { cursor: CursorIcon::Pointer });
         frame_round_trip(FromTab::DownloadStart { hint: hint(1) });
@@ -1505,6 +1563,25 @@ mod tests {
             message: "Page says hi".into(),
             default: None,
         });
+    }
+
+    /// The two things both ends read off [`ScrollState`]: a page that fits its
+    /// window never gets a bar, and the tab's change gate ignores sub-pixel
+    /// movement but not a whole pixel of it.
+    #[test]
+    fn scroll_state_reports_only_real_scroll() {
+        let fits = ScrollState { y: 0.0, range: 0.0, viewport_h: 600.0 };
+        assert!(!fits.is_scrollable());
+        let scrolls = ScrollState { y: 0.0, range: 1200.0, viewport_h: 600.0 };
+        assert!(scrolls.is_scrollable());
+        assert!(!scrolls.same_within(&fits, 0.5), "a range change is not jitter");
+        assert!(scrolls.same_within(&scrolls, 0.5));
+        let nudged = ScrollState { y: 0.4, ..scrolls };
+        assert!(scrolls.same_within(&nudged, 0.5), "half a pixel is jitter");
+        assert!(
+            !scrolls.same_within(&ScrollState { y: 1.0, ..scrolls }, 0.5),
+            "a whole pixel is a scroll"
+        );
     }
 
     /// Every dialog kind survives the codec with its id/message/default

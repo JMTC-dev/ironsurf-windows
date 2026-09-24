@@ -14,8 +14,8 @@ use std::sync::mpsc::{channel, Receiver, Sender};
 
 use ironsurf_common::{debug, error, info, trace, warn};
 use ironsurf_common::{
-    default_url, ContextAction, ContextTarget, ContainerId, DialogKind, FromTab, TabId, ToTab,
-    Userscript,
+    default_url, ContextAction, ContextTarget, ContainerId, DialogKind, FromTab, ScrollState,
+    TabId, ToTab, Userscript,
 };
 use ironsurf_storage::default_data_root;
 use slint::{
@@ -32,7 +32,10 @@ use crate::archive_server::{self, ServeEvent, ServeHandle, Spec};
 use crate::classify::classify_input;
 use crate::downloads;
 use crate::keymap::{self, Shortcut};
-use crate::state::{net_row_clipboard, DownloadRow, DownloadStore, InspectorUi, TabState};
+use crate::state::{
+    net_row_clipboard, scrollbar_thumb, DownloadRow, DownloadStore, InspectorUi, TabState,
+    SCROLLBAR_HOLD,
+};
 use crate::tabs::{PumpedMessage, TabProc};
 use crate::uisettings::UiSettings;
 use crate::{
@@ -92,6 +95,36 @@ pub fn load_sweep_position(step: usize) -> usize {
     }
 }
 
+/// Put the page's overlay scroll bar on the window — or take it off (task:
+/// scroll bar). `scroll` is what the tab on screen last said its document
+/// viewport is, `moved` the moment that document was last under the reader's
+/// wheel: the tab's own report of a *moving offset*, or the shell's wheel click
+/// on that page (see `Core::page_wheel`).
+///
+/// The bar is up while both hold — the page has somewhere to scroll **and** it
+/// moved within [`SCROLLBAR_HOLD`]. It answers the scroll and then gets out of
+/// the reader's way, and nothing has to schedule the hiding: whoever next
+/// pushes the bar (the spinner heartbeat, every 120 ms) finds the hold expired
+/// and draws it away. Where the thumb sits is [`scrollbar_thumb`]'s answer, so
+/// a page at either end of its range sits at either end of the track.
+fn push_scrollbar(ui: &AppWindow, scroll: &ScrollState, moved: Option<Instant>) {
+    let thumb = scrollbar_thumb(scroll, ui.get_page_height());
+    let visible = thumb.is_some() && moved.is_some_and(|at| at.elapsed() < SCROLLBAR_HOLD);
+    if ui.get_scrollbar_visible() != visible {
+        ui.set_scrollbar_visible(visible);
+    }
+    // A page with nothing to scroll has no thumb to place; its stale numbers
+    // do nobody any harm while the bar is hidden.
+    if let Some((top, height)) = thumb {
+        if ui.get_scrollbar_thumb_y() != top {
+            ui.set_scrollbar_thumb_y(top);
+        }
+        if ui.get_scrollbar_thumb_height() != height {
+            ui.set_scrollbar_thumb_height(height);
+        }
+    }
+}
+
 struct Proc {
     tab: TabProc,
     state: TabState,
@@ -104,6 +137,12 @@ struct Proc {
     /// Page zoom factor (Ctrl-`+`/`-`/`0`, shell-owned policy; see
     /// `keymap::zoom_in`/`zoom_out`). Sent to the tab as `ToTab::SetZoom`.
     zoom: f32,
+    /// When *this* tab's document last moved under the reader's wheel (task:
+    /// scroll bar). The overlay bar over the page is up for
+    /// [`SCROLLBAR_HOLD`] after it — per tab, so a wheel that scrolled a
+    /// background page cannot keep the page on screen looking busy. `None` =
+    /// never since the process started.
+    scroll_moved: Option<Instant>,
     /// The child process died without saying `Closed` (crash) or a send hit
     /// a broken pipe. The tab stays in the strip showing its last frame;
     /// `state.error` carries the “has crashed” status-line message.
@@ -768,6 +807,7 @@ impl Core {
                         tab,
                         state: TabState::default(),
                         zoom: 1.0,
+                        scroll_moved: None,
                         crashed: false,
                         devtools_open: false,
                         inspect_stream: false,
@@ -2152,7 +2192,23 @@ impl Core {
     }
 
     fn page_wheel(&self, x: f32, y: f32, delta_x: f32, delta_y: f32) {
+        // The reader is scrolling the page on screen *now*, so its overlay
+        // scroll bar comes up now too — the tab's own report of the new offset
+        // lands a moment later, and the hold window starts at the first wheel
+        // click rather than at the last answer (task: scroll bar). The stamp is
+        // per tab: the page on screen is the one being scrolled.
+        let active = self.active_proc_index();
+        let stamped = {
+            let mut procs = self.procs.borrow_mut();
+            active.map(|i| {
+                procs[i].scroll_moved = Some(Instant::now());
+                (procs[i].state.scroll, procs[i].scroll_moved)
+            })
+        };
         self.send_active(ToTab::Scroll(ironsurf_common::ScrollEvent { x, y, delta_x, delta_y }));
+        if let (Some(ui), Some((scroll, moved))) = (self.ui(), stamped) {
+            push_scrollbar(&ui, &scroll, moved);
+        }
     }
 
     /// Land a tab's hover-cursor report on the UI (task: cursor icon): the
@@ -2402,6 +2458,7 @@ impl Core {
                         tab,
                         state: TabState::default(),
                         zoom,
+                        scroll_moved: None,
                         crashed: false,
                         devtools_open,
                         inspect_stream: false,
@@ -4139,13 +4196,38 @@ impl Core {
                 }
                 continue;
             }
+            // Scroll geometry (task: scroll bar): a document whose *offset*
+            // moved re-arms the clock the overlay bar shows on, and the bar is
+            // drawn on the spot — a reader who just scrolled must not wait a
+            // spinner tick to see where they ended up. A report that only
+            // restates the range (a resize, a document that opens at the top)
+            // moves nothing the bar cares about, and costs no stamp. A
+            // background tab's scroll keeps its own clock and draws nothing.
             let changed = {
                 let mut procs = self.procs.borrow_mut();
-                procs
-                    .iter_mut()
-                    .find(|p| p.tab.id == tid)
-                    .map(|p| p.state.reduce(&msg))
-                    .unwrap_or(false)
+                match procs.iter_mut().find(|p| p.tab.id == tid) {
+                    Some(p) => {
+                        // What the report moves is read before the record takes
+                        // the new numbers, which is what makes it a movement.
+                        let moved = match &msg {
+                            FromTab::ScrollState { state } => p.state.scroll_moves(state),
+                            _ => false,
+                        };
+                        let changed = p.state.reduce(&msg);
+                        if matches!(msg, FromTab::ScrollState { .. }) {
+                            if moved {
+                                p.scroll_moved = Some(Instant::now());
+                            }
+                            if Some(tid) == active {
+                                if let Some(window) = self.ui() {
+                                    push_scrollbar(&window, &p.state.scroll, p.scroll_moved);
+                                } // the frame's own record keeps the numbers meanwhile
+                            }
+                        }
+                        changed
+                    }
+                    None => false,
+                }
             };
             dirty |= changed;
             // Browsing history (task: browsing history): one line per
@@ -4399,6 +4481,17 @@ impl Core {
         };
         if ui.get_spinner() != want {
             ui.set_spinner(want);
+        }
+        // The page's overlay scroll bar rides this same heartbeat (task: scroll
+        // bar): it fades out here, `SCROLLBAR_HOLD` after its document last
+        // moved, which is why nothing needs a timer of its own for the hiding.
+        // It is the tab on screen's bar and nobody else's — switching tabs
+        // switches to that page's own movement clock.
+        let active = self.active_proc_index();
+        let procs = self.procs.borrow();
+        match active.and_then(|i| procs.get(i)) {
+            Some(p) => push_scrollbar(&ui, &p.state.scroll, p.scroll_moved),
+            None => push_scrollbar(&ui, &ScrollState::default(), None),
         }
     }
 

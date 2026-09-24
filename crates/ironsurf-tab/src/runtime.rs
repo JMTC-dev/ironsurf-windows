@@ -81,7 +81,8 @@ use blitz_traits::shell::{ClipboardError, ColorScheme, ShellProvider, Viewport};
 use ironsurf_common::{
     read_frame, write_frame, userscripts_for_url, ContextAction, ContextTarget, ContainerId,
     CursorIcon, DialogKind, DownloadHint, DownloadTrigger, FromTab, InspectSnapshot, KeyEvent,
-    Modifiers, NetEvent, PointerEvent, PointerKind, ScrollEvent, TabId, ToTab, Userscript,
+    Modifiers, NetEvent, PointerEvent, PointerKind, ScrollEvent, ScrollState, TabId, ToTab,
+    Userscript,
     MAX_CONTEXT_TEXT, MAX_DIALOG_MESSAGE, MAX_DOWNLOAD_BYTES, MAX_DOWNLOAD_CHUNK_BYTES,
 };
 use keyboard_types::{Code, Key, Location, Modifiers as KMods};
@@ -651,6 +652,12 @@ pub struct Tab {
     /// `None` = nothing reported for the current document yet. Change
     /// detection works exactly like `hover_status`'s.
     cursor_status: Option<CursorIcon>,
+    /// Last reported viewport scroll geometry (`FromTab::ScrollState`, task:
+    /// scroll bar); `None` = nothing reported for the current document yet.
+    /// Change detection (within half a CSS px) works exactly like
+    /// `cursor_status`'s: the shell's overlay bar needs the numbers, a page
+    /// that sits still needs no messages.
+    scroll_report: Option<ScrollState>,
     /// Video (task: playback): one player per `<video>` element, in attach
     /// order. The blitz widget on the element shares the very same
     /// `Rc<RefCell<MediaPlayer>>`, so the tab pumps the clock and the widget
@@ -1057,6 +1064,7 @@ impl Tab {
             mouse_buttons: MouseEventButtons::None,
             hover_status: None,
             cursor_status: None,
+            scroll_report: None,
             pending_form: None,
             form_press: None,
             label_press: None,
@@ -1569,6 +1577,10 @@ impl Tab {
         self.cursor_status = None;
         // …and no right-click into it survives either (task: context menu).
         self.context_video = None;
+        // …nor the scroll geometry: the new document reports its own range and
+        // offset with the next poll step whatever the old one had said (task:
+        // scroll bar).
+        self.scroll_report = None;
         // The previous document's players die with it (their widgets die with
         // its node tree; their decode threads end when the players drop).
         self.reset_media();
@@ -2708,6 +2720,57 @@ impl Tab {
         if let Some(text) = self.js_status.take() {
             self.emit(FromTab::StatusText { text: Some(text) });
         }
+    }
+
+    // -- scroll geometry --------------------------------------------------------
+
+    /// The viewport's vertical scroll geometry ([`ScrollState`]) — the same
+    /// numbers blitz computes for its own viewport `scroll_state`, read through
+    /// the public API: the root element's scrollable extent (its border-box
+    /// height or whatever overflows it below, whichever is larger) measured
+    /// against the window height in CSS px, and the document's live scroll
+    /// offset.
+    ///
+    /// `range` carries the engine's overscroll rule (a document that scrolls at
+    /// all can be pulled half a window past its content bottom, so its last
+    /// lines rest mid-window): `y` runs `0 …= range`, and the content spans
+    /// `viewport_h + range`. A document that fits its window reports
+    /// `range == 0` — no scroll, and no scroll bar. `None` only while the tab
+    /// has no document (or no root element) to measure.
+    fn viewport_scroll_state(&self) -> Option<ScrollState> {
+        let doc = self.doc.as_ref()?;
+        let root = doc.try_root_element()?;
+        let layout = root.final_layout();
+        let content_h =
+            f64::from(layout.size.height).max(f64::from(layout.scrollable_overflow_rect.bottom));
+        let viewport = doc.viewport();
+        let scale = viewport.scale_f64().max(f64::EPSILON);
+        let window_h = (viewport.window_size.1 as f64 / scale).max(0.0);
+        let beyond = content_h - window_h;
+        let range = match beyond > 0.0 {
+            true => beyond + window_h * 0.5,
+            false => 0.0,
+        };
+        let y = doc.viewport_scroll().y;
+        Some(ScrollState {
+            y: y.clamp(0.0, range) as f32,
+            range: range as f32,
+            viewport_h: window_h as f32,
+        })
+    }
+
+    /// Tell the shell what the page's scroll geometry is, but only when it
+    /// moved ([`ScrollState::same_within`], half a CSS px): the overlay scroll
+    /// bar the shell draws over the page needs the numbers to place its thumb,
+    /// and a page that sits still must not cost a message per poll tick. One
+    /// wheel notch moves the document ~20 px, so the gate never misses a scroll.
+    fn report_scroll_state(&mut self) {
+        let Some(state) = self.viewport_scroll_state() else { return };
+        if self.scroll_report.is_some_and(|prev| prev.same_within(&state, 0.5)) {
+            return;
+        }
+        self.scroll_report = Some(state);
+        self.emit(FromTab::ScrollState { state });
     }
 
     // -- painting -----------------------------------------------------------
@@ -6008,6 +6071,13 @@ pub fn run(args: TabArgs) -> i32 {
             tab.resolve_and_maybe_paint();
         }
 
+        // 3′. Viewport scroll geometry (task: scroll bar): the shell draws the
+        //     page's overlay bar from the document's range and offset, so they
+        //     travel up the pipe the moment they change. Three field reads and a
+        //     half-pixel comparison when nothing moved, and no activity is owed
+        //     to notice a JS scroll or a resize that painted no frame.
+        tab.report_scroll_state();
+
         if tab.out.borrow().broken {
             // Shell vanished: persist what we can, then die quietly.
             debug!("stdout write failed: shell is gone, shutting down");
@@ -8579,6 +8649,178 @@ mod tests {
                 assert!(parent < node.id, "parents precede children: {node:?}");
             }
         }
+    }
+
+    // ------------------------------------------------------------------
+    // SCROLL BAR (task: overlay scroll bar over the shell's page view). The
+    // document lives in this process, so the viewport's scroll geometry — the
+    // offset, how far it can go, and the window it scrolls inside — ships to
+    // the shell, which paints the thumb over the page. One message per change.
+    // ------------------------------------------------------------------
+
+    /// Every [`FromTab::ScrollState`] a (capturing) tab shipped, oldest first.
+    fn scroll_states(sink: &Arc<std::sync::Mutex<Vec<u8>>>) -> Vec<ScrollState> {
+        emitted(sink)
+            .into_iter()
+            .filter_map(|msg| match msg {
+                FromTab::ScrollState { state } => Some(state),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// A tab on a `height: 1600px` page (two thirds more than its 600 px
+    /// window) and a tab on a page that fits its window with room to spare.
+    fn scroll_tab(
+        dir: &std::path::Path,
+        name: &str,
+        html: &str,
+    ) -> (Tab, Arc<std::sync::Mutex<Vec<u8>>>) {
+        std::fs::write(dir.join(name), html).expect("write page");
+        let (mut tab, sink) = capturing_tab(dir);
+        tab.handle_to_tab(ToTab::Resize {
+            width: 800,
+            height: 600,
+            scale: 1.0,
+        });
+        tab.navigate(
+            url::Url::from_file_path(dir.join(name))
+                .expect("file url")
+                .as_str(),
+            NavHistory::Fresh,
+        );
+        tab.settle();
+        (tab, sink)
+    }
+
+    /// The window height the fixtures above are measured in.
+    const SCROLL_WINDOW_H: f64 = 600.0;
+
+    #[test]
+    fn the_tab_ships_scroll_geometry_for_the_bar_once_per_change() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (mut tab, sink) = scroll_tab(
+            dir.path(),
+            "tall.html",
+            "<!doctype html><meta charset=utf-8><style>body{margin:0;height:1600px}</style><p>tall</p>",
+        );
+        let content_h = {
+            let doc = tab.document_mut().expect("doc");
+            let root = doc.try_root_element().expect("root element");
+            let l = root.final_layout();
+            f64::from(l.size.height).max(f64::from(l.scrollable_overflow_rect.bottom))
+        };
+        assert!(
+            content_h > SCROLL_WINDOW_H * 1.5,
+            "the fixture is taller than its window: {content_h}"
+        );
+
+        tab.report_scroll_state();
+        let states = scroll_states(&sink);
+        assert_eq!(states.len(), 1, "one report of the fresh document's geometry");
+        let first = states[0];
+        assert!(
+            (f64::from(first.viewport_h) - SCROLL_WINDOW_H).abs() < 1.0,
+            "the window the bar's track stands for: {:?}",
+            first.viewport_h
+        );
+        assert_eq!(first.y, 0.0, "documents start at the top");
+        assert!(first.is_scrollable(), "a tall page scrolls: {first:?}");
+
+        // The `range` the report claims is the ceiling the engine actually
+        // answers: one enormous wheel reaches exactly it — the content bottom
+        // plus the half-window overscroll the engine allows — and the report
+        // follows the offset while it moves.
+        tab.handle_to_tab(ptr(100.0, 100.0, PointerKind::Move));
+        let wheel = |d: f32| {
+            ToTab::Scroll(ScrollEvent {
+                x: 100.0,
+                y: 100.0,
+                delta_x: 0.0,
+                delta_y: d,
+            })
+        };
+        tab.handle_to_tab(wheel(-100000.0));
+        tab.settle();
+        let scrolled = scroll_y(&mut tab);
+        tab.report_scroll_state();
+        let states = scroll_states(&sink);
+        assert_eq!(states.len(), 2, "the offset moved: one message");
+        let bottom = states[1];
+        assert!(
+            (f64::from(bottom.y) - scrolled).abs() < 1.0,
+            "the report follows the document: {bottom:?} vs scroll y {scrolled}"
+        );
+        assert!(
+            (f64::from(bottom.range) - f64::from(bottom.y)).abs() < 1.0,
+            "the wheel stopped exactly at the reported ceiling: {bottom:?}"
+        );
+        assert!(
+            (f64::from(bottom.range) - (content_h - SCROLL_WINDOW_H + SCROLL_WINDOW_H * 0.5))
+                .abs()
+                < 1.0,
+            "the ceiling is the content bottom + half a window of overscroll: {bottom:?}"
+        );
+        assert!(
+            (bottom.viewport_h - first.viewport_h).abs() < 0.01,
+            "the window did not move"
+        );
+
+        // Sitting still costs nothing: nothing arrives between two identical
+        // reports, which is what keeps a poll tick per page cheap.
+        tab.report_scroll_state();
+        tab.report_scroll_state();
+        assert_eq!(
+            scroll_states(&sink).len(),
+            2,
+            "an unchanged geometry is silence"
+        );
+
+        // Back to the top is a change like any other.
+        tab.handle_to_tab(wheel(100000.0));
+        tab.settle();
+        tab.report_scroll_state();
+        let states = scroll_states(&sink);
+        assert_eq!(states.len(), 3);
+        assert_eq!(states[2].y, 0.0, "back at the top");
+        assert!(
+            states[2].range > 0.0,
+            "the page is still scrollable: {:?}",
+            states[2]
+        );
+    }
+
+    /// A page that fits its window has no range, so the shell shows no bar —
+    /// and the wheel that cannot move it produces no further message either.
+    #[test]
+    fn a_page_that_fits_reports_no_scroll_and_stays_quiet() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (mut tab, sink) = scroll_tab(
+            dir.path(),
+            "short.html",
+            "<!doctype html><meta charset=utf-8><style>body{margin:0}</style><p>fits</p>",
+        );
+        tab.report_scroll_state();
+        let states = scroll_states(&sink);
+        assert_eq!(states.len(), 1);
+        assert_eq!(states[0].range, 0.0, "a fitting page does not scroll");
+        assert_eq!(states[0].y, 0.0);
+        assert!(!states[0].is_scrollable());
+
+        tab.handle_to_tab(ptr(100.0, 100.0, PointerKind::Move));
+        tab.handle_to_tab(ToTab::Scroll(ScrollEvent {
+            x: 100.0,
+            y: 100.0,
+            delta_x: 0.0,
+            delta_y: -100.0,
+        }));
+        tab.settle();
+        tab.report_scroll_state();
+        assert_eq!(
+            scroll_states(&sink).len(),
+            1,
+            "nothing moved, so nothing was reported"
+        );
     }
 }
 

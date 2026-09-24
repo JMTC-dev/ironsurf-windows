@@ -7,8 +7,11 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::time::Duration;
 
-use ironsurf_common::{CursorIcon, DownloadHint, DownloadTrigger, FromTab, NetEvent, TabId};
+use ironsurf_common::{
+    CursorIcon, DownloadHint, DownloadTrigger, FromTab, NetEvent, ScrollState, TabId,
+};
 
 /// Cap on retained DevTools console entries per tab: the oldest are dropped
 /// once the ring is full, so a chatty page cannot grow shell memory forever.
@@ -89,6 +92,13 @@ pub struct TabState {
     /// screen is its cleaned-up text-and-images rendering. The 📄 toolbar
     /// button holds while this is set; every real navigation clears it.
     pub reader: bool,
+    /// The tab's document viewport as the tab itself last described it (task:
+    /// scroll bar). Only the tab has laid the page out, so only it knows how
+    /// far the document goes and where inside it the reader is standing now;
+    /// the overlay bar the shell draws over the page is placed from these
+    /// numbers (see [`scrollbar_thumb`]), kept per tab so switching tabs
+    /// switches the bar along with the page.
+    pub scroll: ScrollState,
 }
 
 impl TabState {
@@ -203,6 +213,18 @@ impl TabState {
                 self.cursor = *cursor;
                 false
             }
+            // Scroll geometry: nothing to repaint (the pump draws the overlay
+            // bar the moment the report lands, so the reader never waits on a UI
+            // sync), and the record here only serves tab switches and a thumb
+            // that has to be re-placed after a resize.
+            FromTab::ScrollState { state } => {
+                if state.same_within(&self.scroll, 0.5) {
+                    false
+                } else {
+                    self.scroll = *state;
+                    true
+                }
+            }
             FromTab::Frame { .. } => false,
             // Archive mode: the pump writes the body to disk; there is no
             // per-tab state to show and never a frame to repaint.
@@ -237,11 +259,62 @@ impl TabState {
         }
     }
 
+    /// Whether a scroll-geometry report from the tab **moves the offset** this
+    /// record holds, as opposed to only restating the range — a window resize,
+    /// a zoom, a fresh document opening at the top. Only an offset that moves
+    /// is the page scrolling, and that alone is the reader's cue to put the
+    /// overlay scroll bar up (task: scroll bar). Half a CSS px of slack, the
+    /// same tolerance [`ScrollState::same_within`] reports with, so a tab that
+    /// settles a fraction of a pixel short of where it said it was never looks
+    /// like a scroll.
+    pub fn scroll_moves(&self, next: &ScrollState) -> bool {
+        (next.y - self.scroll.y).abs() > 0.5
+    }
+
     /// The status-bar security chip for the current URL: a lock for https,
     /// a warning for plain http, nothing for `about:`/`file:`/etc.
     pub fn security(&self) -> Security {
         Security::of(self.url.as_deref().unwrap_or(""))
     }
+}
+
+// ---- overlay scroll bar ---------------------------------------------------------
+//
+// The bar itself is one Rectangle over the page's right edge
+// (ui/ironsurf.slint) and every *decision* about it is here: whether the
+// numbers describe a page that scrolls at all, where its thumb sits, and how
+// long it stays up after the reader last moved the document. Pure and
+// headless, so a thumb's math is testable without a window; the pump in `app`
+// only hands over the live geometry and the clock.
+
+/// How long the page's overlay scroll bar stays up after the document last
+/// moved under the reader's wheel (task: scroll bar), before it hides itself
+/// again. Long enough to read where one stands in a long page after stopping,
+/// short enough that the page gets its right edge back.
+pub const SCROLLBAR_HOLD: Duration = Duration::from_millis(2000);
+
+/// The shortest thumb a reader still reads as a thumb, px. A document many
+/// screens long would otherwise draw a hairline the width of one pixel row.
+pub const SCROLLBAR_MIN_THUMB: f32 = 28.;
+
+/// Where the page's overlay scroll bar thumb sits in a `track`-px column, from
+/// the geometry the tab reported: `(top, height)` in px, or `None` when there
+/// is nothing to point at — a page that fits its window (`range == 0`), or a
+/// track too short to hold a thumb in (a window that is not laid out yet).
+///
+/// The content spans `viewport_h + range` CSS px, so the thumb takes
+/// `viewport_h / (viewport_h + range)` of the track and travels whatever is
+/// left of it: at `y == 0` it sits at the track's top and at `y == range` its
+/// bottom edge lands exactly on the track's end — the same rule at every zoom
+/// and window size, because both numbers come from the page's own space.
+pub fn scrollbar_thumb(state: &ScrollState, track: f32) -> Option<(f32, f32)> {
+    if !state.is_scrollable() || !track.is_finite() || track <= SCROLLBAR_MIN_THUMB {
+        return None;
+    }
+    let window = state.viewport_h.max(0.0);
+    let height = (track * (window / (window + state.range))).clamp(SCROLLBAR_MIN_THUMB, track);
+    let top = (state.y / state.range).clamp(0.0, 1.0) * (track - height);
+    Some((top, height))
 }
 
 // ---- DevTools panel view-models ---------------------------------------------
@@ -2176,5 +2249,123 @@ mod tests {
         // this one — the oldest finished rows, in arrival order
         assert_eq!(store.rows().first().map(|r| r.id), Some(4));
         assert_eq!(store.target(tab, 0), None, "a dropped row's file handle goes with it");
+    }
+
+    // ---- overlay scroll bar (task: scroll bar) --------------------------------
+
+    fn geometry(y: f32, range: f32) -> ScrollState {
+        ScrollState { y, range, viewport_h: 600. }
+    }
+
+    #[test]
+    fn a_page_that_fits_its_window_gets_no_bar() {
+        // Nothing to point at: the document is its viewport, so a bar would
+        // claim the page has places the reader has not seen.
+        assert_eq!(scrollbar_thumb(&geometry(0., 0.), 600.), None);
+        // …and a track with no room in it draws nothing either (the window is
+        // not laid out yet, or the page area is a sliver).
+        assert_eq!(scrollbar_thumb(&geometry(0., 1200.), 0.), None);
+        assert_eq!(scrollbar_thumb(&geometry(0., 1200.), f32::NAN), None);
+    }
+
+    #[test]
+    fn the_thumb_is_the_window_of_content_it_covers_and_travels_the_rest() {
+        // A 600 px window on a page 1800 px tall (range = 1200): the thumb
+        // covers a third of the track, and the track is 600 px tall.
+        let (top, height) = scrollbar_thumb(&geometry(0., 1200.), 600.).expect("a bar");
+        assert!((height - 200.).abs() < 0.01, "one window in three: {height}");
+        assert_eq!(top, 0., "at the top of the page, at the top of the track");
+
+        // Halfway down, halfway along the track.
+        let (middle, _) = scrollbar_thumb(&geometry(600., 1200.), 600.).expect("a bar");
+        assert!((middle - 200.).abs() < 0.01, "half way: {middle}");
+
+        // At the scroll limit the thumb's bottom edge is the track's end — a
+        // reader who reaches the bottom of a page sees the bottom of the bar.
+        let (bottom, height) = scrollbar_thumb(&geometry(1200., 1200.), 600.).expect("a bar");
+        assert!((bottom + height - 600.).abs() < 0.01, "bottom edge: {bottom} + {height}");
+
+        // A taller window means a taller thumb on the same page.
+        let (_, taller) = scrollbar_thumb(
+            &ScrollState { y: 0., range: 1200., viewport_h: 1200. },
+            600.,
+        )
+        .expect("a bar");
+        assert!((taller - 300.).abs() < 0.01, "half the content: {taller}");
+    }
+
+    #[test]
+    fn a_thumb_stays_inside_its_track_however_long_the_page_is() {
+        // A document a hundred screens long: the raw share of the track would
+        // be a pixel row, so the thumb bottoms out at the readable minimum…
+        let (top, height) = thumb(&geometry(0., 60_000.), 600.);
+        assert!((height - SCROLLBAR_MIN_THUMB).abs() < 0.01, "{height}");
+        // …and even then it never hangs off either end of the track.
+        assert!(top >= 0. && top + height <= 600. + 0.001, "{top} + {height}");
+        let (bottom, height) = thumb(&geometry(60_000., 60_000.), 600.);
+        assert!(
+            (bottom + height - 600.).abs() < 0.01,
+            "a huge page still ends its bar at the track's end: {bottom} + {height}"
+        );
+        // A report that overshoots its own range (a tab mid-animation) is
+        // clamped, not drawn past the edge.
+        let (past, _) = thumb(&geometry(70_000., 60_000.), 600.);
+        assert!((past - bottom).abs() < 0.01, "{past}");
+    }
+
+    /// A thumb the tests can assert on without an `Option` in the way.
+    fn thumb(state: &ScrollState, track: f32) -> (f32, f32) {
+        scrollbar_thumb(state, track).expect("a bar")
+    }
+
+    #[test]
+    fn the_bar_hides_itself_a_few_seconds_after_the_last_movement() {
+        // The contract the reader sees: the bar is a response to scrolling, not
+        // a fixture — so it holds for a beat and then goes.
+        let hold = SCROLLBAR_HOLD;
+        assert!(
+            hold > Duration::from_millis(500) && hold < Duration::from_millis(5000),
+            "a few seconds, not a blink and not a fixture: {hold:?}"
+        );
+    }
+
+    #[test]
+    fn only_a_moving_offset_is_the_page_scrolling() {
+        // The bar answers a scroll, not a layout change: a resize or a fresh
+        // document at the top restates the range and must not light the bar up
+        // (task: scroll bar).
+        let mut s = TabState::default();
+        assert!(
+            !s.scroll_moves(&geometry(0., 1200.)),
+            "a new range with the offset where it was is not a scroll"
+        );
+        assert!(
+            s.scroll_moves(&geometry(120., 1200.)),
+            "an offset that moves is a scroll"
+        );
+        s.scroll = geometry(120., 1200.);
+        assert!(
+            !s.scroll_moves(&geometry(120.4, 1200.)),
+            "sub-pixel settling is the same place"
+        );
+        // Back to the top is a movement — the reader should see the thumb go.
+        assert!(s.scroll_moves(&geometry(0., 1200.)));
+    }
+
+    #[test]
+    fn scroll_geometry_lands_on_the_tab_record_without_touching_the_frame() {
+        let mut s = TabState::default();
+        assert!(!s.scroll.is_scrollable(), "a tab with no page cannot scroll");
+        assert!(s.reduce(&FromTab::ScrollState { state: geometry(0., 1200.) }));
+        assert!(s.scroll.is_scrollable());
+        assert!(
+            !s.reduce(&FromTab::ScrollState { state: geometry(0.2, 1200.) }),
+            "sub-pixel jitter is the same geometry"
+        );
+        assert!(s.reduce(&FromTab::ScrollState { state: geometry(600., 1200.) }));
+        assert_eq!(s.scroll.y, 600.);
+        // A new document that fits again says so, and the bar goes away with it.
+        assert!(s.reduce(&FromTab::ScrollState { state: geometry(0., 0.) }));
+        assert!(!s.scroll.is_scrollable());
     }
 }
