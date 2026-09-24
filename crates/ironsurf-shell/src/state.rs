@@ -268,6 +268,24 @@ pub struct NetRow {
     pub failed: bool,
 }
 
+/// What copying a Network row yields (task: copy in the DevTools tabs): its
+/// columns in display order, joined with single spaces. An unknown value
+/// ([`MISSING`]) is skipped rather than pasted as a dash.
+pub fn net_row_clipboard(r: &NetRow) -> String {
+    [
+        r.method.as_str(),
+        r.url.as_str(),
+        r.initiator.as_str(),
+        r.status.as_str(),
+        r.size.as_str(),
+        r.time.as_str(),
+    ]
+    .into_iter()
+    .filter(|s| !s.is_empty() && *s != MISSING)
+    .collect::<Vec<&str>>()
+    .join(" ")
+}
+
 impl TabState {
     /// Console rows for the panel, in arrival order.
     pub fn console_rows(&self) -> Vec<ConsoleRow> {
@@ -777,6 +795,85 @@ pub fn node_tokens(n: &InspectNode, has_children: bool) -> Vec<Tok> {
     out
 }
 
+/// The end of the subtree rooted at `start` in the flat pre-order snapshot:
+/// everything after it deeper than the node itself, up to the first node that
+/// is not. (`Document` has no children of its own in the walk, so this is the
+/// whole rest of a truncated snapshot — which is exactly what a copy of a
+/// truncated document should be.)
+fn copy_subtree_end(nodes: &[InspectNode], start: usize) -> usize {
+    let base = nodes[start].depth;
+    let mut end = start + 1;
+    while end < nodes.len() && nodes[end].depth > base {
+        end += 1;
+    }
+    end
+}
+
+/// Renders one subtree as indented markup for the copy buffer (see
+/// [`InspectorUi::copy_text`]): each node on its own indented line, a
+/// document element's children between its open and close tag, and the
+/// `#document` row itself contributing nothing — a copy of the document is
+/// its children. `root_depth` is the depth painted flush-left: an element
+/// copy passes its own depth, so the node the reader picked starts the text
+/// and every level under it gains one indent.
+fn render_copy_markup(nodes: &[InspectNode], i: usize, root_depth: usize, out: &mut String) {
+    let n = &nodes[i];
+    let end = copy_subtree_end(nodes, i);
+    let indent = "  ".repeat(n.depth.saturating_sub(root_depth));
+    match n.kind {
+        InspectKind::Document => {
+            copy_children(nodes, i + 1, end, root_depth, out);
+        }
+        InspectKind::Element => {
+            if end == i + 1 {
+                // a leaf renders exactly as its row shows it: <tag></tag>
+                out.push_str(&indent);
+                out.push_str(&node_tokens(n, false).into_iter().map(|t| t.0).collect::<String>());
+                out.push('\n');
+                return;
+            }
+            out.push_str(&indent);
+            out.push_str(&node_tokens(n, true).into_iter().map(|t| t.0).collect::<String>());
+            out.push('\n');
+            copy_children(nodes, i + 1, end, root_depth, out);
+            out.push_str(&indent);
+            out.push_str("</");
+            out.push_str(&n.tag);
+            out.push_str(">\n");
+        }
+        InspectKind::Text => {
+            out.push_str(&indent);
+            out.push_str(n.text.trim());
+            out.push('\n');
+        }
+        InspectKind::Comment => {
+            out.push_str(&indent);
+            out.push_str("<!--");
+            out.push_str(&n.text);
+            out.push_str("-->\n");
+        }
+        InspectKind::Doctype => {
+            out.push_str(&indent);
+            out.push_str("<!DOCTYPE");
+            if !n.text.is_empty() {
+                out.push(' ');
+                out.push_str(&n.text);
+            }
+            out.push_str(">\n");
+        }
+    }
+}
+
+/// Renders each direct child of the node spanning `(i, end)` once. The flat
+/// list puts every descendant in the range, so after a child is rendered the
+/// walk jumps past its whole subtree to the next sibling.
+fn copy_children(nodes: &[InspectNode], mut c: usize, end: usize, root_depth: usize, out: &mut String) {
+    while c < end {
+        render_copy_markup(nodes, c, root_depth, out);
+        c = copy_subtree_end(nodes, c);
+    }
+}
+
 /// One visible row of the Inspector tree (a folded-away node simply has no row).
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct InspectorRow {
@@ -1084,6 +1181,27 @@ impl InspectorUi {
     /// current (see `app::Core::write_devtools`).
     pub fn collapsed_len(&self) -> usize {
         self.collapsed.len()
+    }
+
+    /// What copying this node's row yields (task: copy in the DevTools tabs):
+    /// an element copies its **subtree's markup** — opening tag with its
+    /// attributes, every descendant on its own indented line, closing tag —;
+    /// a text or comment node copies its content; `#document` copies the
+    /// whole document. Captured text arrives already truncated with a
+    /// trailing `…` — that is the snapshot's bound, and the copy does not
+    /// pretend otherwise. Folding is irrelevant: the copy takes the subtree
+    /// from the snapshot, not from what the pane happens to show.
+    pub fn copy_text(&self, node: u64) -> Option<String> {
+        let snap = self.snapshot.as_ref()?;
+        let start = snap.nodes.iter().position(|n| n.id == node)?;
+        // The picked node paints flush-left: an element copy starts with its
+        // own `<tag>` at column 0. A `Document` has no tag of its own, so its
+        // children start the text instead.
+        let root_depth = snap.nodes[start].depth
+            + if snap.nodes[start].kind == InspectKind::Document { 1 } else { 0 };
+        let mut out = String::new();
+        render_copy_markup(&snap.nodes, start, root_depth, &mut out);
+        Some(out)
     }
 
     /// The breadcrumb with its own syntax colours: `div#main` is a tag token
@@ -1590,6 +1708,82 @@ mod tests {
         ui.expect_tree();
         ui.set_snapshot(fixture_tree());
         ui
+    }
+
+    // ---- copy (task: copy in the DevTools tabs) ---------------------------
+
+    #[test]
+    fn copying_a_node_yields_its_markup_flush_left() {
+        let ui = ui_with_tree();
+        // a text node is just its (trimmed) text
+        assert_eq!(ui.copy_text(8).unwrap(), "hello\n");
+        // an element with children: open tag, indented contents, close tag
+        assert_eq!(
+            ui.copy_text(7).unwrap(),
+            "<div data-src=\"data:image/png;base64,AAAA\">\n  hello\n</div>\n"
+        );
+        // a leaf shows as the row shows it — `<tag></tag>` on one line
+        assert_eq!(ui.copy_text(10).unwrap(), "<script src=\"app.js\"></script>\n");
+    }
+
+    #[test]
+    fn copying_a_subtree_indents_one_level_per_depth_under_its_root() {
+        let ui = ui_with_tree();
+        assert_eq!(
+            ui.copy_text(6).unwrap(),
+            "\
+<body id=\"main\" class=\"page home\">
+  <div data-src=\"data:image/png;base64,AAAA\">
+    hello
+  </div>
+  <!-- keep the footer -->
+</body>
+"
+        );
+        // the whole document starts flush with the doctype, its children too
+        let all = ui.copy_text(0).unwrap();
+        assert!(all.starts_with("<!DOCTYPE html>\n<html>\n"), "{all}");
+    }
+
+    #[test]
+    fn copy_ignores_folds_a_folded_subtree_still_copies_whole() {
+        let mut ui = ui_with_tree();
+        let before = ui.copy_text(6).unwrap();
+        assert!(ui.toggle_fold(6), "body is foldable");
+        assert!(
+            ui.rows().iter().all(|r| r.node != 7),
+            "the fold hid the div from the tree"
+        );
+        assert_eq!(ui.copy_text(6).unwrap(), before, "the buffer copies the document, not the view");
+    }
+
+    #[test]
+    fn copying_a_network_row_joins_its_columns_and_skips_dashes() {
+        let mut s = TabState::default();
+        s.reduce(&FromTab::NetworkEvent {
+            event: net_event("GET", "https://example.com", Some(200), None),
+        });
+        s.reduce(&FromTab::NetworkEvent {
+            event: ironsurf_common::NetEvent {
+                method: "POST".into(),
+                url: "https://api.example/upload".into(),
+                status: None,
+                response_bytes: None,
+                duration_ms: Some(1500),
+                error: Some("dns failed".into()),
+                initiator: Some("xhr".into()),
+            },
+        });
+        let rows = s.net_rows();
+        assert_eq!(
+            net_row_clipboard(&rows[0]),
+            "GET https://example.com document 200 1.2 kB 42 ms"
+        );
+        // the failed request has no size — the dash is not pasted
+        assert_eq!(
+            net_row_clipboard(&rows[1]),
+            "POST https://api.example/upload xhr dns failed 1.50 s"
+        );
     }
 
     #[test]

@@ -32,7 +32,7 @@ use crate::archive_server::{self, ServeEvent, ServeHandle, Spec};
 use crate::classify::classify_input;
 use crate::downloads;
 use crate::keymap::{self, Shortcut};
-use crate::state::{DownloadRow, DownloadStore, InspectorUi, TabState};
+use crate::state::{net_row_clipboard, DownloadRow, DownloadStore, InspectorUi, TabState};
 use crate::tabs::{PumpedMessage, TabProc};
 use crate::uisettings::UiSettings;
 use crate::{
@@ -143,6 +143,12 @@ struct Proc {
     /// UI (see `clamp_devtools_height`), never here, so the reader's own number
     /// survives a shrink-then-grow.
     devtools_height: Option<f32>,
+    /// The Console row this tab has highlighted **for copy** (task: copy in
+    /// the DevTools tabs) — an index into the feed, set by clicking a row, and
+    /// what the pane's `Copy` button copies. `None` = nothing highlighted.
+    dt_sel_console: Option<usize>,
+    /// The same for the Network pane.
+    dt_sel_network: Option<usize>,
     /// Find-in-page bar open for *this* tab (Ctrl-`F`). Per tab like the panel:
     /// switching tabs switches the bar to the other tab's search, and the
     /// numbers beside it come from that tab (`state.find`).
@@ -604,6 +610,15 @@ impl Core {
             .collect()
     }
 
+    /// What the session clipboard holds (task: copy in the DevTools tabs): the
+    /// copy the last gesture filed — a page selection, a menu `Copy`, a
+    /// DevTools row — without pulling the desktop clipboard in. A test asserts
+    /// a copy landed by reading this; pasting still prefers the desktop
+    /// clipboard when it has text (see `paste_text`).
+    pub fn session_clipboard(&self) -> String {
+        self.clipboard.borrow().clone()
+    }
+
     fn ui(&self) -> Option<AppWindow> {
         self.shell.borrow().as_ref().and_then(|w| w.upgrade())
     }
@@ -742,6 +757,8 @@ impl Core {
                         inspector_target: None,
                         devtools_view: DevToolsView::default(),
                         devtools_height: None,
+                        dt_sel_console: None,
+                        dt_sel_network: None,
                         find_open: false,
                         downloads: DownloadStore::default(),
                     });
@@ -1672,13 +1689,108 @@ impl Core {
         let mut procs = self.procs.borrow_mut();
         let Some(p) = procs.get_mut(i) else { return };
         match view {
-            DevToolsView::Console => p.state.console.clear(),
-            DevToolsView::Network => p.state.network.clear(),
+            DevToolsView::Console => {
+                p.state.console.clear();
+                p.dt_sel_console = None;
+            }
+            DevToolsView::Network => {
+                p.state.network.clear();
+                p.dt_sel_network = None;
+            }
             DevToolsView::Inspector => {}
         }
         info!("DevTools: cleared the {view:?} feed on tab {}", p.tab.id);
         drop(procs);
         self.sync_ui();
+    }
+
+    /// The copy highlight (task: copy in the DevTools tabs): one click on a
+    /// Console (pane 0) or Network (pane 1) row marks that row, and *that* is
+    /// what the pane's `Copy` button copies. An index the feed does not have is
+    /// a feed that moved under the pointer — the click is dropped, so the
+    /// highlight never jumps onto a row nobody touched.
+    fn devtools_select_row(&self, pane: i32, index: i32) {
+        let Some(i) = self.active_proc_index() else { return };
+        let mut procs = self.procs.borrow_mut();
+        let Some(p) = procs.get_mut(i) else { return };
+        let index = index as usize; // a negative index fails the bounds check below
+        let (sel, len) = match pane {
+            0 => (&mut p.dt_sel_console, p.state.console.len()),
+            1 => (&mut p.dt_sel_network, p.state.network.len()),
+            _ => return,
+        };
+        if index >= len {
+            return;
+        }
+        *sel = Some(index);
+        drop(procs);
+        self.sync_ui();
+    }
+
+    /// The text a row of a pane carries: a Console row is its whole rendered
+    /// line (`[source] message`), a Network row its columns joined (see
+    /// [`crate::state::net_row_clipboard`]), and an Inspector row — where
+    /// `index` is the node id — that node's markup (see
+    /// [`crate::state::InspectorUi::copy_text`]).
+    fn devtools_row_text(&self, i: usize, pane: i32, index: usize) -> Option<String> {
+        let procs = self.procs.borrow();
+        let p = procs.get(i)?;
+        match pane {
+            0 => p.state.console_rows().into_iter().nth(index).map(|r| r.text),
+            1 => p.state.net_rows().into_iter().nth(index).map(|r| net_row_clipboard(&r)),
+            2 => p
+                .inspector
+                .as_ref()
+                .filter(|_| p.inspector_target == Some(p.tab.id))
+                .and_then(|ui| ui.copy_text(index as u64)),
+            _ => None,
+        }
+    }
+
+    /// The panel header's `Copy` button: whatever the pane it sits in has
+    /// highlighted — a Console/Network row, or the Inspector's selected node.
+    fn devtools_copy(&self) {
+        let Some(i) = self.active_proc_index() else { return };
+        let (pane, index) = {
+            let procs = self.procs.borrow();
+            let Some(p) = procs.get(i) else { return };
+            match p.devtools_view {
+                DevToolsView::Console => match p.dt_sel_console {
+                    Some(s) => (0, s),
+                    None => return,
+                },
+                DevToolsView::Network => match p.dt_sel_network {
+                    Some(s) => (1, s),
+                    None => return,
+                },
+                DevToolsView::Inspector => {
+                    match p.inspector.as_ref().and_then(|ui| ui.selected()) {
+                        Some(n) => (2, n as usize),
+                        None => return,
+                    }
+                }
+            }
+        };
+        match self.devtools_row_text(i, pane, index) {
+            Some(text) => self.clipboard_set(&text),
+            None => debug!("DevTools copy: pane {pane} row {index} has nothing to copy"),
+        }
+    }
+
+    /// Double-clicking a row: highlight and copy it in one gesture, desktop
+    /// style. On the Inspector pane (`index` is the node id) the double-click
+    /// selects too, so the highlight ends up matching what was copied.
+    fn devtools_copy_row(&self, pane: i32, index: i32) {
+        match pane {
+            0 | 1 => self.devtools_select_row(pane, index),
+            2 => self.inspector_select(index),
+            _ => return,
+        }
+        let Some(i) = self.active_proc_index() else { return };
+        match self.devtools_row_text(i, pane, index as usize) {
+            Some(text) => self.clipboard_set(&text),
+            None => debug!("DevTools copy: nothing at pane {pane} row {index}"),
+        }
     }
 
     // ---- find bar (Ctrl-F) ------------------------------------------------
@@ -1808,11 +1920,16 @@ impl Core {
         // The models are shared (`Rc<VecModel>` installed once): appending the
         // few rows that arrived keeps the list's scroll position, which a fresh
         // model per tick would throw away.
-        sync_model(&self.dt_console, &p.state.console_rows().into_iter().map(|r| ConsoleRow {
+        // The copy highlight rides the rows themselves: one click highlighted
+        // this index, and only an index the feed still has paints or copies.
+        let sel_console = p.dt_sel_console;
+        let sel_network = p.dt_sel_network;
+        sync_model(&self.dt_console, &p.state.console_rows().into_iter().enumerate().map(|(idx, r)| ConsoleRow {
             level: r.level.into(),
             text: r.text.into(),
+            selected: sel_console == Some(idx),
         }).collect::<Vec<_>>());
-        sync_model(&self.dt_net, &p.state.net_rows().into_iter().map(|r| NetRow {
+        sync_model(&self.dt_net, &p.state.net_rows().into_iter().enumerate().map(|(idx, r)| NetRow {
             method: r.method.into(),
             url: r.url.into(),
             initiator: r.initiator.into(),
@@ -1820,6 +1937,7 @@ impl Core {
             size: r.size.into(),
             time: r.time.into(),
             failed: r.failed,
+            selected: sel_network == Some(idx),
         }).collect::<Vec<_>>());
         ui.set_console_count(self.dt_console.row_count() as i32);
         ui.set_network_count(self.dt_net.row_count() as i32);
@@ -1831,6 +1949,14 @@ impl Core {
         let model = (p.inspector_target == Some(p.tab.id))
             .then(|| p.inspector.as_ref())
             .flatten();
+        // `Copy` answers for the pane it sits in: the row the pane has
+        // highlighted, and on the Inspector the selected node (which a tree
+        // always has).
+        ui.set_devtools_copy_available(match p.devtools_view {
+            DevToolsView::Console => sel_console.is_some(),
+            DevToolsView::Network => sel_network.is_some(),
+            DevToolsView::Inspector => model.is_some_and(|m| m.selected().is_some()),
+        });
         ui.set_inspector_pick(model.is_some_and(|ui| ui.pick()));
         ui.set_inspector_truncated(model.is_some_and(|ui| ui.truncated()));
         ui.set_inspector_count(model.map(|ui| ui.element_count()).unwrap_or(0) as i32);
@@ -2226,6 +2352,10 @@ impl Core {
                         inspector_target: None,
                         devtools_view,
                         devtools_height,
+                        // The old process's feeds are gone; nothing on the new
+                        // one is highlighted for copy yet.
+                        dt_sel_console: None,
+                        dt_sel_network: None,
                         find_open,
                         // A crashed tab's unfinished downloads are reaped
                         // before its process is replaced; the new process
@@ -4281,6 +4411,20 @@ impl Core {
             let c = self.clone();
             ui.on_devtools_toggle_fold(move |node| c.inspector_toggle_fold(node));
         }
+        // Copy gestures in the panel (task: copy in the DevTools tabs): a row
+        // click highlights, a double-click highlights and copies, and the
+        // header's `Copy` copies what the pane has highlighted. Panes travel
+        // as numbers — 0 Console, 1 Network, 2 Inspector (`index` is the node
+        // id there) — because that is what the list rows know.
+        {
+            let c = self.clone();
+            ui.on_devtools_select_row(move |pane, index| c.devtools_select_row(pane, index));
+        }
+        {
+            let c = self.clone();
+            ui.on_devtools_copy_row(move |pane, index| c.devtools_copy_row(pane, index));
+        }
+        bind0!(on_devtools_copy, |c: &Rc<Core>| c.devtools_copy());
         // Dragging the panel's top edge reports itself (press / move / release
         // plus the pointer's travel since the grab); the height, its bounds and
         // which tab it belongs to are all decided here. See `devtools_edge`.
@@ -4920,6 +5064,7 @@ mod tests {
         let row = |t: &str| ConsoleRow {
             level: "log".into(),
             text: t.into(),
+            selected: false,
         };
         sync_model(&model, &[row("a"), row("b")]);
         assert_eq!(model.row_count(), 2);
