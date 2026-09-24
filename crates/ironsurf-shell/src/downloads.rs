@@ -150,6 +150,30 @@ pub fn display_name(suggested: Option<&str>, url: &str) -> String {
         .unwrap_or_else(|| DEFAULT_NAME.to_owned())
 }
 
+/// The name the "Save page" dialog (task: save-page selector) proposes for
+/// the page on screen: the URL's own file name when it has one, else the
+/// page title with `.html` put back on it (a page is saved as a page), else
+/// `"page.html"`. Sanitized the way every download name is, so the dialog
+/// always opens holding a legal name.
+pub fn save_page_name(url: &str, title: &str) -> String {
+    if let Some(name) = filename_from_url(url) {
+        return name;
+    }
+    if let Some(from_title) = sanitize_file_name(title.trim()) {
+        let (stem, ext) = split_ext(&from_title);
+        return if ext.is_empty() { format!("{stem}.html") } else { from_title };
+    }
+    "page.html".to_owned()
+}
+
+/// The name a "Save page" dialog confirms with: the draft trimmed and
+/// sanitized, or `fallback` when it holds nothing a file may be called
+/// (blank, `.`, `..`, a bare separator). Never a path — one sanitized
+/// component whatever was typed, the way every download name is.
+pub fn save_name_or(raw: &str, fallback: &str) -> String {
+    sanitize_file_name(raw.trim()).unwrap_or_else(|| fallback.to_owned())
+}
+
 /// The file a download becomes: `name` sanitized, falling back to
 /// [`filename_from_url`] then [`DEFAULT_NAME`], then made unique in `root`
 /// (see [`unique_in_root`]). Traversal-safe by construction: only a single
@@ -615,5 +639,25 @@ mod tests {
         use std::sync::atomic::{AtomicU64, Ordering};
         static SEEN: AtomicU64 = AtomicU64::new(0);
         SEEN.fetch_add(1, Ordering::SeqCst)
+    }
+
+    // "Save page" (task: save-page selector): the dialog's proposed name —
+    // the URL's own file when it has one, else the title wearing `.html`.
+    #[test]
+    fn save_page_name_prefers_the_url_file_then_the_title() {
+        assert_eq!(save_page_name("http://example.com/report.pdf", "Report"), "report.pdf");
+        assert_eq!(save_page_name("http://example.com/", "Welcome!"), "Welcome!.html");
+        // A titleless page (about:blank) still gets a legal name.
+        assert_eq!(save_page_name("about:blank", ""), "page.html");
+    }
+
+    // A confirmed save name is one sanitized component or the fallback —
+    // blank, dot, and traversal drafts never name a path.
+    #[test]
+    fn save_name_or_never_yields_a_path() {
+        assert_eq!(save_name_or("  notes.txt ", "page.html"), "notes.txt");
+        assert_eq!(save_name_or("..", "page.html"), "page.html");
+        assert_eq!(save_name_or("", "page.html"), "page.html");
+        assert_eq!(save_name_or("../../etc/passwd", "page.html"), "page.html");
     }
 }

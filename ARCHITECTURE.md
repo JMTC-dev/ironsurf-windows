@@ -1757,6 +1757,15 @@ pub enum DownloadState { Saving, Done, Failed }
 * "Download linked file" joins the context menu (`"Copy link address"` sibling, only when the
   target carries a link) and sends `ToTab::DownloadUrl` — the shell never fetches, never
   writes from a menu click, never guesses the folder.
+* **Save page**: `Shortcut::SavePage` (Ctrl-`S` — the plain chord is the browser's, and its
+  `\u{13}` form binds too) opens a dialog over the page: the folder to save into (prefilled with
+  the effective ⬇ root, so defaulting to `$HOME/Downloads`) and the name (from the URL, else the
+  title wearing `.html`); the folder Choose validates by the ⬇ root's exact rules, and Save asks
+  the tab for its own page through the same `ToTab::DownloadUrl` — the shell still fetches nothing.
+  The chosen folder is **one-shot**: it rides the `Proc` (`save_target`) and is consumed by the
+  matching `DownloadStart`, so that page lands where the dialog pointed while the ⬇ root keeps
+  receiving everything else. `about:`/`ironsurf:` pages have nothing to save: the dialog says so
+  on its error line instead of opening. Esc shuts it; it never stacks with the other overlays.
 
 Tests: common — disposition RFC 6266 parsing (`filename*=`, quoting, `;` split, the
 `filename=`/`filename*=` precedence), the media-type table (a `.zip`/`.dmg`/`.exe`/`.iso`

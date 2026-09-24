@@ -158,6 +158,24 @@ struct Proc {
     /// unfinished row is `Failed` and its partial file deleted when the tab
     /// crashes ([`DownloadStore::reap]).
     downloads: DownloadStore,
+    /// The "Save page" dialog's armed save for this tab (task: save-page
+    /// selector): folder + name picked with Ctrl-`S`, per tab like every
+    /// other fact of a tab. `None` until that tab opens the dialog.
+    save_target: Option<SaveTarget>,
+}
+
+/// What the "Save page" dialog (task: save-page selector) has armed for
+/// one tab: the page Ctrl-`S` was pressed on, the folder its save was
+/// pointed at in the dialog (defaulting to the ⬇ root, i.e.
+/// `$HOME/Downloads`), and the name the dialog holds for it. Per tab like
+/// everything about a tab, and **consumed once** by the matching
+/// `DownloadStart` (see `Core::download_write`): the chosen folder is never
+/// persisted, because the ⬇ root must go on receiving everything else.
+#[derive(Clone, Debug)]
+struct SaveTarget {
+    page: String,
+    folder: PathBuf,
+    name: Option<String>,
 }
 
 /// The shell-side half of a JS dialog being shown (task: window.alert /
@@ -761,6 +779,7 @@ impl Core {
                         dt_sel_network: None,
                         find_open: false,
                         downloads: DownloadStore::default(),
+                        save_target: None,
                     });
                     self.active.set(procs.len() - 1);
                 }
@@ -1185,6 +1204,13 @@ impl Core {
                 // and the bar shows the tab's real URL again. An armed ⌖ is
                 // dropped first, before focus moves — the picker would otherwise
                 // keep eating the page's clicks with nothing on screen to show.
+                // The "Save page" dialog answers Esc first (task:
+                // save-page selector): it just shuts the dialog, like the
+                // find bar before it.
+                if self.ui().is_some_and(|ui| ui.get_save_menu_open()) {
+                    self.save_dialog(false);
+                    return;
+                }
                 if self.find_open_active() {
                     self.close_find();
                     return;
@@ -1217,6 +1243,15 @@ impl Core {
                 // Ctrl-Shift-D (task: file downloads): the ⬇ panel, the same
                 // overlay as the toolbar's ⬇ button.
                 self.toggle_download_menu();
+                return;
+            }
+            Some(Shortcut::SavePage) => {
+                // Ctrl-S (task: save-page selector): the "Save page" dialog —
+                // pick the folder (default `~/Downloads`) and the name, and
+                // the current page lands there through the download
+                // machinery. Consumed either way: Ctrl-S is the browser's
+                // chord, not the page's.
+                self.toggle_save_dialog();
                 return;
             }
             None => {}
@@ -2270,6 +2305,7 @@ impl Core {
             ui.set_archive_menu_open(false);
             ui.set_history_menu_open(false);
             ui.set_download_menu_open(false);
+            ui.set_save_menu_open(false);
             let active_container = self
                 .active_proc_index()
                 .map(|i| self.procs.borrow()[i].tab.container)
@@ -2359,8 +2395,10 @@ impl Core {
                         find_open,
                         // A crashed tab's unfinished downloads are reaped
                         // before its process is replaced; the new process
-                        // starts with an empty panel (its ids restart at 1).
+                        // starts with an empty panel (its ids restart at 1),
+                        // and with no save armed for the dialog either.
                         downloads: DownloadStore::default(),
+                        save_target: None,
                     },
                 )
             };
@@ -2500,6 +2538,7 @@ impl Core {
             ui.set_archive_menu_open(false);
             ui.set_history_menu_open(false);
             ui.set_download_menu_open(false);
+            ui.set_save_menu_open(false);
             ui.set_us_editing(false);
             ui.set_us_editing_existing(false);
             ui.set_us_error(SharedString::default());
@@ -2720,6 +2759,7 @@ impl Core {
             ui.set_archive_menu_open(false);
             ui.set_history_menu_open(false);
             ui.set_download_menu_open(false);
+            ui.set_save_menu_open(false);
             ui.set_ua_error(SharedString::default());
             let current = container_user_agent(&self.store.borrow(), self.active_container());
             // Prefill the draft with exactly what the container holds (a
@@ -2866,6 +2906,7 @@ impl Core {
             ui.set_ua_menu_open(false);
             ui.set_history_menu_open(false);
             ui.set_download_menu_open(false);
+            ui.set_save_menu_open(false);
             ui.set_archive_error(SharedString::default());
             ui.set_archive_dir_text(self.archive_root_text().as_str().into());
         }
@@ -2879,6 +2920,162 @@ impl Core {
     fn toggle_archive_menu(&self) {
         let open = self.ui().is_some_and(|ui| ui.get_archive_menu_open());
         self.archive_menu(!open);
+    }
+
+    // ---- "Save page" dialog (task: save-page selector) ---------------------
+
+    /// Open or close the "Save page" dialog (Ctrl-`S`). Opening closes every
+    /// other menu (the same never-stacked rule as the ⬇ panel) and prefills
+    /// both fields — the folder with the effective ⬇ root (defaulting to
+    /// `$HOME/Downloads`), the name with the page's own file name when the
+    /// URL has one, else the title wearing `.html` — and arms the tab's
+    /// [`SaveTarget`], which is what the folder chosen in the dialog then
+    /// sits on. A tab with no real address has nothing to save: the dialog
+    /// says so on its one error line instead of opening empty.
+    fn save_dialog(&self, open: bool) {
+        let Some(ui) = self.ui() else { return };
+        debug!("save page dialog {}", if open { "opened" } else { "closed" });
+        if !open {
+            ui.set_save_menu_open(false);
+            return;
+        }
+        ui.set_manager_open(false);
+        ui.set_us_menu_open(false);
+        ui.set_ua_menu_open(false);
+        ui.set_archive_menu_open(false);
+        ui.set_history_menu_open(false);
+        ui.set_download_menu_open(false);
+        let Some(i) = self.active_proc_index() else { return };
+        let (page, title, saved) = {
+            let procs = self.procs.borrow();
+            match procs.get(i) {
+                Some(p) => (
+                    p.state.url.clone().unwrap_or_default(),
+                    p.state.title.clone(),
+                    p.save_target.clone(),
+                ),
+                None => return,
+            }
+        };
+        if page.is_empty() || page.starts_with("about:") || page.starts_with("ironsurf://") {
+            ui.set_save_error("There is no page here to save yet.".into());
+            return;
+        }
+        let folder = saved
+            .as_ref()
+            .map(|t| t.folder.clone())
+            .unwrap_or_else(|| self.download_dir.borrow().clone());
+        let name = saved
+            .as_ref()
+            .and_then(|t| t.name.clone())
+            .unwrap_or_else(|| downloads::save_page_name(&page, &title));
+        let name = downloads::save_name_or(&name, "page.html");
+        if let Some(p) = self.procs.borrow_mut().get_mut(i) {
+            p.save_target = Some(SaveTarget {
+                page: page.clone(),
+                folder: folder.clone(),
+                name: Some(name.clone()),
+            });
+        }
+        let folder = folder.display().to_string();
+        ui.set_save_page(page.as_str().into());
+        ui.set_save_dir_text(folder.as_str().into());
+        ui.set_save_name_text(name.as_str().into());
+        ui.set_save_error(SharedString::default());
+        ui.set_save_menu_open(true);
+    }
+
+    /// Ctrl-`S` (task: save-page selector): flip the dialog.
+    fn toggle_save_dialog(&self) {
+        let open = self.ui().is_some_and(|ui| ui.get_save_menu_open());
+        self.save_dialog(!open);
+    }
+
+    /// The dialog's "Choose \u{1F4C1}": the typed folder follows the ⬇ panel's
+    /// rules exactly (`~` expanded, absolute or refused, created, and a
+    /// rejection keeps the draft while the one line carries the reason) and
+    /// becomes where **this** save lands. The ⬇ root is not re-pointed —
+    /// saving one page elsewhere is exactly what the dialog is for.
+    fn save_pick_folder(&self, text: &str) {
+        let Some(ui) = self.ui() else { return };
+        match downloads::validate_dir(text) {
+            Ok(path) => {
+                if let Some(i) = self.active_proc_index() {
+                    if let Some(p) = self.procs.borrow_mut().get_mut(i) {
+                        if let Some(t) = p.save_target.as_mut() {
+                            t.folder = path.clone();
+                        }
+                    }
+                }
+                let shown = path.display().to_string();
+                ui.set_save_dir_text(shown.as_str().into());
+                ui.set_save_error(SharedString::default());
+                info!("save page dialog: folder \u{2192} {shown}");
+            }
+            Err(err) => ui.set_save_error(err.as_str().into()),
+        }
+    }
+
+    /// The dialog's "Save": the name field is law (sanitized to one
+    /// component; blank or traversal falls back to the armed name), the tab
+    /// is then asked to fetch **its current** page through the ordinary
+    /// [`ToTab::DownloadUrl`] channel with that name as the hint, and the
+    /// armed [`SaveTarget`] steers the bytes into the chosen folder (see
+    /// `download_write`). The row appears in the ⬇ panel like any other
+    /// save, and shutting the dialog does not stop the write. A dead pipe
+    /// says so on the dialog's one line instead of pretending a save.
+    fn save_page_confirm(&self, text: &str) {
+        let Some(ui) = self.ui() else { return };
+        let Some(i) = self.active_proc_index() else { return };
+        let page = {
+            let procs = self.procs.borrow();
+            procs.get(i).and_then(|p| p.state.url.clone()).unwrap_or_default()
+        };
+        if page.is_empty() || page.starts_with("about:") || page.starts_with("ironsurf://") {
+            ui.set_save_error("There is no page here to save yet.".into());
+            return;
+        }
+        let fallback = {
+            let procs = self.procs.borrow();
+            procs
+                .get(i)
+                .and_then(|p| p.save_target.as_ref())
+                .and_then(|t| t.name.clone())
+        }
+        .unwrap_or_else(|| downloads::save_page_name(&page, ""));
+        let name = downloads::save_name_or(text, &downloads::save_name_or(&fallback, "page.html"));
+        // Re-arm for the page as it stands now (it may have navigated since
+        // the dialog opened), holding the folder the dialog shows.
+        let folder = {
+            let mut procs = self.procs.borrow_mut();
+            let Some(p) = procs.get_mut(i) else { return };
+            let target = p.save_target.get_or_insert(SaveTarget {
+                page: page.clone(),
+                folder: self.download_dir.borrow().clone(),
+                name: None,
+            });
+            target.page = page.clone();
+            target.name = Some(name.clone());
+            target.folder.clone()
+        };
+        let sent = {
+            let procs = self.procs.borrow();
+            procs
+                .get(i)
+                .map(|p| {
+                    p.tab.send(ToTab::DownloadUrl {
+                        url: page.clone(),
+                        suggested_name: Some(name.clone()),
+                    })
+                })
+                .map_or(false, |r| r.is_ok())
+        };
+        if !sent {
+            ui.set_save_error("The tab will not take the save \u{2014} its process is gone.".into());
+            return;
+        }
+        info!("save page {page} \u{2192} {}/{name}", folder.display());
+        self.save_dialog(false);
     }
 
     // ---- file downloads (task: file downloads) -------------------------------
@@ -2997,6 +3194,7 @@ impl Core {
             ui.set_ua_menu_open(false);
             ui.set_history_menu_open(false);
             ui.set_archive_menu_open(false);
+            ui.set_save_menu_open(false);
             ui.set_download_error(SharedString::default());
             ui.set_download_dir_text(self.download_root_text().as_str().into());
         }
@@ -3074,7 +3272,20 @@ impl Core {
     fn download_write(&self, tid: TabId, hint: &ironsurf_common::DownloadHint) {
         // Paths and the stamp counter first: `procs` is borrowed for the
         // store, and no UI refresh may happen while it is held.
-        let root = self.download_dir.borrow().clone();
+        // "Save page" (task: save-page selector): a folder chosen in the
+        // dialog is one-shot — it is consumed by the save it was armed for
+        // (the row whose URL is that very page), so the page lands where the
+        // user pointed while the ⬇ root keeps receiving everything else.
+        let root = {
+            let mut procs = self.procs.borrow_mut();
+            match procs.iter_mut().find(|p| p.tab.id == tid) {
+                Some(p) => match p.save_target.take() {
+                    Some(t) if t.page == hint.url => t.folder,
+                    _ => self.download_dir.borrow().clone(),
+                },
+                None => self.download_dir.borrow().clone(),
+            }
+        };
         let name = downloads::display_name(hint.name.as_deref(), &hint.url);
         let path = downloads::download_path(&root, hint.name.as_deref(), &hint.url);
         let stamp = self.download_stamp.get() + 1;
@@ -3264,6 +3475,7 @@ impl Core {
             ui.set_ua_menu_open(false);
             ui.set_archive_menu_open(false);
             ui.set_download_menu_open(false);
+            ui.set_save_menu_open(false);
             self.history_state(&ui);
         }
         ui.set_history_menu_open(open);
@@ -4513,6 +4725,21 @@ impl Core {
             ui.on_download_apply_dir(move |text| c.download_apply_dir(text.as_str()));
         }
         bind0!(on_download_clear_finished, |c: &Rc<Core>| c.download_clear_finished());
+
+        // "Save page" (task: save-page selector): the scrim/✕ close, the
+        // folder Choose (validated by the ⬇ panel's rules), and the Save
+        // confirm, which asks the tab for its page under the name the field
+        // holds — the write itself runs on through the download machinery to
+        // the folder dialog picked. All pure Core state; nothing fetches here.
+        bind0!(on_close_save_menu, |c: &Rc<Core>| c.save_dialog(false));
+        {
+            let c = self.clone();
+            ui.on_save_pick_folder(move |text| c.save_pick_folder(text.as_str()));
+        }
+        {
+            let c = self.clone();
+            ui.on_save_page_confirm(move |text| c.save_page_confirm(text.as_str()));
+        }
 
         // Browsing history (task: browsing history): the ☰ toolbar toggle, the
         // scrim/✕ close, a row pick (reopen the visit in a new tab), and Clear

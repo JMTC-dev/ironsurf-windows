@@ -59,6 +59,12 @@ pub enum Shortcut {
     /// mapped: a plain Ctrl-`D` stays the page's own (bookmark, in every
     /// browser that still has one), exactly as Ctrl-`C` stays copy.
     DownloadsMenu,
+    /// Ctrl-`S`: the "Save page" dialog (task: save-page selector) — pick the
+    /// folder the current page is written to (default `~/Downloads`) and its
+    /// name; the bytes then land through the ⬇ panel like any other save.
+    /// Unlike Ctrl-`D`, the plain chord is the browser's (every browser saves
+    /// with it), and its X11 control-character form (`\u{13}`) binds too.
+    SavePage,
     /// Esc: return keyboard focus to the page.
     PageFocus,
 }
@@ -221,6 +227,10 @@ pub fn shortcut_for(text: &str, ctrl: bool, alt: bool, meta: bool) -> Option<Sho
         // the shifted glyph opens the ⬇ panel, so a plain Ctrl-`D` (`\u{04}`)
         // still reaches the page.
         'D' => Some(Shortcut::DownloadsMenu),
+        // Ctrl-`S` (task: save-page selector): unlike Ctrl-`D`, "save" is the
+        // browser's own chord everywhere, so the plain chord opens the dialog
+        // — both spellings backends hand over (letter, DC3 control char).
+        's' | 'S' | '\u{13}' => Some(Shortcut::SavePage),
         _ => None,
     }
 }
@@ -333,6 +343,13 @@ mod tests {
         // control character) stays the page's.
         assert_eq!(shortcut_for("D", true, false, false), Some(Shortcut::DownloadsMenu));
         assert_eq!(shortcut_for("d", true, false, false), None);
+        // Ctrl-S (task: save-page selector) opens the "Save page" dialog —
+        // both spellings backends hand over (letter, DC3 control char); the
+        // Ctrl-Alt-S relative stays the page's, like other Ctrl-Alt chords.
+        assert_eq!(shortcut_for("s", true, false, false), Some(Shortcut::SavePage));
+        assert_eq!(shortcut_for("S", true, false, false), Some(Shortcut::SavePage));
+        assert_eq!(shortcut_for("\u{13}", true, false, false), Some(Shortcut::SavePage));
+        assert_eq!(shortcut_for("s", true, true, false), None);
         assert_eq!(shortcut_for("\u{04}", true, false, false), None);
         // \u{08} (Backspace, and Alt-Backspace's word-delete) belongs to the
         // text being edited, never to the History chord.
