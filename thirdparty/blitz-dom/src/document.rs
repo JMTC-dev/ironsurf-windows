@@ -1553,7 +1553,8 @@ impl BaseDocument {
         cb(&mut self.nodes[node_id]);
     }
 
-    // Takes (x, y) co-ordinates (relative to the )
+    /// Hit-test at **page** coordinates: the unscrolled layout space, i.e. a
+    /// viewport (client) point plus the document's `viewport_scroll`.
     pub fn hit(&self, x: f32, y: f32) -> Option<HitResult> {
         self.hit_with_scrollbar(x, y).0
     }
@@ -1576,7 +1577,15 @@ impl BaseDocument {
             return None;
         }
 
-        let Some(hit) = self.hit(x, y) else {
+        // `hit` walks the layout tree in PAGE coordinates (the unscrolled
+        // layout space) while this API — like `document.elementFromPoint()` —
+        // takes coordinates relative to the viewport. Feeding client
+        // coordinates straight to `hit` lands `viewport_scroll` away from the
+        // element actually under the point, so on a scrolled page every
+        // caller (inspect hover, context menu, cursor, JS) picks a different
+        // element than the one clicked (task: hit-testing after scrolling).
+        let scroll = self.viewport_scroll();
+        let Some(hit) = self.hit(x + scroll.x as f32, y + scroll.y as f32) else {
             // The point is within the viewport but over no box: the root element
             // (which covers the viewport in an HTML document) is the hit target
             return self.try_root_element().map(|root| root.id);

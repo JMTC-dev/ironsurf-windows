@@ -1,4 +1,10 @@
 # Task log
+## Selection & hit-testing under scroll/zoom: vendored blitz-dom `BaseDocument::element_from_point` fed viewport (client)
+  coords straight into the page-space `hit`, so any nonzero scroll named the element `viewport_scroll` away from the cursor
+  (inspect hover/pick, context menu, cursor) — now it adds `viewport_scroll` first; drag-selection after wheel/zoom was
+  proven green by new tests. Overscroll: viewport `scroll_state` max_y = content bottom + **half a window** (only for a
+  document that scrolls at all), so a page's last lines rest mid-window, selectable/inspectable; a fitting page never scrolls.
+  tab 336u + blitz-dom 57 green (subresource_pool red is pre-existing on the clean tree).
 ## #157 Copy in the DevTools tabs: Console/Network rows gain a `selected` copy highlight — one click marks a row
   (`devtools-select-row`), a double-click marks **and** copies it (`devtools-copy-row`), and the panel header grows a
   `Copy` button that is enabled only while its pane holds a highlight (`devtools-copy-available`); the highlight lives
@@ -25,20 +31,6 @@
   the progress honestly. Sweep unit test + tests/loading_bar.rs (real ironsurf-tab: fast fixture idle → navigate to a 3 s blocking-script page →
   window shows the load in flight, segment travels, both drop when the tab finishes; :2.0 screenshots confirm 4 px/tick travel); shell 102u + all
   suites green, ws check clean; ARCH §Status bar synced.
-## #56 Alt-1 … Alt-9 switch to the N-th tab, dynamically: keymap reports the digit only (`Shortcut::SelectTab(n)`);
-  `tab_index_for_digit(n, tab_count)` resolves it **at press time** (1…8 = that position while it exists, 9 = **last** tab
-  from nine on, no tab behind it ⇒ dropped), so closing a tab re-slots every shortcut by itself; inverse `tab_shortcut_digit`
-  feeds the new `TabInfo.shortcut` so each tab paints the Alt-key reaching it today (positions behind the last show none).
-  Alt-digits accepted plain, meta-escaped (`0xB1`…`0xB9`) and shifted (`!`…`(`); 3 keymap units + tests/tab_switch_shortcuts.rs
-  (real App/fake_tab: 3 tabs → Alt-1/2/3, Alt-9 dropped, close front tab ⇒ old Alt-3 tab answers Alt-2, 11 tabs ⇒ Alt-9 = last,
-  badges 8/""/9, close last ⇒ Alt-9 follows the end), welcome page + ARCH §ironsurf-shell synced; shell 104u green, ws check clean.
-## #55 Fresh cache entries skip the network: storage gains pure `fresh_until(headers, cached_at)` — explicit
-  freshness only (Cache-Control s-maxage>max-age>Expires via a tiny IMF-fixdate parser; no-store/no-cache/
-  must-revalidate/proxy-revalidate ⇒ None; quoted values, folded headers, `-1`/garbage ⇒ revalidate), nothing new
-  stored on CachedEntry; managed_http_fetch_report serves status<400 explicitly-fresh hits directly (from_cache, ONE
-  net_ok on the original URL, duration 0, **no Set-Cookie re-capture**), everything else keeps the 304 path. 8 storage
-  + 2 localhost tab tests (fresh ⇒ server sees exactly 1 request; no-store/no-cache/must-revalidate/proxy-revalidate ⇒
-  always 2); storage 58 green, tab 222u, ws green; ARCH §Network layer + DevTools bullets synced.
 ## #54 `<script src>` bodies download CONCURRENTLY: js.rs splits extraction into a shared `walk_scripts` (type/src rules, notes
   kept in document order via `PendingScript::{Inline,External,Note}`) + shared `assemble_scripts`, driven from the unchanged
   `extract_scripts` (sequential, tests/compat) and new `extract_scripts_batch` (ONE `fetch_many(&[&Url])` call); runtime.rs runs fetch_many via

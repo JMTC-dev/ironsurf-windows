@@ -7009,6 +7009,336 @@ mod tests {
         }
     }
 
+    /// Drag-selection hits the paragraph under the cursor **after the page has
+    /// been scrolled down** (and after zoom + scroll): the selection lands on
+    /// the words whose line the pointer crossed, never on text from another
+    /// element. This is the pointer-space bug class — page coordinates must
+    /// carry the viewport scroll in, and the text-offset hit test must run in
+    /// the same space the hit test resolved.
+    #[test]
+    fn a_drag_selects_the_paragraph_under_the_cursor_after_scrolling_down() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join("scroll-sel.html"),
+            r#"<!doctype html>
+<html><head><title>SS</title></head>
+<body style="margin:0">
+  <p id="one" style="margin:0;font-size:24px">AAA BBB CCC DDD EEE</p>
+  <div style="height:1600px"></div>
+  <p id="two" style="margin:0;font-size:24px">111 222 333 444 555</p>
+  <div style="height:1600px"></div>
+</body></html>"#,
+        )
+        .expect("write");
+        let (mut tab, _sink) = selection_tab(dir.path());
+        tab.navigate(
+            url::Url::from_file_path(dir.path().join("scroll-sel.html"))
+                .expect("file url")
+                .as_str(),
+            NavHistory::Fresh,
+        );
+
+        // Wheel down far enough that paragraph two sits in the viewport.
+        tab.handle_to_tab(ptr(400.0, 300.0, PointerKind::Move));
+        tab.handle_to_tab(ToTab::Scroll(ScrollEvent {
+            x: 400.0,
+            y: 300.0,
+            delta_x: 0.0,
+            delta_y: -1300.0,
+        }));
+        let y = scroll_y(&mut tab);
+        assert!(y > 0.0, "the wheel scrolled the page down: scroll_y={y}");
+
+        // Paragraph two's own box, in client CSS px, after the scroll.
+        let (_cx, cy) = {
+            let doc = tab.document_mut().expect("doc");
+            let id = doc.get_element_by_id("two").expect("#two");
+            let rect = inspector::box_rect(doc, doc.get_node(id).expect("node")).expect("box");
+            assert!(
+                rect.y0 >= 0.0 && rect.y1 <= 600.0,
+                "paragraph two is fully visible after the scroll: {rect:?}"
+            );
+            (((rect.x0 + rect.x1) / 2.0) as f32, ((rect.y0 + rect.y1) / 2.0) as f32)
+        };
+
+        // Drag across the start of its line: from just inside its left edge.
+        let x0 = 2.0;
+        tab.handle_to_tab(ptr(x0, cy, PointerKind::Move));
+        tab.handle_to_tab(ptr(x0, cy, PointerKind::Down));
+        tab.handle_to_tab(ptr(x0 + 94.0, cy, PointerKind::Move));
+        tab.handle_to_tab(ptr(x0 + 94.0, cy, PointerKind::Up));
+
+        let sel = tab.document_mut().expect("doc").get_selected_text();
+        assert!(
+            sel.as_deref().is_some_and(|s| s.starts_with("111")),
+            "the drag after a scroll selects the paragraph under the cursor: {sel:?}"
+        );
+    }
+
+    /// Scrolled down **and** zoomed in, a drag highlights the paragraph under
+    /// the cursor: the selected text is that paragraph's own words and the
+    /// painted highlight sits on its own ink - never on another element.
+    #[test]
+    fn a_highlight_lands_on_the_scrolled_paragraph_at_every_zoom() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join("scroll-hl.html"),
+            r#"<!doctype html>
+<html><head><title>SH</title></head>
+<body style="margin:0">
+  <p id="one" style="margin:0;font-size:24px">AAA BBB CCC DDD EEE</p>
+  <div style="height:1600px"></div>
+  <p id="two" style="margin:0;font-size:24px;color:#0a0">111 222 333 444 555</p>
+  <div style="height:1600px"></div>
+</body></html>"#,
+        )
+        .expect("write");
+        let (mut tab, sink) = selection_tab(dir.path());
+        tab.navigate(
+            url::Url::from_file_path(dir.path().join("scroll-hl.html"))
+                .expect("file url")
+                .as_str(),
+            NavHistory::Fresh,
+        );
+
+        fn frame(tab: &mut Tab, sink: &Arc<std::sync::Mutex<Vec<u8>>>) -> (u32, u32, Vec<u8>) {
+            tab.paint_now();
+            emitted(sink)
+                .into_iter()
+                .rev()
+                .find_map(|m| match m {
+                    FromTab::Frame { width, height, rgba, .. } => Some((width, height, rgba)),
+                    _ => None,
+                })
+                .expect("frame")
+        }
+        fn rows(
+            rgba: &[u8],
+            w: usize,
+            h: usize,
+            on: impl Fn(&[u8]) -> bool,
+        ) -> Option<(usize, usize)> {
+            let mut r: Option<(usize, usize)> = None;
+            for y in 0..h {
+                for x in 0..w {
+                    if on(&rgba[(y * w + x) * 4..]) {
+                        r = Some(match r {
+                            Some((y0, y1)) => (y0.min(y), y1.max(y)),
+                            None => (y, y),
+                        });
+                        break;
+                    }
+                }
+            }
+            r
+        }
+        let green = |p: &[u8]| p[1] as i32 > p[0] as i32 + 20 && p[1] as i32 > p[2] as i32 + 20;
+        let highlight = |p: &[u8]| {
+            (p[0] as i32 - 180).abs() <= 6
+                && (p[1] as i32 - 213).abs() <= 6
+                && (p[2] as i32 - 255).abs() <= 6
+        };
+
+        for zoom in [1.0f32, 2.0] {
+            tab.handle_to_tab(ToTab::SetZoom { zoom });
+            tab.handle_to_tab(ToTab::Resize {
+                width: (800.0 * zoom) as u32,
+                height: 600,
+                scale: 1.0,
+            });
+            // Wheel far down the page (logical px: the page moves delta/zoom CSS px),
+            // after winding the page back to the top from the previous zoom.
+            tab.handle_to_tab(ptr(400.0 * zoom, 300.0 * zoom, PointerKind::Move));
+            tab.handle_to_tab(ToTab::Scroll(ScrollEvent {
+                x: 400.0 * zoom,
+                y: 300.0 * zoom,
+                delta_x: 0.0,
+                delta_y: 9000.0 * zoom,
+            }));
+            tab.handle_to_tab(ToTab::Scroll(ScrollEvent {
+                x: 400.0 * zoom,
+                y: 300.0 * zoom,
+                delta_x: 0.0,
+                delta_y: -1500.0 * zoom,
+            }));
+            let y = scroll_y(&mut tab);
+            assert!(y > 1400.0, "the page is scrolled down at zoom {zoom}: {y}");
+
+            // Paragraph two's own line, in client CSS px after the scroll.
+            let cy = {
+                let doc = tab.document_mut().expect("doc");
+                let id = doc.get_element_by_id("two").expect("#two");
+                let rect =
+                    inspector::box_rect(doc, doc.get_node(id).expect("node")).expect("box");
+                assert!(
+                    rect.y0 >= 0.0 && rect.y1 <= (600.0 / zoom as f64),
+                    "paragraph two is visible after the scroll at zoom {zoom}: {rect:?}"
+                );
+                ((rect.y0 + rect.y1) / 2.0) as f32
+            };
+
+            let (fw, fh, rgba) = frame(&mut tab, &sink);
+            let ink = rows(&rgba, fw as usize, fh as usize, green)
+                .expect("paragraph two's green ink is painted");
+
+            tab.handle_to_tab(ptr(2.0 * zoom, cy * zoom, PointerKind::Down));
+            tab.handle_to_tab(ptr(96.0 * zoom, cy * zoom, PointerKind::Move));
+            tab.handle_to_tab(ptr(96.0 * zoom, cy * zoom, PointerKind::Up));
+
+            let sel = tab.document_mut().expect("doc").get_selected_text();
+            assert!(
+                sel.as_deref().is_some_and(|s| s.starts_with("111")),
+                "the drag after a scroll selects paragraph two's words at zoom {zoom}: {sel:?}"
+            );
+
+            let (fw, fh, rgba) = frame(&mut tab, &sink);
+            let hl = rows(&rgba, fw as usize, fh as usize, highlight)
+                .expect("the drag paints a highlight");
+            assert!(
+                hl.0 <= ink.1 + 2 && hl.1 >= ink.0 - 2,
+                "the highlight overlaps paragraph two's own ink at zoom {zoom}: hl {hl:?} ink {ink:?}"
+            );
+        }
+    }
+
+    /// After scrolling down, everything that hit-tests viewport-relative
+    /// coordinates — `element_from_point` and the Inspect element picker —
+    /// names the element under the cursor, not the one `viewport_scroll`
+    /// away from it.
+    #[test]
+    fn a_scrolled_page_inspects_the_element_under_the_cursor() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join("scroll-hit.html"),
+            r#"<!doctype html>
+<html><head><title>SH</title></head>
+<body style="margin:0">
+  <p id="one" style="margin:0;font-size:24px">AAA BBB CCC DDD EEE</p>
+  <div id="filler" style="height:1600px"></div>
+  <p id="two" style="margin:0;font-size:24px">111 222 333 444 555</p>
+  <div style="height:1600px"></div>
+</body></html>"#,
+        )
+        .expect("write");
+        let (mut tab, _sink) = selection_tab(dir.path());
+        tab.navigate(
+            url::Url::from_file_path(dir.path().join("scroll-hit.html"))
+                .expect("file url")
+                .as_str(),
+            NavHistory::Fresh,
+        );
+        tab.handle_to_tab(ptr(400.0, 300.0, PointerKind::Move));
+        tab.handle_to_tab(ToTab::Scroll(ScrollEvent {
+            x: 400.0,
+            y: 300.0,
+            delta_x: 0.0,
+            delta_y: -1300.0,
+        }));
+        assert!(scroll_y(&mut tab) > 1000.0, "the page is scrolled down");
+
+        let doctype = tab.inspect_doctype.clone();
+        let (two, row, cy) = {
+            let doc = tab.document_mut().expect("doc");
+            let two = doc.get_element_by_id("two").expect("#two");
+            let rect = inspector::box_rect(doc, doc.get_node(two).expect("node")).expect("box");
+            (
+                two.as_u64(),
+                inspector::id_of_node(doc, two, doctype.as_deref()),
+                (rect.y0 + 2.0) as f32,
+            )
+        };
+        assert!(row.is_some(), "#two has an inspect row");
+        assert_eq!(
+            tab.document_mut().expect("doc").element_from_point(10.0, cy).map(|id| id.as_u64()),
+            Some(two),
+            "a client-space point after a scroll names the paragraph under it"
+        );
+
+        // The user-visible path: the Inspect element picker reports the same node.
+        tab.handle_to_tab(ToTab::SetInspectPick { enabled: true });
+        tab.handle_to_tab(ptr(10.0, cy, PointerKind::Move));
+        assert_eq!(
+            tab.inspect_hover,
+            row,
+            "inspect hovers the paragraph under the cursor, not one screenful above it"
+        );
+    }
+
+    /// A user who reaches the bottom of the document can keep scrolling past
+    /// it by half a viewport — the last lines come to rest clear of the
+    /// window edge, where they can be selected and inspected. A page that
+    /// fits the window has no bottom to overshoot and never scrolls.
+    #[test]
+    fn the_user_can_scroll_half_a_viewport_past_the_bottom_of_the_page() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join("overscroll.html"),
+            r#"<!doctype html>
+<html><head><title>OS</title></head>
+<body style="margin:0">
+  <p style="margin:0;font-size:24px">AAA BBB CCC DDD EEE</p>
+  <div style="height:1600px"></div>
+  <p id="tail" style="margin:0;font-size:24px">LAST LINE</p>
+  <div style="height:1600px"></div>
+</body></html>"#,
+        )
+        .expect("write");
+        std::fs::write(
+            dir.path().join("short.html"),
+            "<!doctype html><html><body><p>fits</p></body></html>",
+        )
+        .expect("write");
+        let (mut tab, _sink) = selection_tab(dir.path());
+        let wheel = |y: f32| {
+            ToTab::Scroll(ScrollEvent { x: 400.0, y: 300.0, delta_x: 0.0, delta_y: y })
+        };
+        tab.handle_to_tab(ptr(400.0, 300.0, PointerKind::Move));
+
+        tab.navigate(
+            url::Url::from_file_path(dir.path().join("overscroll.html"))
+                .expect("file url")
+                .as_str(),
+            NavHistory::Fresh,
+        );
+        let content_h = {
+            let doc = tab.document_mut().expect("doc");
+            let root = doc.try_root_element().expect("root element");
+            let layout = root.final_layout();
+            f64::from(layout.size.height).max(f64::from(layout.scrollable_overflow_rect.bottom))
+        };
+        let base = (content_h - 600.0).max(0.0);
+        assert!(base > 0.0, "the document is taller than the window");
+
+        // One huge wheel reaches the overscroll limit: half a viewport past
+        // the bottom, no further.
+        tab.handle_to_tab(wheel(-100000.0));
+        let y = scroll_y(&mut tab);
+        assert!(
+            (y - (base + 300.0)).abs() < 1.0,
+            "the wheel stops half a window past the content bottom: {y} vs {}",
+            base + 300.0
+        );
+        // ... and the document's last line ends up mid-window: visible with a
+        // screen half its height below it, ready to be selected or inspected.
+        assert!(
+            (content_h - y - 300.0).abs() < 1.0,
+            "the bottom of the page sits at the window's middle, not its edge: {y}"
+        );
+        tab.handle_to_tab(wheel(-1000.0));
+        assert_eq!(scroll_y(&mut tab), y, "there is nothing past the overscroll limit");
+
+        // A page that fits the window never scrolls at all.
+        tab.navigate(
+            url::Url::from_file_path(dir.path().join("short.html"))
+                .expect("file url")
+                .as_str(),
+            NavHistory::Fresh,
+        );
+        tab.handle_to_tab(ptr(400.0, 300.0, PointerKind::Move));
+        tab.handle_to_tab(wheel(-5000.0));
+        assert_eq!(scroll_y(&mut tab), 0.0, "a page that fits the window does not scroll");
+    }
+
     /// A mouse drag selects page text; the selection survives to the context
     /// menu, and Ctrl+C ships exactly the reported selection to the shell —
     /// so the menu's Copy row and the keyboard chord can never disagree.

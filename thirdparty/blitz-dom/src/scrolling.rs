@@ -464,9 +464,18 @@ impl BaseDocument {
                 let scale = self.viewport.scale() as f64;
                 let window_width = self.viewport.window_size.0 as f64 / scale;
                 let window_height = self.viewport.window_size.1 as f64 / scale;
+                let max_y = (content_height - window_height).max(0.0);
                 let max = Point {
                     x: (content_width - window_width).max(0.0),
-                    y: (content_height - window_height).max(0.0),
+                    // task: overscroll — a user who reaches the bottom can keep
+                    // scrolling past it by half a viewport, so the document's
+                    // last lines can be brought up from the window edge and
+                    // selected or inspected there. A document that fits the
+                    // window has no bottom to overshoot and never scrolls.
+                    y: match max_y > 0.0 {
+                        true => max_y + window_height * 0.5,
+                        false => 0.0,
+                    },
                 };
                 (self.viewport_scroll, max)
             }
