@@ -150,6 +150,32 @@ pub enum FromTab {
         is_document: bool,
         bytes: Vec<u8>,
     },
+    /// **A download began** (see [`DownloadHint`]): the tab decided a
+    /// top-level fetch is a file rather than a page (attachment header, a
+    /// media type no page is made of, a clicked `<a download>`, or a shell
+    /// [`ToTab::DownloadUrl`]) and is fetching it. The **shell** files a row
+    /// and opens the file — the tab never touches the disk. Every download
+    /// is `DownloadStart` → `DownloadChunk`* → [`Self::DownloadEnd`] for one
+    /// `id`, in that order; nothing else shares the `id`.
+    DownloadStart {
+        hint: DownloadHint,
+    },
+    /// Body bytes of the download `id`, in order, each message at most
+    /// [`MAX_DOWNLOAD_CHUNK_BYTES`] long (a frame must stay under
+    /// [`MAX_FRAME_BYTES`]). A download that failed before its body settled
+    /// sends **no** chunk, so a row's byte count is real progress.
+    DownloadChunk {
+        id: u64,
+        bytes: Vec<u8>,
+    },
+    /// The download `id` settled. `error: Some(reason)` = the fetch failed
+    /// (DNS, connection, a body past [`MAX_DOWNLOAD_BYTES`]) and no chunk
+    /// follows; `None` = every byte was sent. Always the last message for an
+    /// `id` — even when the fetch failed before anything was shipped.
+    DownloadEnd {
+        id: u64,
+        error: Option<String>,
+    },
     /// **Find in page** result (see [`ToTab::SetFind`]): the tab counted
     /// `matches` hits for `query` and the **1-based** index of the hit drawn
     /// in light blue is `active` (`0` = none, which only happens when
@@ -264,6 +290,20 @@ pub enum ToTab {
     /// current contents just before relaying a Ctrl+V keystroke.
     Clipboard {
         text: String,
+    },
+    /// **Download linked file** ("Download linked file" in the context menu,
+    /// and the only shell-side menu row that reaches the tab): fetch `url`
+    /// with this tab's own jar/UA/redirects/cache and ship it back as a
+    /// download — `DownloadStart` (the tab mints the `id`) → chunks →
+    /// `DownloadEnd` is the reply. The URL is **never** rendered, even an
+    /// `http(s)` one that would paint; a URL the tab cannot fetch (a bad
+    /// scheme, an internal `ironsurf://` page) still answers
+    /// `DownloadStart` + `DownloadEnd { error }` so the row always settles.
+    /// `suggested_name` is a name hint (never trusted — see
+    /// [`sanitize_file_name`]); `None` = derive one from the URL.
+    DownloadUrl {
+        url: String,
+        suggested_name: Option<String>,
     },
     /// The user picked an entry in a context menu that the *engine* services
     /// (paste, video play/pause); shell-side entries never reach the tab.
@@ -538,6 +578,263 @@ pub enum ContextAction {
 /// — the selection is a convenience copy path, not an exfil channel.
 pub const MAX_CONTEXT_TEXT: usize = 256 * 1024;
 
+/// What made a top-level fetch a **download** instead of a page. The tab
+/// decides (it owns the response), the shell only displays it, so the
+/// ordering of the reasons is a tab-side rule (see the tab's
+/// `downloads::attachment_for`): `Disposition` beats `MediaType` beats
+/// `AnchorAttribute`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum DownloadTrigger {
+    /// `Content-Disposition: attachment` on the response — the server said
+    /// "this is a file" and nothing else in the contract overrides it.
+    Disposition,
+    /// The response's media type is one no page is made of (see
+    /// [`is_download_media_type`]): an archive, a disk image, an
+    /// installer, a font.
+    MediaType,
+    /// A clicked `<a>`/`<area>` carried the `download` content attribute, so
+    /// the link is a file *promise* even when the URL would paint
+    /// (`<a href="report.html" download>`).
+    AnchorAttribute,
+    /// The shell asked for this URL to be saved ([`ToTab::DownloadUrl`],
+    /// "Download linked file").
+    Requested,
+}
+
+/// What the tab knows about a download when it starts: shipped as
+/// [`FromTab::DownloadStart`] before a byte has arrived, so the shell can
+/// file a row and name the file while the fetch is still running.
+///
+/// `id` is **minted by the tab process** (a per-tab counter, never global):
+/// the shell keys rows by `(tab_id, id)`, so two tabs may both say `1`.
+/// `name` is only a *suggestion* — the `Content-Disposition` filename or a
+/// clicked `<a download>` value — so it is `None` more often than not and
+/// always untrusted: the shell sanitizes it (see [`sanitize_file_name`]) and
+/// falls back to [`filename_from_url`]. `url` is the post-redirect URL the
+/// tab actually fetched, `media_type` the response's `Content-Type`.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct DownloadHint {
+    pub id: u64,
+    pub url: String,
+    pub name: Option<String>,
+    pub media_type: Option<String>,
+    pub trigger: DownloadTrigger,
+}
+
+/// A download body larger than this is refused **before it is buffered**:
+/// the tab buffers the whole response in RAM before shipping it, so a cap
+/// keeps a 4 GiB `.iso` link from killing the process. 512 MiB.
+pub const MAX_DOWNLOAD_BYTES: u64 = 512 * 1024 * 1024;
+
+/// Cap for one [`FromTab::DownloadChunk::bytes`] — a chunk plus its frame
+/// header must stay well under [`MAX_FRAME_BYTES`].
+pub const MAX_DOWNLOAD_CHUNK_BYTES: usize = 4 * 1024 * 1024;
+
+/// The longest file name a download can carry (one path component, so the
+/// shell can still `mkdir` its way out of a pathological name).
+pub const MAX_DOWNLOAD_NAME: usize = 128;
+
+/// Whether a top-level response of this media type is a **file** rather
+/// than a page. IronSurf renders nothing but markup — no image viewer, no
+/// PDF viewer, no plugin — so the rule is what *this* browser can put on
+/// screen, not what Chrome would do:
+///
+/// * `text/*` is a page (a `text/plain` document shows its source, as
+///   today), and so is a top-level `image/*` (a PNG paints, which is why a
+///   "download the picture" link keeps working as a view), `audio/*` and
+///   `video/*` (the tab's own player shows them).
+/// * `application/xml`, `application/xhtml+xml`, `application/atom+xml`,
+///   `application/rss+xml`, `application/\*+json` and
+///   `application/\*+xml` are pages — Blitz parses them as documents.
+/// * `application/json`, `application/javascript` (and the JS spellings)
+///   stay pages: the tab has no viewer, yet it *does* put them on screen as
+///   source text today, and a download that replaced a visible document
+///   would be the regression.
+/// * Every other `application/…` is a file: `octet-stream`, `zip`, `x-…`,
+///   `gzip`, `pdf`, `wasm`, `vnd.…`, `java-archive`, `x-msdownload`, …
+/// * `font/*` and `model/*` are files (nothing renders them).
+/// * An empty or absent media type is **not** a download — a sniffed
+///   `file:` document keeps the behaviour it has today.
+///
+/// Media type parameters (`; charset=…`) and casing are ignored; a
+/// malformed type (`foo`, `application`, `app/zip/`) is not a download.
+pub fn is_download_media_type(media_type: &str) -> bool {
+    let bare = media_type
+        .split(';')
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase();
+    if bare.is_empty() {
+        return false;
+    }
+    let Some((top, sub)) = bare.split_once('/') else {
+        return false;
+    };
+    if !(top == "application" || top == "font" || top == "model") {
+        // text/*, image/*, audio/*, video/*, multipart/, message/ → page.
+        return false;
+    }
+    if top != "application" {
+        return true;
+    }
+    // Structured documents Blitz parses, plus the source-text documents
+    // the tab already shows verbatim (JSON, scripts) — none of them is a
+    // file anyone has to save to read.
+    if matches!(
+        sub,
+        "xhtml+xml" | "xml" | "json" | "javascript" | "x-javascript" | "ecmascript" | "x-ecmascript"
+    ) || sub.ends_with("+xml")
+        || sub.ends_with("+json")
+    {
+        return false;
+    }
+    // `application/pdf`, `application/octet-stream` and every other
+    // `application/…` is a file.
+    !sub.is_empty()
+}
+
+/// One file-system **component** a download may use, or `None` when the
+/// suggestion cannot become a file name at all.
+///
+/// Suggestions come from the network (`Content-Disposition`, an anchor
+/// value, [`ToTab::DownloadUrl::suggested_name`]) and are treated as
+/// hostile input: no `/` or `\`, no NUL or other control character, never
+/// `.`/`..`, no leading dot or whitespace (a dotfile, a hidden file),
+/// trimmed, clamped to [`MAX_DOWNLOAD_NAME`] chars. Both ends call this so
+/// a suggestion the tab *makes* is already safe, yet the shell **still**
+/// sanitizes — the tab is not trusted.
+pub fn sanitize_file_name(name: &str) -> Option<String> {
+    let mut out = String::new();
+    let mut chars = 0usize;
+    for ch in name.chars() {
+        // Chrome's own list of characters a file name may not carry.
+        if ch.is_control()
+            || matches!(ch, '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|' | '\0')
+        {
+            // A separator inside a suggestion is the end of the useful part
+            // (`a/b` → `a`); a leading one means the name has nothing left.
+            if out.is_empty() {
+                return None;
+            }
+            break;
+        }
+        if chars >= MAX_DOWNLOAD_NAME {
+            break;
+        }
+        out.push(ch);
+        chars += 1;
+    }
+    // A leading `.` (or whitespace) is what makes `.`/`..`/`.hidden` not a
+    // name; strip it and whatever is left is the name (`\u{2e}.hidden` →
+    // `hidden`). Digit-only names (`/f/1` → `1`) are names like any other.
+    let trimmed = out.trim().trim_start_matches(['.', ' ']).trim_end();
+    if trimmed.is_empty() {
+        return None;
+    }
+    Some(trimmed.to_string())
+}
+
+/// A file name taken from a URL: the last non-empty path segment,
+/// percent-decoded (`%E2%98%83.zip` → `☃.zip`), then sanitized (see
+/// [`sanitize_file_name`]). `None` when the URL has no usable path segment
+/// (a bare `https://host`, `/?x`, an opaque `data:` URL).
+pub fn filename_from_url(url: &str) -> Option<String> {
+    let (_, rest) = url.split_once("://")?;
+    // No `/` after the authority means no path at all (`https://host`), so
+    // there is nothing to name a file after.
+    let idx = rest.find(['/', '?', '#'])?;
+    let path = rest[idx..].split(['?', '#']).next().unwrap_or("");
+    // A trailing `/` names a directory, not a file — but the directory is
+    // still the best name on offer (`/files/report/` → `report`), so the
+    // last non-empty segment wins.
+    let last = path.trim_end_matches('/').rsplit('/').next().unwrap_or("");
+    if last.is_empty() {
+        return None;
+    }
+    let bytes = percent_decode(last.as_bytes());
+    let decoded = String::from_utf8_lossy(&bytes);
+    sanitize_file_name(decoded.trim_start_matches('/'))
+}
+
+/// Percent-decode bytes the way a browser decodes a URL before using it as
+/// a file name; an invalid `%xx` is passed through rather than dropped.
+pub(crate) fn percent_decode(bytes: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let Ok(hex) = std::str::from_utf8(&bytes[i + 1..i + 3]) {
+                if let Ok(byte) = u8::from_str_radix(hex, 16) {
+                    out.push(byte);
+                    i += 3;
+                    continue;
+                }
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    out
+}
+
+/// The file name a `Content-Disposition` value suggests, or `None`.
+///
+/// `filename*=UTF-8''report%20é.zip` (RFC 6266) is percent-decoded with its
+/// charset ignored (UTF-8 is what every server writes in 2026); the bare
+/// `filename="report.zip"` spelling is backslash-unescaped. When a header
+/// carries **both** spellings, the `*`-suffixed one wins
+/// (`filename="bad.zip"; filename*=UTF-8''good.zip` → `good.zip`), exactly
+/// as browsers resolve it. The value is a suggestion, never a path — the
+/// shell sanitizes it (see [`sanitize_file_name`]).
+pub fn content_disposition_filename(value: &str) -> Option<String> {
+    let mut plain: Option<String> = None;
+    let mut starred: Option<String> = None;
+    for part in value.split(';') {
+        let part = part.trim();
+        if part
+            .get(.."filename*=".len())
+            .is_some_and(|head| head.eq_ignore_ascii_case("filename*="))
+        {
+            let raw = part["filename*=".len()..].trim();
+            // `UTF-8''name` → `name`: skip the charset and its `''`
+            // terminator (any charset is decoded as UTF-8 — the one every
+            // server writes in practice).
+            let raw = raw
+                .split_once("''")
+                .or_else(|| raw.split_once("%27%27"))
+                .map(|(_, tail)| tail)
+                .unwrap_or(raw);
+            starred = Some(String::from_utf8_lossy(&percent_decode(raw.as_bytes())).into_owned());
+        } else if part
+            .get(.."filename=".len())
+            .is_some_and(|head| head.eq_ignore_ascii_case("filename="))
+        {
+            let raw = part["filename=".len()..].trim();
+            let raw = raw.strip_prefix('"').unwrap_or(raw).trim_end_matches('"');
+            // The bare spelling backslash-escapes quotes (`\"` → `"`), the
+            // one thing the RFC 6266 spelling does not need.
+            let mut unescaped = String::new();
+            let mut escape = false;
+            for ch in raw.chars() {
+                if escape {
+                    unescaped.push(ch);
+                    escape = false;
+                } else if ch == '\\' {
+                    escape = true;
+                } else {
+                    unescaped.push(ch);
+                }
+            }
+            if plain.is_none() {
+                plain = Some(unescaped);
+            }
+        }
+    }
+    let candidate = starred.or(plain)?;
+    sanitize_file_name(candidate.trim().trim_matches('"'))
+}
+
 /// A user-defined JavaScript program that runs on matching pages
 /// (Tampermonkey/Greasemonkey-style). The shell owns the script set and
 /// ships it wholesale via [`ToTab::SetUserscripts`]; the tab decides, per
@@ -585,8 +882,9 @@ pub struct NetEvent {
     /// What initiated the request, DevTools-style: `"document"` (a
     /// navigation / form POST), `"script"` (`<script src>`, ES modules),
     /// `"resource"` (any other subresource: images, CSS, fonts), `"xhr"`
-    /// (`XMLHttpRequest`), or `"fetch"` (`window.fetch`). `None` when the
-    /// engine did not say (older events, bare unit tests).
+    /// (`XMLHttpRequest`), `"fetch"` (`window.fetch`), or `"download"` (a
+    /// saved file — see [`DownloadHint`], whose request shows up here too).
+    /// `None` when the engine did not say (older events, bare unit tests).
     pub initiator: Option<String>,
 }
 
@@ -1149,6 +1447,15 @@ mod tests {
         });
         frame_round_trip(FromTab::CursorChanged { cursor: CursorIcon::Default });
         frame_round_trip(FromTab::CursorChanged { cursor: CursorIcon::Pointer });
+        frame_round_trip(FromTab::DownloadStart { hint: hint(1) });
+        frame_round_trip(FromTab::DownloadChunk {
+            id: 1,
+            bytes: vec![1, 2, 3],
+        });
+        frame_round_trip(FromTab::DownloadEnd {
+            id: 1,
+            error: Some("boom".into()),
+        });
         frame_round_trip(FromTab::Closed);
         frame_round_trip(FromTab::Error { message: "boom".into() });
         frame_round_trip(FromTab::ContextMenu {
@@ -1274,6 +1581,10 @@ mod tests {
     #[test]
     fn to_tab_all_variants_round_trip() {
         frame_round_trip(ToTab::Navigate { url: default_url() });
+        frame_round_trip(ToTab::DownloadUrl {
+            url: "https://example.com/file.zip".into(),
+            suggested_name: Some("file.zip".into()),
+        });
         frame_round_trip(ToTab::Reload);
         frame_round_trip(ToTab::Stop);
         frame_round_trip(ToTab::Back);
@@ -1642,5 +1953,269 @@ mod tests {
     #[test]
     fn default_url_is_the_internal_welcome_page() {
         assert_eq!(default_url(), "ironsurf://welcome");
+    }
+
+    // --- downloads (task: file downloads) ---------------------------------
+
+    fn hint(id: u64) -> DownloadHint {
+        DownloadHint {
+            id,
+            url: "https://example.com/files/report.zip".into(),
+            name: Some("report.zip".into()),
+            media_type: Some("application/zip".into()),
+            trigger: DownloadTrigger::Disposition,
+        }
+    }
+
+    #[test]
+    fn download_messages_round_trip() {
+        for trigger in [
+            DownloadTrigger::Disposition,
+            DownloadTrigger::MediaType,
+            DownloadTrigger::AnchorAttribute,
+            DownloadTrigger::Requested,
+        ] {
+            let mut hint = hint(7);
+            hint.trigger = trigger;
+            frame_round_trip(FromTab::DownloadStart { hint });
+        }
+        frame_round_trip(FromTab::DownloadStart { hint: none_name() });
+        frame_round_trip(FromTab::DownloadChunk {
+            id: 3,
+            bytes: vec![0, 128, 255, 7],
+        });
+        // An empty chunk (a zero-byte body) and an error both travel fine.
+        frame_round_trip(FromTab::DownloadChunk {
+            id: 3,
+            bytes: Vec::new(),
+        });
+        frame_round_trip(FromTab::DownloadEnd {
+            id: 3,
+            error: None,
+        });
+        frame_round_trip(FromTab::DownloadEnd {
+            id: 3,
+            error: Some("connection refused".into()),
+        });
+        frame_round_trip(ToTab::DownloadUrl {
+            url: "https://example.com/x.bin".into(),
+            suggested_name: Some("x.bin".into()),
+        });
+        frame_round_trip(ToTab::DownloadUrl {
+            url: "https://example.com/x.bin".into(),
+            suggested_name: None,
+        });
+        // A whole chunk stream survives a real pipe: encode N frames, decode
+        // them back in order (what the shell does to rebuild a file).
+        let mut stream = Vec::new();
+        let chunks: Vec<Vec<u8>> = (0..3)
+            .map(|n| (0..64).map(|i| (n * 64 + i) as u8).collect())
+            .collect();
+        for bytes in &chunks {
+            write_frame(&mut stream, &FromTab::DownloadChunk { id: 9, bytes: bytes.clone() })
+                .unwrap();
+        }
+        write_frame(&mut stream, &FromTab::DownloadEnd { id: 9, error: None }).unwrap();
+        let mut cursor = stream.as_slice();
+        let mut rebuilt = Vec::new();
+        loop {
+            let msg: FromTab = read_frame(&mut cursor).unwrap();
+            match msg {
+                FromTab::DownloadChunk { bytes, .. } => rebuilt.extend_from_slice(&bytes),
+                FromTab::DownloadEnd { id, error } => {
+                    assert_eq!(id, 9);
+                    assert_eq!(error, None);
+                    break;
+                }
+                msg => unreachable!("{msg:?}"), // the loop breaks on DownloadEnd
+            }
+        }
+        assert_eq!(rebuilt.len(), 192);
+        assert_eq!(rebuilt, chunks.concat());
+    }
+
+    fn none_name() -> DownloadHint {
+        DownloadHint {
+            id: 8,
+            url: "https://example.com/thing".into(),
+            name: None,
+            media_type: None,
+            trigger: DownloadTrigger::MediaType,
+        }
+    }
+
+    #[test]
+    fn download_names_are_suggested_not_trusted() {
+        // A `*`-suffixed parameter wins over its unsuffixed twin, RFC 6266.
+        assert_eq!(
+            content_disposition_filename(r#"attachment; filename="bad.zip"; filename*=UTF-8''good.zip"#),
+            Some("good.zip".into())
+        );
+        // Percent-decoded, quoting ignored, case-insensitive parameters.
+        assert_eq!(
+            content_disposition_filename("ATTACHMENT; filename*=UTF-8''report%20%C3%A9.zip"),
+            Some("report é.zip".into())
+        );
+        assert_eq!(
+            content_disposition_filename("attachment; filename=\"quarterly Q3.pdf\""),
+            Some("quarterly Q3.pdf".into())
+        );
+        // The bare spelling backslash-escapes quotes: the header meant
+        // `report"2019.zip`, and `"` is not a file-name character.
+        assert_eq!(
+            content_disposition_filename(r#"attachment; filename="report\"2019.zip""#),
+            Some("report".into())
+        );
+        assert_eq!(
+            content_disposition_filename("attachment; filename=unquoted.tar.gz"),
+            Some("unquoted.tar.gz".into())
+        );
+        // No filename at all — the disposition alone is not a name.
+        assert_eq!(content_disposition_filename("attachment"), None);
+        assert_eq!(
+            content_disposition_filename("inline; filename=page.html"),
+            Some("page.html".into())
+        );
+        // Hostile values: a suggestion is never a path.
+        for hostile in [
+            r#"attachment; filename="../../../.ssh/authorized_keys""#,
+            r#"attachment; filename*=UTF-8''..%2F..%2F..%2Fetc%2Fpasswd"#,
+            r#"attachment; filename="/etc/shadow""#,
+            r#"attachment; filename="..""#,
+            r#"attachment; filename="\r\n""#,
+        ] {
+            let named = content_disposition_filename(hostile);
+            assert!(
+                named.is_none() || !named.as_ref().unwrap().contains(['/', '\\']),
+                "hostile value {hostile:?} → {named:?}"
+            );
+            if let Some(name) = named {
+                assert!(!name.starts_with("..") || name == "authorized_keys", "{name}");
+            }
+        }
+    }
+
+    #[test]
+    fn file_names_survive_their_own_suggestions() {
+        assert_eq!(sanitize_file_name("report.zip"), Some("report.zip".into()));
+        assert_eq!(
+            sanitize_file_name("  spaced name .tar.gz  "),
+            Some("spaced name .tar.gz".into())
+        );
+        // A separator ends the useful part; a leading one leaves nothing.
+        assert_eq!(sanitize_file_name("a/b"), Some("a".into()));
+        assert_eq!(sanitize_file_name("/a"), None);
+        assert_eq!(sanitize_file_name(".."), None);
+        assert_eq!(sanitize_file_name("."), None);
+        assert_eq!(sanitize_file_name(""), None);
+        // dotfiles and all-dot names are not files anyone wants.
+        assert_eq!(sanitize_file_name(".hidden"), Some("hidden".into()));
+        assert_eq!(sanitize_file_name("...."), None);
+        // A long name is clamped, never rejected.
+        let long = format!("{}{}.zip", "a".repeat(300), "");
+        let clamped = sanitize_file_name(&long).expect("clamped");
+        assert_eq!(clamped.chars().count(), MAX_DOWNLOAD_NAME);
+        assert!(clamped.ends_with('a'));
+        // A unicode name keeps its characters (a name is not an ASCII-only field).
+        assert_eq!(
+            sanitize_file_name("☃.zip"),
+            Some("☃.zip".into()),
+            "unicode survives"
+        );
+        assert_eq!(
+            sanitize_file_name("<con>:?.zip"),
+            None,
+            "every reserved char kills the head"
+        );
+    }
+
+    #[test]
+    fn names_come_from_urls_when_the_server_gave_none() {
+        assert_eq!(
+            filename_from_url("https://example.com/files/report.zip"),
+            Some("report.zip".into())
+        );
+        assert_eq!(
+            filename_from_url("https://example.com/files/report.zip?size=full#top"),
+            Some("report.zip".into())
+        );
+        assert_eq!(
+            filename_from_url("https://example.com/a/b/quarterly%E2%98%83.pdf"),
+            Some("quarterly☃.pdf".into())
+        );
+        // A trailing slash means the last segment is the directory above it.
+        assert_eq!(
+            filename_from_url("https://example.com/files/report/"),
+            Some("report".into())
+        );
+        // Nothing to name after: a bare host, a root-only path.
+        assert_eq!(filename_from_url("https://example.com"), None);
+        assert_eq!(filename_from_url("https://example.com/"), None);
+        assert_eq!(filename_from_url("https://example.com/?q=x"), None);
+        assert_eq!(filename_from_url("data:application/zip;base64,AAAA"), None);
+        assert_eq!(filename_from_url("https://example.com/"), None);
+        // A dot-dot in the path cannot escape: the name is the last segment.
+        assert_eq!(
+            filename_from_url("https://example.com/../../etc/shadow"),
+            Some("shadow".into())
+        );
+    }
+
+    #[test]
+    fn only_media_types_that_are_not_pages_download() {
+        let files = [
+            "application/octet-stream",
+            "application/zip",
+            "application/x-debian-package",
+            "application/x-msdownload",
+            "application/gzip",
+            "application/x-gzip",
+            "application/pdf",
+            "application/wasm",
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            "application/java-archive",
+            "application/x-iso9660-image",
+            "application/zip; charset=binary",
+            "APPLICATION/OCTET-STREAM",
+            "font/woff2",
+            "model/gltf-binary",
+        ];
+        for media in files {
+            assert!(is_download_media_type(media), "{media} should download");
+        }
+        let pages = [
+            "text/html",
+            "text/plain",
+            "text/css",
+            "text/csv",
+            "text/html; charset=utf-8",
+            "application/xml",
+            "application/xhtml+xml",
+            "application/atom+xml",
+            "application/rss+xml",
+            "application/json",
+            "application/geo+json",
+            "application/ld+json",
+            "application/javascript",
+            "image/png",
+            "image/svg+xml",
+            "audio/mp4",
+            "video/mp4",
+            "video/webm",
+            "",
+            "foo",
+            "application",
+            "app/zip",
+        ];
+        for media in pages {
+            assert!(
+                !is_download_media_type(media),
+                "{media} should render"
+            );
+        }
+        // The two `application/…` types the tab shows as source text today
+        // stay pages (see the table in the function docs).
+        assert!(!is_download_media_type("application/json"));
+        assert!(!is_download_media_type("application/javascript"));
     }
 }

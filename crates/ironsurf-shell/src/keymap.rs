@@ -54,6 +54,11 @@ pub enum Shortcut {
     /// history) — the same menu as the ☰ toolbar button, and the only place
     /// the shared history log is listed and cleared.
     HistoryMenu,
+    /// Ctrl-Shift-`D`: toggle the ⬇ downloads menu (task: file downloads) —
+    /// the same overlay as the ⬇ toolbar button. Only the shifted glyph is
+    /// mapped: a plain Ctrl-`D` stays the page's own (bookmark, in every
+    /// browser that still has one), exactly as Ctrl-`C` stays copy.
+    DownloadsMenu,
     /// Esc: return keyboard focus to the page.
     PageFocus,
 }
@@ -212,6 +217,10 @@ pub fn shortcut_for(text: &str, ctrl: bool, alt: bool, meta: bool) -> Option<Sho
         // unmapped so a plain Ctrl-`C` always reaches the page's own copy. Only
         // the shifted glyph — what Ctrl-Shift-`C` arrives as — arms the picker.
         'C' => Some(Shortcut::Inspector),
+        // …and the same rule for Ctrl-Shift-`D` (task: file downloads): only
+        // the shifted glyph opens the ⬇ panel, so a plain Ctrl-`D` (`\u{04}`)
+        // still reaches the page.
+        'D' => Some(Shortcut::DownloadsMenu),
         _ => None,
     }
 }
@@ -320,6 +329,11 @@ mod tests {
         assert_eq!(shortcut_for("\u{14}", true, true, false), Some(Shortcut::ReopenClosedTab));
         assert_eq!(shortcut_for("h", true, true, false), Some(Shortcut::HistoryMenu));
         assert_eq!(shortcut_for("H", true, true, false), Some(Shortcut::HistoryMenu));
+        // Ctrl-Shift-D opens the downloads panel; plain Ctrl-D (and its
+        // control character) stays the page's.
+        assert_eq!(shortcut_for("D", true, false, false), Some(Shortcut::DownloadsMenu));
+        assert_eq!(shortcut_for("d", true, false, false), None);
+        assert_eq!(shortcut_for("\u{04}", true, false, false), None);
         // \u{08} (Backspace, and Alt-Backspace's word-delete) belongs to the
         // text being edited, never to the History chord.
         assert_eq!(shortcut_for("\u{08}", true, true, false), None);

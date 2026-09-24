@@ -1512,6 +1512,266 @@ method/status/size). GUI smoke test gated behind `$DISPLAY` + `IRONSURF_SMOKE=1`
 
 ---
 
+## File downloads
+
+A **download** is a top-level fetch whose bytes the browser writes to disk instead of painting.
+The tab fetches (it owns the network: cookies, UA, redirects, cache, archive hooks) and the shell
+writes (it owns the filesystem: folder, file name, de-duplication, panel). Nothing else in the
+browser talks to disk for a download.
+
+**Who decides.** Only the tab decides *whether* a fetch is a download (it owns the response), and
+only the shell decides *where* the bytes land. The decision lives in
+`crates/ironsurf-tab/src/downloads.rs` (pure), the storage in
+`crates/ironsurf-shell/src/downloads.rs` (pure), the shared types/parsers in **ironsurf-common**
+(both halves compile against them).
+
+### A download in four moves
+
+1. **The tab notices.** A top-level fetch becomes a download when any of these holds:
+   * `Content-Disposition: attachment` on the response (a `filename=`/`filename*=` value is a
+     suggestion, nothing more); **or**
+   * the response's media type is one no page is made of —
+     [`is_download_media_type`] in ironsurf-common; **or**
+   * a clicked `<a>`/`<area>` carried the `download` content attribute (even for `text/html`);
+     the attribute's value is a name suggestion; **or**
+   * the shell asked — `ToTab::DownloadUrl` ("Download linked file" in the context menu).
+   Internal pages (`ironsurf://…`), `javascript:` targets and a `POST` whose response is a *page*
+   are never downloads; a `POST` that answers an attachment **is** one (the page stays put).
+2. **The tab fetches, then ships.** The bytes travel as `DownloadStart` → `DownloadChunk`* →
+   `DownloadEnd`. The tab buffers the body (its fetch layer is buffered, like the archive feed),
+   refuses anything past [`MAX_DOWNLOAD_BYTES`], then splits it into ≤
+   [`MAX_DOWNLOAD_CHUNK_BYTES`] chunks so no frame trips [`MAX_FRAME_BYTES`]. A chunk is *never*
+   the last word: `DownloadEnd` says the stream settled, with `error: Some(..)` when it did not.
+3. **The shell writes.** At `DownloadStart` the shell resolves a unique path under the download
+   folder (auto-rename — `(2)`, `(3)`… before the extension), creates the file and appends each
+   chunk as it arrives, so the panel shows bytes landing. At `DownloadEnd` the row is done (or
+   failed, and a file that never got a byte is deleted).
+4. **The page stays.** A download is **not** a navigation: no history entry, no URL/title change,
+   forward history survives, the previous document keeps painting. The URL bar shows the
+   *previous* URL, the toolbar ⬇ row shows progress.
+
+### The protocol (additions to ironsurf-common)
+
+```rust
+/// What made a fetch a download instead of a page. `Clone + Copy + Debug + PartialEq +
+/// Serialize + Deserialize` — the shell shows it, the tab mints it.
+pub enum DownloadTrigger {
+    /// `Content-Disposition: attachment` on the response.
+    Disposition,
+    /// A media type no page is made of ([`is_download_media_type`]).
+    MediaType,
+    /// A clicked `<a>`/`<area>` with the `download` attribute (its value suggests the name).
+    AnchorAttribute,
+    /// The shell asked for this URL to be saved (`ToTab::DownloadUrl`).
+    Requested,
+}
+
+/// What the tab knows about a download when it starts: `id` is **minted by the tab** and
+/// unique per tab process (the shell keys rows by `(tab_id, id)` — ids are never global),
+/// `name` is a *suggestion* (`Content-Disposition`/anchor value) the shell sanitizes, so it is
+/// `None` more often than not. `url` is the post-redirect URL actually fetched.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct DownloadHint {
+    pub id: u64,
+    pub url: String,
+    pub name: Option<String>,
+    pub media_type: Option<String>,
+    pub trigger: DownloadTrigger,
+}
+
+// FromTab — the three messages of one download, in that order for one `id`:
+    /// The tab began a download; the shell files a row and opens the file.
+    DownloadStart { hint: DownloadHint },
+    /// Body bytes, in order, ≤ [`MAX_DOWNLOAD_CHUNK_BYTES`] each. `error`-ended downloads
+    /// send no chunk at all, so a row's byte count is only ever real progress.
+    DownloadChunk { id: u64, bytes: Vec<u8> },
+    /// The stream settled. `error: Some(reason)` = nothing more follows and the fetch
+    /// failed (a refused-too-large body sends one chunk-free `DownloadEnd`).
+    DownloadEnd { id: u64, error: Option<String> },
+
+// ToTab — "Download linked file" from the context menu; fire-and-forget.
+    /// Fetch `url` with this tab's jar/UA/redirects and ship it back as a download
+    /// (`DownloadStart` for it is the tab's reply; it mints the `id`). Never rendered as a
+    /// page — even an `http(s)` URL that would paint. A URL the tab cannot fetch (a bad
+    /// scheme, an internal page) still answers `DownloadStart` + `DownloadEnd { error }`.
+    DownloadUrl { url: String, suggested_name: Option<String> },
+```
+
+`NetEvent.initiator` gains a fifth value, `"download"` (the network panel shows a download as a
+request; an archived-mode tab archives a download response exactly like any other document
+response — the fetch is the same code path).
+
+```rust
+/// A download body larger than this is refused before it is buffered (the tab buffers the
+/// whole response in RAM before shipping it). 512 MiB.
+pub const MAX_DOWNLOAD_BYTES: u64 = 512 * 1024 * 1024;
+/// Cap for one `DownloadChunk::bytes` — a frame must stay under [`MAX_FRAME_BYTES`].
+pub const MAX_DOWNLOAD_CHUNK_BYTES: usize = 4 * 1024 * 1024;
+```
+
+### Pure helpers in ironsurf-common (shared, because both ends name files)
+
+```rust
+/// `Content-Disposition` parsed to the two fields a browser cares about.
+/// `attachment` is true for `attachment` **or** a `filename=` on `name=`-less
+/// `form-data`-style headers? No: only the literal `attachment` disposition sets it.
+/// `filename` is percent-decoded for the `filename*=UTF-8''…` (RFC 6266) spelling and
+/// backslash-escaped for the bare `filename="…"` one; a `*`-suffixed duplicate later in the
+/// header wins over its unsuffixed twin (`filename="bad.zip"; filename*=UTF-8''good.zip`
+/// → `good.zip`). Never trusts the value as a path — the shell sanitizes it.
+pub fn content_disposition_filename(value: &str) -> Option<String>;
+
+/// Whether a top-level response of this media type is a file rather than a page: `text/*`
+/// and `image/*`, `audio/*`/`video/*`, `application/xml|…+xml|…+json`, `application/pdf`,
+/// `application/postscript`? No — **IronSurf renders nothing but markup**: there is no
+/// image viewer, no PDF viewer, no plugin, so `text/*` and `application/(xhtml|xml|atom|
+/// rss)\+xml` stay pages (a `text/plain` document shows the source, as today) while
+/// everything else under `application/` except `xhtml\+xml`, plus every `font/*`,
+/// `audio/*`/`video/*` and `image/svg+xml`-with-`text/`-lies type, is a file. `image/png`
+/// stays a page (a top-level image paints), which is how a "Download" button that points
+/// at a PNG keeps working as a normal view. Empty/unknown media type → not a download
+/// (a sniffed `file:` document keeps its current behaviour).
+pub fn is_download_media_type(media_type: &str) -> bool;
+
+/// The last path segment of a URL, percent-decoded, `''`→`_` for a missing name, clamped to
+/// 128 chars, `None` when a name cannot be taken from it (a `/`-only path, an opaque URL).
+pub fn filename_from_url(url: &str) -> Option<String>;
+
+/// A name that is safe as one file-system component: no `/`, `\`, NUL, control chars, no
+/// `.` or `..`, no leading `.` or whitespace, trimmed, clamped to 128 chars; `None` when
+/// nothing usable survives. Shared so the tab never *suggests* an unsafe name and the shell
+/// still treats every suggestion as untrusted.
+pub fn sanitize_file_name(name: &str) -> Option<String>;
+```
+
+### The tab half (`crates/ironsurf-tab`)
+
+`crates/ironsurf-tab/src/downloads.rs` — pure, no thread, no I/O:
+
+```rust
+/// The tab's download counter (per process, from 1) — ids are minted here, echoed back in
+/// `DownloadChunk`/`DownloadEnd` so the shell can key rows.
+pub struct DownloadIds(u64);
+
+/// Why a fetched top-level response is a file, if it is one: the reason (a `trigger`) plus the
+/// name suggestion the server or the anchor gave. `Disposition` beats `MediaType` beats
+/// `AnchorAttribute` in that order; `None` means "render it".
+pub fn attachment_for(
+    media_type: Option<&str>,
+    content_disposition: Option<&str>,
+    anchor_download: Option<Option<&str>>, // Some(..) = the clicked `<a>` had `download`
+) -> Option<(DownloadTrigger, Option<String>)>;
+```
+
+Wire-up (`src/runtime.rs`, `src/netmod.rs`):
+
+* `DocFetch` gains `pub content_type: Option<String>` and `pub content_disposition: Option<String>`
+  (taken from `FetchOutcome.headers`, case-insensitively — `header_value` exists in netmod), so
+  `navigate_post` can decide *after* the fetch and *before* rendering. Local/internal schemes
+  answer `None`.
+* `<a download>`: the vendored blitz-dom patch (`thirdparty/blitz-dom/src/events/pointer.rs`,
+  documented in `thirdparty/blitz-dom/PATCH.md`) records the clicked anchor's `download` value in
+  a process-global `Mutex<Option<(String, Option<String>)>>` (`pub fn take_anchor_download(url:
+  &str) -> Option<Option<String>>` — matching the resolved URL, clearing the slot), which the
+  tab consumes inside `navigate_post`. A navigation that arrives without a click (a typed URL,
+  `location.href = …`) never sees the slot, so the attribute cannot leak across navigations.
+* The download branch of `navigate_post`: emit `DownloadStart`, run the fetch **on a worker
+  thread** (a big file must not freeze the UI; the shell's own message pump keeps running),
+  buffer the body through the existing fetch path (`fetch_document_report_shared`-style GET, this
+  tab's jar/cache/UA handles, `NetEvent` initiator `"download"`), then push chunks through an
+  `mpsc` the poll loop drains on the self-pipe (`drain_downloads()` beside `drain_archive_events`)
+  and calls `self.emit(..)`. `DownloadEnd` always closes the sequence — including a fetch that
+  failed, which reports the reason verbatim.
+* `ToTab::DownloadUrl` takes the same thread: fetch as a GET with the tab's headers, always
+  download (trigger `Requested`), suggest `suggested_name` ∪ [`filename_from_url`].
+* The name the tab suggests is `sanitize_file_name(..)` of the server/anchor value, then
+  [`filename_from_url`] — and the shell **still** sanitizes, because a name from the network is
+  untrusted input.
+* A download never touches `self.history`, `url_override`, the title, `NavHistory`, the archive
+  store's *document* bookkeeping (its `NetEvent`s still archive as usual) or `check_meta` — the
+  document that was on screen stays loaded, so the tab emits no `UrlChanged`/`TitleChanged`/`Loaded`
+  for the download URL. It does emit `LoadingChanged(false)`/`StatusText(None)` to unwind the
+  "Waiting for…" spinner the navigation set, and logs at `info!` like every other fetch.
+
+### The shell half (`crates/ironsurf-shell`)
+
+`crates/ironsurf-shell/src/downloads.rs` — pure (no Slint, no thread):
+
+```rust
+/// The folder downloads land in: `$IRONSURF_DOWNLOAD_DIR` when set and absolute, else
+/// `$XDG_DOWNLOAD_DIR`, else `$HOME/Downloads` — the default is the folder the OS and every
+/// other browser uses (the archive keeps its own `Downloads/ironsurf-tabs` subfolder inside it,
+/// so the two never share a directory). Same shape as the archive: an absolute path (or `~/…`) in
+/// `UiState::download_dir` wins; a relative path is rejected against the live default.
+pub fn download_root(dir: Option<&str>) -> PathBuf;
+
+/// The file a download becomes: `name` sanitized ([`sanitize_file_name`]) falling back to
+/// [`filename_from_url`] then `"download"`, then made unique in `root` — `report.zip`,
+/// `report (2).zip`, `report (3).zip`… (a name-only collision adds the counter before the
+/// extension; a *stem* collision — `report.zip` vs `report.txt`? no, distinct names — and an
+/// already-numbered name extends the run: `report (2).zip` → `report (3).zip`). Traversal-safe:
+/// the resolved path is always a direct child of `root`, whatever the suggestion contained
+/// (`../../../.ssh/x`, `/etc/x`, `..%2f`-decoded `../x`).
+pub fn download_path(root: &Path, name: Option<&str>, url: &str) -> PathBuf;
+
+/// Create the file and write the whole body, returning the byte count. Like the archive's
+/// writer it never trusts the caller's path: the parent exists (create_dir_all), the file is
+/// new (`O_CREAT | O_EXCL` through the unique path) and the write is complete.
+pub fn write_download(root: &Path, name: Option<&str>, url: &str, bytes: &[u8]) -> Result<u64, String>;
+```
+
+State + UI (`src/state.rs`, `src/app.rs`, `src/keymap.rs`, `ui/ironsurf.slint`):
+
+```rust
+/// One download row. `bytes` counts what landed *so far* (a chunked feed makes it progress);
+/// `path` is `Some` only once the file is complete.
+pub struct DownloadRow {
+    pub tab_id: TabId,
+    pub id: u64,
+    pub name: String,       // the name shown (post-sanitize, pre-unique-suffix? no: the stored name)
+    pub url: String,
+    pub trigger: DownloadTrigger,
+    pub bytes: u64,
+    pub state: DownloadState,
+}
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum DownloadState { Saving, Done, Failed }
+```
+
+* Rows live on the owning `Proc` (a tab's downloads die with its process) and ship to Slint as a
+  `downloads-rows` repeat (`name`, `status`, `sub` = `"{bytes} · {url host}"`) beside the
+  `history-rows` precedent; a **⬇ toolbar button** in the archive row opens the fifth
+  right-docked overlay (same rectangle pattern as the archive/UA menus, never a PopupWindow),
+  with the folder LineEdit (persisted in `ui.json` as `download_dir`, same rules as
+  `archive_root`: absolute or `~/…` only, blank reverts to the default) plus a row list, each
+  row showing its full path once done, and a `Clear finished` button that drops Done/Failed
+  rows. `Shortcut::DownloadsMenu` (Ctrl-Shift-D) toggles the same overlay; opening it closes
+  every other menu and vice-versa, as the archive menu already does.
+* A download **opens the ⬇ overlay** the moment its row starts (for the tab on screen — the
+  panel lists that tab's rows, so a background tab's save keeps its status line and leaves the
+  overlay shut). Announce, don't wait to be asked.
+* The **status line** carries the newest active row (`Saving name — N MB`) while any row is
+  `Saving`, and the newest finished one otherwise, so a download is visible without the panel.
+* A tab process that dies mid-download marks its unfinished rows `Failed` and deletes the
+  partial file: no orphan `.zip` grows in the folder.
+* "Download linked file" joins the context menu (`"Copy link address"` sibling, only when the
+  target carries a link) and sends `ToTab::DownloadUrl` — the shell never fetches, never
+  writes from a menu click, never guesses the folder.
+
+Tests: common — disposition RFC 6266 parsing (`filename*=`, quoting, `;` split, the
+`filename=`/`filename*=` precedence), the media-type table (a `.zip`/`.dmg`/`.exe`/`.iso`
+`application/octet-stream` is a file, `text/html`/`text/plain`/`application/json` are pages),
+name derivation + sanitization (`../../x`, `a\b`, `..`, empty, 200-char, percent-decoded
+`%E2%98%83.zip`). Tab — `attachment_for` precedence, and a headless fixture that navigates to a
+`Content-Disposition: attachment` fixture (and one that only announces `application/zip`) and
+asserts the `DownloadStart`/`DownloadChunk`/`DownloadEnd` sequence *and* that the URL bar,
+history and the on-screen document are untouched; `ToTab::DownloadUrl` for a `data:`/bad-scheme
+URL answers `DownloadEnd { error }` with the UI still rendering the old page. Shell — the fake
+`FromTab` script drives a download (chunks land in a temp folder, `(2)` on collision, a failed
+download leaves no file behind) without X or a network beyond localhost.
+
+---
+
 ## Root-level deliverables
 
 - `README.md`: features, screenshots note, build (`cargo build --release`), run

@@ -1,5 +1,7 @@
 use blitz_traits::node_id::NodeId;
 use std::collections::VecDeque;
+use std::sync::Mutex;
+use url::Url;
 
 use web_time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -610,6 +612,51 @@ pub(crate) fn handle_pointerup<F: FnMut(DomEvent)>(
     }
 }
 
+// IronSurf patch (task: file downloads) — `<a download>`
+//
+// A click on `<a href="…" download>` must save the target instead of painting it, but
+// `NavigationOptions` (blitz-traits, not vendored) has no slot for the attribute, so the
+// information travels out-of-band: the click handler records the attribute here and the
+// embedder (`ironsurf-tab`, inside its own navigation entry point) takes it back out with
+// [`take_anchor_download`], keyed by the resolved URL so a navigation that arrived without a
+// click — a typed URL, `location.href = …`, a form POST — can never inherit an old slot.
+// Only the click path records anything, and taking clears the slot, so a link the user never
+// clicked leaves nothing behind. An `<a>` whose `download` has no value (or an empty one) is
+// still a download — it simply suggests no file name.
+
+/// `(url, name suggestion)` of the last clicked `<a download>` (task: file downloads).
+static ANCHOR_DOWNLOAD: Mutex<Option<(String, Option<String>)>> = Mutex::new(None);
+
+/// Record a clicked `<a>`'s `download` attribute against the URL it resolved to. `None` = the
+/// clicked element had no such attribute, so nothing is recorded (a plain link stays a plain
+/// navigation). A bare or empty `download` suggests no name but *is* recorded.
+fn remember_anchor_download(download: Option<&str>, url: &Url) {
+    let Some(download) = download else {
+        return;
+    };
+    let suggested = {
+        let trimmed = download.trim();
+        (!trimmed.is_empty()).then(|| trimmed.to_owned())
+    };
+    *ANCHOR_DOWNLOAD
+        .lock()
+        .expect("anchor download mutex") = Some((url.to_string(), suggested));
+}
+
+/// Take the `download` attribute of the last clicked `<a>` whose resolved URL is `url` —
+/// `Some(..)` means the clicked link was a `<a download>` (its value, when `Some`, is a name
+/// suggestion), `None` that it was not. Matching the URL is what keeps the slot from leaking
+/// into a later navigation to another address; taking always clears it.
+pub fn take_anchor_download(url: &str) -> Option<Option<String>> {
+    let mut slot = ANCHOR_DOWNLOAD.lock().expect("anchor download mutex");
+    // Taking always clears: a slot left for another URL would answer a later navigation to a
+    // different address with an attribute from a link the user never activated.
+    let Some((held, suggested)) = slot.take() else {
+        return None;
+    };
+    (held == url).then_some(suggested)
+}
+
 pub(crate) fn handle_click(
     doc: &mut BaseDocument,
     target: NodeId,
@@ -741,6 +788,11 @@ pub(crate) fn handle_click(
                             if url.fragment().is_some() && doc.url.is_same_document(&url) {
                                 doc.scroll_to_fragment(url.fragment().unwrap_or_default());
                             } else {
+                                // IronSurf patch (task: file downloads): remember that the
+                                // clicked link carried the `download` content attribute, so the
+                                // embedder can save its target instead of painting it. The
+                                // attribute's value is a *name suggestion*, nothing more.
+                                remember_anchor_download(el.attr(local_name!("download")), &url);
                                 doc.navigation_provider.navigate_to(NavigationOptions::new(
                                     url,
                                     None,

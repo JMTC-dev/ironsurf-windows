@@ -8,7 +8,8 @@ use std::io::BufReader;
 
 use ironsurf_common::{
     read_frame, write_frame, ContextAction, ContextTarget, ContainerId, CursorIcon, DialogKind,
-    FromTab, InspectKind, InspectNode, InspectSnapshot, MouseButton, PointerKind, TabId, ToTab,
+    DownloadHint, DownloadTrigger, FromTab, InspectKind, InspectNode, InspectSnapshot, MouseButton,
+    PointerKind, TabId, ToTab,
 };
 
 /// The fake tab's "page": the text its find-in-page searches, standing in for
@@ -193,6 +194,10 @@ fn main() {
     if devtools_feed {
         emit_feed(&mut emit, 1);
     }
+
+    // Downloads (task: file downloads): the next id this fake mints — the real
+    // tab mints ids per process too, never globally.
+    let mut download_seq: u64 = 0;
 
     // The scripted dialogs: `dialog_seq` is the next request id (the shell
     // must answer it before this fake tab speaks again on the topic).
@@ -501,6 +506,45 @@ fn main() {
                     emit(FromTab::StatusText {
                         text: Some(format!("userscripts:[{ids}]")),
                     });
+                }
+            }
+            // Downloads (task: file downloads): the fake has no engine, no
+            // network, and no disk — so it scripts the fetch the real tab
+            // would make, in the same order: `DownloadStart` (whose `name` is
+            // the **untrusted** hint handed in, so a test can watch the shell
+            // sanitize it), the body in two chunks, `DownloadEnd`. A URL
+            // carrying "fail" fails before a byte ships — which is also the
+            // scripted zero-byte download; the echo names the row's id.
+            // No status-line echo: the real tab answers a download with
+            // `StatusText(None)` (the download is not a navigation), so the
+            // shell's own row is what the line shows.
+            ToTab::DownloadUrl { url, suggested_name } => {
+                download_seq += 1;
+                let id = download_seq;
+                emit(FromTab::DownloadStart {
+                    hint: DownloadHint {
+                        id,
+                        url: url.clone(),
+                        name: suggested_name,
+                        media_type: Some("application/zip".into()),
+                        trigger: DownloadTrigger::Requested,
+                    },
+                });
+                if url.contains("fail") {
+                    emit(FromTab::DownloadEnd {
+                        id,
+                        error: Some("dns failure".into()),
+                    });
+                } else {
+                    emit(FromTab::DownloadChunk {
+                        id,
+                        bytes: b"FAKE-DOWNLOAD-".to_vec(),
+                    });
+                    emit(FromTab::DownloadChunk {
+                        id,
+                        bytes: b"BODY".to_vec(),
+                    });
+                    emit(FromTab::DownloadEnd { id, error: None });
                 }
             }
             ToTab::Destroy => break,

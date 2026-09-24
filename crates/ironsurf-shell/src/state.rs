@@ -5,7 +5,10 @@
 //! `Frame` messages never touch the state — they are handed to the frame
 //! compositor directly (coalesced to the newest per tab).
 
-use ironsurf_common::{CursorIcon, FromTab, NetEvent};
+use std::collections::HashMap;
+use std::path::PathBuf;
+
+use ironsurf_common::{CursorIcon, DownloadHint, DownloadTrigger, FromTab, NetEvent, TabId};
 
 /// Cap on retained DevTools console entries per tab: the oldest are dropped
 /// once the ring is full, so a chatty page cannot grow shell memory forever.
@@ -193,6 +196,12 @@ impl TabState {
             // acts on it (bind the server / mirror the settings), the tab's
             // own line never changes.
             FromTab::ArchiveServerStart { .. } | FromTab::ArchiveServerSettingsChanged { .. } => false,
+            // File downloads: rows live on the owning `Proc` (they die with
+            // its process), not on the tab's line, so nothing here changes.
+            // The pump writes bytes and files the row; `sync_ui` shows it.
+            FromTab::DownloadStart { .. }
+            | FromTab::DownloadChunk { .. }
+            | FromTab::DownloadEnd { .. } => false,
             // DevTools Inspector: the contract landed with the snapshot stream and
             // the pane is task #82 (shell side) — reducing it to nothing until then
             // keeps the pump honest (there is no inspector state to show yet).
@@ -361,6 +370,237 @@ impl Security {
             Security::Https => ("⛬", "#8fce8f"),
             Security::InsecureHttp => ("⚠ http", "#e57373"),
             Security::None => ("", "#888888"),
+        }
+    }
+}
+
+// ---- downloads (task: file downloads) ---------------------------------------
+//
+// A tab decides a top-level fetch is a file and streams it to the shell; the
+// **shell** owns the row, the name, and the file (see the tab's `downloads.rs`
+// for the sending half and [`crate::downloads`] for the writing half). Rows
+// live on the owning `Proc` — a tab's downloads die with its process.
+
+/// Where a download stands. `Saving` is a live file on disk; `Done` means
+/// every byte landed and the path is real; `Failed` means the fetch or the
+/// write did not, and a file that never got a byte is deleted rather than
+/// left as a zero-byte tease.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DownloadState {
+    Saving,
+    Done,
+    Failed,
+}
+
+/// One download row: what the ⬇ panel lists and the status line quotes.
+/// `bytes` counts what landed **so far** (a chunked feed makes it progress);
+/// `path` is `Some` only once the file is complete — an in-flight row's file
+/// is known to the store ([`DownloadStore::target`]), not to the view.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DownloadRow {
+    pub tab_id: TabId,
+    /// The tab's own id for this download (a per-tab counter: two tabs can
+    /// both say `1`, so a row is keyed `(tab_id, id)`).
+    pub id: u64,
+    /// The name shown — sanitized, and the name the file was *asked* to be.
+    /// The file on disk may carry a `(2)` counter next to it; the row keeps
+    /// the clean name and [`DownloadRow::path`] carries the truth.
+    pub name: String,
+    pub url: String,
+    pub trigger: DownloadTrigger,
+    pub bytes: u64,
+    pub state: DownloadState,
+    /// Set when the file is complete; `None` while `Saving` and when a
+    /// download failed with no bytes written.
+    pub path: Option<PathBuf>,
+    /// Monotonic counter handed out by the shell's pump, so the ⬇ panel can
+    /// order rows across tabs (rows arrive per-proc; the panel lists them
+    /// newest first).
+    pub stamp: u64,
+}
+
+/// Rows a tab's store keeps at most (oldest **finished** row dropped first,
+/// so a live `Saving` row is never lost to a cap). A panel shows
+/// [`crate::downloads::MENU_ROWS`] of these, newest first.
+pub const MAX_DOWNLOAD_ROWS: usize = 200;
+
+/// The downloads one tab process has filed. Keys are `(tab_id, id)` pairs
+/// the tab itself minted; a download whose process died is reaped by
+/// [`DownloadStore::reap`] so no row streams into a dead file.
+#[derive(Clone, Debug, Default)]
+pub struct DownloadStore {
+    /// Arrival order; the panel re-sorts by [`DownloadRow::stamp`] desc.
+    rows: Vec<DownloadRow>,
+    /// The file an in-flight row streams into, per `(tab, id)`.
+    targets: HashMap<(TabId, u64), PathBuf>,
+}
+
+/// A download settled ([`DownloadStore::finish`]): enough for the pump to
+/// delete what should not be in the folder.
+pub struct Finished {
+    pub row: DownloadRow,
+    /// The partial file to delete: `Some` when nothing was ever written.
+    pub delete: Option<PathBuf>,
+}
+
+impl DownloadStore {
+    /// Rows in arrival order.
+    pub fn rows(&self) -> &[DownloadRow] {
+        &self.rows
+    }
+
+    /// The file the row streams into, while it is `Saving` (`None` once it
+    /// settles: the row's own [`DownloadRow::path`] carries a finished file).
+    pub fn target(&self, tab: TabId, id: u64) -> Option<PathBuf> {
+        self.targets.get(&(tab, id)).cloned()
+    }
+
+    /// File a [`FromTab::DownloadStart`]: a `Saving` row, named, plus the
+    /// path its bytes are streaming into. `path` is the file the pump has
+    /// just created (see [`crate::downloads::create`]); `None` when the disk
+    /// refused (a read-only folder), which leaves the row `Saving` with no
+    /// file to show — the pump marks it `Failed` right away.
+    pub fn start(&mut self, tab: TabId, hint: &DownloadHint, name: String, path: Option<PathBuf>, stamp: u64) -> DownloadRow {
+        let row = DownloadRow {
+            tab_id: tab,
+            id: hint.id,
+            name,
+            url: hint.url.clone(),
+            trigger: hint.trigger,
+            bytes: 0,
+            state: DownloadState::Saving,
+            path: None,
+            stamp,
+        };
+        self.rows.push(row.clone());
+        self.enforce_cap();
+        if let Some(path) = path {
+            self.targets.insert((row.tab_id, row.id), path);
+        }
+        row
+    }
+
+    /// Add arrived bytes to a row. Returns `None` when no row is streaming
+    /// (a chunk after its `End`, or a row dropped by [`Self::enforce_cap`])
+    /// — the pump then writes nothing, because there is no file to trust.
+    pub fn add_bytes(&mut self, tab: TabId, id: u64, bytes: usize) -> Option<PathBuf> {
+        let idx = self.find_streaming(tab, id)?;
+        self.rows[idx].bytes += bytes as u64;
+        self.targets.get(&(tab, id)).cloned()
+    }
+
+    /// A download settled. `error: Some` (or a write that failed) marks the
+    /// row `Failed` — and a file that never got a byte is handed back for
+    /// deletion, because an empty `report.zip` is not a download. `error:
+    /// None` marks it `Done` with the path it grew at.
+    pub fn finish(&mut self, tab: TabId, id: u64, error: Option<&str>) -> Option<Finished> {
+        let idx = self.find_streaming(tab, id)?;
+        let target = self.targets.remove(&(tab, id));
+        let (failed, bytes) = {
+            let row = &mut self.rows[idx];
+            row.state = if error.is_some() { DownloadState::Failed } else { DownloadState::Done };
+            // A failed row keeps its path only when bytes landed: the reader
+            // should see the name of a file that still exists.
+            row.path = match (error, target.as_ref()) {
+                (None, path) => path.cloned(),
+                (Some(_), path) if row.bytes > 0 => path.cloned(),
+                (_, _) => None,
+            };
+            (error.is_some(), row.bytes)
+        };
+        let delete = match (failed, bytes) {
+            (true, 0) => target.clone(),
+            (_, _) => None,
+        };
+        Some(Finished { row: self.rows[idx].clone(), delete })
+    }
+
+    /// The newest row — `Saving` rows outrank finished ones so the status
+    /// line says what is happening, not what happened. A tab with no
+    /// download says `None`; the UI's last-known-rule keeps the old text.
+    pub fn newest(&self) -> Option<&DownloadRow> {
+        self.rows
+            .iter()
+            .max_by_key(|row| (row.state == DownloadState::Saving, row.stamp))
+    }
+
+    /// A tab process died: its unfinished rows are `Failed` and their
+    /// partial files come back for deletion — no orphan `.zip` is left
+    /// growing in the folder ([`DownloadStore::reap`] hands the paths to the
+    /// pump, which calls [`crate::downloads::discard`]).
+    pub fn reap(&mut self, tab: TabId) -> Vec<PathBuf> {
+        let mut orphans = Vec::new();
+        let mut keys = Vec::new();
+        for idx in 0..self.rows.len() {
+            if self.rows[idx].tab_id == tab && self.rows[idx].state == DownloadState::Saving {
+                self.rows[idx].state = DownloadState::Failed;
+                self.rows[idx].path = None;
+                keys.push((tab, self.rows[idx].id));
+            }
+        }
+        for key in keys {
+            if let Some(path) = self.targets.remove(&key) {
+                orphans.push(path);
+            }
+        }
+        orphans
+    }
+
+    /// `Clear finished`: drop the settled rows, keep the ones still running.
+    /// Returns the dropped rows so the pump can leave their files alone —
+    /// clearing a list is not deleting what it listed.
+    pub fn clear_finished(&mut self) -> Vec<DownloadRow> {
+        let mut dropped = Vec::new();
+        self.rows.retain(|row| {
+            let keep = row.state == DownloadState::Saving;
+            if !keep {
+                dropped.push(row.clone());
+            }
+            keep
+        });
+        dropped
+    }
+
+    /// Every file a finished row points at — what `Clear finished` leaves
+    /// behind on disk, and what the panel shows once done.
+    pub fn files(&self) -> Vec<PathBuf> {
+        self.rows.iter().filter_map(|r| r.path.clone()).collect()
+    }
+
+    fn find_index(&self, tab: TabId, id: u64) -> Option<usize> {
+        self.rows.iter().position(|r| r.tab_id == tab && r.id == id)
+    }
+
+    /// A row that is still writing. The last message for an id settles it,
+    /// and nothing after that has anywhere to land.
+    fn find_streaming(&self, tab: TabId, id: u64) -> Option<usize> {
+        self.rows
+            .iter()
+            .position(|r| r.tab_id == tab && r.id == id && r.state == DownloadState::Saving)
+    }
+
+    /// Drop the oldest **finished** row until the vec fits
+    /// [`MAX_DOWNLOAD_ROWS`]. A `Saving` row is never dropped: its file is
+    /// still growing, and losing it would lose the only handle to it.
+    fn enforce_cap(&mut self) {
+        let excess = self.rows.len().saturating_sub(MAX_DOWNLOAD_ROWS);
+        if excess == 0 {
+            return;
+        }
+        // Oldest first: finished rows go, a live one stays (its file is
+        // still growing). A store of only live rows bends the cap.
+        let mut doomed: Vec<usize> = self
+            .rows
+            .iter()
+            .enumerate()
+            .filter(|(_, r)| r.state != DownloadState::Saving)
+            .map(|(i, _)| i)
+            .take(excess)
+            .collect();
+        doomed.reverse(); // remove from the back so indexes stay valid
+        for i in doomed {
+            let row = self.rows.remove(i);
+            self.targets.remove(&(row.tab_id, row.id));
         }
     }
 }
@@ -1591,5 +1831,141 @@ mod tests {
         ui.set_snapshot(snap);
         assert_eq!(ui.rows().len(), 11);
         assert!(!ui.rows().iter().any(|r| r.node == 11));
+    }
+    // ---- downloads (task: file downloads) ---------------------------------
+
+    fn hint(id: u64, name: Option<&str>) -> DownloadHint {
+        DownloadHint {
+            id,
+            url: "http://example.com/files/report.zip".to_owned(),
+            name: name.map(|n| n.to_owned()),
+            media_type: Some("application/zip".to_owned()),
+            trigger: DownloadTrigger::Disposition,
+        }
+    }
+
+    fn path(s: &str) -> PathBuf {
+        PathBuf::from(s)
+    }
+
+    #[test]
+    fn a_download_is_filed_named_and_settled() {
+        let tab = TabId(1);
+        let mut store = DownloadStore::default();
+        let row = store.start(tab, &hint(7, Some("report.zip")), "report.zip".to_owned(), Some(path("/d/report.zip")), 1);
+        assert_eq!((row.state, row.bytes, row.path.as_ref()), (DownloadState::Saving, 0, None));
+        // the file is known while it streams, and progress counts real bytes
+        assert_eq!(store.target(tab, 7), Some(path("/d/report.zip")));
+        assert_eq!(store.add_bytes(tab, 7, 4096), Some(path("/d/report.zip")));
+        let done = store.finish(tab, 7, None).expect("settles");
+        assert_eq!(done.row.state, DownloadState::Done);
+        assert_eq!((done.row.bytes, done.delete), (4096, None));
+        assert_eq!(store.target(tab, 7), None, "the file rides on the row now");
+        assert_eq!(store.files(), vec![path("/d/report.zip")]);
+        // a late chunk has no row and no file to trust
+        assert_eq!(store.add_bytes(tab, 7, 4), None);
+        assert_eq!(store.finish(tab, 7, None).map(|_| ()), None);
+    }
+
+    #[test]
+    fn a_failed_download_only_keeps_a_file_that_has_bytes() {
+        let tab = TabId(2);
+        let mut store = DownloadStore::default();
+        // nothing landed: the empty file comes back for deletion
+        store.start(tab, &hint(1, Some("big.iso")), "big.iso".to_owned(), Some(path("/d/big.iso")), 1);
+        let failed = store.finish(tab, 1, Some("connection refused")).expect("settles");
+        assert_eq!((failed.row.state, failed.row.path.as_ref(), failed.delete), (DownloadState::Failed, None, Some(path("/d/big.iso"))));
+        assert!(failed.row.url.len() > 0, "a Failed row still says where it came from");
+        assert_eq!(store.files(), Vec::<PathBuf>::new(), "nothing to show for a failed fetch");
+        // half a file landed: the row keeps the name of a file that exists
+        store.start(tab, &hint(2, Some("half.zip")), "half.zip".to_owned(), Some(path("/d/half.zip")), 2);
+        store.add_bytes(tab, 2, 512);
+        let partial = store.finish(tab, 2, Some("too large")).expect("settles");
+        assert_eq!(
+            (partial.row.state, partial.row.path, partial.delete),
+            (DownloadState::Failed, Some(path("/d/half.zip")), None)
+        );
+    }
+
+    #[test]
+    fn rows_are_keyed_by_tab_and_process_death_reaps_them() {
+        // two tabs may both mint id 1 — a row is keyed `(tab, id)`
+        let (a, b) = (TabId(1), TabId(2));
+        let mut store = DownloadStore::default();
+        store.start(a, &hint(1, Some("a.txt")), "a.txt".to_owned(), Some(path("/d/a.txt")), 1);
+        store.start(b, &hint(1, Some("b.txt")), "b.txt".to_owned(), Some(path("/d/b.txt")), 2);
+        assert_eq!(store.add_bytes(a, 1, 8), Some(path("/d/a.txt")));
+        assert_eq!(store.add_bytes(b, 1, 16), Some(path("/d/b.txt")));
+        assert_eq!(store.rows().len(), 2);
+
+        // the process dies mid-fetch: the row Failed, the partial file goes
+        let orphans = store.reap(a);
+        assert_eq!(orphans, vec![path("/d/a.txt")]);
+        let row = store.rows().iter().find(|r| r.tab_id == a).expect("row stays");
+        assert_eq!((row.state, row.bytes, row.path.as_ref()), (DownloadState::Failed, 8, None));
+        assert_eq!(store.target(a, 1), None, "nothing streams into a dead file");
+        assert_eq!(store.target(b, 1), Some(path("/d/b.txt")), "the other tab is untouched");
+        assert_eq!(store.reap(a), Vec::<PathBuf>::new(), "reaping twice invents no file");
+        store.finish(b, 1, None).expect("settles");
+    }
+
+    #[test]
+    fn the_newest_row_leads_the_status_line() {
+        let tab = TabId(1);
+        let mut store = DownloadStore::default();
+        assert_eq!(store.newest(), None, "a tab with no download says nothing");
+        store.start(tab, &hint(1, Some("old.zip")), "old.zip".to_owned(), Some(path("/d/old.zip")), 1);
+        store.finish(tab, 1, None).expect("settles");
+        store.start(tab, &hint(2, Some("new.zip")), "new.zip".to_owned(), Some(path("/d/new.zip")), 2);
+        // a live row outranks an older finished one no matter the stamp
+        assert_eq!(store.newest().map(|r| (r.id, r.state)), Some((2, DownloadState::Saving)));
+        store.finish(tab, 2, None).expect("settles");
+        // two finished rows: the newer stamp wins
+        assert_eq!(store.newest().map(|r| (r.id, r.state)), Some((2, DownloadState::Done)));
+        store.start(tab, &hint(3, Some("third.zip")), "third.zip".to_owned(), None, 3);
+        // a row whose file the disk refused is still the newest thing
+        assert_eq!(store.newest().map(|r| (r.id, r.state)), Some((3, DownloadState::Saving)));
+    }
+
+    #[test]
+    fn clear_finished_keeps_files_and_the_running_rows() {
+        let tab = TabId(1);
+        let mut store = DownloadStore::default();
+        store.start(tab, &hint(1, Some("a.zip")), "a.zip".to_owned(), Some(path("/d/a.zip")), 1);
+        store.finish(tab, 1, None).expect("settles");
+        store.start(tab, &hint(2, Some("b.zip")), "b.zip".to_owned(), Some(path("/d/b.zip")), 2);
+        store.start(tab, &hint(3, Some("c.zip")), "c.zip".to_owned(), Some(path("/d/c.zip")), 3);
+        store.finish(tab, 3, Some("boom")).expect("settles");
+        let dropped = store.clear_finished();
+        assert_eq!(dropped.iter().map(|r| r.id).collect::<Vec<_>>(), vec![1, 3]);
+        assert_eq!(store.rows().iter().map(|r| r.id).collect::<Vec<_>>(), vec![2], "only what is still running");
+        // clearing the list is not deleting what it listed: both files stay,
+        // one of them a Failed row's because half a file is still a file
+        assert_eq!(
+            dropped.iter().filter_map(|r| r.path.clone()).count(),
+            1,
+            "the Failed row lost its file with the error and says so with no path"
+        );
+        assert_eq!(store.target(tab, 2), Some(path("/d/b.zip")));
+        assert_eq!(store.clear_finished().len(), 0, "nothing finished left to drop");
+    }
+
+    #[test]
+    fn the_cap_drops_finished_rows_never_a_live_one() {
+        let tab = TabId(1);
+        let mut store = DownloadStore::default();
+        for i in 0..(MAX_DOWNLOAD_ROWS + 3) as u64 {
+            store.start(tab, &hint(i, Some("x.bin")), "x.bin".to_owned(), Some(path("/d/x.bin")), i);
+            store.finish(tab, i, None).expect("settles");
+        }
+        // a live row past the cap survives the next arrival
+        store.start(tab, &hint(999, Some("live.zip")), "live.zip".to_owned(), Some(path("/d/live.zip")), 900);
+        assert_eq!(store.rows().len(), MAX_DOWNLOAD_ROWS);
+        assert!(store.rows().iter().any(|r| r.id == 999), "the newest row is never dropped");
+        assert_eq!(store.target(tab, 999), Some(path("/d/live.zip")), "its file stays known");
+        // three rows went out with the last finished arrival, one more with
+        // this one — the oldest finished rows, in arrival order
+        assert_eq!(store.rows().first().map(|r| r.id), Some(4));
+        assert_eq!(store.target(tab, 0), None, "a dropped row's file handle goes with it");
     }
 }

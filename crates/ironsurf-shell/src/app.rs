@@ -30,11 +30,14 @@ use slint::private_unstable_api::re_exports::MouseCursor;
 use crate::archive;
 use crate::archive_server::{self, ServeEvent, ServeHandle, Spec};
 use crate::classify::classify_input;
+use crate::downloads;
 use crate::keymap::{self, Shortcut};
-use crate::state::{InspectorUi, TabState};
+use crate::state::{DownloadRow, DownloadStore, InspectorUi, TabState};
 use crate::tabs::{PumpedMessage, TabProc};
 use crate::uisettings::UiSettings;
-use crate::{AppWindow, ContainerInfo, HistoryItem, MenuItem, SuggestItem, TabInfo};
+use crate::{
+    AppWindow, ContainerInfo, DownloadItem, HistoryItem, MenuItem, SuggestItem, TabInfo,
+};
 // The Slint-side row structs the DevTools panel renders (`state`'s own
 // view-models of the same name are converted into these).
 use crate::{ConsoleRow, CrumbItem, InspectRow, NetRow, Tok};
@@ -144,6 +147,11 @@ struct Proc {
     /// switching tabs switches the bar to the other tab's search, and the
     /// numbers beside it come from that tab (`state.find`).
     find_open: bool,
+    /// The downloads this tab process has filed (task: file downloads). Per
+    /// tab like the zoom: a tab's downloads **die with its process**, so an
+    /// unfinished row is `Failed` and its partial file deleted when the tab
+    /// crashes ([`DownloadStore::reap]).
+    downloads: DownloadStore,
 }
 
 /// The shell-side half of a JS dialog being shown (task: window.alert /
@@ -375,6 +383,14 @@ pub struct Core {
     /// Files written by archive mode this shell session (the one-line
     /// overlay status; the counter is not persisted — the files are).
     archive_saved: Cell<usize>,
+    /// Downloads folder in force (the ⬇ menu's folder LineEdit → Apply
+    /// re-points it): the effective value of the persisted setting,
+    /// defaulting to [`downloads::download_root`] with the env falling
+    /// through (task: file downloads).
+    download_dir: RefCell<PathBuf>,
+    /// Counter behind every row's [`DownloadRow::stamp`]: the panel sorts by
+    /// it so rows from several tabs stay in one honest arrival order.
+    download_stamp: Cell<u64>,
     /// The **archive browsing server** (`ironsurf://archive`): started on the
     /// first request, serving the archive folder over `http://127.0.0.1:<random>`
     /// from a pair of background threads. The handle talks to the control
@@ -451,6 +467,13 @@ impl App {
             .filter(|d| !d.is_empty())
             .map(PathBuf::from)
             .unwrap_or_else(archive::default_archive_root);
+        // …and the downloads folder (task: file downloads): the persisted
+        // folder, else `$IRONSURF_DOWNLOAD_DIR`, else `$XDG_DOWNLOAD_DIR`, else
+        // `~/Downloads`.
+        let download_root =
+            downloads::download_root(settings.download_dir.as_deref());
+        let download_root =
+            downloads::download_root(settings.download_dir.as_deref());
         let (sink, rx) = channel();
         let core = Rc::new(Core {
             store: RefCell::new(store),
@@ -486,6 +509,8 @@ impl App {
             us_edit_id: RefCell::new(None),
             archive_dir: RefCell::new(archive_root),
             archive_saved: Cell::new(0),
+            download_dir: RefCell::new(download_root),
+            download_stamp: Cell::new(0),
             archive_server: RefCell::new(None),
             archive_server_rx: RefCell::new(None),
             archive_server_sink: RefCell::new(None),
@@ -628,6 +653,11 @@ impl Core {
                             format_args!("its stdin is dead ({err}) — the process is no longer reachable"),
                         ),
                     }
+                    // …and a half-written download goes back out of the folder
+                    // (task: file downloads).
+                    for path in p.downloads.reap(p.tab.id) {
+                        downloads::discard(&path);
+                    }
                     crashed = true;
                 }
             }
@@ -713,6 +743,7 @@ impl Core {
                         devtools_view: DevToolsView::default(),
                         devtools_height: None,
                         find_open: false,
+                        downloads: DownloadStore::default(),
                     });
                     self.active.set(procs.len() - 1);
                 }
@@ -789,6 +820,12 @@ impl Core {
         }
         let mut proc = procs.remove(idx);
         proc.tab.destroy();
+        // A tab closed mid-download takes its partial file out of the folder
+        // too — the rows vanish with the process, so nothing is left to say
+        // what the orphan was (task: file downloads).
+        for path in proc.downloads.reap(proc.tab.id) {
+            downloads::discard(&path);
+        }
         let empty = procs.is_empty();
         if !empty {
             self.active.set(self.active.get().min(procs.len() - 1));
@@ -1157,6 +1194,12 @@ impl Core {
                 // Ctrl-Alt-H (task: browsing history): the same menu as the ☰
                 // toolbar button, for keyboard-first users.
                 self.toggle_history_menu();
+                return;
+            }
+            Some(Shortcut::DownloadsMenu) => {
+                // Ctrl-Shift-D (task: file downloads): the ⬇ panel, the same
+                // overlay as the toolbar's ⬇ button.
+                self.toggle_download_menu();
                 return;
             }
             None => {}
@@ -2039,6 +2082,15 @@ impl Core {
             MenuAction::ToggleVideo => {
                 self.send_active(ToTab::ContextAction(ContextAction::ToggleVideo))
             }
+            MenuAction::DownloadLink(url) => {
+                // The name comes from the URL (`filename_from_url`) and the
+                // server's `Content-Disposition`, never from the anchor's
+                // text: the shell has no reason to guess.
+                self.send_active(ToTab::DownloadUrl {
+                    url,
+                    suggested_name: None,
+                });
+            }
         }
     }
 
@@ -2091,6 +2143,7 @@ impl Core {
             ui.set_ua_menu_open(false);
             ui.set_archive_menu_open(false);
             ui.set_history_menu_open(false);
+            ui.set_download_menu_open(false);
             let active_container = self
                 .active_proc_index()
                 .map(|i| self.procs.borrow()[i].tab.container)
@@ -2174,6 +2227,10 @@ impl Core {
                         devtools_view,
                         devtools_height,
                         find_open,
+                        // A crashed tab's unfinished downloads are reaped
+                        // before its process is replaced; the new process
+                        // starts with an empty panel (its ids restart at 1).
+                        downloads: DownloadStore::default(),
                     },
                 )
             };
@@ -2182,6 +2239,13 @@ impl Core {
             }
             let mut old = old;
             old.tab.destroy();
+            // Downloads do not move with a tab: the old process dies with its
+            // unfinished rows `Failed` and their partial files out of the
+            // folder, and the new process starts an empty panel (task: file
+            // downloads).
+            for path in old.downloads.reap(old.tab.id) {
+                downloads::discard(&path);
+            }
             // The replacement process is new: seed its userscript set too, and
             // re-issue the Inspector instruction — the pane is still open on this
             // tab, and the new process has never been asked for its document.
@@ -2305,6 +2369,7 @@ impl Core {
             ui.set_ua_menu_open(false);
             ui.set_archive_menu_open(false);
             ui.set_history_menu_open(false);
+            ui.set_download_menu_open(false);
             ui.set_us_editing(false);
             ui.set_us_editing_existing(false);
             ui.set_us_error(SharedString::default());
@@ -2524,6 +2589,7 @@ impl Core {
             ui.set_us_menu_open(false);
             ui.set_archive_menu_open(false);
             ui.set_history_menu_open(false);
+            ui.set_download_menu_open(false);
             ui.set_ua_error(SharedString::default());
             let current = container_user_agent(&self.store.borrow(), self.active_container());
             // Prefill the draft with exactly what the container holds (a
@@ -2669,6 +2735,7 @@ impl Core {
             ui.set_us_menu_open(false);
             ui.set_ua_menu_open(false);
             ui.set_history_menu_open(false);
+            ui.set_download_menu_open(false);
             ui.set_archive_error(SharedString::default());
             ui.set_archive_dir_text(self.archive_root_text().as_str().into());
         }
@@ -2682,6 +2749,343 @@ impl Core {
     fn toggle_archive_menu(&self) {
         let open = self.ui().is_some_and(|ui| ui.get_archive_menu_open());
         self.archive_menu(!open);
+    }
+
+    // ---- file downloads (task: file downloads) -------------------------------
+
+    /// The effective downloads folder as display text (the ⬇ panel's summary
+    /// and the LineEdit's prefill: one folder, named once).
+    fn download_root_text(&self) -> String {
+        self.download_dir.borrow().display().to_string()
+    }
+
+    /// The ⬇ panel's one-line summary (rows of the tab on screen + the folder
+    /// receiving them). Rows are per process, so the count says what the
+    /// reader can see, not what every tab ever saved.
+    fn download_summary(&self) -> String {
+        let procs = self.procs.borrow();
+        let count = self
+            .active_proc_index()
+            .and_then(|i| procs.get(i))
+            .map(|p| p.downloads.rows().len())
+            .unwrap_or(0);
+        downloads::summary_line(count, &self.download_dir.borrow())
+    }
+
+    /// The active tab's downloads, newest first, capped to
+    /// [`downloads::MENU_ROWS`]: the panel is a window onto the store, which
+    /// keeps more ([`crate::state::MAX_DOWNLOAD_ROWS]). A row quotes its full
+    /// path once the file is complete; until then it says how much has landed
+    /// and where from.
+    fn download_rows(&self) -> Vec<DownloadItem> {
+        let procs = self.procs.borrow();
+        let Some(active) = self
+            .active_proc_index()
+            .and_then(|i| procs.get(i))
+        else {
+            return Vec::new();
+        };
+        let mut rows: Vec<&DownloadRow> = active.downloads.rows().iter().collect();
+        rows.sort_by(|a, b| b.stamp.cmp(&a.stamp));
+        rows.truncate(downloads::MENU_ROWS);
+        rows
+            .into_iter()
+            .map(|row| {
+                let sub = row
+                    .path
+                    .as_ref()
+                    .map(|path| path.display().to_string())
+                    .unwrap_or_else(|| downloads::sub_line(row.bytes, &row.url));
+                DownloadItem {
+                    name: row.name.clone().into(),
+                    status: downloads::status_label(row.state, row.bytes).into(),
+                    sub: sub.into(),
+                }
+            })
+            .collect()
+    }
+
+    /// Push the panel's live values (folder summary + rows).
+    fn download_state(&self, ui: &AppWindow) {
+        ui.set_download_status(self.download_summary().as_str().into());
+        ui.set_downloads(ModelRc::from(Rc::new(VecModel::from(self.download_rows()))));
+    }
+
+    /// Refresh the panel while it is open (a chunk just landed).
+    fn download_refresh_if_open(&self) {
+        if let Some(ui) = self.ui() {
+            if ui.get_download_menu_open() {
+                self.download_state(&ui);
+            }
+        }
+    }
+
+    /// The status bar's **one** message for a tab: its error, its own status
+    /// text, a spawn failure, then a download — the newest row of that tab, a
+    /// `Saving` one before a settled one — and only then the generic
+    /// "Loading …" (task: file downloads: a download is worth naming before
+    /// the page is worth spinning). Extracted from `sync_ui` so a chunk
+    /// updates the same line the tab switch would.
+    fn status_text(&self, p: &Proc) -> String {
+        let download = p
+            .downloads
+            .newest()
+            .map(|row| downloads::status_line(&row.name, row.state, row.bytes));
+        p.state
+            .error
+            .clone()
+            .or_else(|| p.state.status.clone())
+            .or_else(|| self.spawn_error.borrow().clone())
+            .or(download)
+            .or_else(|| p.state.loading.then(|| "Loading \u{2026}".to_string()))
+            .unwrap_or_default()
+    }
+
+    /// Re-push the status line after a row moved, so a download is visible
+    /// without the panel (the newest row of the tab on screen wins).
+    fn download_status_refresh(&self) {
+        let Some(ui) = self.ui() else { return };
+        let procs = self.procs.borrow();
+        if let Some(status) = self
+            .active_proc_index()
+            .and_then(|i| procs.get(i))
+            .map(|p| self.status_text(p))
+        {
+            ui.set_status_text(status.into());
+        }
+    }
+
+    /// Open/close the ⬇ overlay. Opening closes every other menu (the same
+    /// never-stacked rule as the archive overlay) and prefills the folder
+    /// draft with the effective root.
+    fn download_menu(&self, open: bool) {
+        let Some(ui) = self.ui() else { return };
+        debug!("downloads menu {}", if open { "opened" } else { "closed" });
+        if open {
+            ui.set_manager_open(false);
+            ui.set_us_menu_open(false);
+            ui.set_ua_menu_open(false);
+            ui.set_history_menu_open(false);
+            ui.set_archive_menu_open(false);
+            ui.set_download_error(SharedString::default());
+            ui.set_download_dir_text(self.download_root_text().as_str().into());
+        }
+        ui.set_download_menu_open(open);
+        if open {
+            self.download_state(&ui);
+        }
+    }
+
+    /// The toolbar's ⬇ button (and Ctrl-Shift-D): flip the overlay.
+    fn toggle_download_menu(&self) {
+        let open = self.ui().is_some_and(|ui| ui.get_download_menu_open());
+        self.download_menu(!open);
+    }
+
+    /// A folder typed into the ⬇ panel (or Enter in its LineEdit). Accepted →
+    /// effective at once and persisted; rejected → the draft stays with the
+    /// reason under it. A blank draft reverts to the default folder (the
+    /// archive folder's rule, inverted on purpose: a blank says "give it
+    /// back to the browser").
+    fn download_apply_dir(&self, text: &str) {
+        let Some(ui) = self.ui() else { return };
+        let trimmed = text.trim();
+        if trimmed.is_empty() {
+            *self.download_dir.borrow_mut() = downloads::download_root(None);
+            self.settings.borrow_mut().download_dir = None;
+            self.save_settings();
+            ui.set_download_error(SharedString::default());
+            let root = self.download_root_text();
+            ui.set_download_dir_text(root.as_str().into());
+            info!("download folder \u{2192} default ({root})");
+            self.download_state(&ui);
+            return;
+        }
+        match downloads::validate_dir(trimmed) {
+            Ok(path) => {
+                let shown = path.display().to_string();
+                *self.download_dir.borrow_mut() = path;
+                self.settings.borrow_mut().download_dir = Some(shown.clone());
+                self.save_settings();
+                ui.set_download_error(SharedString::default());
+                ui.set_download_dir_text(shown.as_str().into());
+                info!("download folder \u{2192} {shown}");
+            }
+            Err(err) => {
+                ui.set_download_error(err.as_str().into());
+                return;
+            }
+        }
+        self.download_state(&ui);
+    }
+
+    /// `Clear finished`: drop the settled rows of every tab, keep the ones
+    /// still writing. The files are left where they are — clearing a list is
+    /// not deleting what the list named.
+    fn download_clear_finished(&self) {
+        let mut dropped = 0;
+        for p in self.procs.borrow_mut().iter_mut() {
+            dropped += p.downloads.clear_finished().len();
+        }
+        info!("downloads: cleared {dropped} finished row(s)");
+        if let Some(ui) = self.ui() {
+            if ui.get_download_menu_open() {
+                self.download_state(&ui);
+            }
+        }
+        self.download_status_refresh();
+    }
+
+    /// A [`ironsurf_common::FromTab::DownloadStart`] from this tab: file the
+    /// row, name the file, and **create it now** (`O_CREAT | O_EXCL` through
+    /// the unique path), so a crash mid-fetch leaves a partial file the shell
+    /// can delete. A folder that refuses the file (read-only, gone) fails the
+    /// row at once — a row that says `Saving` with no file would lie.
+    fn download_write(&self, tid: TabId, hint: &ironsurf_common::DownloadHint) {
+        // Paths and the stamp counter first: `procs` is borrowed for the
+        // store, and no UI refresh may happen while it is held.
+        let root = self.download_dir.borrow().clone();
+        let name = downloads::display_name(hint.name.as_deref(), &hint.url);
+        let path = downloads::download_path(&root, hint.name.as_deref(), &hint.url);
+        let stamp = self.download_stamp.get() + 1;
+        self.download_stamp.set(stamp);
+        let created = match downloads::create(&path) {
+            Ok(_file) => Some(path.clone()),
+            Err(err) => {
+                error!("tab {tid} download #{}: {err}", hint.id);
+                None
+            }
+        };
+        let mut procs = self.procs.borrow_mut();
+        let Some(p) = procs.iter_mut().find(|p| p.tab.id == tid) else {
+            // A tab that died between its Start and this message: the file it
+            // made is nothing but a partial, so it never gets to stay.
+            if created.is_some() {
+                downloads::discard(&path);
+            }
+            return;
+        };
+        p.downloads.start(tid, hint, name.clone(), created.clone(), stamp);
+        if created.is_none() {
+            // Nothing was ever written: the row says `Failed` and has no
+            // path, which is the truth about a disk that refused the file.
+            let reason = format!("cannot create {}", path.display());
+            p.downloads.finish(tid, hint.id, Some(&reason));
+        }
+        drop(procs);
+        info!(
+            "tab {tid} download #{} {name} \u{2192} {} ({:?})",
+            hint.id,
+            path.display(),
+            hint.trigger
+        );
+        // A save announces itself (task: file downloads): the ⬇ panel opens at
+        // a row that just started, so the reader sees the bytes land instead
+        // of having to ask — for **this** tab, whose rows the panel shows (a
+        // background tab's save keeps its status line and its panel shut).
+        if self.active_tab_id() == Some(tid)
+            && !self
+                .ui()
+                .is_some_and(|ui| ui.get_download_menu_open())
+        {
+            debug!("tab {tid} started a download: the \u{2B07} panel opens");
+            self.download_menu(true);
+        }
+        self.download_shown(tid);
+    }
+
+    /// A [`ironsurf_common::FromTab::DownloadChunk`]: append it to the row's
+    /// file (written as it arrives — the shell never buffers a file the size
+    /// of an `.iso` in RAM), then count it. A row with no file left (the disk
+    /// refused, or a write already failed) drops the chunk: there is nothing
+    /// to trust.
+    fn download_chunk(&self, tid: TabId, id: u64, bytes: &[u8]) {
+        let mut procs = self.procs.borrow_mut();
+        let Some(p) = procs.iter_mut().find(|p| p.tab.id == tid) else {
+            return;
+        };
+        let Some(path) = p.downloads.target(tid, id) else {
+            // The disk refused this row, or it settled under an earlier
+            // `End`: a late chunk has no file to trust.
+            return;
+        };
+        if let Err(err) = downloads::append(&path, bytes) {
+            error!("tab {tid} download #{id}: {err}");
+            let _ = p.downloads.finish(tid, id, Some(&err));
+            // A half-written file is not a download: take it out of the
+            // folder instead of letting a `Failed` row point at it.
+            downloads::discard(&path);
+            drop(procs);
+            self.download_shown(tid);
+            return;
+        }
+        p.downloads.add_bytes(tid, id, bytes.len());
+        drop(procs);
+        self.download_shown(tid);
+    }
+
+    /// A [`ironsurf_common::FromTab::DownloadEnd`]: the row settles — `Done`
+    /// with its path, or `Failed` (and a file that never got a byte goes back
+    /// out of the folder, because an empty `report.zip` is not a download).
+    fn download_end(&self, tid: TabId, id: u64, error: Option<&str>) {
+        let mut procs = self.procs.borrow_mut();
+        let Some(p) = procs.iter_mut().find(|p| p.tab.id == tid) else {
+            return;
+        };
+        let Some(finished) = p.downloads.finish(tid, id, error) else {
+            warn!("tab {tid} download #{id} ended twice (no row is writing)");
+            return;
+        };
+        drop(procs);
+        if let Some(delete) = &finished.delete {
+            info!(
+                "tab {tid} download #{id} failed with no bytes: {} deleted",
+                delete.display()
+            );
+            downloads::discard(delete);
+        } else if let Some(err) = error {
+            warn!("tab {tid} download #{id} failed: {err}");
+        } else {
+            info!(
+                "tab {tid} download #{id} done: {} ({} B)",
+                finished
+                    .row
+                    .path
+                    .as_ref()
+                    .map(|path| path.display().to_string())
+                    .unwrap_or_default(),
+                finished.row.bytes
+            );
+        }
+        self.download_shown(tid);
+    }
+
+    /// Where a row's news is visible: the panel while it is open, and the
+    /// status line whenever the tab is the one on screen.
+    fn download_shown(&self, tid: TabId) {
+        self.download_refresh_if_open();
+        if self.active_tab_id() == Some(tid) {
+            self.download_status_refresh();
+        }
+    }
+
+    /// A tab process died mid-download (crash, or the last tab closed): its
+    /// unfinished rows are `Failed`, and their partial files leave the folder
+    /// — no orphan `.zip` is left growing where nothing writes any more.
+    fn download_reap(&self, tid: TabId) {
+        for p in self.procs.borrow_mut().iter_mut() {
+            let orphans = p.downloads.reap(tid);
+            for path in orphans {
+                info!(
+                    "tab {} died mid-download: {} deleted",
+                    p.tab.id.0,
+                    path.display()
+                );
+                downloads::discard(&path);
+            }
+        }
+        self.download_refresh_if_open();
+        self.download_status_refresh();
     }
 
     // ---- browsing history & reopen closed tab (task: browsing history) ----
@@ -2729,6 +3133,7 @@ impl Core {
             ui.set_us_menu_open(false);
             ui.set_ua_menu_open(false);
             ui.set_archive_menu_open(false);
+            ui.set_download_menu_open(false);
             self.history_state(&ui);
         }
         ui.set_history_menu_open(open);
@@ -3309,6 +3714,22 @@ impl Core {
                     if *is_document { "document " } else { "subresource " },
                     bytes.len()
                 ),
+                // A download is a stream, so only its ends are worth a line;
+                // the chunk count belongs to the panel, not the log (task:
+                // file downloads).
+                FromTab::DownloadStart { hint } => debug!(
+                    "tab {tid} download #{} starts: {:?} ({:?})",
+                    hint.id,
+                    hint.name,
+                    hint.trigger
+                ),
+                FromTab::DownloadChunk { id, bytes } => {
+                    trace!("tab {tid} download #{id} ships {} B", bytes.len())
+                }
+                FromTab::DownloadEnd { id, error } => debug!(
+                    "tab {tid} download #{id} ends ({})",
+                    error.as_deref().unwrap_or("ok")
+                ),
                 FromTab::UrlChanged { url } => {
                     info!("tab {tid} url → {}", url.as_deref().unwrap_or("<none>"))
                 }
@@ -3462,8 +3883,28 @@ impl Core {
             if let FromTab::ArchivedFetch { url, is_document, bytes } = &msg {
                 self.archive_write(tid, *is_document, url, bytes);
             }
+            // A download lands on disk from the pump — the tab that fetched it
+            // never opens a file (task: file downloads).
+            match &msg {
+                FromTab::DownloadStart { hint } => self.download_write(tid, hint),
+                FromTab::DownloadChunk { id, bytes } => self.download_chunk(tid, *id, bytes),
+                FromTab::DownloadEnd { id, error } => {
+                    self.download_end(tid, *id, error.as_deref())
+                }
+                _ => {}
+            }
         }
 
+        // A tab that closed cleanly while a download was still writing leaves
+        // its partial file out of the folder before its rows go away (task:
+        // file downloads).
+        let orphans: Vec<PathBuf> = {
+            let mut paths = Vec::new();
+            for p in self.procs.borrow_mut().iter_mut().filter(|p| p.state.closed) {
+                paths.extend(p.downloads.reap(p.tab.id));
+            }
+            paths
+        };
         // Reap closed tabs (dropping a TabProc closes stdin and reaps it).
         let (before, after) = {
             let mut procs = self.procs.borrow_mut();
@@ -3493,6 +3934,10 @@ impl Core {
                     self.clear_dialog_for(tab, false);
                 }
             }
+        }
+        for path in &orphans {
+            info!("a tab closed mid-download: {} deleted", path.display());
+            downloads::discard(path);
         }
         if before != after {
             info!("reaped {} closed tab(s); {} remain", before - after, after);
@@ -3540,6 +3985,9 @@ impl Core {
         // down with it — the answer cannot reach a dead process (task: JS
         // dialogs).
         for tid in victims {
+            // Its unfinished rows are `Failed` and their partial files leave
+            // the folder (task: file downloads).
+            self.download_reap(tid);
             self.clear_dialog_for(tid, false);
         }
         if crashed {
@@ -3654,16 +4102,7 @@ impl Core {
             // The status line is *one* message, always the newest: an error is
             // dropped when the next load starts (TabState::reduce), a load
             // with nothing reported yet still says so instead of going blank.
-            let status = p
-                .state
-                .error
-                .clone()
-                .or_else(|| p.state.status.clone())
-                .or_else(|| self.spawn_error.borrow().clone())
-                .or_else(|| {
-                    p.state.loading.then(|| "Loading \u{2026}".to_string())
-                })
-                .unwrap_or_default();
+            let status = self.status_text(p);
             ui.set_status_text(status.into());
             let (glyph, color) = p.state.security().render();
             ui.set_sec_glyph(glyph.into());
@@ -3681,6 +4120,12 @@ impl Core {
         self.write_devtools(&ui, &procs);
         // …and so does the find bar (open flag + the tab's own counter).
         self.write_find(&ui, &procs);
+        // …and so does the ⬇ panel: its rows belong to the tab on screen, so
+        // switching tabs switches the download list with it (task: file
+        // downloads).
+        if ui.get_download_menu_open() {
+            self.download_state(&ui);
+        }
         // The spinner must react to LoadingChanged immediately, not on the next
         // tick of the spinner timer — a click on a link should start turning
         // the moment the tab says it is loading.
@@ -3913,6 +4358,18 @@ impl Core {
             ui.on_archive_apply_dir(move |text| c.archive_apply_dir(text.as_str()));
         }
 
+        // Downloads (task: file downloads): the ⬇ toolbar toggle (and
+        // Ctrl-Shift-D), the scrim/✕ close, the folder Apply (validated, a
+        // rejected draft survives on the one-line error) and `Clear finished`
+        // — all pure Core state. Nothing here fetches: the tab does.
+        bind0!(on_toggle_download_menu, |c: &Rc<Core>| c.toggle_download_menu());
+        bind0!(on_close_download_menu, |c: &Rc<Core>| c.download_menu(false));
+        {
+            let c = self.clone();
+            ui.on_download_apply_dir(move |text| c.download_apply_dir(text.as_str()));
+        }
+        bind0!(on_download_clear_finished, |c: &Rc<Core>| c.download_clear_finished());
+
         // Browsing history (task: browsing history): the ☰ toolbar toggle, the
         // scrim/✕ close, a row pick (reopen the visit in a new tab), and Clear
         // (wipe the log shared by every container) — all pure Core state.
@@ -4010,6 +4467,11 @@ pub enum MenuAction {
     /// under the cursor), which is exactly the point `ToTab::InspectPickAt`
     /// wants — see `Core::menu_pick`.
     InspectElement,
+    /// “⬇ Download linked file” (task: file downloads): the shell asks *this
+    /// tab* to fetch the address. It never fetches for a menu click, never
+    /// writes, and never guesses a folder — the tab answers `DownloadStart`,
+    /// the pump files the bytes.
+    DownloadLink(String),
 }
 
 /// The menu for one right-click, in display order. Entries exist exactly
@@ -4050,6 +4512,12 @@ pub fn context_menu_items(
         items.push((
             "Copy link address".into(),
             MenuAction::CopyText(link.clone()),
+        ));
+        // Its sibling, in the order every browser keeps them (task: file
+        // downloads): copy the address, or put the file on the disk.
+        items.push((
+            "⬇ Download linked file".into(),
+            MenuAction::DownloadLink(link.clone()),
         ));
     }
     if let Some(image) = &target.image {
@@ -4331,6 +4799,7 @@ mod tests {
                 "⟳ Reload",
                 "Open link in new tab",
                 "Copy link address",
+                "⬇ Download linked file",
                 "Copy page address",
                 "⌖ Inspect Element",
             ]
@@ -4338,6 +4807,10 @@ mod tests {
         assert_eq!(
             items[1].1,
             MenuAction::OpenNewTab("https://example.com/a".into())
+        );
+        assert_eq!(
+            items[3].1,
+            MenuAction::DownloadLink("https://example.com/a".into())
         );
     }
 

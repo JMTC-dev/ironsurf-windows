@@ -2356,7 +2356,16 @@ pub struct DocFetch {
     /// `Refresh:` header (task: Anubis `metarefresh` gates), resolved against
     /// [`Self::url`]. The runtime arms a real timer for it; a cached entry
     /// replays the directive stored with its headers like any browser cache.
+    /// The header the fetch layer never sees is `content-disposition`.
     pub refresh: Option<RefreshSpec>,
+    /// `Content-Type:` of the response (task: file downloads) — the media type
+    /// decides whether this top-level fetch is a page or a file. Local schemes
+    /// answer `None` (a `file:` document keeps its current behaviour).
+    pub content_type: Option<String>,
+    /// `Content-Disposition:` of the response (task: file downloads). `Some`
+    /// with an `attachment` disposition makes the fetch a download whatever its
+    /// media type; the `filename=` value inside is only a suggestion.
+    pub content_disposition: Option<String>,
 }
 
 /// [`DocFetch`] from a completed exchange, lifting the `Refresh:` header out of
@@ -2368,7 +2377,19 @@ fn doc_fetch_from(outcome: FetchOutcome) -> DocFetch {
         status: outcome.status,
         body: outcome.body,
         refresh,
+        content_type: header_value(&outcome.headers, "content-type").map(str::to_owned),
+        content_disposition: header_value(&outcome.headers, "content-disposition")
+            .map(str::to_owned),
     }
+}
+
+/// First value of a named response header, name matched case-insensitively
+/// (task: file downloads — `Content-Type:` / `Content-Disposition:`).
+pub fn header_value<'a>(headers: &'a [(String, String)], name: &str) -> Option<&'a str> {
+    headers
+        .iter()
+        .find(|(header, _)| header.eq_ignore_ascii_case(name))
+        .map(|(_, value)| value.as_str())
 }
 
 impl DocFetch {
@@ -2624,6 +2645,11 @@ where
             status: 200,
             body,
             refresh: None,
+            // A local page is never a download: no server spoke, so there is
+            // no disposition and no media-type decision to make (task: file
+            // downloads).
+            content_type: None,
+            content_disposition: None,
         }
     };
     match url.scheme() {

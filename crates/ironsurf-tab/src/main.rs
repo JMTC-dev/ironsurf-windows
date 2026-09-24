@@ -9,6 +9,7 @@
 //! kept behind `--spike`.
 
 mod archive;
+mod downloads;
 mod find;
 mod forms;
 mod headless;

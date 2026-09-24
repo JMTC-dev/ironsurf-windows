@@ -57,6 +57,7 @@ use std::os::fd::AsRawFd;
 use std::os::fd::RawFd;
 use std::path::PathBuf;
 use std::rc::Rc;
+use std::sync::mpsc;
 use std::sync::{
     atomic::{AtomicUsize, Ordering},
     Arc, Mutex,
@@ -79,8 +80,9 @@ use blitz_traits::navigation::{NavigationOptions, NavigationProvider};
 use blitz_traits::shell::{ClipboardError, ColorScheme, ShellProvider, Viewport};
 use ironsurf_common::{
     read_frame, write_frame, userscripts_for_url, ContextAction, ContextTarget, ContainerId,
-    CursorIcon, DialogKind, FromTab, InspectSnapshot, KeyEvent, Modifiers, NetEvent, PointerEvent,
-    PointerKind, ScrollEvent, TabId, ToTab, Userscript, MAX_CONTEXT_TEXT, MAX_DIALOG_MESSAGE,
+    CursorIcon, DialogKind, DownloadHint, DownloadTrigger, FromTab, InspectSnapshot, KeyEvent,
+    Modifiers, NetEvent, PointerEvent, PointerKind, ScrollEvent, TabId, ToTab, Userscript,
+    MAX_CONTEXT_TEXT, MAX_DIALOG_MESSAGE, MAX_DOWNLOAD_BYTES, MAX_DOWNLOAD_CHUNK_BYTES,
 };
 use keyboard_types::{Code, Key, Location, Modifiers as KMods};
 use kurbo::{Affine, Rect, Size};
@@ -94,6 +96,7 @@ use ironsurf_sandbox::SandboxPolicy;
 use ironsurf_storage::{ContainerStore, CookieJar, NetCache};
 use url::Url;
 
+use crate::downloads;
 use crate::find;
 use crate::forms::{self, FormMethod, FormSubmission};
 use crate::inspector;
@@ -413,6 +416,21 @@ fn javascript_url_code(raw: &str) -> Option<String> {
     None
 }
 
+/// Why a URL can never be saved (task: file downloads): an internal page is a
+/// surface the renderer draws, `javascript:` is a program, and only http(s)
+/// has bytes the fetch layer can pull. `None` = go and get it.
+pub fn download_target_problem(url: &Url) -> Option<String> {
+    if url.scheme() == netmod::INTERNAL_SCHEME {
+        Some("an internal page is not a file".to_owned())
+    } else if url.scheme() == "javascript" {
+        Some("a `javascript:` target is a program, not bytes".to_owned())
+    } else if netmod::is_http_scheme(url) {
+        None
+    } else {
+        Some(format!("{} is not a scheme the tab can fetch", url.scheme()))
+    }
+}
+
 pub fn parse_input_url(input: &str) -> Result<Url, Box<dyn Error>> {
     match Url::parse(input) {
         Ok(url) => Ok(url),
@@ -631,6 +649,17 @@ pub struct Tab {
     /// Completion queue from the fetch threads; the shared self-pipe wakes
     /// the loop the moment one arrived (the NavHook/NetWaker pattern).
     media_results: Arc<Mutex<Vec<MediaLoaded>>>,
+    /// Download ids for this process (task: file downloads). Minted here, echoed
+    /// in every `DownloadChunk`/`DownloadEnd`; the shell keys a row by
+    /// `(tab_id, id)`, so ids never need to be global.
+    download_ids: downloads::DownloadIds,
+    /// Worker-thread side of the download feed (task: file downloads): the
+    /// fetch thread that settled a download pushes one [`DownloadShipment`] —
+    /// chunks already taken out of the fetch buffer — here, the shared
+    /// self-pipe wakes the loop, and [`Tab::drain_downloads`] turns it into
+    /// `DownloadChunk`/`DownloadEnd` exactly like `drain_archive_events`.
+    download_tx: mpsc::Sender<DownloadShipment>,
+    download_rx: mpsc::Receiver<DownloadShipment>,
     /// The tab's **effective User-Agent** cell (task: per-container UA): the
     /// `--user-agent` flag seeds it, `ToTab::SetUserAgent` replaces its
     /// contents, and every fetch (documents, subresources, form POSTs,
@@ -932,6 +961,11 @@ impl Tab {
     }
 
     fn new(args: &TabArgs, pipe: Arc<SelfPipe>) -> Self {
+        // Task: file downloads — the one queue a fetch worker uses to hand a
+        // settled download back to the single-threaded loop (the same
+        // self-pipe wakes the loop, so the drain is timely rather than tick-
+        // late). An unbounded channel: a download is one message per file.
+        let (download_tx, download_rx) = mpsc::channel();
         let store = ContainerStore::from_profile_dir(args.container_id, &args.profile_dir);
         // One DOM-storage store per container per tab (task: per-origin
         // `localStorage`): areas are one JSON file per origin under the
@@ -1013,6 +1047,9 @@ impl Tab {
             media: Vec::new(),
             media_inflight: HashSet::new(),
             media_results: Arc::new(Mutex::new(Vec::new())),
+            download_ids: downloads::DownloadIds::new(),
+            download_tx: download_tx,
+            download_rx: download_rx,
             media_enabled: args.media_enabled,
             media_next_pump: None,
             archive_page: None,
@@ -1173,6 +1210,45 @@ impl Tab {
             "navigate \"{raw}\" ({history:?}{})",
             if post.is_some() { ", form POST" } else { "" }
         );
+        // An `<a download>` click (task: file downloads) is a *file promise*,
+        // settled before anything is fetched or touched: the page on screen
+        // keeps painting, no history entry appears and no URL/title changes.
+        // The vendored blitz-dom click handler records the attribute against
+        // the URL that click resolved to, and taking it always clears the slot
+        // — a typed address, `location.href = …` or a form POST can never
+        // inherit an attribute from a link nobody clicked. A bare `download`
+        // (or an empty one) suggests no name but still means "save it".
+        let anchor = blitz_dom::take_anchor_download(raw);
+        if let Some(suggested) = anchor.filter(|_| post.is_none()) {
+            let target = Url::parse(raw).ok();
+            let problem = target
+                .as_ref()
+                .and_then(|url| download_target_problem(url));
+            match (target, problem) {
+                (Some(target), None) => self.start_download(
+                    target,
+                    suggested,
+                    DownloadTrigger::AnchorAttribute,
+                    None,
+                ),
+                (Some(target), Some(reason)) => self.refuse_download(
+                    target.as_str(),
+                    suggested,
+                    DownloadTrigger::AnchorAttribute,
+                    reason,
+                ),
+                // A `javascript:` program inside a download link is refused
+                // like any other target the tab cannot fetch, so the shell's
+                // row settles instead of hanging on a promise.
+                (None, _) => self.refuse_download(
+                    raw,
+                    suggested,
+                    DownloadTrigger::AnchorAttribute,
+                    "that address is not a URL the tab can fetch".to_owned(),
+                ),
+            }
+            return false;
+        }
         // A real navigation owns the URL again: any pushState address-bar
         // override from the outgoing document dies with it.
         self.url_override = None;
@@ -1264,7 +1340,7 @@ impl Tab {
             self.emit(FromTab::NetworkEvent { event });
         }
         match fetch {
-            Ok(doc_fetch) => {
+            Ok(mut doc_fetch) => {
                 debug!(
                     "document fetched: {} status {} ({} B) in {} ms",
                     doc_fetch.url,
@@ -1272,6 +1348,37 @@ impl Tab {
                     doc_fetch.body.len(),
                     started.elapsed().as_millis()
                 );
+                // Task: file downloads — a top-level response the server wants
+                // saved instead of painted (`Content-Disposition: attachment`,
+                // whatever its media type) or built of a media type no page is
+                // made of. The bytes go to the shell and the document that was
+                // on screen stays loaded: no history, no archive document, no
+                // `check_meta`, no URL/title change. A form `POST` that answers
+                // an attachment is a download too — the page stays put.
+                let trigger = downloads::attachment_for(
+                    doc_fetch.content_type.as_deref(),
+                    doc_fetch.content_disposition.as_deref(),
+                    // The anchor slot was taken at the top of this function, so
+                    // nothing else suggests itself here.
+                    None,
+                );
+                if let Some((trigger, suggested)) = trigger {
+                    let hint = self.download_hint(
+                        doc_fetch.url.as_str(),
+                        suggested,
+                        trigger,
+                        doc_fetch.content_type.clone(),
+                    );
+                    // The body is already in hand: hand its chunks over by
+                    // taking them out, so a big file is never mapped twice in
+                    // RAM at once.
+                    self.emit_download(hint, &mut doc_fetch.body);
+                    // Unwind the "Waiting for…" the navigation set; the shell
+                    // keeps showing the page that is loaded.
+                    self.emit(FromTab::LoadingChanged { loading: false });
+                    self.emit(FromTab::StatusText { text: None });
+                    return false;
+                }
                 // Archive mode: the served document rides to the shell as
                 // `FromTab::ArchivedFetch` (documents become the host's
                 // `index.html`); error statuses are not "visited pages".
@@ -3252,6 +3359,36 @@ impl Tab {
                 // apply, and never a protocol error.
                 warn!("dialog response #{dialog_id} arrived with no dialog open — ignored");
             }
+            // "Download linked file" (task: file downloads): the shell's
+            // context menu asked, so save it — never render it, even an
+            // `http(s)` URL that would paint. The fetch runs on a worker
+            // thread; the reply is `DownloadStart` → chunks → `DownloadEnd`,
+            // and a URL the tab can never fetch gets the same sequence with
+            // a chunk-free `DownloadEnd { error }`, so a row always settles.
+            ToTab::DownloadUrl { url, suggested_name } => {
+                match parse_input_url(&url).ok() {
+                    Some(target) => match download_target_problem(&target) {
+                        Some(reason) => self.refuse_download(
+                            target.as_str(),
+                            suggested_name,
+                            DownloadTrigger::Requested,
+                            reason,
+                        ),
+                        None => self.start_download(
+                            target,
+                            suggested_name,
+                            DownloadTrigger::Requested,
+                            None,
+                        ),
+                    },
+                    None => self.refuse_download(
+                        &url,
+                        suggested_name,
+                        DownloadTrigger::Requested,
+                        "that address is not a URL the tab can fetch".to_owned(),
+                    ),
+                }
+            }
             ToTab::Destroy => {
                 self.persist();
                 return Some(0);
@@ -4186,6 +4323,224 @@ impl Tab {
     }
 
 
+    // -- downloads -----------------------------------------------------------
+    //
+    // See `ARCHITECTURE.md` §File downloads for the whole feature: the tab
+    // owns *whether* a fetch is a file (it owns the response) and the shell
+    // owns *where* the bytes land. The tab never touches disk.
+
+    /// Start a download of `url` **now**, on a worker thread, and answer
+    /// immediately with `DownloadStart` so the shell can file a row while the
+    /// bytes are still coming (a 500 MB file must not freeze the UI: the tab
+    /// cannot answer stdin while a fetch blocks the tab thread, and the
+    /// shell's own pump has nothing to chew on). `trigger` says what made this
+    /// a download; `suggested` is the name the server or the clicked `<a>`
+    /// wanted — a *suggestion*, sanitized here and sanitized again by the
+    /// shell, because a name from the network is untrusted input.
+    ///
+    /// Nothing else is emitted and nothing else is touched: no history, no
+    /// URL/title change, no `check_meta` — the document on screen stays
+    /// loaded (a download is not a navigation).
+    fn start_download(
+        &mut self,
+        url: Url,
+        suggested: Option<String>,
+        trigger: DownloadTrigger,
+        media_type: Option<String>,
+    ) {
+        // `media_type` is known only when the tab already fetched on its own
+        // thread (a response whose headers revealed it was a file); the
+        // worker's fetch has not settled, so `None` = not yet known.
+        let hint = self.download_hint(url.as_str(), suggested, trigger, media_type);
+        let id = hint.id;
+        self.emit(FromTab::DownloadStart { hint });
+        self.spawn_download(id, url);
+    }
+
+    /// Mint the [`DownloadHint`] for a download and log its start (task: file
+    /// downloads): a fresh id from this process's counter, the URL the tab
+    /// fetches, the name the server or the clicked `<a download>` wanted (a
+    /// *suggestion* — `sanitize_file_name` here, the shell sanitizes again),
+    /// and what made this a download at all.
+    fn download_hint(
+        &mut self,
+        url: &str,
+        suggested: Option<String>,
+        trigger: DownloadTrigger,
+        media_type: Option<String>,
+    ) -> DownloadHint {
+        let hint = DownloadHint {
+            id: self.download_ids.next(),
+            url: url.to_owned(),
+            name: downloads::name_suggestion(suggested.as_deref(), url),
+            media_type,
+            trigger,
+        };
+        info!(
+            "download {:?} {}{}",
+            trigger,
+            url,
+            hint.name
+                .as_deref()
+                .map(|n| format!(" → {n}"))
+                .unwrap_or_default()
+        );
+        hint
+    }
+
+    /// The worker thread behind [`Self::start_download`]: fetch `url` as a GET
+    /// with this tab's own jar/cache/UA (the same code path every navigation
+    /// uses, `fetch_document_report_shared`-style, so cookies, redirects, the
+    /// archive hooks and the DevTools feed all apply), then hand the buffered
+    /// body back through the download queue. A failed fetch is reported
+    /// verbatim — `DownloadEnd { error }` always closes the sequence, so a row
+    /// never sticks at 0 bytes. Its network event carries
+    /// `NetEvent::initiator` `"download"`, so the DevTools panel shows the
+    /// request as one.
+    fn spawn_download(&mut self, id: u64, url: Url) {
+        let policy = self_provider_policy(&self.provider);
+        let jar = Arc::clone(&self.jar);
+        let cache = Arc::clone(&self.cache);
+        let user_agent = self.user_agent.clone();
+        let net_events = Arc::clone(&self.net_events);
+        let archive = Arc::clone(&self.archive);
+        let pipe = Arc::clone(&self.pipe);
+        let tx = self.download_tx.clone();
+        let worker_url = url.clone();
+        let spawn = std::thread::Builder::new()
+            .name("ironsurf-download".to_string())
+            .spawn(move || {
+                let events = Arc::clone(&net_events);
+                let mut report = |event: NetEvent| {
+                    // A download is a request the page never asked for; the
+                    // panel still shows it, tagged as ours.
+                    let mut event = event;
+                    event.initiator = Some("download".to_owned());
+                    events.lock().expect("net events mutex").push(event);
+                };
+                let fetch = netmod::fetch_document_report_shared(
+                    &worker_url,
+                    policy,
+                    &jar,
+                    &cache,
+                    netmod::now_unix(),
+                    &user_agent,
+                    Some(&mut report),
+                );
+                let (chunks, error) = match fetch {
+                    Ok(fetch) => {
+                        info!(
+                            "download {} fetched {} B ({})",
+                            netmod::url_for_log(&fetch.url),
+                            fetch.body.len(),
+                            fetch.status
+                        );
+                        // Archive mode: the bytes are a response like any
+                        // other, so they ride the same feed — but never as
+                        // *the host's document*, which is what an archived
+                        // navigation would overwrite (contract §File
+                        // downloads: a download never touches the archive's
+                        // document bookkeeping).
+                        archive.store(&fetch.url, false, &fetch.body);
+                        let mut body = fetch.body;
+                        match downloads::refusal_for(body.len()) {
+                            Some(reason) => {
+                                warn!("download refused: {reason}");
+                                (Vec::new(), Some(reason))
+                            }
+                            None => (downloads::into_chunks(&mut body), None),
+                        }
+                    }
+                    Err(err) => {
+                        // The user asked to save this; the reason is for them.
+                        warn!("download fetch failed: {err}");
+                        (Vec::new(), Some(err.to_string()))
+                    }
+                };
+                if tx
+                    .send(DownloadShipment {
+                        id,
+                        chunks,
+                        error,
+                    })
+                    .is_err()
+                {
+                    // The tab is being torn down; nothing to ship to.
+                    return;
+                }
+                pipe.wake();
+            });
+        if let Err(err) = spawn {
+            // No thread, no download: say so instead of leaving a spinner.
+            warn!("cannot spawn download worker: {err}");
+            self.emit(FromTab::DownloadEnd {
+                id,
+                error: Some(format!("cannot start the download: {err}")),
+            });
+        }
+    }
+
+    /// Ship a download whose bytes the tab thread already holds (task: file
+    /// downloads): `DownloadStart`, then every chunk, then `DownloadEnd`. The
+    /// bytes are **taken out** of `body` ([`downloads::into_chunks`]) rather
+    /// than copied, so a big file never exists twice, and every chunk leaves
+    /// before the next frame is written.
+    fn emit_download(&mut self, hint: DownloadHint, body: &mut Vec<u8>) {
+        let id = hint.id;
+        let bytes = body.len();
+        let reason = downloads::refusal_for(body.len());
+        let chunks = downloads::into_chunks(body);
+        info!(
+            "download {} shipped {} B ({})",
+            hint.url,
+            bytes,
+            reason.as_deref().unwrap_or("ok")
+        );
+        self.emit(FromTab::DownloadStart { hint });
+        for chunk in chunks {
+            self.emit(FromTab::DownloadChunk { id, bytes: chunk });
+        }
+        self.emit(FromTab::DownloadEnd { id, error: reason });
+    }
+
+    /// Refuse a download the tab cannot fetch at all (task: file downloads):
+    /// a bad scheme, an internal page, a `javascript:` target. The shell still
+    /// gets the full sequence — `DownloadStart` then a chunk-free
+    /// `DownloadEnd { error }` — so its row always settles rather than
+    /// spinning at 0 bytes, and the page on screen stays exactly as it was.
+    fn refuse_download(
+        &mut self,
+        url: &str,
+        suggested: Option<String>,
+        trigger: DownloadTrigger,
+        reason: String,
+    ) {
+        let hint = self.download_hint(url, suggested, trigger, None);
+        let id = hint.id;
+        info!("download of {url} refused: {reason}");
+        self.emit(FromTab::DownloadStart { hint });
+        self.emit(FromTab::DownloadEnd { id, error: Some(reason) });
+    }
+
+    /// Turn one settled worker download into its `DownloadChunk`* →
+    /// `DownloadEnd` tail (task: file downloads). The worker pushes then wakes
+    /// the shared self-pipe, so this runs the moment the fetch lands — never a
+    /// tick late, and always before the next frame is written.
+    fn drain_downloads(&mut self) {
+        while let Ok(shipment) = self.download_rx.try_recv() {
+            for bytes in shipment.chunks {
+                self.emit(FromTab::DownloadChunk {
+                    id: shipment.id,
+                    bytes,
+                });
+            }
+            self.emit(FromTab::DownloadEnd {
+                id: shipment.id,
+                error: shipment.error,
+            });
+        }
+    }
+
     pub(crate) fn persist(&mut self) {
         // Best-effort: the one shared jar (main doc + subresources) lives
         // inside the sandbox-writable profile dir.
@@ -4290,6 +4645,18 @@ struct MediaLoaded {
     node_id: NodeId,
     href: String,
     outcome: Result<Vec<u8>, MediaError>,
+}
+
+/// One download a fetch worker settled (task: file downloads). The tab already
+/// emitted `DownloadStart` when it spawned the worker, so this carries only
+/// what the fetch learned: the body, sliced into chunk-sized `Vec`s **taken
+/// out of** the fetch buffer (never copied: a 512 MiB download must not exist
+/// twice in RAM), or the reason it never got bytes. [`Tab::drain_downloads`]
+/// turns it into the `DownloadChunk`* → `DownloadEnd` tail of the sequence.
+pub(crate) struct DownloadShipment {
+    id: u64,
+    chunks: Vec<Vec<u8>>,
+    error: Option<String>,
 }
 
 /// What page JavaScript asked the players to do (`v.play()`, `v.currentTime
@@ -5510,6 +5877,11 @@ pub fn run(args: TabArgs) -> i32 {
         // poll ships to the shell, which owns the archive folder.
         tab.drain_archive_events();
 
+        // 2a⁗. Downloads (task: file downloads): bytes fetched on the worker
+        // thread land here — the wake it sends makes this drain immediate, so
+        // the shell's panel grows with the file instead of a tick late.
+        tab.drain_downloads();
+
         // 2a″. Console: fetch-side CSS diagnostics (wrong `Content-Type` on a
         // `.css` response) join the DevTools console here (src/logging.rs).
         tab.drain_console_events();
@@ -5581,6 +5953,10 @@ mod tests {
             status: 200,
             body: body.as_bytes().to_vec(),
             refresh: None,
+            // A `data:` URL has no response headers, so the download decision
+            // never comes from here (task: file downloads).
+            content_type: None,
+            content_disposition: None,
         }
     }
 
@@ -5638,6 +6014,8 @@ mod tests {
             status: 200,
             body: script.as_bytes().to_vec(),
             refresh: None,
+            content_type: None,
+            content_disposition: None,
         };
         assert_eq!(render_document(&fetched), script);
     }

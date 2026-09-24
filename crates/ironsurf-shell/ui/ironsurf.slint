@@ -46,6 +46,17 @@ export struct SuggestItem {
     url: string,
 }
 
+/// One ⬇ download row (task: file downloads), reduced from the active tab's
+/// store by `Core::download_rows`: newest first. `name` is what the file is
+/// called, `status` says how far it came (`Saving 1.2 MB` / `Done 3 MB` /
+/// `Failed`), and `sub` is the secondary line — the full path once the file
+/// is on disk, until then how much has landed and where from.
+export struct DownloadItem {
+    name: string,
+    status: string,
+    sub: string,
+}
+
 /// One context-menu row (labels only; Rust keeps the matching actions and
 /// maps the picked index back onto them).
 export struct MenuItem {
@@ -669,6 +680,20 @@ export component AppWindow inherits Window {
     in property <string> archive-status: "";
     in property <string> archive-error: "";
 
+    // Downloads menu (task: file downloads): opened by the ⬇ button beside the
+    // archive's 💾. `downloads` are the active tab's rows (newest first — a
+    // tab's downloads die with its process, so another tab's list is never
+    // mixed in), `download-status` is the one-line folder summary under the
+    // header, and `download-dir-text` the folder draft (prefilled with the
+    // effective root, default `$HOME/Downloads`) whose `download-error`
+    // carries a rejection. `Clear finished` drops the settled rows, never the
+    // files they named.
+    in property <bool> download-menu-open: false;
+    in-out property <string> download-dir-text: "";
+    in property <string> download-status: "";
+    in property <string> download-error: "";
+    in property <[DownloadItem]> downloads;
+
     // Browsing-history menu (task: browsing history): opened by the ☰ button
     // at the right-hand end of the toolbar, next to the container dropdown.
     // `history-items` is the shared visit log (newest first — the log lives
@@ -776,6 +801,15 @@ export component AppWindow inherits Window {
     callback archive-set-enabled(on: bool);
     callback archive-apply-dir(text: string);
 
+    // Download-menu intents (task: file downloads): Apply re-points the folder
+    // (validated in Rust; rejected → `download-error`), `Clear finished` drops
+    // the settled rows of every live tab. Nothing here fetches or writes — the
+    // tab fetches and the pump writes.
+    callback toggle-download-menu();
+    callback close-download-menu();
+    callback download-apply-dir(text: string);
+    callback download-clear-finished();
+
     // History-menu intents (task: browsing history): a row click opens that
     // URL in a new tab; Clear wipes the whole shared log. Row indices are
     // rows of `history-items`, which Rust caps at a display window.
@@ -882,6 +916,11 @@ export component AppWindow inherits Window {
                 // again; the glyph doubles as the on/off state hint in the
                 // overlay, the button only ever toggles the menu.
                 MiniButton { label: "\u{1F4BE}"; clicked => { root.toggle-archive-menu(); } }
+
+                // downloads (task: file downloads) — the ⬇ beside the archive
+                // button it shares a folder-with-draft pattern with: the same
+                // house rule for the button (it only ever toggles the overlay).
+                MiniButton { label: "\u{2B07}"; clicked => { root.toggle-download-menu(); } }
 
                 // container dropdown: shows the active tab's container,
                 // opens the manager on click
@@ -2116,6 +2155,132 @@ export component AppWindow inherits Window {
 
                 Text {
                     text: "History is shared by all containers: one visit in one container is listed (and can be cleared) from all of them. Ctrl-Alt-T reopens the last closed tab.";
+                    color: #888888;
+                    wrap: word-wrap;
+                }
+            }
+        }
+    }
+
+    // ------------------------------------------------------------------------
+    // Downloads overlay (task: file downloads)
+    //
+    // The fifth right-docked Rectangle — the same rectangle pattern as the
+    // archive/UA/manager/history menus (never a PopupWindow: LinuxKMS has
+    // none), opened by the ⬇ toolbar button or Ctrl-Shift-D and never stacked.
+    // Rows are per tab process: what the tab on screen has filed. A row shows
+    // its full path once the file is complete; while it is writing the row
+    // counts what has landed. `Clear finished` is a list operation — files it
+    // named stay on the disk.
+    // ------------------------------------------------------------------------
+    Rectangle {
+        x: 0; y: 0;
+        width: root.width; height: root.height;
+        visible: root.download-menu-open;
+        background: #00000099;
+        download-scrim := TouchArea { clicked => { root.close-download-menu(); } }
+
+        download-panel := Rectangle {
+            TouchArea {} // swallow clicks over the panel
+            x: root.width - self.width;
+            width: Math.min(460px, root.width);
+            height: root.height;
+            background: #1e1e1e;
+
+            VerticalLayout {
+                padding: 12px;
+                spacing: 6px;
+
+                HorizontalLayout {
+                    spacing: 8px;
+                    height: 26px;
+                    Text { text: "\u{2B07} Downloads"; color: #f0f0f0; font-weight: 600; vertical-alignment: center; }
+                    Rectangle { horizontal-stretch: 1; }
+                    MiniButton { label: "✕"; clicked => { root.close-download-menu(); } }
+                }
+
+                // one-line summary (folder receiving the files + rows this tab filed)
+                Text {
+                    text: root.download-status;
+                    color: #a8b8c8;
+                    wrap: word-wrap;
+                }
+
+                // one-line validation feedback (a rejected Apply keeps the draft)
+                Text {
+                    visible: root.download-error != "";
+                    text: root.download-error;
+                    color: #ef5350;
+                    wrap: word-wrap;
+                }
+
+                HorizontalLayout {
+                    height: 28px;
+                    spacing: 6px;
+                    LineEdit {
+                        horizontal-stretch: 1;
+                        text <=> root.download-dir-text;
+                        placeholder-text: "download folder (default: ~/Downloads)";
+                        accepted(t) => { root.download-apply-dir(t); }
+                    }
+                    MiniButton { label: "Apply"; clicked => { root.download-apply-dir(root.download-dir-text); } }
+                }
+
+                dl-list := ListView {
+                    vertical-stretch: 1;
+                    for di in root.downloads: Rectangle {
+                        height: 46px;
+                        width: parent.width;
+                        VerticalLayout {
+                            x: 6px; y: 2px;
+                            width: parent.width - 12px;
+                            spacing: 0px;
+                            HorizontalLayout {
+                                spacing: 6px;
+                                height: 20px;
+                                Text {
+                                    text: di.name;
+                                    color: #e8e8e8;
+                                    font-weight: 600;
+                                    horizontal-alignment: left;
+                                    overflow: elide;
+                                    horizontal-stretch: 1;
+                                }
+                                Text {
+                                    text: di.status;
+                                    color: #7fb27f;
+                                    font-size: 11px;
+                                    horizontal-alignment: right;
+                                }
+                            }
+                            Text {
+                                text: di.sub;
+                                color: #8a8a8a;
+                                font-size: 11px;
+                                horizontal-alignment: left;
+                                overflow: elide;
+                            }
+                        }
+                    }
+                }
+
+                if root.downloads.length == 0: Text {
+                    text: "No downloads in this tab — a file a page offers lands here, and the status line says so even when the panel is shut.";
+                    color: #888888;
+                    wrap: word-wrap;
+                }
+
+                Rectangle { vertical-stretch: 1; }
+
+                HorizontalLayout {
+                    height: 28px;
+                    spacing: 6px;
+                    MiniButton { label: "Clear finished"; clicked => { root.download-clear-finished(); } }
+                    Rectangle { horizontal-stretch: 1; }
+                }
+
+                Text {
+                    text: "A download is not a navigation: the page stays put while its bytes land in the folder. Rows belong to the tab that filed them — closing the tab drops the rows, and a tab that dies mid-download leaves no partial file behind. Ctrl-Shift-D opens and shuts this panel.";
                     color: #888888;
                     wrap: word-wrap;
                 }

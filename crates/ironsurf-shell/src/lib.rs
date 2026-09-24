@@ -15,6 +15,7 @@ slint::include_modules!();
 pub mod archive;
 pub mod archive_server;
 pub mod classify;
+pub mod downloads;
 pub mod clipboard;
 pub mod keymap;
 pub mod state;
@@ -41,6 +42,11 @@ pub mod uisettings {
         /// (`$HOME/Downloads/ironsurf-tabs`).
         #[serde(default)]
         pub archive_dir: Option<String>,
+        /// Downloads folder; `None` = [`crate::downloads::download_root`] with
+        /// the env falling through (`$HOME/Downloads`). Same rules as
+        /// `archive_dir`: absolute (or `~/…`) only, blank reverts to default.
+        #[serde(default)]
+        pub download_dir: Option<String>,
         /// The **archive browsing server** (`ironsurf://archive`): folder, host
         /// and port, all applied from its own control page. `None`s mean "the
         /// default": folder = the archive root, host `127.0.0.1`, port random.
