@@ -83,7 +83,7 @@ use ironsurf_common::{
     CursorIcon, DialogKind, DownloadHint, DownloadTrigger, FromTab, InspectSnapshot, KeyEvent,
     Modifiers, NetEvent, PointerEvent, PointerKind, ScrollEvent, ScrollState, TabId, ToTab,
     Userscript,
-    MAX_CONTEXT_TEXT, MAX_DIALOG_MESSAGE, MAX_DOWNLOAD_BYTES, MAX_DOWNLOAD_CHUNK_BYTES,
+    MAX_CONTEXT_TEXT, MAX_DIALOG_MESSAGE,
 };
 use keyboard_types::{Code, Key, Location, Modifiers as KMods};
 use kurbo::{Affine, Rect, Size};
@@ -239,10 +239,38 @@ unsafe impl Sync for SelfPipe {}
 impl SelfPipe {
     pub fn new() -> io::Result<Self> {
         let mut fds = [0 as RawFd; 2];
-        // SAFETY: writing two fds into a 2-element array.
-        let rc = unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_NONBLOCK | libc::O_CLOEXEC) };
-        if rc != 0 {
-            return Err(io::Error::last_os_error());
+        #[cfg(target_os = "linux")]
+        {
+            // SAFETY: writing two fds into a 2-element array.
+            let rc = unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_NONBLOCK | libc::O_CLOEXEC) };
+            if rc != 0 {
+                return Err(io::Error::last_os_error());
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            // macOS lacks pipe2(): pipe() then fcntl the ends non-blocking/close-on-exec.
+            // SAFETY: writing two fds into a 2-element array.
+            let rc = unsafe { libc::pipe(fds.as_mut_ptr()) };
+            if rc != 0 {
+                return Err(io::Error::last_os_error());
+            }
+            for fd in &fds {
+                // SAFETY: F_GETFL/F_SETFL/F_SETFD on our freshly created fds.
+                let flags = unsafe { libc::fcntl(*fd, libc::F_GETFL) };
+                if flags == -1
+                    || unsafe { libc::fcntl(*fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } == -1
+                    || unsafe { libc::fcntl(*fd, libc::F_SETFD, libc::FD_CLOEXEC) } == -1
+                {
+                    let err = io::Error::last_os_error();
+                    // SAFETY: closing our own pipe ends on the setup error path.
+                    unsafe {
+                        libc::close(fds[0]);
+                        libc::close(fds[1]);
+                    }
+                    return Err(err);
+                }
+            }
         }
         Ok(SelfPipe {
             read_fd: fds[0],
@@ -3722,7 +3750,7 @@ impl Tab {
                 let pressed = BlitzKeyEvent {
                     key: Key::Character("v".to_string()),
                     code: Code::KeyV,
-                    modifiers: KMods::CONTROL,
+                    modifiers: blitz_action_chord(),
                     location: Location::Standard,
                     is_auto_repeating: false,
                     is_composing: false,
@@ -4168,16 +4196,16 @@ impl Tab {
         }
     }
 
-    /// The Ctrl+A chord exactly as the shell forwards it: the letter `a` with
-    /// the Ctrl bit and nothing else (the shell never intercepts clipboard
-    /// chords — `keymap::clipboard_chords_always_reach_the_page` covers `a`).
-    /// Shift/Alt/Meta combinations are different chords (blitz's editor maps
+    /// The action chord exactly as the shell forwards it: the letter with
+    /// just the platform's primary modifier (Ctrl everywhere, Cmd on macOS)
+    /// and nothing else (the shell never intercepts clipboard chords —
+    /// `keymap::clipboard_chords_always_reach_the_page` covers `a`).
+    /// Shift/Alt combinations are different chords (blitz's editor maps
     /// Ctrl+Shift+A to *deselect*), and auto-repeat must not re-run the select.
     fn is_select_all_chord(ev: &KeyEvent) -> bool {
-        ev.mods.ctrl()
+        is_action_chord(ev)
             && !ev.mods.shift()
             && !ev.mods.alt()
-            && !ev.mods.meta()
             && !ev.repeat
             && ev.key.eq_ignore_ascii_case("a")
     }
@@ -5599,8 +5627,42 @@ fn to_blitz_mods(m: Modifiers) -> KMods {
     }
     if m.meta() {
         k |= KMods::META;
+        // macOS: blitz's editing chords run on Cmd (`util::ACTION_MOD = SUPER`),
+        // and the shell forwards the Command key to us as `meta`, so it must
+        // also arrive as SUPER or the editor never sees its paste/copy/select.
+        if cfg!(target_os = "macos") {
+            k |= KMods::SUPER;
+        }
     }
     k
+}
+
+/// The modifier the tab itself keys its editing chords on — mirrors
+/// `blitz-dom`: Ctrl everywhere, Cmd on macOS.
+#[cfg(target_os = "macos")]
+fn is_action_chord(ev: &KeyEvent) -> bool {
+    ev.mods.meta() && !ev.mods.ctrl()
+}
+
+/// The modifier the tab itself keys its editing chords on — mirrors
+/// `blitz-dom`: Ctrl everywhere, Cmd on macOS.
+#[cfg(not(target_os = "macos"))]
+fn is_action_chord(ev: &KeyEvent) -> bool {
+    ev.mods.ctrl() && !ev.mods.meta()
+}
+
+/// A freshly-synthesized editing chord (context-menu Paste) must carry the
+/// platform's action modifier exactly as blitz expects it.
+#[cfg(target_os = "macos")]
+fn blitz_action_chord() -> KMods {
+    KMods::SUPER
+}
+
+/// A freshly-synthesized editing chord (context-menu Paste) must carry the
+/// platform's action modifier exactly as blitz expects it.
+#[cfg(not(target_os = "macos"))]
+fn blitz_action_chord() -> KMods {
+    KMods::CONTROL
 }
 
 /// Net policy is fixed at startup; read it back from the provider so the
@@ -6777,7 +6839,7 @@ mod tests {
             code: "KeyV".into(),
             text: Some("v".into()),
             repeat: false,
-            mods: Modifiers::NONE.with_ctrl(),
+            mods: action_mod(),
         }));
         assert_eq!(
             tab.document_mut().and_then(focused_input_value).as_deref(),
@@ -6851,39 +6913,53 @@ mod tests {
         (tab, sink)
     }
 
-    /// Ctrl+`c` exactly as the shell forwards it (the chord is the letter
-    /// with the Ctrl bit — the shell intercepts copy by contract never).
+    /// The platform's primary chord modifier as the shell forwards it: Ctrl
+    /// everywhere, Cmd on macOS (mirrors `blitz-dom::util::ACTION_MOD`).
+    fn action_mod() -> Modifiers {
+        #[cfg(target_os = "macos")]
+        {
+            Modifiers::NONE.with_meta()
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            Modifiers::NONE.with_ctrl()
+        }
+    }
+
+    /// The action chord exactly as the shell forwards it (the chord is the
+    /// letter with just the primary modifier — the shell intercepts copy by
+    /// contract never).
     fn ctrl_c() -> ToTab {
         ToTab::Key(KeyEvent {
             key: "c".into(),
             code: "KeyC".into(),
             text: Some("c".into()),
             repeat: false,
-            mods: Modifiers::NONE.with_ctrl(),
+            mods: action_mod(),
         })
     }
 
-    /// Ctrl+`v` as the shell forwards it, right after pushing the session
-    /// clipboard with `ToTab::Clipboard`.
+    /// The paste chord as the shell forwards it, right after pushing the
+    /// session clipboard with `ToTab::Clipboard`.
     fn ctrl_v() -> ToTab {
         ToTab::Key(KeyEvent {
             key: "v".into(),
             code: "KeyV".into(),
             text: Some("v".into()),
             repeat: false,
-            mods: Modifiers::NONE.with_ctrl(),
+            mods: action_mod(),
         })
     }
 
-    /// Ctrl+`a` (select all) as the shell forwards it — also never a
-    /// shell-intercepted chord.
+    /// Select-all as the shell forwards it — also never a shell-intercepted
+    /// chord.
     fn ctrl_a() -> ToTab {
         ToTab::Key(KeyEvent {
             key: "a".into(),
             code: "KeyA".into(),
             text: Some("a".into()),
             repeat: false,
-            mods: Modifiers::NONE.with_ctrl(),
+            mods: action_mod(),
         })
     }
 
@@ -7113,6 +7189,20 @@ mod tests {
                 && (p[2] as i32 - 255).abs() <= 6
         };
 
+        // The selection rect is the full line box of the laid-out font, and
+        // that box is taller on macOS (system font metrics); let it hug the
+        // ink within one extra line's worth of slack there, otherwise 14 px.
+        fn highlight_bottom_slack() -> usize {
+            #[cfg(target_os = "macos")]
+            {
+                28
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                14
+            }
+        }
+
         for (zoom, win, devtools) in [
             (1.0f32, 800u32, false),
             (2.0, 1600, false),
@@ -7158,7 +7248,7 @@ mod tests {
                 "the highlight stays below paragraph one's ink at zoom {zoom}                  (devtools {devtools}): sel {sel_box:?}, paragraph one {p1:?}",
             );
             assert!(
-                sel_box.3 < p2.3 + 14,
+                sel_box.3 < p2.3 + highlight_bottom_slack(),
                 "the highlight does not spill below paragraph two's ink at zoom {zoom}                  (devtools {devtools}): sel {sel_box:?}, paragraph two {p2:?}",
             );
             assert!(
@@ -7685,13 +7775,13 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let (mut tab, _sink) = selection_tab(dir.path());
 
-        // Ctrl+Shift+A: not the select-all chord.
+        // The action chord + Shift: not the select-all chord.
         tab.handle_to_tab(ToTab::Key(KeyEvent {
             key: "A".into(),
             code: "KeyA".into(),
             text: Some("A".into()),
             repeat: false,
-            mods: Modifiers::NONE.with_ctrl().with_shift(),
+            mods: action_mod() | Modifiers::NONE.with_shift(),
         }));
         assert!(
             tab.document_mut()

@@ -90,8 +90,12 @@ fn assert_graceful_notes(stdout: &str) {
         "notes should explain the Landlock fallback: {all}"
     );
     assert!(
-        all.contains("NO_NEW_PRIVS") && all.contains("rlimit"),
-        "fallback must still record no_new_privs + rlimits: {all}"
+        all.contains("NO_NEW_PRIVS") || all.contains("no prctl/Landlock"),
+        "fallback must record no_new_privs (Linux) or the platform fallback note: {all}"
+    );
+    assert!(
+        all.contains("rlimit"),
+        "fallback must still record rlimits: {all}"
     );
 }
 

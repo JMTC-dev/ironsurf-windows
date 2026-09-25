@@ -135,7 +135,10 @@ fn main() -> ExitCode {
         }
         let degraded = !status.landlock_active
             && status.rlimits_applied
-            && status.notes.iter().any(|n| n.contains("NO_NEW_PRIVS"));
+            && status
+                .notes
+                .iter()
+                .any(|n| n.contains("NO_NEW_PRIVS") || n.contains("no prctl/Landlock"));
         if degraded {
             eprintln!("sbox-probe: graceful-degradation path verified");
             return ExitCode::from(EXIT_OK);

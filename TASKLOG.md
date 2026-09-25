@@ -84,3 +84,10 @@
   Tests: 14 reader units (chrome falls/prose + img + anchors survive, hidden subtrees never material, JS-added content is material, JS-cleared page falls back to source, lazy placeholders, escaping); headless `--reader` e2e vs local server: cleared.html (script empties #root) → full article + /pic.png restored from source, added.html (pure XHR body) → live text shown; live shell on Xvfb (box's X server dead again; winit needs windowfocus + XTEST): ctrl+alt+r → `ReaderState{true}` → button held, again → off. tab 361u + shell 143u + all integration green.
 ## Scroll bar
 implemented scroll bar
+## macOS: the tab builds and tests green on darwin, and the shell's tofu icons are cross-platform. `SelfPipe::new` uses
+  `pipe2` on Linux only (else `libc::pipe` + fcntl NONBLOCK/CLOEXEC); `to_blitz_mods` maps ⌘→SUPER on mac, and
+  `is_action_chord`/`blitz_action_chord` make Cmd the action/select-all/paste chord (Ctrl elsewhere), with highlight slack 28
+  mac / 14 else; tab tests went geometry-agnostic (headless inspect pick/shot derive points from a probe dump's boxes) and the
+  sandbox probe accepts its mac fallback note. UI: every `✕` (U+2715 — tofu on mac fonts) is now `×`, and the Inspector's ⌖
+  picker button draws a rectangle `Crosshair` instead of the font-missing glyph. tab 349u / sandbox 7 / common 36 green; shell
+  suite green except two pre-existing archive_server fs failures that likewise fail stashed.

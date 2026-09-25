@@ -827,26 +827,32 @@ fn headless_inspect_out_is_the_tree_a_pane_renders() {
 
 /// Where "inspect element" lands, and the row it selects.
 ///
-/// The three points are chosen against the geometry this fixture lays out at
-/// 1024x768 (the `<h1>` starts at `y = 21`, its `<b>` at `x = 53.4`, its `<a>` at
-/// `x = 132.8`), and each one has exactly one element's box under it — so the
-/// answer is not "the nearest thing", it is the deepest thing. This is the test
-/// that the hit-test and the traversal agree on row ids: the doctype row shifts
-/// every id by one, and if the two sides computed ids differently every pick
-/// here would name its parent.
+/// The points come from a probe dump's own boxes, so the test does not depend
+/// on the engine's default font metrics (they differ macOS vs Linux): each
+/// pick is the centre of exactly one element's box — so the answer is not
+/// "the nearest thing", it is the deepest thing. This is the test that the
+/// hit-test and the traversal agree on row ids: the doctype row shifts every
+/// id by one, and if the two sides computed ids differently every pick here
+/// would name its parent.
 #[test]
 fn headless_inspect_pick_selects_the_row_of_the_thing_under_the_cursor() {
     let dir = tempfile::tempdir().expect("tempdir");
-    for (x, y, tag) in [(30.0, 40.0, "h1"), (90.0, 90.0, "b"), (150.0, 90.0, "a")] {
-        let name = format!("pick_{x}_{}", (y * 10.0) as u32);
+    let probe = inspect_dump(dir.path(), "probe", &[]);
+    for tag in ["h1", "b", "a"] {
+        let bounds = tag_of(&probe, tag).bounds.expect("<tag> has a box");
+        // A point the probe's own geometry owns: inside the box, well clear of
+        // every edge (an inline fragment's reported box unions its runs).
+        let x = bounds.x + bounds.width * 0.5;
+        let y = bounds.y + bounds.height * 0.5;
+        let name = format!("pick_{tag}");
         let snapshot = inspect_dump(
             dir.path(),
             &name,
-            &["--inspect-pick", &format!("{x},{y}")],
+            &["--inspect-pick", &format!("{x:.1},{y:.1}")],
         );
         let selected = snapshot
             .selected
-            .unwrap_or_else(|| panic!("({x},{y}) selected nothing"));
+            .unwrap_or_else(|| panic!("pick {tag} at ({x:.1},{y:.1}) selected nothing"));
         let row = snapshot
             .nodes
             .iter()
@@ -854,22 +860,22 @@ fn headless_inspect_pick_selects_the_row_of_the_thing_under_the_cursor() {
             .expect("the selected id is a row of the same snapshot");
         assert_eq!(
             row.tag, tag,
-            "({x},{y}) is inside exactly one element's box"
+            "({x:.1},{y:.1}) is inside exactly one element's box (its own {tag})"
         );
-        let bounds = row.bounds.expect("the selected row has a box");
+        let row_bounds = row.bounds.expect("the selected row has a box");
         assert!(
-            bounds.x <= x && x <= bounds.x + bounds.width,
-            "the row the hit-test named owns ({x},{y}): {bounds:?}"
+            row_bounds.x <= x && x <= row_bounds.x + row_bounds.width,
+            "the row the hit-test named owns ({x:.1},{y:.1}): {row_bounds:?}"
         );
         assert!(
-            bounds.y <= y && y <= bounds.y + bounds.height,
-            "the row the hit-test named owns ({x},{y}): {bounds:?}"
+            row_bounds.y <= y && y <= row_bounds.y + row_bounds.height,
+            "the row the hit-test named owns ({x:.1},{y:.1}): {row_bounds:?}"
         );
     }
 
-    // A point over the page background answers the root element (blitz's rule,
-    // the one `elementFromPoint` uses) and still selects a row.
-    let background = inspect_dump(dir.path(), "pick_background", &["--inspect-pick", "30,20"]);
+    // A point over the margin at the far corner answers the root element
+    // (blitz's rule, the one `elementFromPoint` uses) and still selects a row.
+    let background = inspect_dump(dir.path(), "pick_background", &["--inspect-pick", "990,750"]);
     assert_eq!(
         tag_of(&background, "html").id,
         background.selected.expect("the root element is selectable")
@@ -897,7 +903,9 @@ fn headless_inspect_pick_selects_the_row_of_the_thing_under_the_cursor() {
 /// (`inspector::COLOR_FILL` / `COLOR_OUTLINE`); composited over this fixture's
 /// white page at the headless device scale of 1.0 they land on exact RGB values,
 /// so the shot can be checked pixel for pixel. The unselected shot of the same
-/// page is the control: neither colour occurs anywhere in it.
+/// page is the control: neither colour occurs anywhere in it. The picked point
+/// comes from a probe dump's own `<a>` box, so the test does not depend on the
+/// engine's default font metrics (they differ macOS vs Linux).
 #[test]
 fn headless_inspect_shot_carries_the_marker_on_the_selected_box() {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -917,14 +925,18 @@ fn headless_inspect_shot_carries_the_marker_on_the_selected_box() {
     assert_eq!(count_pixels(px, w, h, amber), 0, "an amber page");
     assert_eq!(count_pixels(px, w, h, ring), 0, "a yellow page");
 
-    // Pick the `<a>`, whose box this fixture lays out at x 132.8..177.6, y 81..100.
+    // Pick a point inside the `<a>`'s own box (probed, not assumed), so the
+    // fixture's layout needs no hardcoded font geometry.
+    let probe = inspect_dump(dir.path(), "probe", &[]);
+    let ab = tag_of(&probe, "a").bounds.expect("the link has a box");
+    let (bx, by) = (ab.x + ab.width * 0.5, ab.y + ab.height * 0.5);
     let shot = dir.path().join("marked.ppm");
     let (marked_json, marked_shot) = inspect_run(
         dir.path(),
         "marked",
         &[
             "--inspect-pick",
-            "150,90",
+            &format!("{bx:.1},{by:.1}"),
             "--shot",
             shot.to_str().unwrap(),
         ],
@@ -940,7 +952,7 @@ fn headless_inspect_shot_carries_the_marker_on_the_selected_box() {
         "the shot shows what the same run selected"
     );
     // The ring sits on the border box, the fill inside it.
-    let inside = pixel(px, w, 150, 90);
+    let inside = pixel(px, w, bx as usize, by as usize);
     assert!(
         count_pixels(px, w, h, amber) > 200,
         "the content box is filled with the marker: {amber:?} found {} times",
@@ -952,10 +964,11 @@ fn headless_inspect_shot_carries_the_marker_on_the_selected_box() {
         count_pixels(px, w, h, ring)
     );
     assert_ne!(inside, (255, 255, 255), "the box under the cursor is marked");
-    // …and it is confined to that box. The `<a>` is ~45x19 device px, so the
-    // whole marker is a few hundred pixels; if the marker leaked (scaled wrong,
-    // painted over the viewport, painted twice per frame) these counts would run
-    // away, and a page the colour of nothing else in the fixture is untouched.
+    // …and it is confined to that box. The `<a>` is only a few tens of px, so
+    // the whole marker is a few hundred pixels; if the marker leaked (scaled
+    // wrong, painted over the viewport, painted twice per frame) these counts
+    // would run away, and a page the colour of nothing else in the fixture is
+    // untouched.
     let marked_pixels = count_pixels(px, w, h, amber) + count_pixels(px, w, h, ring);
     assert!(
         marked_pixels < 5_000,
