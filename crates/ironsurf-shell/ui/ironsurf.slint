@@ -158,6 +158,16 @@ component Crosshair inherits Rectangle {
     }
 }
 
+/// Hamburger icon (the history ☰ button and its menu header). U+2630 exists
+/// only in some fonts (macOS renders tofu), so the icon is three rectangles —
+/// the same everywhere.
+component Hamburger inherits Rectangle {
+    in property <color> tint: #e8e8e8;
+    Rectangle { x: 2px; y: root.height / 2 - 5px; width: root.width - 4px; height: 2px; background: root.tint; }
+    Rectangle { x: 2px; y: root.height / 2 - 1px; width: root.width - 4px; height: 2px; background: root.tint; }
+    Rectangle { x: 2px; y: root.height / 2 + 3px; width: root.width - 4px; height: 2px; background: root.tint; }
+}
+
 /// A tiny borderless toolbar button (cheaper than styled Buttons in rows).
 component MiniButton inherits Rectangle {
     in property <string> label: "";
@@ -166,10 +176,12 @@ component MiniButton inherits Rectangle {
     /// stays dark-blue while the mode it toggles is on.
     in property <bool> checked: false;
     in property <color> tint: #262626;
-    /// Show the drawn [`Crosshair`] instead of a text label (the picker ⌖).
-    in property <bool> icon-crosshair: false;
+    /// Draw an icon instead of the text label: "crosshair" is the Inspector
+    /// picker's ⌖, "hamburger" is the history ☰ — both glyphs miss on some
+    /// fonts, so both icons are drawn rectangles that render everywhere.
+    in property <string> icon: "";
     callback clicked();
-    width: Math.max(22px, root.icon-crosshair ? 0px : lbl.preferred-width + 12px);
+    width: Math.max(22px, root.icon == "" ? lbl.preferred-width + 12px : 0px);
     height: 24px;
     bg := Rectangle {
         background: ta.has-hover ? (root.enabled ? #3d3d3d : #2c2c2c) : (root.checked ? #35567d : root.tint);
@@ -177,15 +189,23 @@ component MiniButton inherits Rectangle {
     }
     lbl := Text {
         text: root.label;
-        visible: !root.icon-crosshair;
+        visible: root.icon == "";
         color: root.enabled ? #e8e8e8 : #6a6a6a;
         horizontal-alignment: center;
         vertical-alignment: center;
         width: parent.width;
         height: parent.height;
     }
-    ico := Crosshair {
-        visible: root.icon-crosshair;
+    cross-ico := Crosshair {
+        visible: root.icon == "crosshair";
+        x: (parent.width - self.width) / 2;
+        y: (parent.height - self.height) / 2;
+        width: 14px;
+        height: 14px;
+        tint: root.enabled ? #e8e8e8 : #6a6a6a;
+    }
+    menu-ico := Hamburger {
+        visible: root.icon == "hamburger";
         x: (parent.width - self.width) / 2;
         y: (parent.height - self.height) / 2;
         width: 14px;
@@ -975,8 +995,13 @@ export component AppWindow inherits Window {
             height: 38px;
             background: #2b2b2b;
 
+            // The bar fills the window (the url-bar below stretches to eat
+            // whatever is left), so the rightmost ☰ history button sits inside
+            // the window instead of drifting off the right edge when the
+            // window or the OS fonts are narrow/wide.
             HorizontalLayout {
                 x: 8px;
+                width: parent.width - 16px;
                 height: parent.height;
                 cross-axis-alignment: center;
                 spacing: 6px;
@@ -1049,7 +1074,7 @@ export component AppWindow inherits Window {
                 // browsing history (task: browsing history) — the rightmost
                 // control of the top bar, right next to the container
                 // dropdown; same house pattern as the menu buttons to its left
-                MiniButton { label: "\u{2630}"; clicked => { root.toggle-history-menu(); } }
+                MiniButton { icon: "hamburger"; clicked => { root.toggle-history-menu(); } }
             }
         }
 
@@ -1264,7 +1289,7 @@ export component AppWindow inherits Window {
                                 // the picker (Ctrl-Shift-C is the same chord).
                                 MiniButton {
                                     label: "";
-                                    icon-crosshair: true;
+                                    icon: "crosshair";
                                     tint: root.inspector-pick ? #7a4a1d : #262626;
                                     clicked => { root.devtools-toggle-pick(); }
                                 }
@@ -2247,7 +2272,8 @@ export component AppWindow inherits Window {
                 HorizontalLayout {
                     spacing: 8px;
                     height: 26px;
-                    Text { text: "\u{2630} History"; color: #f0f0f0; font-weight: 600; vertical-alignment: center; }
+                    Hamburger { width: 14px; height: 14px; tint: #f0f0f0; }
+                    Text { text: "History"; color: #f0f0f0; font-weight: 600; vertical-alignment: center; }
                     Rectangle { horizontal-stretch: 1; }
                     MiniButton { label: "×"; clicked => { root.close-history-menu(); } }
                 }
