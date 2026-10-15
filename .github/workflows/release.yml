@@ -1,0 +1,83 @@
+name: Release
+
+on:
+  release:
+    types: [created]
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-upload:
+    name: Build ${{ matrix.os }} binary
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install Linux dependencies
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential \
+            pkg-config \
+            libssl-dev \
+            libfontconfig-dev \
+            libudev-dev \
+            libxkbcommon-dev \
+            libx11-dev \
+            libx11-xcb-dev \
+            libxcb1-dev \
+            libxrandr-dev \
+            libxi-dev \
+            libxext-dev \
+            libxfixes-dev \
+            libxrender-dev
+
+      - name: Install macOS dependencies
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          brew install pkg-config fontconfig openssl@3
+          echo "PKG_CONFIG_PATH=/opt/homebrew/opt/openssl@3/lib/pkgconfig:/opt/homebrew/opt/fontconfig/lib/pkgconfig:/usr/local/opt/openssl@3/lib/pkgconfig:/usr/local/opt/fontconfig/lib/pkgconfig${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}" >> "$GITHUB_ENV"
+          echo "LDFLAGS=-L/opt/homebrew/opt/openssl@3/lib -L/opt/homebrew/opt/fontconfig/lib${LDFLAGS:+ $LDFLAGS}" >> "$GITHUB_ENV"
+          echo "CPPFLAGS=-I/opt/homebrew/opt/openssl@3/include -I/opt/homebrew/opt/fontconfig/include${CPPFLAGS:+ $CPPFLAGS}" >> "$GITHUB_ENV"
+
+      - name: Build release binary
+        shell: bash
+        run: cargo build --release --locked --workspace
+
+      - name: Prepare artifact name
+        id: artifact
+        shell: bash
+        run: |
+          os_name="${{ runner.os }}"
+          if [ "$os_name" = "Linux" ]; then
+            artifact_name="ironsurf-linux-x86_64"
+          else
+            artifact_name="ironsurf-macos-x86_64"
+          fi
+          echo "name=$artifact_name" >> "$GITHUB_OUTPUT"
+
+      - name: Package binary
+        shell: bash
+        run: |
+          mkdir -p dist
+          cp target/release/ironsurf-shell dist/${{ steps.artifact.outputs.name }}
+          chmod +x dist/${{ steps.artifact.outputs.name }}
+          tar -czf dist/${{ steps.artifact.outputs.name }}.tar.gz -C dist ${{ steps.artifact.outputs.name }}
+
+      - name: Upload release asset
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*.tar.gz
