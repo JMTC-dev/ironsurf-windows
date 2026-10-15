@@ -91,10 +91,7 @@ implemented scroll bar
   sandbox probe accepts its mac fallback note. UI: every `✕` (U+2715 — tofu on mac fonts) is now `×`, and the Inspector's ⌖
   picker button draws a rectangle `Crosshair` instead of the font-missing glyph. tab 349u / sandbox 7 / common 36 green; shell
   suite green except two pre-existing archive_server fs failures that likewise fail stashed.
-## History button: cross-platform + always on-screen. The ☰ (U+2630) history button was tofu on macOS fonts — like the ✕/⌖
-  before it, MiniButton now takes a drawn `icon` ("crosshair" | "hamburger") instead of a font glyph; the history menu header's
-  `☰ History` text is a drawn `Hamburger` + "History". The toolbar also no longer sizes to its preferred width (~1030, so its
-  rightmost end drifted past a 1040 window and any font-metric shift on macOS): `MiniButton`'s layout now fills the bar
-  (`width: parent.width - 16px`) and the url-bar's stretch absorbs the leftover, so the history button always sits inside the
-  window whatever the window or font width. Slint-only; shell units (147 pass, 3 pre-existing archive_server fs/timing fails)
-  + 17 layout-sensitive integration binaries (gui/pump/url_bar/find/loading_bar/devtools/history_menu/…) all green.
+## GitHub Actions CI + release: added Linux/macOS build workflow on push/workflow_dispatch, plus a release-triggered
+  packaging job that builds `ironsurf-shell` and uploads a `.tar.gz` asset to the GitHub release.
+  Validation: installed the repo's required Linux build dependencies and ran `cargo build --workspace --locked`; it completed successfully.
+  This closes the GitHub Actions issue by wiring the project to automated CI and publish-on-release automation.
