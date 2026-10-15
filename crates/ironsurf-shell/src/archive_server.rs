@@ -181,7 +181,8 @@ pub fn parse_port(raw: &str) -> Result<u16, String> {
 
 /// Normalize a folder field: trim, expand a leading `~`, insist on an absolute
 /// path, create the tree (an archive folder that does not exist yet is a
-/// feature, not an error).
+/// feature, not an error), and return the canonical absolute path so symlinks
+/// and trailing separators do not persist in the server configuration.
 pub fn normalize_root(raw: &str) -> Result<PathBuf, String> {
     let expanded = expand_tilde(raw.trim());
     if expanded.is_empty() {
@@ -192,7 +193,10 @@ pub fn normalize_root(raw: &str) -> Result<PathBuf, String> {
         return Err(format!("folder must be an absolute path: {expanded}"));
     }
     std::fs::create_dir_all(&path).map_err(|e| format!("cannot create {expanded}: {e}"))?;
-    Ok(path)
+    let canonical = path
+        .canonicalize()
+        .map_err(|e| format!("cannot canonicalize {expanded}: {e}"))?;
+    Ok(canonical)
 }
 
 /// `~` and `~/…` expanded against `$HOME` (left alone when `HOME` is unset).
