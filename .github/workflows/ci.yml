@@ -69,5 +69,8 @@ jobs:
       - name: Build release binary
         run: cargo build --release --locked --workspace
 
+      - name: Free release build artifacts
+        run: cargo clean --release
+
       - name: Run test suite
         run: cargo test --locked --workspace
