@@ -15,7 +15,8 @@ export PATH="$HOME/.cargo/bin:$PATH"
 # 2. Build-time system packages
 apt install -y --no-install-recommends \
   build-essential pkg-config git curl ca-certificates \
-  libssl-dev libfontconfig-dev libudev-dev
+  libssl-dev libfontconfig-dev \
+  libudev-dev libinput-dev libgbm-dev libxkbcommon-dev
 
 # 3. Runtime libraries for `cargo run -p ironsurf-shell` (X11, software rendering)
 apt install -y --no-install-recommends \

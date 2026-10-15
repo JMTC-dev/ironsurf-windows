@@ -34,6 +34,8 @@ jobs:
             libssl-dev \
             libfontconfig-dev \
             libudev-dev \
+            libinput-dev \
+            libgbm-dev \
             libxkbcommon-dev \
             libx11-dev \
             libx11-xcb-dev \
