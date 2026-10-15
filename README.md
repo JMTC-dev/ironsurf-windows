@@ -4,7 +4,25 @@ This is a browser I am building using AI Agents. Almost none of the code is hand
 
 Components: Boa for JS, Stylo for CSS, Blitz for HTML DOM. Slint for the UI.
 
-Tab support with native firefox-style multi-account containers is the goal.
+It is still very experimental but notable features implemented so far include:
+- tabs
+- multi-account containers (like the firefox extension)
+- userscripts
+- dev tools console, network traffic and inspect element
+- reader mode
+- user agent switcher
+- archive mode that saves every request automatically
+
+This project aims to show that anyone can now build their own browser with AI to fit their own needs. No frontier model is needed; this codebase is largely written with Qwen 3.8 Flash Next running locally.
+
+Eventually security auditing will be done a lot more and since rendering stack is fully Rust there should be way less memory based vulns than Chromium and Gecko which still use C++.
+
+**Go build your own browser and help end the monopoly of Chromium!**
+
+
+---------------
+
+mostly AI gen'd text from this pt on
 
 ## Building (Debian)
 
