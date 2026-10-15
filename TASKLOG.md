@@ -95,3 +95,6 @@ implemented scroll bar
   packaging job that builds `ironsurf-shell` and uploads a `.tar.gz` asset to the GitHub release.
   Validation: installed the repo's required Linux build dependencies and ran `cargo build --workspace --locked`; it completed successfully.
   This closes the GitHub Actions issue by wiring the project to automated CI and publish-on-release automation.
+## CI linker fix: ubuntu-latest lacked libinput-dev and libgbm-dev, so shell linking failed on `-linput`/`-lgbm`;
+  added both to CI and the Debian build list, correcting the stale legacy note. Workflow YAML parses;
+  cargo check was blocked locally by missing fontconfig-dev and denied apt installation.
