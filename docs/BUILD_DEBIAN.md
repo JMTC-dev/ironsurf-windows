@@ -15,7 +15,7 @@ export PATH="$HOME/.cargo/bin:$PATH"
 # 2. Build-time system packages
 apt install -y --no-install-recommends \
   build-essential pkg-config git curl ca-certificates \
-  libssl-dev libfontconfig-dev libudev-dev
+  libssl-dev libfontconfig-dev libudev-dev libinput-dev libgbm-dev libxkbcommon-dev
 
 # 3. Runtime libraries for `cargo run -p ironsurf-shell` (X11, software rendering)
 apt install -y --no-install-recommends \
@@ -96,8 +96,8 @@ The test suite itself needs nothing beyond localhost + `example.com`:
 ## Legacy packages that are no longer dependencies
 
 Removed with the Servo/mozjs pivot (task #6/#10; see `docs/ENGINE_INTEGRATION.md` §System build
-deps): `libglib2.0-dev`, `libgstreamer-plugins-base1.0-dev` + friends, `libgbm-dev`/Mesa dev
-packages, `llvm` (was only needed for `llvm-objdump` in `mozjs-sys`), `clang`/`libclang`,
+deps): `libglib2.0-dev`, `libgstreamer-plugins-base1.0-dev` + friends, Mesa dev packages,
+`llvm` (was only needed for `llvm-objdump` in `mozjs-sys`), `clang`/`libclang`,
 `libfreetype-dev` + `freetype-sys`, `libx11-dev`/`libxcb1-dev`. If you are pruning an old box,
 `dpkg -l` will still show several of them — none are used by the current graph
 (`cargo tree -e normal | grep -- '-sys '` → only `openssl-sys`, `wayland-sys`,
