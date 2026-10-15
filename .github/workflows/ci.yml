@@ -67,10 +67,10 @@ jobs:
             ${{ runner.os }}-cargo-
 
       - name: Build release binary
-        run: cargo build --release --locked --workspace
+        run: cargo build --release --verbose --locked --workspace
 
       - name: Free release build artifacts
         run: cargo clean --release
 
       - name: Run test suite
-        run: cargo test --locked --workspace
+        run: cargo test --locked --workspace --verbose
