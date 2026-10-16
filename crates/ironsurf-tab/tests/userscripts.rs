@@ -159,6 +159,45 @@ impl TabChild {
         }
     }
 
+    /// Like [`TestTab::wait_for`], but only messages from `from` onwards count.
+    ///
+    /// `wait_for` answers from the whole log, which is wrong for a **reload of
+    /// the same address**: that address is already in the log from the first
+    /// visit, so it returns before the reload happened. Sleeping a fixed while
+    /// instead — what step 7 below used to do — loses the reloaded document's
+    /// title on a loaded machine, which is how that assert went red.
+    fn wait_for_after(
+        &mut self,
+        what: &str,
+        from: usize,
+        pred: impl Fn(&FromTab) -> bool,
+    ) {
+        let deadline = Instant::now() + DEADLINE;
+        loop {
+            if self.seen[from..].iter().any(|msg| pred(msg)) {
+                return;
+            }
+            if Instant::now() >= deadline {
+                let status = self.child.try_wait().ok().flatten();
+                panic!(
+                    "timed out waiting for {what} after message #{from} (child status: \
+                     {status:?})\nmessages since then: {:#?}",
+                    &self.seen[from..]
+                );
+            }
+            match self.events.recv_timeout(Duration::from_millis(500)) {
+                Ok(msg) => self.seen.push(msg),
+                Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    let status = self.child.wait().ok();
+                    panic!(
+                        "stdout closed while waiting for {what} (child status: {status:?})"
+                    );
+                }
+            }
+        }
+    }
+
     fn console(&self, source: &str) -> Vec<(String, String)> {
         self.seen
             .iter()
@@ -392,13 +431,21 @@ fn userscripts_run_per_document_and_are_attributed_by_name() {
         .filter(|(level, _)| level == "error")
         .count();
     let user_lines_before = tab.console("userscript").len();
+    let reloaded_from = tab.seen.len();
     tab.send(ToTab::SetUserscripts { scripts: vec![] });
     tab.send(ToTab::Navigate { url: target.clone() });
-    tab.wait_for("reload of the target page", |msg| {
-        matches!(msg, FromTab::UrlChanged { url: Some(u) } if u == &target)
-    });
-    // Give the reloaded document's script turn a chance to speak, then count.
-    thread::sleep(Duration::from_millis(750));
+    // A positioned wait, not a sleep, and not on `UrlChanged`: this navigation
+    // goes to the address the tab is already on, and an address that did not
+    // change is not announced again — the reload's own evidence is its document,
+    // whose title is the page's own now that the patcher is gone. Waiting for it
+    // also means the console counts below are read after this document had its
+    // script turn (scripts run before the title settles), not after a guess.
+    tab.wait_for_after(
+        "the reloaded document keeps its own title",
+        reloaded_from,
+        |msg| matches!(msg, FromTab::TitleChanged { title: Some(t) } if t == "Userscript target"),
+    );
+    thread::sleep(Duration::from_millis(250));
     while let Ok(msg) = tab.events.try_recv() {
         tab.seen.push(msg);
     }
@@ -415,15 +462,7 @@ fn userscripts_run_per_document_and_are_attributed_by_name() {
         user_errors_before,
         "the cleared set must not re-report the thrower"
     );
-    // The page's own title stands again (the patcher is gone).
-    assert!(
-        tab.seen.iter().any(|msg| matches!(
-            msg,
-            FromTab::TitleChanged { title: Some(t) } if t == "Userscript target"
-        )),
-        "after the clear the document keeps its own title: {:#?}",
-        tab.seen
-    );
+    // (The title itself was waited for above, positioned on this reload.)
     assert!(
         tab.child.try_wait().ok().flatten().is_none(),
         "the tab is still alive after the cleared navigation"

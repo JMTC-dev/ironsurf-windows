@@ -73,8 +73,11 @@ pub enum FromTab {
     StatusText {
         text: Option<String>,
     },
-    /// Middle-click on a link: the shell must open `url` in a **new tab**
-    /// (same container as the requesting tab) without navigating this tab.
+    /// Middle-click on a link, or a **popup the blocker allowed** (task: popup
+    /// blocker): the shell must open `url` in a **new tab** (same container as
+    /// the requesting tab) without navigating this tab. The tab never spawns
+    /// anything itself — the shell owns every tab — so this is the only way a
+    /// page's `window.open`/`target="_blank"` becomes a window at all.
     OpenLinkInNewTab {
         url: String,
     },
@@ -267,6 +270,18 @@ pub enum FromTab {
     ScrollState {
         state: ScrollState,
     },
+    /// **Popup blocked** (task: popup blocker): the page tried to open a new
+    /// tab — `window.open(…)`, or a script activating a `target="_blank"`
+    /// link — with no recent user gesture behind it, and this tab's popup
+    /// policy refused it. `url` is the request's target resolved against the
+    /// document URL, capped at [`MAX_POPUP_URL_CHARS`] chars (a `data:` target
+    /// can be megabytes). Nothing else happens: no tab is spawned, this tab
+    /// keeps its document. The message exists so the user can see a refusal
+    /// happened and allow the site — only the shell can open a tab, so only
+    /// the shell can say whether one opened.
+    PopupBlocked {
+        url: String,
+    },
     Closed,
     Error {
         message: String,
@@ -453,6 +468,23 @@ pub enum ToTab {
     SetReader {
         enabled: bool,
     },
+    /// **Popup policy** (task: popup blocker): whether this tab refuses the
+    /// popups its page asks for. `block` is the master switch (`true` = block
+    /// anything a user gesture did not just authorize); `allowed` lists the
+    /// document origins whose popups are never blocked — each entry an ASCII
+    /// origin (`https://example.com`, no path, lower-case), matched against the
+    /// document URL's origin at the moment of the request, so a page on
+    /// `accounts.example.com` is a different entry than `example.com`.
+    ///
+    /// Sent to a tab at spawn (before its first load), and rebroadcast to
+    /// every live tab whenever either half changes — a change applies to the
+    /// page on screen, not just to tabs opened afterwards. A tab that never
+    /// receives this message blocks popups with an empty allow-list: the safe
+    /// reading is the default.
+    SetPopupPolicy {
+        block: bool,
+        allowed: Vec<String>,
+    },
     Destroy,
 }
 
@@ -599,9 +631,7 @@ pub struct ContextTarget {
 pub enum ContextAction {
     /// Insert `text` at the focused text control's caret (the tab feeds the
     /// clipboard cache to blitz and synthesizes Ctrl+V).
-    Paste {
-        text: String,
-    },
+    Paste { text: String },
     /// Play/pause the `<video>` that was under the cursor at right-click
     /// (the tab keeps that element's player around until the next click).
     ToggleVideo,
@@ -610,6 +640,81 @@ pub enum ContextAction {
 /// Cap for text carried in context-menu messages (`ContextTarget::selection`)
 /// — the selection is a convenience copy path, not an exfil channel.
 pub const MAX_CONTEXT_TEXT: usize = 256 * 1024;
+
+/// Characters of a blocked popup's URL the tab reports (task: popup blocker).
+/// The notice is one line of UI; a `data:text/html,…` target is arbitrarily
+/// large, so the tail is dropped rather than shipped.
+pub const MAX_POPUP_URL_CHARS: usize = 512;
+
+/// Origins a popup allow-list may hold (task: block popups). It is user data
+/// carried on every `ToTab::SetPopupPolicy`, so it is bounded — and bounded
+/// *identically* on both ends, because a list the shell trimmed differently
+/// from the list the tab judged with is a site the user allowed that is
+/// silently blocked anyway.
+pub const MAX_POPUP_ALLOWED_ORIGINS: usize = 64;
+
+/// The origin of an already-parsed URL, as the popup policy names it: tuple
+/// schemes only, ASCII-serialized, port included when it is not the scheme's
+/// default (`https://example.com:8443/a?b` → `https://example.com:8443`).
+/// `None` = an origin nothing can match — `about:blank`, a `data:`/`blob:`
+/// document, a `javascript:` run — which is exactly the reading a policy wants:
+/// a document with no origin is never covered by an allow-list entry.
+pub fn origin_of(url: &url::Url) -> Option<String> {
+    let origin = url.origin();
+    if !origin.is_tuple() {
+        return None;
+    }
+    let serialized = origin.ascii_serialization();
+    (!serialized.is_empty() && serialized != "null").then_some(serialized)
+}
+
+/// [`origin_of`] for a URL given as text (what the shell has: the address bar,
+/// a `FromTab::UrlChanged`). A URL it cannot parse has no origin.
+pub fn popup_origin(url: &str) -> Option<String> {
+    url::Url::parse(url.trim()).ok().and_then(|url| origin_of(&url))
+}
+
+/// What a **user** types for a site, normalized to the origin the policy
+/// stores: `Example.COM/path` → `https://example.com`,
+/// `http://localhost:8080/x` → `http://localhost:8080`. A bare host is read as
+/// `https`, because that is what naming a site today means. `None` = not a site
+/// name at all (empty, whitespace, a host-less URL) — dropped, never stored
+/// broken, rather than kept as an entry that matches nothing.
+pub fn normalize_popup_origin(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() || trimmed.contains(char::is_whitespace) {
+        return None;
+    }
+    let candidate = if trimmed.contains("://") {
+        trimmed.to_owned()
+    } else {
+        format!("https://{trimmed}")
+    };
+    let parsed = url::Url::parse(&candidate).ok()?;
+    parsed.host_str()?;
+    origin_of(&parsed)
+}
+
+/// Replace an allow-list entry for `origin` (task: block popups): `allow` adds
+/// it (deduped, list capped at [`MAX_POPUP_ALLOWED_ORIGINS`] — oldest entries
+/// give way, since the one the user just acted on must never be the one that
+/// falls off) and `false` removes it. Both ends of the wire use it so a list
+/// the shell shows is a list the tab judges with, byte for byte.
+pub fn set_popup_allowed(allowed: &[String], origin: &str, allow: bool) -> Vec<String> {
+    let mut list: Vec<String> = allowed
+        .iter()
+        .filter(|entry| entry.as_str() != origin)
+        .cloned()
+        .collect();
+    if allow {
+        list.push(origin.to_owned());
+        // Oldest entries give way: the one the user has just acted on must
+        // never be the one that falls off the capped list.
+        let overflow = list.len().saturating_sub(MAX_POPUP_ALLOWED_ORIGINS);
+        list.drain(..overflow);
+    }
+    list
+}
 
 /// What made a top-level fetch a **download** instead of a page. The tab
 /// decides (it owns the response), the shell only displays it, so the
@@ -716,7 +821,13 @@ pub fn is_download_media_type(media_type: &str) -> bool {
     // file anyone has to save to read.
     if matches!(
         sub,
-        "xhtml+xml" | "xml" | "json" | "javascript" | "x-javascript" | "ecmascript" | "x-ecmascript"
+        "xhtml+xml"
+            | "xml"
+            | "json"
+            | "javascript"
+            | "x-javascript"
+            | "ecmascript"
+            | "x-ecmascript"
     ) || sub.ends_with("+xml")
         || sub.ends_with("+json")
     {
@@ -743,7 +854,10 @@ pub fn sanitize_file_name(name: &str) -> Option<String> {
     for ch in name.chars() {
         // Chrome's own list of characters a file name may not carry.
         if ch.is_control()
-            || matches!(ch, '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|' | '\0')
+            || matches!(
+                ch,
+                '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|' | '\0'
+            )
         {
             // A separator inside a suggestion is the end of the useful part
             // (`a/b` → `a`); a leading one means the name has nothing left.
@@ -1167,9 +1281,15 @@ fn scheme_and_host(url: &str) -> (Option<&str>, Option<&str>) {
     let scheme = &url[..idx];
     let rest = &url[idx + 3..];
     let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
-    let host = authority.rsplit_once('@').map(|(_, h)| h).unwrap_or(authority);
+    let host = authority
+        .rsplit_once('@')
+        .map(|(_, h)| h)
+        .unwrap_or(authority);
     let host = host.split(':').next().unwrap_or("");
-    (Some(scheme), if host.is_empty() { None } else { Some(host) })
+    (
+        Some(scheme),
+        if host.is_empty() { None } else { Some(host) },
+    )
 }
 
 /// Whether the URL speaks `http:` or `https:` (the only schemes a wildcard
@@ -1221,7 +1341,10 @@ pub fn userscript_matches(pattern: &str, url: &str) -> bool {
             Some((d, p)) => (d, Some(p)),
             None => (domain, None),
         };
-        let domain = domain.strip_prefix("*.").or_else(|| domain.strip_prefix('.')).unwrap_or(domain);
+        let domain = domain
+            .strip_prefix("*.")
+            .or_else(|| domain.strip_prefix('.'))
+            .unwrap_or(domain);
         let (scheme, host) = scheme_and_host(&url);
         if !is_http_like(scheme) {
             return false;
@@ -1230,8 +1353,7 @@ pub fn userscript_matches(pattern: &str, url: &str) -> bool {
             Some(h) => h,
             None => return false,
         };
-        let host_ok =
-            domain.is_empty() || host == domain || host.ends_with(&format!(".{domain}"));
+        let host_ok = domain.is_empty() || host == domain || host.ends_with(&format!(".{domain}"));
         host_ok && path.map(|p| url.ends_with(p)).unwrap_or(true)
     } else {
         if url == pattern {
@@ -1248,8 +1370,7 @@ pub fn userscript_matches(pattern: &str, url: &str) -> bool {
                 let url_path = url
                     .split_once("://")
                     .map(|(_, r)| {
-                        let after_auth =
-                            r.split_once('/').map(|(_, p)| p).unwrap_or("");
+                        let after_auth = r.split_once('/').map(|(_, p)| p).unwrap_or("");
                         after_auth.split(['?', '#']).next().unwrap_or("")
                     })
                     .unwrap_or("");
@@ -1287,7 +1408,10 @@ pub const BUILTIN_USER_AGENTS: &[(&str, &str)] = &[
 /// string match (no case folding, no trimming). `None` means `ua` is a
 /// custom (non-preset) UA string.
 pub fn builtin_user_agent_label(ua: &str) -> Option<&'static str> {
-    BUILTIN_USER_AGENTS.iter().find(|(_, v)| *v == ua).map(|(label, _)| *label)
+    BUILTIN_USER_AGENTS
+        .iter()
+        .find(|(_, v)| *v == ua)
+        .map(|(label, _)| *label)
 }
 
 /// Whether `ua` is one of the [`BUILTIN_USER_AGENTS`] presets (exact match);
@@ -1411,7 +1535,9 @@ mod tests {
         frame_round_trip(ToTab::SetUserAgent {
             user_agent: Some("Mozilla/5.0 (custom UA // IronSurf-测试)".into()),
         });
-        let preset = builtin_user_agent_label("Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)");
+        let preset = builtin_user_agent_label(
+            "Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)",
+        );
         assert_eq!(preset, Some("Googlebot"));
         let msg = frame_round_trip(ToTab::SetUserAgent {
             user_agent: Some(BUILTIN_USER_AGENTS[0].1.to_string()),
@@ -1431,7 +1557,13 @@ mod tests {
         let labels: Vec<&str> = BUILTIN_USER_AGENTS.iter().map(|(l, _)| *l).collect();
         assert_eq!(
             labels,
-            vec!["Firefox", "Chrome", "Bingbot", "Googlebot", "Android Chrome"]
+            vec![
+                "Firefox",
+                "Chrome",
+                "Bingbot",
+                "Googlebot",
+                "Android Chrome"
+            ]
         );
         for (label, ua) in BUILTIN_USER_AGENTS {
             assert_eq!(builtin_user_agent_label(ua), Some(*label));
@@ -1443,7 +1575,12 @@ mod tests {
         assert!(!is_builtin_user_agent("firefox"));
         assert_eq!(builtin_user_agent_label(""), None);
         assert!(!is_builtin_user_agent(""));
-        assert_eq!(builtin_user_agent_label("Mozilla/5.0 (X11; Linux x86_64; rv:999.0) Gecko/20100101 Firefox/999.0"), None);
+        assert_eq!(
+            builtin_user_agent_label(
+                "Mozilla/5.0 (X11; Linux x86_64; rv:999.0) Gecko/20100101 Firefox/999.0"
+            ),
+            None
+        );
         let firefox = BUILTIN_USER_AGENTS[0].1;
         assert_eq!(builtin_user_agent_label(&format!(" {firefox}")), None);
     }
@@ -1492,17 +1629,26 @@ mod tests {
             scale: 1.0,
             rgba: vec![0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15],
         });
-        frame_round_trip(FromTab::TitleChanged { title: Some("t".into()) });
+        frame_round_trip(FromTab::TitleChanged {
+            title: Some("t".into()),
+        });
         frame_round_trip(FromTab::TitleChanged { title: None });
-        frame_round_trip(FromTab::UrlChanged { url: Some("https://example.com".into()) });
+        frame_round_trip(FromTab::UrlChanged {
+            url: Some("https://example.com".into()),
+        });
         frame_round_trip(FromTab::UrlChanged { url: None });
         frame_round_trip(FromTab::LoadingChanged { loading: true });
         frame_round_trip(FromTab::LoadingChanged { loading: false });
-        frame_round_trip(FromTab::HistoryChanged { can_go_back: true, can_go_forward: false });
-        frame_round_trip(FromTab::StatusText { text: Some("s".into()) });
+        frame_round_trip(FromTab::HistoryChanged {
+            can_go_back: true,
+            can_go_forward: false,
+        });
+        frame_round_trip(FromTab::StatusText {
+            text: Some("s".into()),
+        });
         frame_round_trip(FromTab::StatusText { text: None });
         frame_round_trip(FromTab::OpenLinkInNewTab {
-            url: "https://example.com/link".into()
+            url: "https://example.com/link".into(),
         });
         frame_round_trip(FromTab::ConsoleLog {
             source: "js".into(),
@@ -1521,13 +1667,25 @@ mod tests {
             },
         });
         frame_round_trip(FromTab::ScrollState {
-            state: ScrollState { y: 0.0, range: 0.0, viewport_h: 600.0 },
+            state: ScrollState {
+                y: 0.0,
+                range: 0.0,
+                viewport_h: 600.0,
+            },
         });
         frame_round_trip(FromTab::ScrollState {
-            state: ScrollState { y: 1234.5, range: 2000.0, viewport_h: 600.0 },
+            state: ScrollState {
+                y: 1234.5,
+                range: 2000.0,
+                viewport_h: 600.0,
+            },
         });
-        frame_round_trip(FromTab::CursorChanged { cursor: CursorIcon::Default });
-        frame_round_trip(FromTab::CursorChanged { cursor: CursorIcon::Pointer });
+        frame_round_trip(FromTab::CursorChanged {
+            cursor: CursorIcon::Default,
+        });
+        frame_round_trip(FromTab::CursorChanged {
+            cursor: CursorIcon::Pointer,
+        });
         frame_round_trip(FromTab::DownloadStart { hint: hint(1) });
         frame_round_trip(FromTab::DownloadChunk {
             id: 1,
@@ -1538,7 +1696,9 @@ mod tests {
             error: Some("boom".into()),
         });
         frame_round_trip(FromTab::Closed);
-        frame_round_trip(FromTab::Error { message: "boom".into() });
+        frame_round_trip(FromTab::Error {
+            message: "boom".into(),
+        });
         frame_round_trip(FromTab::ContextMenu {
             x: 120.5,
             y: 64.25,
@@ -1556,7 +1716,9 @@ mod tests {
             y: 0.0,
             target: ContextTarget::default(),
         });
-        frame_round_trip(FromTab::ClipboardText { text: "copied".into() });
+        frame_round_trip(FromTab::ClipboardText {
+            text: "copied".into(),
+        });
         frame_round_trip(FromTab::DialogRequest {
             dialog_id: 1,
             kind: DialogKind::Alert,
@@ -1570,11 +1732,22 @@ mod tests {
     /// movement but not a whole pixel of it.
     #[test]
     fn scroll_state_reports_only_real_scroll() {
-        let fits = ScrollState { y: 0.0, range: 0.0, viewport_h: 600.0 };
+        let fits = ScrollState {
+            y: 0.0,
+            range: 0.0,
+            viewport_h: 600.0,
+        };
         assert!(!fits.is_scrollable());
-        let scrolls = ScrollState { y: 0.0, range: 1200.0, viewport_h: 600.0 };
+        let scrolls = ScrollState {
+            y: 0.0,
+            range: 1200.0,
+            viewport_h: 600.0,
+        };
         assert!(scrolls.is_scrollable());
-        assert!(!scrolls.same_within(&fits, 0.5), "a range change is not jitter");
+        assert!(
+            !scrolls.same_within(&fits, 0.5),
+            "a range change is not jitter"
+        );
         assert!(scrolls.same_within(&scrolls, 0.5));
         let nudged = ScrollState { y: 0.4, ..scrolls };
         assert!(scrolls.same_within(&nudged, 0.5), "half a pixel is jitter");
@@ -1607,7 +1780,12 @@ mod tests {
             default: Some("Ada".into()),
         });
         match msg {
-            FromTab::DialogRequest { dialog_id, kind, message, default } => {
+            FromTab::DialogRequest {
+                dialog_id,
+                kind,
+                message,
+                default,
+            } => {
                 assert_eq!(dialog_id, 42);
                 assert_eq!(kind, DialogKind::Prompt);
                 assert_eq!(message, "Your name:");
@@ -1628,7 +1806,11 @@ mod tests {
                 message: "unclosed string".into(),
             });
             match msg {
-                FromTab::ConsoleLog { source: s, level, message } => {
+                FromTab::ConsoleLog {
+                    source: s,
+                    level,
+                    message,
+                } => {
                     assert_eq!(s, source);
                     assert_eq!(level, "error");
                     assert_eq!(message, "unclosed string");
@@ -1689,7 +1871,11 @@ mod tests {
         frame_round_trip(ToTab::Stop);
         frame_round_trip(ToTab::Back);
         frame_round_trip(ToTab::Forward);
-        frame_round_trip(ToTab::Resize { width: 800, height: 600, scale: 2.0 });
+        frame_round_trip(ToTab::Resize {
+            width: 800,
+            height: 600,
+            scale: 2.0,
+        });
         frame_round_trip(ToTab::SetZoom { zoom: 1.0 });
         frame_round_trip(ToTab::SetZoom { zoom: 1.33 });
         frame_round_trip(ToTab::SetZoom { zoom: 0.5 });
@@ -1711,10 +1897,18 @@ mod tests {
         }
         frame_round_trip(ToTab::Key(key_event()));
         frame_round_trip(ToTab::Scroll(scroll_event()));
-        frame_round_trip(ToTab::Clipboard { text: "clip".into() });
-        frame_round_trip(ToTab::ContextAction(ContextAction::Paste { text: "hi".into() }));
+        frame_round_trip(ToTab::Clipboard {
+            text: "clip".into(),
+        });
+        frame_round_trip(ToTab::ContextAction(ContextAction::Paste {
+            text: "hi".into(),
+        }));
         frame_round_trip(ToTab::ContextAction(ContextAction::ToggleVideo));
-        frame_round_trip(ToTab::DialogResponse { dialog_id: 1, confirmed: true, text: None });
+        frame_round_trip(ToTab::DialogResponse {
+            dialog_id: 1,
+            confirmed: true,
+            text: None,
+        });
         frame_round_trip(ToTab::DialogResponse {
             dialog_id: 2,
             confirmed: false,
@@ -1796,7 +1990,11 @@ mod tests {
             // Wildcard domain boundary: exact host and subdomains match.
             ("*example.com", "https://example.com/", true),
             ("*example.com", "http://x.example.com/page", true),
-            ("*example.com", "https://a.b.example.com/deep/path?q=1", true),
+            (
+                "*example.com",
+                "https://a.b.example.com/deep/path?q=1",
+                true,
+            ),
             ("*example.com", "https://EXAMPLE.COM/Upper/Path", true),
             // …a lookalike suffix NEVER matches (host boundary rule).
             ("*example.com", "https://notexample.com/", false),
@@ -1831,7 +2029,11 @@ mod tests {
             // …but exact patterns match internal schemes literally.
             ("ironsurf://welcome", "ironsurf://welcome", true),
             ("ironsurf://welcome", "ironsurf://settings", false),
-            ("ironsurf://settings/plugins", "ironsurf://settings/plugins", true),
+            (
+                "ironsurf://settings/plugins",
+                "ironsurf://settings/plugins",
+                true,
+            ),
             // Blank patterns match nothing.
             ("", "https://example.com/", false),
             ("   ", "https://example.com/", false),
@@ -1889,7 +2091,11 @@ mod tests {
             Userscript {
                 id: 6,
                 name: "multi-pattern".into(),
-                patterns: vec!["example.org".into(), "  ".into(), "*docs.example.net/guide".into()],
+                patterns: vec![
+                    "example.org".into(),
+                    "  ".into(),
+                    "*docs.example.net/guide".into(),
+                ],
                 code: "6".into(),
                 enabled: true,
             },
@@ -1928,7 +2134,11 @@ mod tests {
     fn modifiers_helpers() {
         assert!(Modifiers::NONE.empty());
         assert!(!Modifiers::NONE.with_ctrl().empty());
-        let m = Modifiers::NONE.with_ctrl().with_shift().with_alt().with_meta();
+        let m = Modifiers::NONE
+            .with_ctrl()
+            .with_shift()
+            .with_alt()
+            .with_meta();
         assert!(m.ctrl() && m.shift() && m.alt() && m.meta());
         assert_eq!(m.bits(), 0b1111);
         assert_eq!(
@@ -1985,14 +2195,22 @@ mod tests {
     fn multiple_frames_stream_in_order() {
         let mut buf = Vec::new();
         write_frame(&mut buf, &ToTab::Reload).unwrap();
-        write_frame(&mut buf, &ToTab::Navigate { url: "https://a.test".into() }).unwrap();
+        write_frame(
+            &mut buf,
+            &ToTab::Navigate {
+                url: "https://a.test".into(),
+            },
+        )
+        .unwrap();
         write_frame(&mut buf, &FromTab::Closed).unwrap();
 
         let mut cur = std::io::Cursor::new(&buf);
         assert_eq!(read_frame::<_, ToTab>(&mut cur).unwrap(), ToTab::Reload);
         assert_eq!(
             read_frame::<_, ToTab>(&mut cur).unwrap(),
-            ToTab::Navigate { url: "https://a.test".into() }
+            ToTab::Navigate {
+                url: "https://a.test".into()
+            }
         );
         assert_eq!(read_frame::<_, FromTab>(&mut cur).unwrap(), FromTab::Closed);
         // Stream exhausted -> error, not a hang.
@@ -2002,7 +2220,13 @@ mod tests {
     #[test]
     fn truncated_frame_is_error() {
         let mut buf = Vec::new();
-        write_frame(&mut buf, &ToTab::Navigate { url: "https://example.com/x".into() }).unwrap();
+        write_frame(
+            &mut buf,
+            &ToTab::Navigate {
+                url: "https://example.com/x".into(),
+            },
+        )
+        .unwrap();
         // Cut the payload in half (length prefix intact).
         let cut = buf.len() - 5;
         let mut truncated = &buf[..cut];
@@ -2025,7 +2249,10 @@ mod tests {
         // Craft a header claiming more than MAX_FRAME_BYTES.
         let header = (MAX_FRAME_BYTES as u32 + 1).to_le_bytes();
         let res = read_frame::<_, ToTab>(&mut &header[..]);
-        assert!(res.is_err(), "oversize length prefix must error, got {res:?}");
+        assert!(
+            res.is_err(),
+            "oversize length prefix must error, got {res:?}"
+        );
 
         let u32_max = u32::MAX.to_le_bytes();
         let res2 = read_frame::<_, ToTab>(&mut &u32_max[..]);
@@ -2089,10 +2316,7 @@ mod tests {
             id: 3,
             bytes: Vec::new(),
         });
-        frame_round_trip(FromTab::DownloadEnd {
-            id: 3,
-            error: None,
-        });
+        frame_round_trip(FromTab::DownloadEnd { id: 3, error: None });
         frame_round_trip(FromTab::DownloadEnd {
             id: 3,
             error: Some("connection refused".into()),
@@ -2112,8 +2336,14 @@ mod tests {
             .map(|n| (0..64).map(|i| (n * 64 + i) as u8).collect())
             .collect();
         for bytes in &chunks {
-            write_frame(&mut stream, &FromTab::DownloadChunk { id: 9, bytes: bytes.clone() })
-                .unwrap();
+            write_frame(
+                &mut stream,
+                &FromTab::DownloadChunk {
+                    id: 9,
+                    bytes: bytes.clone(),
+                },
+            )
+            .unwrap();
         }
         write_frame(&mut stream, &FromTab::DownloadEnd { id: 9, error: None }).unwrap();
         let mut cursor = stream.as_slice();
@@ -2148,7 +2378,9 @@ mod tests {
     fn download_names_are_suggested_not_trusted() {
         // A `*`-suffixed parameter wins over its unsuffixed twin, RFC 6266.
         assert_eq!(
-            content_disposition_filename(r#"attachment; filename="bad.zip"; filename*=UTF-8''good.zip"#),
+            content_disposition_filename(
+                r#"attachment; filename="bad.zip"; filename*=UTF-8''good.zip"#
+            ),
             Some("good.zip".into())
         );
         // Percent-decoded, quoting ignored, case-insensitive parameters.
@@ -2190,7 +2422,10 @@ mod tests {
                 "hostile value {hostile:?} → {named:?}"
             );
             if let Some(name) = named {
-                assert!(!name.starts_with("..") || name == "authorized_keys", "{name}");
+                assert!(
+                    !name.starts_with("..") || name == "authorized_keys",
+                    "{name}"
+                );
             }
         }
     }
@@ -2308,10 +2543,7 @@ mod tests {
             "app/zip",
         ];
         for media in pages {
-            assert!(
-                !is_download_media_type(media),
-                "{media} should render"
-            );
+            assert!(!is_download_media_type(media), "{media} should render");
         }
         // The two `application/…` types the tab shows as source text today
         // stay pages (see the table in the function docs).

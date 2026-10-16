@@ -10,7 +10,8 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use ironsurf_common::{
-    CursorIcon, DownloadHint, DownloadTrigger, FromTab, NetEvent, ScrollState, TabId,
+    CursorIcon, DownloadHint, DownloadTrigger, FromTab, NetEvent, ScrollState, TabId, ToTab,
+    popup_origin, set_popup_allowed,
 };
 
 /// Cap on retained DevTools console entries per tab: the oldest are dropped
@@ -92,6 +93,26 @@ pub struct TabState {
     /// screen is its cleaned-up text-and-images rendering. The 📄 toolbar
     /// button holds while this is set; every real navigation clears it.
     pub reader: bool,
+    /// How many windows the page on screen tried to open **without the user**
+    /// and the tab refused (task: block popups). The blocking happens entirely
+    /// inside the tab — its default policy stops a `window.open` nobody asked
+    /// for — so this is the shell's memory of what was stopped on its behalf:
+    /// the tally the status-line notice and the "allow this site" affordance
+    /// point at. Cleared by the next page, like the find bar's numbers.
+    pub popups_blocked: u32,
+    /// The user switched popup blocking **off** for this tab (task: block
+    /// popups). Named as the negation on purpose: a freshly-spawned tab already
+    /// blocks (that is the tab's own default policy), so the shell starts with
+    /// this `false` and has nothing to send until a hand changes it — the ⛔
+    /// button holds while blocking stands.
+    pub popup_block_off: bool,
+    /// Origins the user allowed to open windows **even while blocking stands**
+    /// ("Allow popups from this site"), as normalized origins
+    /// (`https://example.com`) — see [`ironsurf_common::normalize_popup_origin`].
+    /// Bounded by [`ironsurf_common::MAX_POPUP_ALLOWED_ORIGINS`], oldest entry
+    /// dropped when full. Per tab, like every other page setting here: allowing
+    /// a site in one tab never speaks for another tab's process.
+    pub popup_allowed: Vec<String>,
     /// The tab's document viewport as the tab itself last described it (task:
     /// scroll bar). Only the tab has laid the page out, so only it knows how
     /// far the document goes and where inside it the reader is standing now;
@@ -127,9 +148,20 @@ impl TabState {
                 if url == &self.url {
                     false
                 } else {
+                    // A new page is a fresh record: what the last one did is no
+                    // longer worth a notice.
+                    self.popups_blocked = 0;
                     self.url = url.clone();
                     true
                 }
+            }
+            // The tab refused a popup on the user's behalf (task: block
+            // popups). Worth a redraw: the status line gains "blocked N popups"
+            // for this page, which is where an unaware user learns the blocker
+            // exists and what key lets a trusted site through.
+            FromTab::PopupBlocked { .. } => {
+                self.popups_blocked = self.popups_blocked.saturating_add(1);
+                true
             }
             FromTab::LoadingChanged { loading } => {
                 // A load that starts replaces the last thing the bar had to
@@ -269,6 +301,66 @@ impl TabState {
     /// like a scroll.
     pub fn scroll_moves(&self, next: &ScrollState) -> bool {
         (next.y - self.scroll.y).abs() > 0.5
+    }
+
+    /// The policy this tab's process enforces (task: block popups): master
+    /// switch plus the sites the user let through it. Both halves always travel
+    /// together — a tab never holds a policy the shell only partly knows, and a
+    /// shell that never sends one inherits the tab's own blocking default.
+    pub fn popup_policy(&self) -> ToTab {
+        ToTab::SetPopupPolicy {
+            block: !self.popup_block_off,
+            allowed: self.popup_allowed.clone(),
+        }
+    }
+
+    /// Raise or lower this tab's popup blocker (the ⛔ button). Sent to the
+    /// process; the tab decides per page, and the user's own clicks still open
+    /// windows with the switch up (task: block popups).
+    pub fn set_popup_block(&mut self, block: bool) -> ToTab {
+        self.popup_block_off = !block;
+        self.popup_policy()
+    }
+
+    /// "Allow popups from this site": remember the page's origin and re-send the
+    /// policy. Only a real web page has an origin — `about:blank`, `data:` and
+    /// the internal pages have nothing to allow, and get no reply rather than a
+    /// policy entry that matches every site. Ctrl-Alt-`P` and the ⚙ menu's row
+    /// both land here (task: block popups).
+    pub fn allow_popup_site(&mut self, allow: bool) -> Option<ToTab> {
+        let origin = self.url.as_deref().and_then(popup_origin)?;
+        self.popup_allowed = set_popup_allowed(&self.popup_allowed, &origin, allow);
+        // The user has acted on the notice; leaving it up would keep telling
+        // them about the thing they just decided (task: block popups).
+        self.popups_blocked = 0;
+        Some(self.popup_policy())
+    }
+
+    /// What the ⛔ says when the pointer rests on it (task: popup blocker
+    /// tooltip): the switch's own word for what it is doing to this tab, so the
+    /// button explains itself without a click being wasted to find out. The
+    /// master switch alone decides it — an allow-listed site is still a tab whose
+    /// blocker stands, and saying "allowed" there would be a promise the tab is
+    /// not making about every other site.
+    pub fn popup_tip(&self) -> &'static str {
+        if self.popup_block_off {
+            "popups allowed"
+        } else {
+            "popups blocked"
+        }
+    }
+
+    /// The status-line notice for a page that tried to open windows nobody asked
+    /// for (task: block popups): the count the tab reported, and the one key
+    /// that lets the site through when the user wants it to.
+    pub fn popup_notice(&self) -> Option<String> {
+        match self.popups_blocked {
+            0 => None,
+            1 => Some("blocked 1 popup \u{2014} Ctrl-Alt-P allows this site".into()),
+            n => Some(format!(
+                "blocked {n} popups \u{2014} Ctrl-Alt-P allows this site"
+            )),
+        }
     }
 
     /// The status-bar security chip for the current URL: a lock for https,
@@ -1423,6 +1515,128 @@ mod tests {
         assert!(s.reduce(&FromTab::Closed));
         assert!(s.closed);
         assert!(!s.reduce(&FromTab::Closed));
+    }
+
+    /// The popup tally (task: block popups): every refusal the tab reports is
+    /// remembered (and shown, so it earns its redraw), and a new page starts
+    /// clean — yesterday's blocked popup is not a notice on today's page.
+    #[test]
+    fn blocked_popups_are_counted_and_cleared_by_the_next_page() {
+        let mut s = TabState::default();
+        assert_eq!(s.popups_blocked, 0, "a tab that said nothing blocked nothing");
+        for _ in 0..3 {
+            assert!(
+                s.reduce(&FromTab::PopupBlocked {
+                    url: "https://ads.test/popup".into(),
+                }),
+                "the notice the status line grows is worth a redraw"
+            );
+        }
+        assert_eq!(s.popups_blocked, 3);
+        s.reduce(&FromTab::UrlChanged { url: Some("https://news.test/".into()) });
+        assert_eq!(s.popups_blocked, 0, "the record belongs to the page that made it");
+        // A message for the page already on screen leaves it alone.
+        s.reduce(&FromTab::TitleChanged { title: Some("News".into()) });
+        assert_eq!(s.popups_blocked, 0);
+    }
+
+    /// The popup switch and the allow-list (task: block popups) are per tab and
+    /// travel together: a shell that never touches them sends nothing (the tab
+    /// already blocks), lowering the switch says so explicitly, and allowing a
+    /// site adds an origin that survives the switch going back up.
+    #[test]
+    fn popup_policy_starts_blocking_and_remembers_allowed_sites() {
+        let mut s = TabState::default();
+        assert!(!s.popup_block_off, "a new tab blocks popups");
+        assert!(s.popup_allowed.is_empty());
+        // A page with no site origin has nothing to allow.
+        assert!(s.allow_popup_site(true).is_none(), "about:blank names no site");
+
+        s.url = Some("https://news.example.com/top/story?a=1".into());
+        let msg = s.allow_popup_site(true).expect("a web page has an origin");
+        assert_eq!(
+            msg,
+            ToTab::SetPopupPolicy {
+                block: true,
+                allowed: vec!["https://news.example.com".into()]
+            },
+            "port-less default ports normalize away; the switch stays up"
+        );
+        // Allowing the same site twice changes nothing, and removing it works.
+        let again = s.allow_popup_site(true).unwrap();
+        assert_eq!(again, msg);
+        assert!(s
+            .allow_popup_site(false)
+            .unwrap()
+            .eq(&ToTab::SetPopupPolicy { block: true, allowed: vec![] }));
+
+        // The switch and the list are one message: the tab never half-knows.
+        assert_eq!(
+            s.set_popup_block(false),
+            ToTab::SetPopupPolicy { block: false, allowed: vec![] }
+        );
+        assert!(s.popup_block_off);
+        // Raising the switch again keeps the list: the two decisions are
+        // independent, and one message carries both so the tab can never be left
+        // half-informed. A host with a port keeps it in the origin it allows.
+        s.url = Some("http://localhost:8080/".into());
+        assert_eq!(
+            s.set_popup_block(true),
+            ToTab::SetPopupPolicy { block: true, allowed: vec![] }
+        );
+        assert_eq!(
+            s.allow_popup_site(true).unwrap(),
+            ToTab::SetPopupPolicy {
+                block: true,
+                allowed: vec!["http://localhost:8080".into()]
+            },
+            "a non-default port is part of the origin"
+        );
+    }
+
+    /// The words the ⛔ shows on hover (task: popup blocker tooltip) are the
+    /// master switch read out loud: a fresh tab says it blocks, a released
+    /// switch says windows are allowed, and an **allow-listed site changes
+    /// neither** — the blocker still stands over every other site this tab
+    /// visits, and "allowed" would promise what the switch is not making.
+    #[test]
+    fn the_popup_button_names_its_own_switch() {
+        let mut s = TabState::default();
+        assert_eq!(s.popup_tip(), "popups blocked", "a new tab blocks");
+        s.set_popup_block(false);
+        assert_eq!(s.popup_tip(), "popups allowed");
+        s.set_popup_block(true);
+        assert_eq!(s.popup_tip(), "popups blocked");
+
+        s.url = Some("https://news.test:8443/top".into());
+        s.allow_popup_site(true);
+        assert!(
+            !s.popup_allowed.is_empty(),
+            "the site is on the list \u{2026}"
+        );
+        assert_eq!(
+            s.popup_tip(),
+            "popups blocked",
+            "\u{2026} and the tab still blocks everywhere else"
+        );
+        s.allow_popup_site(false);
+        assert_eq!(s.popup_tip(), "popups blocked");
+    }
+
+    /// What a blocked popup is worth in the status line (task: block popups):
+    /// one line naming the key, plural counting, and silence once the page
+    /// changes or nothing was stopped.
+    #[test]
+    fn a_blocked_popup_shows_in_the_notice_and_stops_when_the_page_changes() {
+        let mut s = TabState::default();
+        assert_eq!(s.popup_notice(), None, "nothing stopped, nothing to say");
+        s.reduce(&FromTab::PopupBlocked { url: "https://ads.test/x".into() });
+        let line = s.popup_notice().expect("one blocked popup is worth a line");
+        assert_eq!(line, "blocked 1 popup \u{2014} Ctrl-Alt-P allows this site");
+        s.reduce(&FromTab::PopupBlocked { url: "https://ads.test/y".into() });
+        assert!(s.popup_notice().unwrap().starts_with("blocked 2 popups"));
+        s.reduce(&FromTab::UrlChanged { url: Some("https://news.test/".into()) });
+        assert_eq!(s.popup_notice(), None, "the notice dies with its page");
     }
 
     #[test]

@@ -686,6 +686,19 @@ pub struct Tab {
     /// `cursor_status`'s: the shell's overlay bar needs the numbers, a page
     /// that sits still needs no messages.
     scroll_report: Option<ScrollState>,
+    /// Popup blocker (task: block popups — a website opening new tabs without a
+    /// user interaction). One shared cell: the `window.open` native answers
+    /// through it synchronously, real input arms its engagement credit, and the
+    /// poll loop drains its queues into `FromTab::OpenLinkInNewTab` (allowed) /
+    /// `FromTab::PopupBlocked` (refused). The tab never spawns a tab itself.
+    popups: Arc<crate::popup::PopupHook>,
+    /// Set by a left release that landed on an `<a target="_blank">`, carrying
+    /// the window name the link asked for (task: block popups). blitz knows
+    /// nothing about `target`, so that click comes back as a navigation *of
+    /// this tab*; the next `drain_nav_hook` turns it into a popup request
+    /// instead. Taken unconditionally at the top of every drain, so a mark can
+    /// never outlive the click that made it.
+    new_window_click: Option<String>,
     /// Video (task: playback): one player per `<video>` element, in attach
     /// order. The blitz widget on the element shares the very same
     /// `Rc<RefCell<MediaPlayer>>`, so the tab pumps the clock and the widget
@@ -1071,6 +1084,11 @@ impl Tab {
                 pipe: Arc::clone(&pipe),
                 pending: Mutex::new(None),
             }),
+            // The popup gate wakes this very loop, so an allowed popup reaches
+            // the shell the moment the page asked for it rather than a tick
+            // later (the NetWaker/NavHook pattern).
+            popups: Arc::new(crate::popup::PopupHook::with_pipe(Arc::clone(&pipe))),
+            new_window_click: None,
             history: Vec::new(),
             history_index: 0,
             last_title: None,
@@ -1597,6 +1615,11 @@ impl Tab {
         *self.shell.title.lock().expect("title mutex") = None;
         self.js_title = None;
         self.js_status = None;
+        // Popup blocker (task: block popups): requests are judged against *this*
+        // document's origin, and the previous page's user gesture does not carry
+        // over — the click that brought the user here belongs to the page they
+        // left.
+        self.popups.set_document(url);
         // The new document has nothing under the cursor yet; the next hover
         // transition must be allowed to report again.
         self.hover_status = None;
@@ -2026,6 +2049,10 @@ impl Tab {
         // queue, so a page `fetch()` lands in the DevTools network panel like
         // XHR and subresources (task: XHR/fetch in the network panel).
         host.borrow_mut().net_events = Some(Arc::clone(&self.net_events));
+        // `window.open`, and a script-activated `<a target="_blank">`, ask the
+        // popup gate (task: block popups) — the very cell the poll loop drains
+        // and that the shell's `SetPopupPolicy` writes into.
+        host.borrow_mut().popups = Some(Arc::clone(&self.popups));
         // `XMLHttpRequest.send` runs on THIS network stack (task:
         // infosec.exchange posts): Mastodon's axios picks its XHR adapter
         // whenever the constructor exists, and without it not one `/api/`
@@ -3537,6 +3564,7 @@ impl Tab {
             ToTab::InspectSelect { node } => self.inspect_select(node),
             ToTab::InspectPickAt { x, y } => self.inspect_pick_at(x, y),
             ToTab::SetReader { enabled } => self.set_reader(enabled),
+            ToTab::SetPopupPolicy { block, allowed } => self.set_popup_policy(block, allowed),
             ToTab::DialogResponse { dialog_id, .. } => {
                 // A reply with no modal open: it either raced the tab-side
                 // cancel (shell quit mid-dialog) or is stale — nothing to
@@ -3636,9 +3664,19 @@ impl Tab {
     }
 
     /// Nearest `<a href>` target under the cursor, resolved against the
-    /// document URL, as `(hovered_node, target)`. `None` target = not over a
-    /// link; a `#fragment` target is kept (blitz scrolls in place for those).
+    /// document URL. `None` = not over a link; a `#fragment` target is kept
+    /// (blitz scrolls in place for those).
     fn hover_link(&self) -> Option<String> {
+        self.hover_anchor().map(|(href, _)| href)
+    }
+
+    /// The link under the cursor and what it asks for: `(resolved href, target)`
+    /// where the target is `Some(name)` **only when the `target` attribute names
+    /// another window** (`_blank` or a window name) — `_self`, `_top`, `_parent`,
+    /// `""` and an absent attribute all mean “this tab” and read as `None`
+    /// (task: block popups; `popupTargetName` in the JS prelude applies the same
+    /// rule to `window.open` and to `el.click()`).
+    fn hover_anchor(&self) -> Option<(String, Option<String>)> {
         let doc = self.doc.as_ref()?;
         let mut node_id = doc.get_hover_node_id()?;
         while let Some(node) = doc.get_node(node_id) {
@@ -3652,7 +3690,10 @@ impl Tab {
                                 .join(href)
                                 .map(|u| u.to_string())
                                 .unwrap_or_else(|_| href.to_owned());
-                            return Some(resolved);
+                            let target = crate::popup::new_window_target(el.attr(
+                                blitz_dom::local_name!("target"),
+                            ));
+                            return Some((resolved, target));
                         }
                     }
                 }
@@ -3981,6 +4022,15 @@ impl Tab {
             MouseButton::Middle => MouseEventButton::Auxiliary,
         };
 
+        // **A real user gesture just happened** (task: block popups): every
+        // pointer event reaching a tab was put there by a human, and a press is
+        // what the page's later `window.open` spends ([`crate::popup`]). Moves
+        // arm nothing: a page may watch the cursor all day without earning a
+        // window.
+        if matches!(ev.kind, PointerKind::Down) {
+            self.popups.arm();
+        }
+
         // `<form>` presses (task: `<form>`), decided from blitz's live hover
         // node (the shell always moves the mouse before pressing). Nothing is
         // swallowed: clicking an `<option>` selects it (this engine renders
@@ -4054,6 +4104,16 @@ impl Tab {
                 self.emit(FromTab::OpenLinkInNewTab { url });
                 return true;
             }
+        }
+
+        // A left release over a link whose `target` names another window
+        // (task: block popups): blitz ignores `target`, so the click's default
+        // action comes back as a navigation **of this tab** — the one thing
+        // `target="_blank"` does not mean. Mark it; the drain that picks up this
+        // click's navigation turns it into a popup request, and a click the page
+        // cancelled leaves nothing to answer.
+        if matches!(ev.kind, PointerKind::Up) && ev.button == MouseButton::Left {
+            self.new_window_click = self.hover_anchor().and_then(|(_, target)| target);
         }
 
         // The right-button press/release pair is the tab's own: it exists to
@@ -4219,6 +4279,11 @@ impl Tab {
     /// no-op, events/mod.rs:222); there is no release in the contract to
     /// model beyond that.
     fn handle_key(&mut self, ev: &KeyEvent) {
+        // A keystroke is a user interaction as much as a click is (task: block
+        // popups): the Enter that activates a link and the key a page answers
+        // with `window.open` are the same thing from here, and both are the
+        // user asking.
+        self.popups.arm();
         // The page's JS sees every press first: a `keydown` handler that
         // calls `preventDefault()` swallows the default action — no editor
         // insert, no form submission, no focus move (task: `<form>` glue with
@@ -4408,6 +4473,10 @@ impl Tab {
         // A press that never got its release is not a click; forget it.
         self.form_press = None;
         self.label_press = None;
+        // Taken first and unconditionally (task: block popups): the mark only
+        // ever describes the click blitz was just fed, and an unanswered mark
+        // must never turn an unrelated later navigation into a popup.
+        let new_window = self.new_window_click.take();
         if let Some(sub) = self.pending_form.take() {
             self.navigate_submission(&sub);
             return true;
@@ -4415,16 +4484,28 @@ impl Tab {
         let pending = self.nav.pending.lock().expect("nav mutex").take();
         if let Some(options) = pending {
             let url = options.url.as_str().to_owned();
-            match form_body_from_nav(&options) {
-                Some(post) => {
-                    info!("form POST (blitz hook) → {url} ({} B)", post.body.len());
-                    self.navigate_post(&url, NavHistory::Fresh, Some(&post));
+            if let Some(target) = new_window {
+                // The user clicked a link that asked for a NEW window, so this
+                // tab does not navigate — that is what `target` means — and the
+                // request goes to the gate on the page's behalf.
+                // `PopupVia::Link` carries the fact that a human clicked, which
+                // is the interaction the blocker exists to wait for, so it
+                // passes (task: block popups).
+                info!("target={target:?} click → popup request {url}");
+                self.popups
+                    .request(&url, Some(target), crate::popup::PopupVia::Link);
+            } else {
+                match form_body_from_nav(&options) {
+                    Some(post) => {
+                        info!("form POST (blitz hook) → {url} ({} B)", post.body.len());
+                        self.navigate_post(&url, NavHistory::Fresh, Some(&post));
+                    }
+                    None => {
+                        self.navigate(&url, NavHistory::Fresh);
+                    }
                 }
-                None => {
-                    self.navigate(&url, NavHistory::Fresh);
-                }
+                return true;
             }
-            return true;
         }
         // 3. `history.pushState`/`replaceState` (task: infosec.exchange): a
         //    URL-only change — address bar follows, document stays put.
@@ -4439,6 +4520,46 @@ impl Tab {
         // 5. A `Refresh:` header / `<meta http-equiv="refresh">` deadline that
         //    has come due (task: Anubis `metarefresh` gates).
         self.follow_due_refresh()
+    }
+
+    /// Popups (task: block popups): every window the page asked for since the
+    /// last poll leaves the tab here. An **allowed** request becomes
+    /// [`FromTab::OpenLinkInNewTab`] — the shell spawns a sibling tab in this
+    /// tab's container, because tabs belong to the shell and that is the only
+    /// way a page's `window.open` ever becomes a window. A **refused** one
+    /// becomes [`FromTab::PopupBlocked`], so the user can see the refusal and
+    /// allow the site. Nothing else happens either way: no document loads here,
+    /// no history entry is written, no address bar moves.
+    fn drain_popups(&mut self) {
+        let pending = self.popups.take_pending();
+        if pending.is_empty() {
+            return;
+        }
+        for request in pending.allowed {
+            info!(
+                "popup allowed ({:?}) → {}",
+                request.via, request.url
+            );
+            self.emit(FromTab::OpenLinkInNewTab { url: request.url });
+        }
+        for request in pending.blocked {
+            let url = crate::popup::cap_reported_url(&request.url);
+            warn!("popup blocked ({:?}) → {url}", request.via);
+            self.emit(FromTab::PopupBlocked { url });
+        }
+        self.flush_stdout();
+    }
+
+    /// The shell's popup rules (task: block popups): the master switch and the
+    /// site allow-list, replaced wholesale. No reload is involved — the gate is
+    /// consulted per request, so a change applies to the page on screen as well
+    /// as to every document loaded afterwards.
+    fn set_popup_policy(&mut self, block: bool, allowed: Vec<String>) {
+        info!(
+            "popup policy: block={block}, {} allowed origin(s)",
+            allowed.len()
+        );
+        self.popups.configure(block, allowed);
     }
 
     /// Apply the URL-only address-bar change `history.pushState`/`replaceState`
@@ -6083,6 +6204,12 @@ pub fn run(args: TabArgs) -> i32 {
         if tab.drain_nav_hook() {
             continue;
         }
+
+        // 2a⁵ Popups (task: block popups): the windows the page asked for since
+        // the last poll — allowed ones go to the shell to open, refused ones are
+        // reported so the user can see it happened. Runs right after the nav
+        // hook because that is where a `target="_blank"` click's request lands.
+        tab.drain_popups();
 
         // 2a. Page copies (Ctrl+C/X, editor cut) surface to the shell here
         // (the shell owns the session clipboard; task: context menu).

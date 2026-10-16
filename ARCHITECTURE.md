@@ -99,6 +99,14 @@ pub enum FromTab {
     HistoryChanged   { can_go_back: bool, can_go_forward: bool },
     StatusText       { text: Option<String> },
     OpenLinkInNewTab { url: String },      // middle-click a link → shell opens url in a new tab (same container)
+    // (task: block popups) this tab **refused** to open a window: the page asked
+    // for one with no user interaction behind it, and its origin is not allowed.
+    // Nothing was fetched and nothing changed in this tab. `url` is the target,
+    // already resolved against the document URL and capped at 512 chars — a
+    // `data:` target is megabytes of document and
+    // must not travel to the shell whole. The notice is what an "allow this
+    // site" affordance sends back for as `ToTab::SetPopupPolicy`.
+    PopupBlocked     { url: String },
     // right-click on the page: the tab has hit-tested what the cursor was over
     // (`ContextTarget`); the shell opens the context menu at (`x`, `y`) — logical
     // px in the page viewport — and each choice comes back as `ToTab::ContextAction`
@@ -216,6 +224,14 @@ pub enum ToTab {
     // User-Agent on every subsequent request; None = the tab's built-in
     // default. The shell re-sends it on every tab spawn and on every switch.
     SetUserAgent { user_agent: Option<String> },
+    // popup blocking (task: block popups): `block` = refuse every window a user
+    // gesture did not authorize (the tab's own default when nobody ever sends
+    // this); `allowed` = **document origins** whose popups are never blocked,
+    // normalized, deduped, capped at 64. Sent at tab spawn and on change, like
+    // every other per-tab setting; it applies to the page already loaded, no
+    // reload. The rules live in the tab (`src/popup.rs`) — the shell only owns
+    // the levers, and answers nothing back to this.
+    SetPopupPolicy   { block: bool, allowed: Vec<String> },
     // archive mode master switch (the 💾 toolbar menu; **global**, not
     // per-container): while enabled the tab emits `FromTab::ArchivedFetch`
     // for every successful http(s) response (documents, subresources,
@@ -1226,6 +1242,36 @@ the tab owns submission outright — blitz's own submission is never used for it
 - The welcome page (`ironsurf://welcome`) is a working GET-form demo: it echoes the query
   string its own form submits against it.
 
+### Popups (`src/popup.rs`)
+
+A tab cannot open a window — tabs belong to the shell — so "block popups" is entirely about who
+gets to *ask*. Two questions decide every request and nothing else does:
+- **Does the policy allow it?** `Policy` (master switch + allowed document origins) is what the
+  shell pushes as `ToTab::SetPopupPolicy`; a tab nobody ever told anything **blocks** with an
+  empty list, so the safe reading is the default and a shell ignorant of popups is still safe.
+- **Did a user just ask for this?** Real input (a pointer or key press the shell forwarded, which
+  by construction came from a human) arms engagement for 5 s and buys **one** window: Firefox's
+  `dom.disable_open_click_delay` model, because this engine has no event-loop task identities to
+  hang true transient activation on. That is what separates an `onclick` handler calling
+  `window.open` (allowed) from a `load`/`setTimeout` handler doing it (blocked).
+- Rules, in order: a `javascript:`/`data:`/`blob:`/`file:` target is refused before anything else
+  (script, or a document smuggled in a URL — no policy or gesture makes it a page); a target that
+  does not name a *new* window (`_self`, `_top`, a name in this window) is not a popup at all and
+  never reaches the gate; the master switch off allows; an allowed origin allows; an armed gesture
+  allows and spends itself; everything else is blocked. A user click on `<a target="_blank">` is
+  the interaction itself and needs no budget — and it opens a tab **without navigating this one**,
+  since blitz's `NavigationProvider` knows nothing about `target`.
+- `window.open` must answer `null` or a window **synchronously**, so the decision runs inside the
+  JS call (`PopupHook` is one shared cell) while the consequences — "shell, open this" and "shell,
+  I refused" — are queued and drained by the poll loop like the link-click hook. An allowed popup
+  is answered with an isolated `Window` stub: resolved `location`, the `features` size, a document
+  that answers politely, `opener` always `null` (a popup never gets a handle on the page that made
+  it) and `close()`/`focus()`/`postMessage` no-ops — no script ever gets a real second window.
+- A refusal is never silent: each one becomes `FromTab::PopupBlocked` with the resolved, capped
+  target. Blocked is not dropped, allowed is not opened by us — the notice and the levers (the
+  status-line notice naming the key, the ⛔ toolbar switch and Ctrl-Alt-`P`) are the shell's half,
+  documented in §ironsurf-shell "Popup blocker".
+
 ### Headless tests (must run with no X display)
 - `tests/spike.rs`: render a `file://` fixture (tempdir HTML with colored blocks) through
   the full parse→resolve→paint path; assert buffer size `w*h*4` and non-uniform pixels.
@@ -1263,7 +1309,9 @@ UI (`crates/ironsurf-shell/ui/ironsurf.slint`):
   column indents past it while it is up. The tab protocol reports a load as one bool
   (no byte counts), so the progress is honestly indeterminate and the sweep is the
   progress. Then status text + loading spinner (timer animation) + https/lock
-  indicator (⛬ / http warning).
+  indicator (⛬ / http warning), and only then the status text — which is where a page that was
+  stopped from opening windows says so (see *Popup blocker*: while the tab is idle and its tally is
+  up, the tally's line outranks the tab's own idle status).
 - DevTools panel (F12 / Ctrl-Shift-I toggle, per tab): bottom-docked overlay Rectangle over the
   page area (never a `PopupWindow` — LinuxKMS has no popups), header [Console ‹n› |
   Network ‹n› | Inspector | ⌖ | Clear | ✕] plus a Console view (level icon + colour,
@@ -1335,6 +1383,36 @@ UI (`crates/ironsurf-shell/ui/ironsurf.slint`):
   of other containers never receive it), and spawn/respawn of a UA container's tab
   appends `--user-agent <ua>` to that spawn alone (per-spawn args; the first page load
   already sends it).
+- **Popup blocker** (top-bar ⛔ + Ctrl-Alt-`P`, task: block popups): the tab blocks on the shell's
+  behalf and reports every refusal, so all the shell adds is a notice and two levers, both per tab.
+  ⛔ sits in the toolbar (right of ＋) **pressed while the active tab blocks** — pressing it lowers
+  the switch for that tab alone (a released blocker means a page may open windows nobody asked for;
+  the user's own clicks open windows either way), and its `checked` state always mirrors the tab
+  shown, so switching tabs switches the switch. **Both** the icon and its hover tooltip —
+  `popups blocked` / `popups allowed`, the switch read out loud, and only the switch: an
+  allow-listed site leaves the blocker standing over every other site — move the **instant** the
+  button is clicked: the tab is handed a policy and never answers one, so no message on the wire
+  would ever have repainted it, and waiting for the next full `sync_ui` left the reader pressing
+  an icon that only changed after they switched tabs and came back (`Core::popup_switch_refresh`).
+  Tooltips are the window's, not the widget's: `MiniButton` reports a hover (`tip` empty = says
+  nothing) and one overlay `Rectangle`, declared last in `AppWindow` so nothing on the page can
+  cover it, draws the words below the control and pulls itself back from the right edge. Ctrl-Alt-`P` says "this site may open windows
+  anyway": the page's own origin (scheme+host+port, `ironsurf_common::popup_origin`) joins the
+  tab's allow-list and the whole policy ships as one `ToTab::SetPopupPolicy` — switch and list
+  together, so a tab is never half-informed. A page with no site origin (`about:blank`,
+  `ironsurf:`) has nothing to allow and sends **nothing**, rather than an empty rule the tab would
+  read as allowing everything. Nothing is persisted: a fresh tab blocks with an empty list, which is
+  the safe reading and needs no UI at all (a shell that never sends a policy is still safe).
+- A refusal is shown where the user is already looking: while the active tab's tally is up and it is
+  not loading, the status line reads `blocked 2 popups — Ctrl-Alt-P allows this site` (one line, the
+  key named in it), the tally belongs to the page that made it (the next navigation drops it), and
+  allowing the site retires it immediately. The refused URL is logged, not drawn — the tab already
+  resolved and capped it. Helpers the two sides share (`ironsurf_common::{popup_origin, origin_of,
+  normalize_popup_origin, set_popup_allowed, MAX_POPUP_ALLOWED_ORIGINS}`) because a list the shell
+  sends and a list the tab judges with must agree byte for byte or an allowed site stays blocked.
+  `fake_tab --expect-popup-policy` echoes the policy it is sent (`popups:block:` /
+  `popups:allow:https://a.test`) and `--popup-blocked` makes a page whose address contains `popup`
+  report a refusal, so both halves of the wire are testable without an engine.
 - Archive mode (top-bar 💾 button, right of "UA", toggles it): the same right-docked
   overlay Rectangle, and no two of the four full-window overlays (manager /
   userscripts / UA / archive) ever stack — each open closes the others. The CheckBox

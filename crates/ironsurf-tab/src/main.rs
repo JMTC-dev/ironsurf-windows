@@ -18,6 +18,7 @@ mod js;
 mod logging;
 mod media;
 mod netmod;
+mod popup;
 mod reader;
 mod runtime;
 mod select;

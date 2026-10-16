@@ -92,23 +92,29 @@ fn spawn_local_http() -> u16 {
                 "/img.png" => http_response(200, "image/png", PNG),
                 _ => http_response(404, "text/plain", b"no such route"),
             };
-            let _ = stream.write_all(response.as_bytes());
+            let _ = stream.write_all(&response);
             let _ = stream.flush();
         }
     });
     port
 }
 
-fn http_response(status: u16, content_type: &str, body: &[u8]) -> String {
+/// Build the whole response as bytes — a body that is not text (a PNG,
+/// say) must reach the tab intact, so nothing here may round-trip it
+/// through a `String`.
+fn http_response(status: u16, content_type: &str, body: &[u8]) -> Vec<u8> {
     let reason = match status {
         200 => "OK",
         404 => "Not Found",
         _ => "Status",
     };
-    format!(
+    let mut response = format!(
         "HTTP/1.0 {status} {reason}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
         body.len()
-    ) + &String::from_utf8_lossy(body)
+    )
+    .into_bytes();
+    response.extend_from_slice(body);
+    response
 }
 
 /// The workspace-built `ironsurf-tab` (same resolution as `tests/real_tab.rs`).
