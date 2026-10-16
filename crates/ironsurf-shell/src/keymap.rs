@@ -54,6 +54,12 @@ pub enum Shortcut {
     /// mode) — the same command as the 📄 toolbar button. The tab answers
     /// with `FromTab::ReaderState`, which moves the button.
     ToggleReader,
+    /// Ctrl-Alt-`P`: "allow popups from this site" (task: block popups) — puts
+    /// the page's own origin on the active tab's allow-list and re-sends the
+    /// policy, so it works on the page already on screen. The popup blocker
+    /// itself is the ⛔ toolbar button; this is the one thing a user wants after
+    /// the status line says a popup was blocked.
+    PopupAllowSite,
     /// Ctrl-Alt-`H`: toggle the browsing-History menu (task: browsing
     /// history) — the same menu as the ☰ toolbar button, and the only place
     /// the shared history log is listed and cleared.
@@ -194,6 +200,11 @@ pub fn shortcut_for(text: &str, ctrl: bool, alt: bool, meta: bool) -> Option<Sho
             't' | 'T' | '\u{14}' => Some(Shortcut::ReopenClosedTab),
             'h' | 'H' => Some(Shortcut::HistoryMenu),
             'r' | 'R' => Some(Shortcut::ToggleReader),
+            // popups (task: block popups): Ctrl-Alt-`P` says "this site may
+            // open windows anyway" — the thing to do after the status line
+            // reports a blocked popup. Raising/lowering the blocker itself is
+            // the ⛔ button, which states the switch and flips it.
+            'p' | 'P' | '\u{10}' => Some(Shortcut::PopupAllowSite),
             _ => None,
         };
     }
@@ -325,6 +336,15 @@ mod tests {
     fn ctrl_alt_r_toggles_reader() {
         assert_eq!(shortcut_for("r", true, true, false), Some(Shortcut::ToggleReader));
         assert_eq!(shortcut_for("R", true, true, false), Some(Shortcut::ToggleReader));
+        // popups (task: block popups): Ctrl-Alt-`P` allows the current site,
+        // both spellings backends hand over; plain Ctrl-`P` and Alt-`P` stay
+        // somebody else's, and the reader/History chords are untouched.
+        assert_eq!(shortcut_for("p", true, true, false), Some(Shortcut::PopupAllowSite));
+        assert_eq!(shortcut_for("P", true, true, false), Some(Shortcut::PopupAllowSite));
+        assert_eq!(shortcut_for("\u{10}", true, true, false), Some(Shortcut::PopupAllowSite));
+        assert_eq!(shortcut_for("p", true, false, false), None);
+        assert_eq!(shortcut_for("p", false, true, false), None);
+        assert_eq!(shortcut_for("t", true, true, false), Some(Shortcut::ReopenClosedTab));
         assert_eq!(shortcut_for("r", true, false, false), Some(Shortcut::Reload));
         assert_eq!(shortcut_for("\u{12}", true, false, false), Some(Shortcut::Reload));
     }

@@ -1268,7 +1268,9 @@ gets to *ask*. Two questions decide every request and nothing else does:
   that answers politely, `opener` always `null` (a popup never gets a handle on the page that made
   it) and `close()`/`focus()`/`postMessage` no-ops — no script ever gets a real second window.
 - A refusal is never silent: each one becomes `FromTab::PopupBlocked` with the resolved, capped
-  target. Blocked is not dropped, allowed is not opened by us.
+  target. Blocked is not dropped, allowed is not opened by us — the notice and the levers (the
+  status-line notice naming the key, the ⛔ toolbar switch and Ctrl-Alt-`P`) are the shell's half,
+  documented in §ironsurf-shell "Popup blocker".
 
 ### Headless tests (must run with no X display)
 - `tests/spike.rs`: render a `file://` fixture (tempdir HTML with colored blocks) through
@@ -1307,7 +1309,9 @@ UI (`crates/ironsurf-shell/ui/ironsurf.slint`):
   column indents past it while it is up. The tab protocol reports a load as one bool
   (no byte counts), so the progress is honestly indeterminate and the sweep is the
   progress. Then status text + loading spinner (timer animation) + https/lock
-  indicator (⛬ / http warning).
+  indicator (⛬ / http warning), and only then the status text — which is where a page that was
+  stopped from opening windows says so (see *Popup blocker*: while the tab is idle and its tally is
+  up, the tally's line outranks the tab's own idle status).
 - DevTools panel (F12 / Ctrl-Shift-I toggle, per tab): bottom-docked overlay Rectangle over the
   page area (never a `PopupWindow` — LinuxKMS has no popups), header [Console ‹n› |
   Network ‹n› | Inspector | ⌖ | Clear | ✕] plus a Console view (level icon + colour,
@@ -1379,6 +1383,28 @@ UI (`crates/ironsurf-shell/ui/ironsurf.slint`):
   of other containers never receive it), and spawn/respawn of a UA container's tab
   appends `--user-agent <ua>` to that spawn alone (per-spawn args; the first page load
   already sends it).
+- **Popup blocker** (top-bar ⛔ + Ctrl-Alt-`P`, task: block popups): the tab blocks on the shell's
+  behalf and reports every refusal, so all the shell adds is a notice and two levers, both per tab.
+  ⛔ sits in the toolbar (right of ＋) **pressed while the active tab blocks** — pressing it lowers
+  the switch for that tab alone (a released blocker means a page may open windows nobody asked for;
+  the user's own clicks open windows either way), and its `checked` state always mirrors the tab
+  shown, so switching tabs switches the switch. Ctrl-Alt-`P` says "this site may open windows
+  anyway": the page's own origin (scheme+host+port, `ironsurf_common::popup_origin`) joins the
+  tab's allow-list and the whole policy ships as one `ToTab::SetPopupPolicy` — switch and list
+  together, so a tab is never half-informed. A page with no site origin (`about:blank`,
+  `ironsurf:`) has nothing to allow and sends **nothing**, rather than an empty rule the tab would
+  read as allowing everything. Nothing is persisted: a fresh tab blocks with an empty list, which is
+  the safe reading and needs no UI at all (a shell that never sends a policy is still safe).
+- A refusal is shown where the user is already looking: while the active tab's tally is up and it is
+  not loading, the status line reads `blocked 2 popups — Ctrl-Alt-P allows this site` (one line, the
+  key named in it), the tally belongs to the page that made it (the next navigation drops it), and
+  allowing the site retires it immediately. The refused URL is logged, not drawn — the tab already
+  resolved and capped it. Helpers the two sides share (`ironsurf_common::{popup_origin, origin_of,
+  normalize_popup_origin, set_popup_allowed, MAX_POPUP_ALLOWED_ORIGINS}`) because a list the shell
+  sends and a list the tab judges with must agree byte for byte or an allowed site stays blocked.
+  `fake_tab --expect-popup-policy` echoes the policy it is sent (`popups:block:` /
+  `popups:allow:https://a.test`) and `--popup-blocked` makes a page whose address contains `popup`
+  report a refusal, so both halves of the wire are testable without an engine.
 - Archive mode (top-bar 💾 button, right of "UA", toggles it): the same right-docked
   overlay Rectangle, and no two of the four full-window overlays (manager /
   userscripts / UA / archive) ever stack — each open closes the others. The CheckBox

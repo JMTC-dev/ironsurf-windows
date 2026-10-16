@@ -1292,6 +1292,14 @@ impl Core {
                 self.toggle_reader();
                 return;
             }
+            Some(Shortcut::PopupAllowSite) => {
+                // Ctrl-Alt-P (task: block popups): allow this site to open
+                // windows; the tab applies the new policy to the page it is
+                // showing, so the reload the user would otherwise reach for is
+                // not needed.
+                self.allow_popup_site();
+                return;
+            }
             Some(Shortcut::SavePage) => {
                 // Ctrl-S (task: save-page selector): the "Save page" dialog —
                 // pick the folder (default `~/Downloads`) and the name, and
@@ -1899,6 +1907,49 @@ impl Core {
             .is_some_and(|i| !self.procs.borrow()[i].state.reader);
         info!("reader mode: toggling {enabled} on tab {}", self.active_tab_id().map(|id| id.0).unwrap_or(0));
         self.send_active(ToTab::SetReader { enabled });
+    }
+
+    /// ⛔ — raise or lower the active tab's popup blocker (task: block popups).
+    /// The policy is per tab (each tab is its own process) and only ever says
+    /// "a page may not open a window nobody asked for": the user's own clicks
+    /// keep working with the blocker up. The tab blocks by default, so a shell
+    /// that never sends this message still blocks.
+    fn set_popup_block(&self, block: bool) {
+        let Some(i) = self.active_proc_index() else {
+            debug!("popup switch dropped: no active tab");
+            return;
+        };
+        let msg = self.procs.borrow_mut()[i].state.set_popup_block(block);
+        info!("popups: block={block} on tab {}", self.procs.borrow()[i].tab.id.0);
+        self.send_active(msg);
+    }
+
+    /// "Allow popups from this site" (Ctrl-Alt-`P`, task: block popups): the
+    /// page's own origin goes on this tab's allow-list and the policy is re-sent,
+    /// so it applies to the page already on screen — no reload. A page with no
+    /// site origin (`about:blank`, `data:`, our internal pages) has nothing to
+    /// allow, and saying so beats writing a rule that matches every site.
+    fn allow_popup_site(&self) {
+        let Some(i) = self.active_proc_index() else {
+            debug!("popup allow dropped: no active tab");
+            return;
+        };
+        let msg = {
+            let mut procs = self.procs.borrow_mut();
+            let Some(msg) = procs[i].state.allow_popup_site(true) else {
+                info!(
+                    "popups: nothing to allow on tab {} (the page has no site origin)",
+                    procs[i].tab.id.0
+                );
+                return;
+            };
+            info!("popups: allowed {}", procs[i].state.popup_allowed.join(", "));
+            msg
+        };
+        // The notice the status line was showing is now about a site the user has
+        // just allowed; no tab says so, so the line is refreshed by hand.
+        self.status_refresh();
+        self.send_active(msg);
     }
 
     fn open_find(&self) {
@@ -3239,6 +3290,14 @@ impl Core {
         p.state
             .error
             .clone()
+            // A page the tab stopped from opening windows outranks the tab's own
+            // idle status line (task: block popups) — but never a load in flight,
+            // because "Waiting for host…" is the newer fact.
+            .or_else(|| {
+                (!p.state.loading)
+                    .then(|| p.state.popup_notice())
+                    .flatten()
+            })
             .or_else(|| p.state.status.clone())
             .or_else(|| self.spawn_error.borrow().clone())
             .or(download)
@@ -3248,6 +3307,21 @@ impl Core {
 
     /// Re-push the status line after a row moved, so a download is visible
     /// without the panel (the newest row of the tab on screen wins).
+    /// Re-push the active tab's status line after something it reports changed
+    /// without a message from any tab — here, allowing a site retires the
+    /// blocked-popup notice (task: block popups).
+    fn status_refresh(&self) {
+        let Some(ui) = self.ui() else { return };
+        let procs = self.procs.borrow();
+        if let Some(status) = self
+            .active_proc_index()
+            .and_then(|i| procs.get(i))
+            .map(|p| self.status_text(p))
+        {
+            ui.set_status_text(status.into());
+        }
+    }
+
     fn download_status_refresh(&self) {
         let Some(ui) = self.ui() else { return };
         let procs = self.procs.borrow();
@@ -4540,6 +4614,9 @@ impl Core {
             ui.set_can_back(p.state.can_back);
             ui.set_can_fwd(p.state.can_forward);
             ui.set_reader_on(p.state.reader);
+            // The popup blocker comes back with the tab too: one switch per
+            // process, so a site allowed here says nothing about there.
+            ui.set_popup_blocked(!p.state.popup_block_off);
             // An address being typed belongs to exactly one tab: switching
             // tabs (or that tab going away) drops the draft, so the strip can
             // never leave a stale address in the bar. While it is live the
@@ -4602,6 +4679,14 @@ impl Core {
         bind0!(on_go_forward, |c: &Rc<Core>| c.send_active(ToTab::Forward));
         bind0!(on_reload, |c: &Rc<Core>| c.send_active(ToTab::Reload));
         bind0!(on_reader_toggled, |c: &Rc<Core>| c.toggle_reader());
+        bind0!(on_popup_block_toggled, |c: &Rc<Core>| {
+            // The button states the tab's switch, so the command is its flip.
+            let blocking = c
+                .active_proc_index()
+                .is_some_and(|i| !c.procs.borrow()[i].state.popup_block_off);
+            c.set_popup_block(!blocking);
+        });
+        bind0!(on_popup_allow_site, |c: &Rc<Core>| c.allow_popup_site());
         bind0!(on_new_tab, |c: &Rc<Core>| {
             let cid = c.new_tab_container();
             c.open_tab(cid, Some(&default_url()));

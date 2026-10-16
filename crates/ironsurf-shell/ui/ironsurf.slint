@@ -584,6 +584,16 @@ export component AppWindow inherits Window {
     in property <bool> reader-on: false;
     callback reader-toggled();
 
+    // popups (task: block popups): the ⛔ button mirrors whether the active
+    // tab's blocker stands, and holds-in while it does (blocking is the default,
+    // so the button starts pressed). `popup-allow-site` is "this site may open
+    // windows anyway" — Ctrl-Alt-`P`, the same command the status-line notice
+    // names after a blocked popup. Neither says anything about the user's own
+    // clicks: those open windows while the switch is up.
+    in property <bool> popup-blocked: true;
+    callback popup-block-toggled();
+    callback popup-allow-site();
+
     in-out property<string> url-text <=> url-bar.text;
     in property <string> status-text;
     in property <string> sec-glyph: "";
@@ -1030,6 +1040,11 @@ export component AppWindow inherits Window {
                 // and stays held-in while it is on; Ctrl-Alt-`R` is the same
                 // command.
                 MiniButton { label: "\u{1F4C4}"; checked: root.reader-on; clicked => { root.reader-toggled(); } }
+
+                // popups (task: block popups): ⛔ — no entry — pressed while the
+                // blocker stands, which is every tab's starting state; releasing
+                // it lets this tab's pages open windows unasked.
+                MiniButton { label: "\u{26D4}"; checked: root.popup-blocked; clicked => { root.popup-block-toggled(); } }
 
                 // userscript menu (task: userscript menu)
                 MiniButton { label: "</>"; clicked => { root.toggle-us-menu(); } }

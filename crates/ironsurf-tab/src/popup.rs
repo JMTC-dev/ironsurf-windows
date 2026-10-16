@@ -48,9 +48,11 @@ pub const ACTIVATION_WINDOW: Duration = Duration::from_secs(5);
 /// open a window" means; a second click arms a second one. Everything past the
 /// first is a page deciding on its own how many tabs the user wanted.
 pub const MAX_OPEN_PER_ACTIVATION: u32 = 1;
-/// Origins the shell can hand over at once (the allow-list is user data, not
-/// an unbounded list, and it travels on every policy message).
-pub const MAX_ALLOWED_ORIGINS: usize = 64;
+/// Origins the shell can hand over at once (the allow-list is user data, not an
+/// unbounded list, and it travels on every policy message). Named in
+/// ironsurf-common so the list the shell displays and the list this gate judges
+/// with are capped by the same number (task: block popups).
+pub const MAX_ALLOWED_ORIGINS: usize = ironsurf_common::MAX_POPUP_ALLOWED_ORIGINS;
 
 /// What asked for the window.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -140,22 +142,14 @@ impl Policy {
 /// `https://Example.COM:8443/a?b#c` → `https://example.com:8443`. A bare host
 /// (`example.com`) is read as an `https` origin, since that is what a user
 /// typing a site name means. `None` = not a site name at all.
+///
+/// The rule lives in ironsurf-common ([`ironsurf_common::normalize_popup_origin`])
+/// because the shell has to normalize the very same way when it adds a site from
+/// its own overlay: an entry stored as `Example.COM` has to match the document
+/// origin this gate computes, or the user allowed a site that stays blocked
+/// (task: block popups).
 pub fn normalize_origin(raw: &str) -> Option<String> {
-    let trimmed = raw.trim();
-    if trimmed.is_empty() || trimmed.contains(char::is_whitespace) {
-        return None;
-    }
-    let candidate = if trimmed.contains("://") {
-        trimmed.to_owned()
-    } else {
-        format!("https://{trimmed}")
-    };
-    let parsed = Url::parse(&candidate).ok()?;
-    if parsed.host_str().is_none() {
-        return None;
-    }
-    let origin = parsed.origin().ascii_serialization();
-    (!origin.is_empty() && origin != "null").then_some(origin)
+    ironsurf_common::normalize_popup_origin(raw)
 }
 
 /// Does a `target` attribute ask for a **new window**? `_self`, `_top`,
@@ -212,15 +206,11 @@ pub fn loadable_target(url: &str) -> bool {
     }
 }
 
-/// The origin a popup request is judged against (`None` = opaque).
+/// The origin a popup request is judged against (`None` = opaque): see
+/// [`ironsurf_common::origin_of`], the shared rule the shell reads the same page
+/// with when it decides what "allow this site" would write.
 pub fn document_origin(url: &Url) -> Option<String> {
-    match url.origin() {
-        origin if origin.is_tuple() => {
-            let serialized = origin.ascii_serialization();
-            (!serialized.is_empty() && serialized != "null").then_some(serialized)
-        }
-        _ => None,
-    }
+    ironsurf_common::origin_of(url)
 }
 
 /// User activation: armed by real input, spent by an allowed window.

@@ -90,18 +90,24 @@ fn spawn_image_server() -> u16 {
                 let tag = if tag.is_empty() { "a" } else { &tag };
                 http_response(200, "text/html", page(tag).as_bytes())
             };
-            let _ = stream.write_all(response.as_bytes());
+            let _ = stream.write_all(&response);
             let _ = stream.flush();
         }
     });
     port
 }
 
-fn http_response(status: u16, content_type: &str, body: &[u8]) -> String {
-    format!(
+/// Build the whole response as bytes — a body that is not text (a PNG,
+/// say) must reach the tab intact, so nothing here may round-trip it
+/// through a `String`.
+fn http_response(status: u16, content_type: &str, body: &[u8]) -> Vec<u8> {
+    let mut response = format!(
         "HTTP/1.0 {status} OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
         body.len()
-    ) + &String::from_utf8_lossy(body)
+    )
+    .into_bytes();
+    response.extend_from_slice(body);
+    response
 }
 
 struct TabChild {

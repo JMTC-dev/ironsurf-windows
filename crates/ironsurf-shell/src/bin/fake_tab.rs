@@ -78,6 +78,12 @@ fn main() {
     // (task: block popups). The rules live in the real tab; a fake only proves a
     // decision written by the shell reached the page's gate.
     let mut expect_popup_policy = false;
+    // With `--popup-blocked`: a page whose address contains "popup" asks for a
+    // window nobody clicked for, and the tab refuses it (task: block popups) —
+    // the fake has no engine, so it reports the refusal the real runtime reports
+    // (`FromTab::PopupBlocked`) and lets the test follow what the shell makes of
+    // it: a notice on the status line, gone with the next page.
+    let mut popup_blocked = false;
     let mut current_block = true;
     let mut current_allowed: Vec<String> = Vec::new();
 
@@ -122,6 +128,7 @@ fn main() {
             "--expect-user-agent" => expect_user_agent = true,
             "--archive-mode" => current_archive = true,
             "--expect-popup-policy" => expect_popup_policy = true,
+            "--popup-blocked" => popup_blocked = true,
             "--expect-archive-mode" => expect_archive_mode = true,
             "--expect-copy" => expect_copy = true,
             // the shell spawns a UA container's tabs with the container's UA;
@@ -259,6 +266,13 @@ fn main() {
                 ask_archive(&mut emit, &new);
                 url = new;
                 announce(&mut emit, &url, true);
+                // The scripted "popup page": one window asked for, one refusal
+                // reported (task: block popups).
+                if popup_blocked && url.contains("popup") {
+                    emit(FromTab::PopupBlocked {
+                        url: "https://ads.test/interstitial".to_string(),
+                    });
+                }
             }
             // The shell's answer: report it on the status line, which is what
             // the tests read as the page's summary.

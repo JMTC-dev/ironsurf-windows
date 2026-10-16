@@ -646,6 +646,76 @@ pub const MAX_CONTEXT_TEXT: usize = 256 * 1024;
 /// large, so the tail is dropped rather than shipped.
 pub const MAX_POPUP_URL_CHARS: usize = 512;
 
+/// Origins a popup allow-list may hold (task: block popups). It is user data
+/// carried on every `ToTab::SetPopupPolicy`, so it is bounded — and bounded
+/// *identically* on both ends, because a list the shell trimmed differently
+/// from the list the tab judged with is a site the user allowed that is
+/// silently blocked anyway.
+pub const MAX_POPUP_ALLOWED_ORIGINS: usize = 64;
+
+/// The origin of an already-parsed URL, as the popup policy names it: tuple
+/// schemes only, ASCII-serialized, port included when it is not the scheme's
+/// default (`https://example.com:8443/a?b` → `https://example.com:8443`).
+/// `None` = an origin nothing can match — `about:blank`, a `data:`/`blob:`
+/// document, a `javascript:` run — which is exactly the reading a policy wants:
+/// a document with no origin is never covered by an allow-list entry.
+pub fn origin_of(url: &url::Url) -> Option<String> {
+    let origin = url.origin();
+    if !origin.is_tuple() {
+        return None;
+    }
+    let serialized = origin.ascii_serialization();
+    (!serialized.is_empty() && serialized != "null").then_some(serialized)
+}
+
+/// [`origin_of`] for a URL given as text (what the shell has: the address bar,
+/// a `FromTab::UrlChanged`). A URL it cannot parse has no origin.
+pub fn popup_origin(url: &str) -> Option<String> {
+    url::Url::parse(url.trim()).ok().and_then(|url| origin_of(&url))
+}
+
+/// What a **user** types for a site, normalized to the origin the policy
+/// stores: `Example.COM/path` → `https://example.com`,
+/// `http://localhost:8080/x` → `http://localhost:8080`. A bare host is read as
+/// `https`, because that is what naming a site today means. `None` = not a site
+/// name at all (empty, whitespace, a host-less URL) — dropped, never stored
+/// broken, rather than kept as an entry that matches nothing.
+pub fn normalize_popup_origin(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() || trimmed.contains(char::is_whitespace) {
+        return None;
+    }
+    let candidate = if trimmed.contains("://") {
+        trimmed.to_owned()
+    } else {
+        format!("https://{trimmed}")
+    };
+    let parsed = url::Url::parse(&candidate).ok()?;
+    parsed.host_str()?;
+    origin_of(&parsed)
+}
+
+/// Replace an allow-list entry for `origin` (task: block popups): `allow` adds
+/// it (deduped, list capped at [`MAX_POPUP_ALLOWED_ORIGINS`] — oldest entries
+/// give way, since the one the user just acted on must never be the one that
+/// falls off) and `false` removes it. Both ends of the wire use it so a list
+/// the shell shows is a list the tab judges with, byte for byte.
+pub fn set_popup_allowed(allowed: &[String], origin: &str, allow: bool) -> Vec<String> {
+    let mut list: Vec<String> = allowed
+        .iter()
+        .filter(|entry| entry.as_str() != origin)
+        .cloned()
+        .collect();
+    if allow {
+        list.push(origin.to_owned());
+        // Oldest entries give way: the one the user has just acted on must
+        // never be the one that falls off the capped list.
+        let overflow = list.len().saturating_sub(MAX_POPUP_ALLOWED_ORIGINS);
+        list.drain(..overflow);
+    }
+    list
+}
+
 /// What made a top-level fetch a **download** instead of a page. The tab
 /// decides (it owns the response), the shell only displays it, so the
 /// ordering of the reasons is a tab-side rule (see the tab's
