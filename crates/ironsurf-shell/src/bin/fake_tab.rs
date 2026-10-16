@@ -74,6 +74,12 @@ fn main() {
     // echoed on the status line, so the tests can watch the shell's chord
     // protocol: clipboard first, keystroke second.
     let mut current_archive = false;
+    // With `--expect-popup-policy`: echo the popup policy the shell installs
+    // (task: block popups). The rules live in the real tab; a fake only proves a
+    // decision written by the shell reached the page's gate.
+    let mut expect_popup_policy = false;
+    let mut current_block = true;
+    let mut current_allowed: Vec<String> = Vec::new();
 
     let mut it = args.iter().skip(1);
     while let Some(arg) = it.next() {
@@ -115,6 +121,7 @@ fn main() {
             "--expect-userscripts" => expect_userscripts = true,
             "--expect-user-agent" => expect_user_agent = true,
             "--archive-mode" => current_archive = true,
+            "--expect-popup-policy" => expect_popup_policy = true,
             "--expect-archive-mode" => expect_archive_mode = true,
             "--expect-copy" => expect_copy = true,
             // the shell spawns a UA container's tabs with the container's UA;
@@ -426,6 +433,25 @@ fn main() {
                 if expect_archive_mode {
                     emit(FromTab::StatusText {
                         text: Some(format!("archive:{}", if current_archive { "on" } else { "off" })),
+                    });
+                }
+            }
+            // The popup policy wire (task: block popups): hold what the shell
+            // asked for and — with `--expect-popup-policy` — echo it as
+            // `popups:block:` / `popups:allow:https://a.test,https://b.test`, the
+            // same shape every other per-tab setting echoes in. The real tab
+            // applies the rules to its own pages; neither this fake nor the
+            // shell rewrites what the tab then decided.
+            ToTab::SetPopupPolicy { block, allowed } => {
+                current_block = block;
+                current_allowed = allowed.clone();
+                if expect_popup_policy {
+                    emit(FromTab::StatusText {
+                        text: Some(format!(
+                            "popups:{}:{}",
+                            if current_block { "block" } else { "allow" },
+                            current_allowed.join(",")
+                        )),
                     });
                 }
             }

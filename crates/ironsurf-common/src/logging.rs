@@ -149,7 +149,11 @@ pub fn level_from_args(args: &[String]) -> Option<Level> {
         } else if arg == "--log" || arg == "--log-level" {
             found = it.next().and_then(|v| Level::parse(v));
         } else if matches!(arg.as_str(), "-v" | "-vv" | "--verbose" | "--debug") {
-            found = Some(if arg == "-vv" { Level::Trace } else { Level::Debug });
+            found = Some(if arg == "-vv" {
+                Level::Trace
+            } else {
+                Level::Debug
+            });
         }
     }
     found
@@ -227,7 +231,11 @@ pub fn format_line(now: Duration, level: Level, context: &str, target: &str, msg
     if context.is_empty() {
         format!("{} {} {target}: {msg}", clock(now), level.as_str())
     } else {
-        format!("{} {} {context} {target}: {msg}", clock(now), level.as_str())
+        format!(
+            "{} {} {context} {target}: {msg}",
+            clock(now),
+            level.as_str()
+        )
     }
 }
 
@@ -257,7 +265,8 @@ pub fn emit(level: Level, target: &str, msg: Arguments<'_>) {
     }
     if let Some(e) = err {
         // Never recurse into the logger about the logger.
-        let _ = std::io::stderr().write_all(format!("ironsurf: stderr write failed: {e}\n").as_bytes());
+        let _ =
+            std::io::stderr().write_all(format!("ironsurf: stderr write failed: {e}\n").as_bytes());
     }
 }
 
@@ -341,9 +350,21 @@ mod tests {
 
     #[test]
     fn format_line_with_and_without_context() {
-        let line = format_line(dur(1, 2, 3, 4), Level::Info, "tab 3", "ironsurf_tab::runtime", "hello");
+        let line = format_line(
+            dur(1, 2, 3, 4),
+            Level::Info,
+            "tab 3",
+            "ironsurf_tab::runtime",
+            "hello",
+        );
         assert_eq!(line, "[01:02:03.004] INFO tab 3 runtime: hello");
-        let no_ctx = format_line(dur(1, 2, 3, 4), Level::Warn, "", "ironsurf_shell::app", "gone");
+        let no_ctx = format_line(
+            dur(1, 2, 3, 4),
+            Level::Warn,
+            "",
+            "ironsurf_shell::app",
+            "gone",
+        );
         // An empty context drops that field entirely (the shell may not have one yet).
         assert_eq!(no_ctx, "[01:02:03.004] WARN app: gone");
     }
@@ -362,14 +383,23 @@ mod tests {
         assert_eq!(level_from_spec("*:debug"), Some(Level::Debug));
         assert_eq!(level_from_spec("*=warn"), Some(Level::Warn));
         assert_eq!(level_from_spec("ironsurf_tab=trace"), None);
-        assert_eq!(level_from_spec("ironsurf_tab=trace,warn"), Some(Level::Warn));
+        assert_eq!(
+            level_from_spec("ironsurf_tab=trace,warn"),
+            Some(Level::Warn)
+        );
     }
 
     #[test]
     fn cli_flags_win_over_default() {
         let args = |v: &[&str]| -> Vec<String> { v.iter().map(|s| s.to_string()).collect() };
-        assert_eq!(level_from_args(&args(&["ironsurf-tab", "--log", "trace"])), Some(Level::Trace));
-        assert_eq!(level_from_args(&args(&["x", "--log=warn"])), Some(Level::Warn));
+        assert_eq!(
+            level_from_args(&args(&["ironsurf-tab", "--log", "trace"])),
+            Some(Level::Trace)
+        );
+        assert_eq!(
+            level_from_args(&args(&["x", "--log=warn"])),
+            Some(Level::Warn)
+        );
         assert_eq!(level_from_args(&args(&["x", "-v"])), Some(Level::Debug));
         assert_eq!(level_from_args(&args(&["x", "-vv"])), Some(Level::Trace));
         assert_eq!(level_from_args(&args(&["x", "--url", "y"])), None);

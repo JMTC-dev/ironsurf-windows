@@ -99,6 +99,14 @@ pub enum FromTab {
     HistoryChanged   { can_go_back: bool, can_go_forward: bool },
     StatusText       { text: Option<String> },
     OpenLinkInNewTab { url: String },      // middle-click a link → shell opens url in a new tab (same container)
+    // (task: block popups) this tab **refused** to open a window: the page asked
+    // for one with no user interaction behind it, and its origin is not allowed.
+    // Nothing was fetched and nothing changed in this tab. `url` is the target,
+    // already resolved against the document URL and capped at 512 chars — a
+    // `data:` target is megabytes of document and
+    // must not travel to the shell whole. The notice is what an "allow this
+    // site" affordance sends back for as `ToTab::SetPopupPolicy`.
+    PopupBlocked     { url: String },
     // right-click on the page: the tab has hit-tested what the cursor was over
     // (`ContextTarget`); the shell opens the context menu at (`x`, `y`) — logical
     // px in the page viewport — and each choice comes back as `ToTab::ContextAction`
@@ -216,6 +224,14 @@ pub enum ToTab {
     // User-Agent on every subsequent request; None = the tab's built-in
     // default. The shell re-sends it on every tab spawn and on every switch.
     SetUserAgent { user_agent: Option<String> },
+    // popup blocking (task: block popups): `block` = refuse every window a user
+    // gesture did not authorize (the tab's own default when nobody ever sends
+    // this); `allowed` = **document origins** whose popups are never blocked,
+    // normalized, deduped, capped at 64. Sent at tab spawn and on change, like
+    // every other per-tab setting; it applies to the page already loaded, no
+    // reload. The rules live in the tab (`src/popup.rs`) — the shell only owns
+    // the levers, and answers nothing back to this.
+    SetPopupPolicy   { block: bool, allowed: Vec<String> },
     // archive mode master switch (the 💾 toolbar menu; **global**, not
     // per-container): while enabled the tab emits `FromTab::ArchivedFetch`
     // for every successful http(s) response (documents, subresources,
@@ -1225,6 +1241,34 @@ the tab owns submission outright — blitz's own submission is never used for it
   select's initial selectedness once per parsed document, before the first layout.
 - The welcome page (`ironsurf://welcome`) is a working GET-form demo: it echoes the query
   string its own form submits against it.
+
+### Popups (`src/popup.rs`)
+
+A tab cannot open a window — tabs belong to the shell — so "block popups" is entirely about who
+gets to *ask*. Two questions decide every request and nothing else does:
+- **Does the policy allow it?** `Policy` (master switch + allowed document origins) is what the
+  shell pushes as `ToTab::SetPopupPolicy`; a tab nobody ever told anything **blocks** with an
+  empty list, so the safe reading is the default and a shell ignorant of popups is still safe.
+- **Did a user just ask for this?** Real input (a pointer or key press the shell forwarded, which
+  by construction came from a human) arms engagement for 5 s and buys **one** window: Firefox's
+  `dom.disable_open_click_delay` model, because this engine has no event-loop task identities to
+  hang true transient activation on. That is what separates an `onclick` handler calling
+  `window.open` (allowed) from a `load`/`setTimeout` handler doing it (blocked).
+- Rules, in order: a `javascript:`/`data:`/`blob:`/`file:` target is refused before anything else
+  (script, or a document smuggled in a URL — no policy or gesture makes it a page); a target that
+  does not name a *new* window (`_self`, `_top`, a name in this window) is not a popup at all and
+  never reaches the gate; the master switch off allows; an allowed origin allows; an armed gesture
+  allows and spends itself; everything else is blocked. A user click on `<a target="_blank">` is
+  the interaction itself and needs no budget — and it opens a tab **without navigating this one**,
+  since blitz's `NavigationProvider` knows nothing about `target`.
+- `window.open` must answer `null` or a window **synchronously**, so the decision runs inside the
+  JS call (`PopupHook` is one shared cell) while the consequences — "shell, open this" and "shell,
+  I refused" — are queued and drained by the poll loop like the link-click hook. An allowed popup
+  is answered with an isolated `Window` stub: resolved `location`, the `features` size, a document
+  that answers politely, `opener` always `null` (a popup never gets a handle on the page that made
+  it) and `close()`/`focus()`/`postMessage` no-ops — no script ever gets a real second window.
+- A refusal is never silent: each one becomes `FromTab::PopupBlocked` with the resolved, capped
+  target. Blocked is not dropped, allowed is not opened by us.
 
 ### Headless tests (must run with no X display)
 - `tests/spike.rs`: render a `file://` fixture (tempdir HTML with colored blocks) through

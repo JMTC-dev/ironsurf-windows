@@ -1255,6 +1255,11 @@ pub struct HostState {
     /// `None` (bare JS tests, no tab attached) makes `fetch()` report
     /// nowhere.
     pub net_events: Option<Arc<std::sync::Mutex<Vec<NetEvent>>>>,
+    /// The popup blocker's gate (task: block popups): what `window.open` and a
+    /// script-activated `target="_blank"` link ask, and what the tab loop
+    /// drains. `None` (bare JS tests, no tab behind the context) blocks: a page
+    /// may open a window only through a gate that exists to say yes.
+    pub popups: Option<crate::popup::SharedPopupHook>,
 }
 
 impl HostState {
@@ -3780,6 +3785,15 @@ fn active_dialog() -> Option<Arc<crate::runtime::DialogHost>> {
         .and_then(|scope| scope.host.borrow().dialog.clone())
 }
 
+/// The active document realm's popup gate (task: block popups). The `Arc` is
+/// cloned out before the native decides — the convention every native follows,
+/// since a decision queues work the tab loop drains.
+pub(crate) fn active_popups() -> Option<crate::popup::SharedPopupHook> {
+    ACTIVE_HOSTS
+        .with(|stack| stack.borrow().last().cloned())
+        .and_then(|scope| scope.host.borrow().popups.clone())
+}
+
 // ---------------------------------------------------------------------------
 // Bindings
 
@@ -3802,6 +3816,7 @@ mod native {
     pub(super) const MEDIA_GET: &str = "__ironsurfMediaGet";
     pub(super) const MEDIA_CMD: &str = "__ironsurfMediaCmd";
     pub(super) const DIALOG: &str = "__ironsurfDialog";
+    pub(super) const POPUP: &str = "__ironsurfPopup";
     pub(super) const STORAGE: &str = "__ironsurfStorage";
     pub(super) const COOKIES: &str = "__ironsurfCookies";
     pub(super) const XHR: &str = "__ironsurfXhr";
@@ -5310,7 +5325,16 @@ const PRELUDE: &str = r##"
       if (href !== null && href !== "" && !/^javascript:/i.test(String(href))) {
         try {
           var target = new URL(String(href), host.location.href).href;
-          host.__ironsurfNavigate(target, false);
+          // A `target` naming another window asks for a POPUP, not for this
+          // tab to navigate (task: block popups) — so it goes through the same
+          // gate `window.open` does. `<a target="_blank">.click()` from script
+          // cannot smuggle a tab past a blocker that way.
+          var name = popupTargetName(this.getAttribute("target"));
+          if (name === null) {
+            host.__ironsurfNavigate(target, false);
+          } else {
+            host.__ironsurfPopup(target, name);
+          }
         } catch (err) {
           /* unresolvable href: no default action, like the spec */
         }
@@ -6515,6 +6539,114 @@ const PRELUDE: &str = r##"
     var fallback = def === undefined || def === null ? "" : String(def);
     return host.__ironsurfDialog("prompt", dialogMessage(message), fallback);
   };
+
+  // ---------------------------------------------------------------------
+  // window.open — the popup blocker's front door (task: block popups: a
+  // website opening a new tab without a user interaction). Whether a window
+  // may open at all is answered in RUST (crate::popup), never here: policy,
+  // the site allow-list, and whether a real click or key press just happened
+  // all live there. A refusal answers `null` exactly like a browser that
+  // blocked the popup, and the page keeps running. An acceptance answers a
+  // stub window for the tab the shell is about to open — an isolated window
+  // like every tab is, sized by the `features` string, and with `opener`
+  // null: no page reaches into another tab's JavaScript here, so the
+  // `window.opener.document.write` dance no site ever needed cannot be
+  // written at all. A popup is never a `<div>` dressed up as a window.
+  // ---------------------------------------------------------------------
+  function popupFeature(features, name, fallback) {
+    // `window.open(u, "_blank", "width=1024,height=768")`: the two sizes the
+    // stub reports back. Clamped to something a window could really be.
+    var m = new RegExp("(?:^|[,;\\s])" + name + "=(\\d+)").exec(
+      features === undefined || features === null ? "" : String(features));
+    if (m === null) return fallback;
+    var n = parseInt(m[1], 10);
+    if (!isFinite(n)) return fallback;
+    return Math.max(100, Math.min(8192, n));
+  }
+  function popupTargetName(target) {
+    // null/undefined/""/"_self"/"_top"/"_parent" mean THIS window: no new tab
+    // is being asked for. Anything else ("_blank" or a window name) is.
+    if (target === undefined || target === null) return null;
+    var name = String(target).trim();
+    if (name === "" || name === "_self" || name === "_top" || name === "_parent") {
+      return null;
+    }
+    return name.length > 120 ? name.slice(0, 120) : name;
+  }
+  function popupUrl(raw) {
+    // An omitted url is about:blank (spec); anything unparseable asks for
+    // nothing at all.
+    var text = raw === undefined || raw === null ? "" : String(raw);
+    if (text === "") return "about:blank";
+    try { return new URL(text, host.location.href).href; } catch (err) { return null; }
+  }
+  function popupWindow(url, name, width, height) {
+    var win = {
+      closed: false,
+      name: name || "",
+      length: 0,
+      // The one place IronSurf is stricter than the web: a popup never gets
+      // a handle on the window that opened it.
+      opener: null,
+      top: null, self: null, window: null, parent: null, frames: null,
+      innerWidth: width, innerHeight: height,
+      outerWidth: width, outerHeight: height,
+      screen: { width: width, height: height, availWidth: width, availHeight: height },
+      location: {
+        href: url,
+        assign: noop, replace: noop, reload: noop,
+        toString: function () { return url; }
+      },
+      close: function () { win.closed = true; },
+      focus: noop, blur: noop, stop: noop, print: noop, postMessage: noop,
+      addEventListener: noop, removeEventListener: noop,
+      dispatchEvent: returnTrue,
+      alert: noop,
+      confirm: function () { return false; },
+      prompt: function () { return null; },
+      document: {
+        title: "", URL: url, readyState: "complete", location: null,
+        write: noop, writeln: noop, open: noop, close: noop,
+        getElementById: function () { return null; },
+        querySelector: function () { return null; },
+        querySelectorAll: function () { return []; },
+        addEventListener: noop, removeEventListener: noop,
+        body: null, documentElement: null
+      }
+    };
+    win.document.location = win.location;
+    win.top = win; win.self = win; win.window = win; win.parent = win;
+    win.frames = win;
+    return win;
+  }
+  host.open = function (raw, target, features) {
+    var url = popupUrl(raw);
+    if (url === null) return null;
+    // The gate takes the resolved URL as-is. It refuses `javascript:`/`data:`/
+    // `blob:`/`file:` targets itself — they are script or a document smuggled
+    // inside a URL, not a page a tab can load — and reports them capped, so the
+    // megabytes never travel to the shell either (task: block popups).
+    var name = popupTargetName(target);
+    if (host.__ironsurfPopup(url, name) !== true) return null;
+    return popupWindow(
+      url, name,
+      popupFeature(features, "width", 800),
+      popupFeature(features, "height", 600));
+  };
+  // The window itself: every one of these is accepted and answered politely,
+  // because none of them is a page's to decide. `close`/`print` do nothing —
+  // the shell owns tabs — `postMessage` is dropped (no other window is
+  // reachable from here), and `opener` is null: this tab is not script-
+  // reachable from any page, which is also what makes a blocked popup's
+  // would-be parent safe.
+  host.close = noop;
+  host.focus = noop;
+  host.blur = noop;
+  host.stop = noop;
+  host.print = noop;
+  host.postMessage = noop;
+  host.opener = null;
+  host.closed = false;
 
   // ---------------------------------------------------------------------
   // window.localStorage (task: per-origin DOM storage). The area lookup —
@@ -9560,6 +9692,37 @@ fn build_context_with_modules(
     ) {
         error!("js binding `dialog` failed to install: {err}");
     }
+    // window.open, and a script activating an `<a target="_blank">` link
+    // (task: block popups): ONE synchronous question to the gate — the page is
+    // owed a `Window` or `null` right here. The gate records the request; the
+    // tab loop tells the shell to open the allowed ones and reports the
+    // refused ones ([`crate::popup`]). This native never opens anything, and a
+    // context with no gate (bare tests) gets the safe answer: no.
+    if let Err(err) = context.register_global_builtin_callable(
+        JsString::from(native::POPUP),
+        2,
+        NativeFunction::from_copy_closure(|_this, args, context| {
+            let url = args
+                .first()
+                .cloned()
+                .unwrap_or(JsValue::undefined())
+                .to_string(context)?
+                .to_std_string_escaped();
+            let target = match args.get(1) {
+                Some(value) if !value.is_undefined() && !value.is_null() => {
+                    Some(value.to_string(context)?.to_std_string_escaped())
+                }
+                _ => None,
+            };
+            let decision = match active_popups() {
+                Some(gate) => gate.request(&url, target, crate::popup::PopupVia::Script),
+                None => crate::popup::Decision::Blocked,
+            };
+            Ok(JsValue::from(decision.allowed()))
+        }),
+    ) {
+        error!("js binding `popup gate` failed to install: {err}");
+    }
     // window.localStorage (task: per-origin DOM storage): the whole Storage
     // surface funnels through this ONE native, and every call answers an
     // envelope `[status, payload]` — "ok", "denied" or "quota" — that the
@@ -10885,6 +11048,154 @@ pub(crate) mod tests {
                 .as_boolean(),
             Some(true)
         );
+    }
+
+    /// A bare test host has no popup gate — and `window.open` answers the safe
+    /// reading (task: block popups): `null`, exactly what a browser that refused
+    /// the popup hands back, with the page left running. The rest of the window
+    /// surface the blocker touches exists and is polite: `close`/`focus`/`blur`/
+    /// `stop`/`postMessage` do nothing rather than throw, and `opener` is null.
+    /// The snippet's boolean answer (`false` for anything that is not a JS
+    /// `true`, including a throw swallowed by `undefined`).
+    fn truthy(source: &str, host: &HostRef) -> bool {
+        eval_snippet(source, host).as_boolean().unwrap_or(false)
+    }
+
+    /// A bare test host has no popup gate, and `window.open` answers the safe
+    /// reading (task: block popups): `null`, exactly what a browser that refused
+    /// the popup hands back, with the page left running. The rest of the window
+    /// surface the blocker touches exists and is polite: `close`/`focus`/`blur`/
+    /// `stop`/`postMessage` do nothing rather than throw, and `opener` is null.
+    #[test]
+    fn window_open_answers_null_when_no_gate_can_allow_it() {
+        let host = sample_host();
+        assert!(host.borrow().popups.is_none(), "a bare test host has no gate");
+        assert!(
+            truthy("typeof window.open === 'function' && typeof open === 'function'", &host),
+            "open must exist as a window function"
+        );
+        assert!(truthy("window.open('https://ads.test/popup') === null", &host), "no gate, no window");
+        assert!(truthy("window.open() === null", &host), "not even about:blank opens without a gate");
+        assert!(truthy("window.opener === null", &host), "no page reaches the window that opened it");
+        assert!(truthy("window.closed === false", &host));
+        assert!(
+            truthy(
+                concat!(
+                    "window.close(); window.focus(); window.blur(); window.stop(); ",
+                    "window.postMessage({a: 1}, '*'); window.print(); true"
+                ),
+                &host
+            ),
+            "none of these may throw, and none of them closes a tab"
+        );
+    }
+
+    /// With a gate that says yes, `window.open` answers a real `Window`-shaped
+    /// stub of the tab the shell is about to open (task: block popups): the URL
+    /// resolved against the document, the size the `features` string asked for, a
+    /// `document` that answers without throwing, and `opener` null — a popup
+    /// never gets a handle on the page that opened it. Every acceptance is also
+    /// queued for the poll loop, which is what tells the shell to open the tab.
+    #[test]
+    fn window_open_answers_an_isolated_window_when_the_gate_allows_it() {
+        let host = sample_host();
+        let gate = std::sync::Arc::new(crate::popup::PopupHook::detached());
+        // Blocking off for this test: the question here is the shape of the
+        // answer, not the rules (the rules have their own tests in `popup`).
+        gate.configure(false, Vec::new());
+        host.borrow_mut().popups = Some(std::sync::Arc::clone(&gate));
+        assert!(
+            truthy(
+                concat!(
+                    "var w = window.open('/promo?a=1', 'promo', 'width=1024,height=768'); ",
+                    "w !== null ",
+                    "&& w.location.href === 'https://example.test/promo?a=1' ",
+                    "&& w.name === 'promo' && w.innerWidth === 1024 && w.innerHeight === 768 ",
+                    "&& w.outerWidth === 1024 && w.closed === false && w.opener === null ",
+                    "&& w.self === w && w.top === w && w.document.title === '' ",
+                    "&& w.document.readyState === 'complete' ",
+                    "&& w.document.getElementById('x') === null ",
+                    "&& w.document.querySelector('p') === null ",
+                    "&& w.confirm('ok?') === false && w.prompt('name') === null ",
+                    "&& (w.document.write('hi'), w.focus(), w.postMessage(1, '*'), true) ",
+                    "&& (w.close(), w.closed === true)"
+                ),
+                &host
+            ),
+            "an allowed popup must look like a window, not like a div"
+        );
+        assert!(
+            truthy(
+                concat!(
+                    "var w = window.open('https://other.test/x'); ",
+                    "w.location.href === 'https://other.test/x' ",
+                    "&& w.name === '' && w.innerWidth > 0 && w.innerHeight > 0"
+                ),
+                &host
+            ),
+            "the default size is a window's, not 0x0"
+        );
+        let pending = gate.take_pending();
+        assert_eq!(pending.allowed.len(), 2, "every allowed request is reported");
+        assert_eq!(pending.allowed[0].url, "https://example.test/promo?a=1");
+        assert_eq!(pending.allowed[0].target.as_deref(), Some("promo"));
+        assert_eq!(pending.blocked.len(), 0);
+    }
+
+    /// A refusal is reported, never silently dropped, and a `javascript:` or
+    /// `data:` target is refused whatever the policy says — it is script, or a
+    /// whole document smuggled inside a URL, not a page a tab could load (task:
+    /// block popups).
+    #[test]
+    fn a_refused_popup_is_reported_and_script_targets_never_open() {
+        let host = sample_host();
+        let gate = std::sync::Arc::new(crate::popup::PopupHook::detached());
+        gate.configure(false, Vec::new());
+        host.borrow_mut().popups = Some(std::sync::Arc::clone(&gate));
+        // Blocking is off, yet these two are still refused: the scheme rule runs
+        // before any policy is consulted.
+        assert!(
+            truthy(
+                concat!(
+                    "window.open('data:text/html,<h1>hi</h1>') === null ",
+                    "&& window.open('javascript:evil()') === null"
+                ),
+                &host
+            ),
+            "a data:/javascript: target is not a page to open in a tab"
+        );
+        let pending = gate.take_pending();
+        assert_eq!(pending.allowed.len(), 0);
+        assert_eq!(
+            pending.blocked.len(),
+            2,
+            "a scheme refusal is a reported refusal: the user sees what the page reached for"
+        );
+        assert!(pending.blocked[0].url.starts_with("data:"));
+        assert!(pending.blocked[1].url.starts_with("javascript:"));
+        // And with the default policy (blocking on, no gesture, site not
+        // allowed) the same ordinary call is a reported refusal too.
+        let strict = std::sync::Arc::new(crate::popup::PopupHook::detached());
+        strict.state.lock().unwrap().set_origin(Some("https://example.test".to_owned()));
+        host.borrow_mut().popups = Some(std::sync::Arc::clone(&strict));
+        assert!(truthy("window.open('/x') === null", &host));
+        let pending = strict.take_pending();
+        assert_eq!(pending.allowed.len(), 0);
+        assert_eq!(pending.blocked.len(), 1);
+        assert_eq!(pending.blocked[0].url, "https://example.test/x");
+    }
+
+    /// The default host state is the safe one on both axes the popup blocker
+    /// cares about: no gate, and through it no policy, no allow-list, no
+    /// engagement, no way for a page to earn a window.
+    #[test]
+    fn host_state_defaults_to_no_popup_door_at_all() {
+        let host = HostState::default();
+        assert!(host.popups.is_none());
+        let state = crate::popup::PopupHook::detached().state.lock().unwrap().clone();
+        assert!(state.policy().block, "a tab nobody configured still blocks");
+        assert!(state.policy().allowed.is_empty());
+        assert_eq!(state.remaining(std::time::Instant::now()), 0);
     }
 
     #[test]

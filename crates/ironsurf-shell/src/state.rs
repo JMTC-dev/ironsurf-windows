@@ -92,6 +92,14 @@ pub struct TabState {
     /// screen is its cleaned-up text-and-images rendering. The 📄 toolbar
     /// button holds while this is set; every real navigation clears it.
     pub reader: bool,
+    /// How many windows the page on screen tried to open **without the user**
+    /// and the tab refused (task: block popups). The blocking happens entirely
+    /// inside the tab — its default policy stops a `window.open` nobody asked
+    /// for — so this is the shell's memory of what was stopped on its behalf:
+    /// the tally a notice or an "allow this site" affordance (sent back as
+    /// `ToTab::SetPopupPolicy`) has to point at. Counted, never drawn, so — like
+    /// the DevTools feeds — it does not dirty the frame.
+    pub popups_blocked: u32,
     /// The tab's document viewport as the tab itself last described it (task:
     /// scroll bar). Only the tab has laid the page out, so only it knows how
     /// far the document goes and where inside it the reader is standing now;
@@ -127,9 +135,19 @@ impl TabState {
                 if url == &self.url {
                     false
                 } else {
+                    // A new page is a fresh record: what the last one did is no
+                    // longer worth a notice.
+                    self.popups_blocked = 0;
                     self.url = url.clone();
                     true
                 }
+            }
+            // The tab refused a popup on the user's behalf (task: block
+            // popups). Nothing on screen depends on the count yet, so — as with
+            // the console and network feeds — acceptance is not a redraw.
+            FromTab::PopupBlocked { .. } => {
+                self.popups_blocked = self.popups_blocked.saturating_add(1);
+                false
             }
             FromTab::LoadingChanged { loading } => {
                 // A load that starts replaces the last thing the bar had to
@@ -1423,6 +1441,28 @@ mod tests {
         assert!(s.reduce(&FromTab::Closed));
         assert!(s.closed);
         assert!(!s.reduce(&FromTab::Closed));
+    }
+
+    /// The popup tally (task: block popups): every refusal the tab reports is
+    /// remembered, nothing about it redraws, and a new page starts clean.
+    #[test]
+    fn blocked_popups_are_counted_and_cleared_by_the_next_page() {
+        let mut s = TabState::default();
+        assert_eq!(s.popups_blocked, 0, "a tab that said nothing blocked nothing");
+        for _ in 0..3 {
+            assert!(
+                !s.reduce(&FromTab::PopupBlocked {
+                    url: "https://ads.test/popup".into(),
+                }),
+                "a tally nobody draws must not dirty the frame"
+            );
+        }
+        assert_eq!(s.popups_blocked, 3);
+        s.reduce(&FromTab::UrlChanged { url: Some("https://news.test/".into()) });
+        assert_eq!(s.popups_blocked, 0, "the record belongs to the page that made it");
+        // A message for the page already on screen leaves it alone.
+        s.reduce(&FromTab::TitleChanged { title: Some("News".into()) });
+        assert_eq!(s.popups_blocked, 0);
     }
 
     #[test]
