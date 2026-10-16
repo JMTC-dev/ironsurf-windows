@@ -52,7 +52,7 @@ jobs:
           if [ "$os_name" = "Linux" ]; then
             artifact_name="ironsurf-linux-x86_64"
           else
-            artifact_name="ironsurf-macos-x86_64"
+            artifact_name="ironsurf-macos-arm64"
           fi
           echo "name=$artifact_name" >> "$GITHUB_OUTPUT"
 
