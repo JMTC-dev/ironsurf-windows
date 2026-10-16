@@ -1388,7 +1388,15 @@ UI (`crates/ironsurf-shell/ui/ironsurf.slint`):
   ⛔ sits in the toolbar (right of ＋) **pressed while the active tab blocks** — pressing it lowers
   the switch for that tab alone (a released blocker means a page may open windows nobody asked for;
   the user's own clicks open windows either way), and its `checked` state always mirrors the tab
-  shown, so switching tabs switches the switch. Ctrl-Alt-`P` says "this site may open windows
+  shown, so switching tabs switches the switch. **Both** the icon and its hover tooltip —
+  `popups blocked` / `popups allowed`, the switch read out loud, and only the switch: an
+  allow-listed site leaves the blocker standing over every other site — move the **instant** the
+  button is clicked: the tab is handed a policy and never answers one, so no message on the wire
+  would ever have repainted it, and waiting for the next full `sync_ui` left the reader pressing
+  an icon that only changed after they switched tabs and came back (`Core::popup_switch_refresh`).
+  Tooltips are the window's, not the widget's: `MiniButton` reports a hover (`tip` empty = says
+  nothing) and one overlay `Rectangle`, declared last in `AppWindow` so nothing on the page can
+  cover it, draws the words below the control and pulls itself back from the right edge. Ctrl-Alt-`P` says "this site may open windows
   anyway": the page's own origin (scheme+host+port, `ironsurf_common::popup_origin`) joins the
   tab's allow-list and the whole policy ships as one `ToTab::SetPopupPolicy` — switch and list
   together, so a tab is never half-informed. A page with no site origin (`about:blank`,

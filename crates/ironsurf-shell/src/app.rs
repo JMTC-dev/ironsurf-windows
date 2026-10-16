@@ -1922,6 +1922,25 @@ impl Core {
         let msg = self.procs.borrow_mut()[i].state.set_popup_block(block);
         info!("popups: block={block} on tab {}", self.procs.borrow()[i].tab.id.0);
         self.send_active(msg);
+        // …and the ⛔ moves now. A tab accepts a policy and never answers it —
+        // there is no message coming back with the switch on it — so the button
+        // that was just pressed is repainted here or nowhere: waiting for the
+        // next `sync_ui` left the reader pressing an icon that only changed
+        // once they switched tabs and came back (task: popup blocker tooltip).
+        self.popup_switch_refresh();
+    }
+
+    /// Re-push the ⛔ and what it has to say for itself on hover, after the
+    /// switch moved without a tab ever reporting it (task: popup blocker
+    /// tooltip). `sync_ui` pushes the same two on a full snapshot; this is the
+    /// one thing in it the reader must not wait for a tab switch to see.
+    fn popup_switch_refresh(&self) {
+        let Some(ui) = self.ui() else { return };
+        let procs = self.procs.borrow();
+        if let Some(p) = self.active_proc_index().and_then(|i| procs.get(i)) {
+            ui.set_popup_blocked(!p.state.popup_block_off);
+            ui.set_popup_tip(p.state.popup_tip().into());
+        }
     }
 
     /// "Allow popups from this site" (Ctrl-Alt-`P`, task: block popups): the
@@ -4615,8 +4634,10 @@ impl Core {
             ui.set_can_fwd(p.state.can_forward);
             ui.set_reader_on(p.state.reader);
             // The popup blocker comes back with the tab too: one switch per
-            // process, so a site allowed here says nothing about there.
+            // process, so a site allowed here says nothing about there — and it
+            // says which of the two it is, in the words shown on hover.
             ui.set_popup_blocked(!p.state.popup_block_off);
+            ui.set_popup_tip(p.state.popup_tip().into());
             // An address being typed belongs to exactly one tab: switching
             // tabs (or that tab going away) drops the draft, so the strip can
             // never leave a stale address in the bar. While it is live the
@@ -4647,6 +4668,10 @@ impl Core {
         } else {
             let status = self.spawn_error.borrow().clone().unwrap_or_default();
             ui.set_status_text(status.into());
+            // No tab, nothing to claim about its popups: the ⛔ stays on screen
+            // but falls silent rather than repeating the last tab's answer
+            // (task: popup blocker tooltip).
+            ui.set_popup_tip("".into());
         }
         ui.set_active_index(active as i32);
         // The DevTools panel renders the active tab too (pane, counts, rows):

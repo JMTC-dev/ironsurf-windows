@@ -336,6 +336,20 @@ impl TabState {
         Some(self.popup_policy())
     }
 
+    /// What the ⛔ says when the pointer rests on it (task: popup blocker
+    /// tooltip): the switch's own word for what it is doing to this tab, so the
+    /// button explains itself without a click being wasted to find out. The
+    /// master switch alone decides it — an allow-listed site is still a tab whose
+    /// blocker stands, and saying "allowed" there would be a promise the tab is
+    /// not making about every other site.
+    pub fn popup_tip(&self) -> &'static str {
+        if self.popup_block_off {
+            "popups allowed"
+        } else {
+            "popups blocked"
+        }
+    }
+
     /// The status-line notice for a page that tried to open windows nobody asked
     /// for (task: block popups): the count the tab reported, and the one key
     /// that lets the site through when the user wants it to.
@@ -1578,6 +1592,35 @@ mod tests {
             },
             "a non-default port is part of the origin"
         );
+    }
+
+    /// The words the ⛔ shows on hover (task: popup blocker tooltip) are the
+    /// master switch read out loud: a fresh tab says it blocks, a released
+    /// switch says windows are allowed, and an **allow-listed site changes
+    /// neither** — the blocker still stands over every other site this tab
+    /// visits, and "allowed" would promise what the switch is not making.
+    #[test]
+    fn the_popup_button_names_its_own_switch() {
+        let mut s = TabState::default();
+        assert_eq!(s.popup_tip(), "popups blocked", "a new tab blocks");
+        s.set_popup_block(false);
+        assert_eq!(s.popup_tip(), "popups allowed");
+        s.set_popup_block(true);
+        assert_eq!(s.popup_tip(), "popups blocked");
+
+        s.url = Some("https://news.test:8443/top".into());
+        s.allow_popup_site(true);
+        assert!(
+            !s.popup_allowed.is_empty(),
+            "the site is on the list \u{2026}"
+        );
+        assert_eq!(
+            s.popup_tip(),
+            "popups blocked",
+            "\u{2026} and the tab still blocks everywhere else"
+        );
+        s.allow_popup_site(false);
+        assert_eq!(s.popup_tip(), "popups blocked");
     }
 
     /// What a blocked popup is worth in the status line (task: block popups):

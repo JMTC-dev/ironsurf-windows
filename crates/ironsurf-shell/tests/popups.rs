@@ -14,10 +14,17 @@
 //!     site;
 //!   * a popup the tab refused shows in the status line ("blocked 1 popup —
 //!     Ctrl-Alt-P allows this site") and the notice dies with the page that made
-//!     it, while allowing the site puts it away at once.
+//!     it, while allowing the site puts it away at once;
+//!   * hovering ⛔ says `popups blocked` or `popups allowed` for the tab on
+//!     screen, and the words — like the pressed icon itself — follow a click
+//!     immediately: a tab is handed a policy and never answers one, so nothing
+//!     on the wire would ever have moved that button (task: popup blocker
+//!     tooltip). They stay the tab's own words: a second tab starts blocked
+//!     however the first was left, and a tab that closes leaves the button with
+//!     nothing to say.
 //!
 //! `IRONSURF_DATA_DIR` is process-global and each test wants its own directory,
-//! so the three tests are serialized on one lock and each keeps its data dir
+//! so every test here is serialized on one lock and each keeps its data dir
 //! alive until it is finished.
 
 use std::path::PathBuf;
@@ -26,6 +33,7 @@ use std::time::{Duration, Instant};
 
 use ironsurf_shell::AppWindow;
 use ironsurf_shell::app::App;
+use slint::ComponentHandle;
 
 /// One test at a time: the data dir is chosen by a process-wide variable.
 fn serialized() -> std::sync::MutexGuard<'static, ()> {
@@ -206,4 +214,152 @@ fn a_blocked_popup_shows_in_the_status_line_until_the_next_page() {
         "the notice belongs to the page that made it: {}",
         status(&ui)
     );
+}
+
+// ---- what the ⛔ says when the pointer rests on it --------------------------
+//
+// (task: popup blocker tooltip). Two rules the reader feels but cannot see in
+// the wire: the button *names its own state* on hover, and it changes *under
+// the click* that changes it. The second one is the whole point of
+// `Core::popup_switch_refresh` — a tab accepts a policy and never answers it,
+// so with nothing pushed from Rust the ⛔ kept its old look until the reader
+// switched tabs and came back.
+
+/// `(x, y, width, height)` of the first realized element with `id`. The window
+/// has to be shown for the tree to have geometry at all.
+fn box_of(ui: &AppWindow, id: &str) -> (f32, f32, f32, f32) {
+    let found = i_slint_backend_testing::ElementQuery::from_root(ui)
+        .match_id(format!("AppWindow::{id}"))
+        .find_all();
+    let element = found.first().unwrap_or_else(|| panic!("{id} is not in the tree"));
+    let p = element.absolute_position();
+    let s = element.size();
+    (p.x, p.y, s.width, s.height)
+}
+
+/// Move the virtual pointer. Hover is derived from where the pointer *is*, so
+/// one of these is both an enter (into a button) and a leave (out of one).
+fn pointer(ui: &AppWindow, at: (f32, f32)) {
+    ui.window()
+        .dispatch_event(slint::platform::WindowEvent::PointerMoved {
+            position: slint::LogicalPosition::new(at.0, at.1),
+        });
+}
+
+#[test]
+fn the_popup_button_says_which_way_it_is() {
+    let _serialized = serialized();
+    let (_dir, ui, app) = shell(&[]);
+    ui.show().expect("show on the testing backend");
+    let core = app.core();
+    wait_for("tab ready", || {
+        core.drain();
+        core.tab_snapshot().first().is_some_and(|s| s.ready)
+    });
+
+    // The words follow the switch, and a fresh tab blocks.
+    assert_eq!(ui.get_popup_tip().as_str(), "popups blocked");
+    assert!(!ui.get_tip_on(), "nobody has hovered anything yet");
+
+    let btn = box_of(&ui, "pop-btn");
+    assert!(btn.2 > 8.0 && btn.3 > 8.0, "the ⛔ is laid out: {btn:?}");
+    let center = (btn.0 + btn.2 / 2.0, btn.1 + btn.3 / 2.0);
+    pointer(&ui, center);
+    assert!(
+        ui.get_tip_on(),
+        "the pointer is on the ⛔, which has something to say"
+    );
+
+    // The tooltip is drawn *under* the button it came from and stays inside the
+    // window, however near the right edge that button sits.
+    let tip = box_of(&ui, "tip-layer");
+    let window = ui.window().size();
+    assert!(tip.2 > 40.0 && tip.3 > 10.0, "a box with words in it: {tip:?}");
+    assert!(tip.1 >= btn.1 + btn.3, "below the button: {tip:?} vs {btn:?}");
+    assert!(tip.0 <= btn.0 + 0.5, "never to the right of its button: {tip:?}");
+    assert!(
+        tip.0 + tip.2 <= window.width as f32 + 0.5,
+        "the whole tooltip is on screen: {tip:?} in {:?}",
+        window
+    );
+
+    // The click that lowers the blocker leaves the pointer exactly where it
+    // was: the tooltip restates itself without the reader lifting the hand.
+    ui.invoke_popup_block_toggled();
+    assert!(!ui.get_popup_blocked(), "the icon moves with the click");
+    assert_eq!(ui.get_popup_tip().as_str(), "popups allowed");
+    assert!(ui.get_tip_on(), "the pointer never moved, so the tooltip stays");
+
+    // …and the pointer leaving puts it away.
+    pointer(&ui, (btn.0 + btn.2 / 2.0, btn.1 + 200.0));
+    assert!(!ui.get_tip_on(), "the pointer is over the page now");
+
+    // The words belong to the tab on screen, not to the button: a second tab
+    // blocks whatever the first was doing, and coming back finds the first
+    // tab's own answer again — one switch per process.
+    ui.invoke_new_tab();
+    wait_for("a second tab", || {
+        core.drain();
+        core.tab_snapshot().len() == 2
+    });
+    assert!(ui.get_popup_blocked(), "a fresh tab blocks");
+    assert_eq!(ui.get_popup_tip().as_str(), "popups blocked");
+
+    ui.invoke_activate_tab(0);
+    wait_for("back on the first tab", || {
+        core.drain();
+        ui.get_active_index() == 0
+    });
+    assert_eq!(
+        ui.get_popup_tip().as_str(),
+        "popups allowed",
+        "the tab that lowered its blocker says so again on its own row"
+    );
+    assert!(!ui.get_popup_blocked());
+}
+
+#[test]
+fn the_popup_switch_answers_the_click_that_made_it() {
+    let _serialized = serialized();
+    let (_dir, ui, app) = shell(&["--expect-popup-policy"]);
+    let core = app.core();
+    wait_for("tab ready", || {
+        core.drain();
+        core.tab_snapshot().first().is_some_and(|s| s.ready)
+    });
+    assert!(ui.get_popup_blocked());
+    assert_eq!(ui.get_popup_tip().as_str(), "popups blocked");
+
+    // The click *is* the repaint: nothing is awaited, no tab is switched, and
+    // no message is drained first — the tab never answers a policy it is handed.
+    ui.invoke_popup_block_toggled();
+    assert!(
+        !ui.get_popup_blocked(),
+        "the ⛔ stopped being pressed the moment it was clicked"
+    );
+    assert_eq!(ui.get_popup_tip().as_str(), "popups allowed");
+
+    // The tab was told, too: the switch and what the button shows agree once the
+    // policy round-trip has come back, and neither drifts after.
+    wait_for("the tab hears the switch", || {
+        core.drain();
+        status(&ui) == "popups:allow:"
+    });
+    assert!(!ui.get_popup_blocked());
+    assert!(!policy(&app).0);
+    ui.invoke_popup_block_toggled();
+    assert!(ui.get_popup_blocked());
+    assert_eq!(ui.get_popup_tip().as_str(), "popups blocked");
+    wait_for("the tab hears it again", || {
+        core.drain();
+        status(&ui) == "popups:block:"
+    });
+
+    // And the words are the tab's, not the button's: close it and the ⛔ falls
+    // silent rather than going on repeating the answer of a page that is gone.
+    ui.invoke_close_tab(0);
+    wait_for("the ⛔ has no tab left to talk about", || {
+        core.drain();
+        core.tab_snapshot().is_empty() && ui.get_popup_tip().is_empty()
+    });
 }

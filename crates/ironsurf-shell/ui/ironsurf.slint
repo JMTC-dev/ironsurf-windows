@@ -180,7 +180,17 @@ component MiniButton inherits Rectangle {
     /// picker's ⌖, "hamburger" is the history ☰ — both glyphs miss on some
     /// fonts, so both icons are drawn rectangles that render everywhere.
     in property <string> icon: "";
+    /// Words worth showing while the pointer rests on this button (task: popup
+    /// blocker tooltip). Empty — every button but ⛔ today — and the button
+    /// never says anything. Only the *hover* is reported: the text stays the
+    /// owner's, so a control whose meaning changes under a pointer that never
+    /// moved (⛔ clicked while hovered) restates itself instead of freezing on
+    /// the words it had when the pointer arrived.
+    in property <string> tip: "";
     callback clicked();
+    /// The pointer came to a button that has something to say / left it again.
+    callback tip-entered();
+    callback tip-exited();
     width: Math.max(22px, root.icon == "" ? lbl.preferred-width + 12px : 0px);
     height: 24px;
     bg := Rectangle {
@@ -215,6 +225,18 @@ component MiniButton inherits Rectangle {
     ta := TouchArea {
         enabled: root.enabled;
         clicked => { root.clicked(); }
+        // A tooltip follows the pointer, not the click: it arrives when the
+        // pointer comes to rest over a button that has something to say and is
+        // put away when the pointer goes (out of the button or out of the
+        // window), and a move *across* the button repeats neither half.
+        changed has-hover => {
+            if (ta.has-hover && root.tip != "") {
+                root.tip-entered();
+            }
+            if (!ta.has-hover) {
+                root.tip-exited();
+            }
+        }
     }
 }
 
@@ -593,6 +615,23 @@ export component AppWindow inherits Window {
     in property <bool> popup-blocked: true;
     callback popup-block-toggled();
     callback popup-allow-site();
+
+    /// What ⛔ says while the pointer rests on it: `popups blocked` while the
+    /// active tab's blocker stands, `popups allowed` once it has been lowered
+    /// (task: popup blocker tooltip). Rust pushes it *with* the switch, so the
+    /// words change in the same click that changes the icon — the pointer does
+    /// not have to leave the button and come back to find out what it just did.
+    in property <string> popup-tip: "popups blocked";
+
+    // The one hover tooltip the whole window shares (task: popup blocker
+    // tooltip): a button reports a hover and the single overlay at the end of
+    // this component draws it, which is why *where* has to be carried up here —
+    // a tooltip hung off the button itself is a descendant of the toolbar and
+    // would paint under the page declared after it. No hover delay: the pointer
+    // is already on the thing the reader is asking about.
+    in-out property <bool> tip-on: false;
+    in-out property <length> tip-x: 0px;
+    in-out property <length> tip-y: 0px;
 
     in-out property<string> url-text <=> url-bar.text;
     in property <string> status-text;
@@ -1043,8 +1082,20 @@ export component AppWindow inherits Window {
 
                 // popups (task: block popups): ⛔ — no entry — pressed while the
                 // blocker stands, which is every tab's starting state; releasing
-                // it lets this tab's pages open windows unasked.
-                MiniButton { label: "\u{26D4}"; checked: root.popup-blocked; clicked => { root.popup-block-toggled(); } }
+                // it lets this tab's pages open windows unasked. Hovering it says
+                // which of the two the active tab is doing right now.
+                pop-btn := MiniButton {
+                    label: "\u{26D4}";
+                    checked: root.popup-blocked;
+                    tip: root.popup-tip;
+                    clicked => { root.popup-block-toggled(); }
+                    tip-entered() => {
+                        root.tip-x = pop-btn.absolute-position.x;
+                        root.tip-y = pop-btn.absolute-position.y + pop-btn.height + 6px;
+                        root.tip-on = true;
+                    }
+                    tip-exited() => { root.tip-on = false; }
+                }
 
                 // userscript menu (task: userscript menu)
                 MiniButton { label: "</>"; clicked => { root.toggle-us-menu(); } }
@@ -2625,6 +2676,36 @@ export component AppWindow inherits Window {
                     overflow: elide;
                 }
             }
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Hover tooltip (task: popup blocker tooltip)
+    // ------------------------------------------------------------------
+    // Declared last ⇒ in front of the page, the DevTools panel and every other
+    // overlay; it hangs below the control the pointer is on (`tip-x`/`tip-y`,
+    // reported by that control) and pulls itself back from the right edge so a
+    // button near the end of the toolbar does not push its own words off the
+    // screen. Nothing here takes the pointer — no `TouchArea` — so the tooltip
+    // never eats the hover it is drawn from, and it disappears the moment the
+    // pointer leaves the control it came from.
+    tip-layer := Rectangle {
+        visible: root.tip-on && root.popup-tip != "";
+        x: Math.min(root.tip-x, parent.width - self.width - 8px);
+        y: root.tip-y;
+        width: tip-lbl.preferred-width + 16px;
+        height: tip-lbl.preferred-height + 10px;
+        background: #1b1b1bf7;
+        border-radius: 4px;
+        border-width: 1px;
+        border-color: #4a4a4a;
+
+        tip-lbl := Text {
+            x: 8px;
+            y: 5px;
+            text: root.popup-tip;
+            color: #e0e0e0;
+            font-size: 11px;
         }
     }
 }
