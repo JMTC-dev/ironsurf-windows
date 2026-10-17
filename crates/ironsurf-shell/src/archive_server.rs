@@ -2532,4 +2532,93 @@ mod tests {
         assert!(closed, "the control thread reports Closed");
         wait_until_unreachable(SocketAddr::from(([127, 0, 0, 1], port)));
     }
+
+    // ---------------------------------------------------------------------
+    // AUDIT proofs — each asserts the CURRENT (insecure) behaviour, so a
+    // passing test is the finding. See docs/SECURITY_AUDIT.md.
+    // ---------------------------------------------------------------------
+
+    /// AUDIT F4: the served folder's own origin can *start* the server change.
+    /// `/ironsurf/serve/apply` on the serve socket is answered with a 302 to
+    /// the control socket that keeps the whole query, so a document loaded
+    /// from the served folder needs no token and never has to know the
+    /// control port: a top-level navigation follows the redirect for it.
+    #[test]
+    fn an_archive_page_can_start_the_server_change_without_a_token() {
+        let state = PageState {
+            spec: Spec::default(),
+            serving: Some("http://127.0.0.1:8123".into()),
+            control: Some("http://127.0.0.1:9001".into()),
+        };
+        let resp = route_request(
+            "GET",
+            "/ironsurf/serve/apply",
+            "root=%2F&host=0.0.0.0&port=4321",
+            &state,
+        );
+        // The serve socket must refuse the mutation outright, not hand it on.
+        assert_ne!(
+            resp.status, 302,
+            "the served origin forwarded a server change to the control socket \
+             at {:?} — a page on the archive origin needs no token",
+            resp.location
+        );
+    }
+
+    /// AUDIT F5: the control page served *on the serve socket* prints the
+    /// control socket's address, and the listing's own footer links to it
+    /// (`<a href="/ironsurf/serve">`). A document already on the served
+    /// origin therefore reads the "random" control port with one same-origin
+    /// fetch, and can then re-point the server at any folder.
+    #[test]
+    fn the_served_origin_discloses_the_control_address() {
+        let root = sandbox("disclose");
+        let state = PageState {
+            spec: Spec { root: root.clone(), host: "127.0.0.1".into(), port: 8123 },
+            serving: Some("http://127.0.0.1:8123".into()),
+            control: Some("http://127.0.0.1:9001".into()),
+        };
+        let control_page = route_request("GET", "/ironsurf/serve", "", &state);
+        assert_eq!(control_page.status, 200);
+        let body = String::from_utf8_lossy(&control_page.body).into_owned();
+        assert!(
+            !body.contains("http://127.0.0.1:9001"),
+            "the control socket's address was disclosed to the served origin \
+             (one same-origin fetch reveals the port)"
+        );
+        // …and the listing points the browser at that page.
+        let listing = render_listing(&root, "/").expect("listing");
+        assert!(listing.contains("Control page"), "the listing links to it");
+    }
+
+    /// AUDIT F6: the request path is percent-decoded twice (once in
+    /// `parse_request_head`, once per segment in `resolve_inside`). A name the
+    /// listing links to verbatim (`%aé`) therefore reaches
+    /// `percent_decode("%a\u{e9}")`, which slices a `String` off a char
+    /// boundary and panics — killing the serve thread, so the archive stops
+    /// serving for the rest of the session.
+    #[test]
+    fn a_twice_decoded_name_kills_the_path_resolver() {
+        let root = sandbox("twice");
+        std::fs::write(root.join("%a\u{e9}"), b"planted").expect("plant");
+        let listing = render_listing(&root, "/").expect("listing");
+        // The href the listing emits is exactly what a browser puts on the
+        // wire, and it survives url-crate normalisation unchanged.
+        let href = listing
+            .find("href=\"")
+            .map(|at| &listing[at + 6..])
+            .and_then(|rest| rest.split('"').next())
+            .expect("a link in the listing")
+            .to_string();
+        assert_eq!(href, "%25a%C3%A9");
+        // First decode (`parse_request_head`), then per segment below.
+        let once = percent_decode(&href);
+        assert_eq!(once, "%a\u{e9}");
+        let r = std::panic::catch_unwind(|| resolve_inside(&root, &format!("/{once}")));
+        assert!(
+            r.is_ok(),
+            "the percent-decode inside resolve_inside panicked on a name the \
+             listing itself links to"
+        );
+    }
 }
