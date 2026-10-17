@@ -259,10 +259,20 @@ fn f1c_a_page_chooses_which_folder_the_browser_exports_and_where_it_listens() {
         Some("0.0.0.0".to_string()),
         Some(0),
     );
-    assert_eq!(
+    // FIXED: neither the folder nor the interface a page named survives
+    // `spec_from` — the host is pinned to loopback (the served folder has no
+    // authentication at all) and a system folder is refused, so the spec falls
+    // back to the configured archive root.
+    assert_ne!(
         (spec.root.to_str().unwrap(), spec.host.as_str()),
         ("/etc", "0.0.0.0"),
-        "the page's root/host must not be accepted as the server's spec"
+        "the page's root/host were accepted as the server's spec"
+    );
+    assert_eq!(spec.host, "127.0.0.1", "only loopback may serve the archive");
+    assert!(
+        !spec.root.starts_with("/etc"),
+        "a system folder must not become the served root: {:?}",
+        spec.root
     );
     // And it really does serve it: bind on loopback with that root and read a
     // file outside any archive folder.

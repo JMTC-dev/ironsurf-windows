@@ -83,6 +83,15 @@ impl TabChild {
         write_frame(&mut self.stdin, &msg).expect("write ToTab frame");
     }
 
+    fn collect(&mut self, for_long: Duration) {
+        let deadline = Instant::now() + for_long;
+        while Instant::now() < deadline {
+            if let Ok(msg) = self.events.recv_timeout(Duration::from_millis(100)) {
+                self.seen.push(msg);
+            }
+        }
+    }
+
     fn wait_for(&mut self, what: &str, pred: impl Fn(&FromTab) -> bool) {
         let deadline = Instant::now() + DEADLINE;
         loop {
@@ -152,29 +161,28 @@ fn f1_a_page_navigation_configures_the_archive_server() {
     let mut tab = spawn_at(&url, dir.path());
     tab.send(ToTab::Resize { width: 800, height: 600, scale: 1.0 });
 
-    let asked = tab.wait_for("the archive server to be asked for", |msg| {
-        matches!(msg, FromTab::ArchiveServerStart { .. })
-    });
-    // Drain the exact message for a readable failure report.
-    let found = tab
+    // Give a page-driven `ironsurf://archive?…` long enough to reach the shell
+    // (it renders in well under a second), then look at what it produced.
+    for _ in 0..8 {
+        tab.collect(Duration::from_millis(500));
+    }
+    let asked: Vec<(Option<String>, Option<String>, Option<u16>)> = tab
         .seen
         .iter()
-        .find_map(|msg| match msg {
-            FromTab::ArchiveServerStart { root, host, port, open_in_new_tab } => {
-                Some((root.clone(), host.clone(), *port, *open_in_new_tab))
+        .filter_map(|msg| match msg {
+            FromTab::ArchiveServerStart { root, host, port, .. } => {
+                Some((root.clone(), host.clone(), *port))
             }
             _ => None,
         })
-        .unwrap();
-    let (root, host, port, _) = found;
-    // A page that never met the user's archive must not move it at all; and
-    // above all it must not choose the folder or the interface.
+        .collect();
+    let carried = asked
+        .iter()
+        .find(|(root, host, port)| root.is_some() || host.is_some() || port.is_some());
     assert!(
-        root.as_deref() != Some(WANTED_ROOT) && host.as_deref() != Some(WANTED_HOST),
+        carried.is_none(),
         "a page script reached FromTab::ArchiveServerStart carrying its own \
-         parameters: root={root:?} host={host:?} port={port:?} (initial nav \
-         {url}); the shell applies these verbatim (app.rs:4005) and \
-         normalize_root accepts {WANTED_ROOT}"
+         parameters: {carried:?} (all asks: {asked:?}); the shell applies these \
+         verbatim (app.rs:4005) and normalize_root accepted {WANTED_ROOT}"
     );
-    let _ = asked;
 }

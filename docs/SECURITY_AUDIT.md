@@ -35,6 +35,25 @@ findings above).
 
 ---
 
+## Fix status — this round
+
+| # | Finding | State | What changed |
+|---|---|---|---|
+| 1 | web page reads the local disk (`file:` navigation) | **FIXED** | `Tab::document_may_reach` (`ironsurf-tab/src/runtime.rs`) is the scheme policy for page-initiated navigation: `http(s)`/`about`/`data`/`blob` anywhere, `file:` only from a local document, `ironsurf:` never by following a page. `nav_from_shell` records the one navigation the user typed. |
+| 2 | page re-points the archive server | **FIXED** | Tab: `ask_archive_server` forwards `root`/`host`/`port` only when `nav_from_shell` (address bar), including for `<form action="ironsurf://archive?…">`; a page-driven `ironsurf://` navigation no longer reaches the shell at all. Shell: `normalize_host` pins the bind to loopback and `normalize_root` refuses system folders **before** creating anything. |
+| 3 | control socket: unauthenticated mutations | **FIXED** | Per-process session token (`session_token`), embedded in the control page's form and required by `/apply` and `/stop` (`mutation_authorized`), which also rejects a request whose `Origin`/`Referer` is not the control socket's. The served origin no longer defers an untokened change (403) and never prints the token or the control port. |
+| 4 | `percent_decode` panic / one-request DoS | **FIXED** | Decode is byte-driven with `hex_digit` validation and `from_utf8_lossy` at the end; no `str` slicing at input-chosen offsets. The listed name `%aé`, its wire form and the twice-decoded path all survive. |
+| 5 | no same-origin policy on responses; no private-address rule | **OPEN** | Needs `Origin` threaded into the fetch path and opaque cross-origin responses in `netmod.rs` (+ preflight). PoCs `audit_poc_sop::f5`, `f5b` and `audit_poc_nav::f4` still fail — treat them as the spec for the fix. |
+| 6 | `container-id` parsed, never used | **OPEN** | Small: validate the profile dir against the container id (a marker file the shell writes) so a mis-wired launch fails closed. |
+
+Verification of this round: `cargo test -p ironsurf-shell` → 156 lib + 8 integration
+tests green **including all 8 audit PoCs**; `cargo test -p ironsurf-tab --bins` →
+366 green (no regressions from the navigation policy); `audit_poc_nav` 7/8 and
+`audit_poc_archive` 1/1 green. Two project tests and one example were updated to
+the new control-page contract (the form carries the session token), and
+`ARCHITECTURE`'s "both addresses show the same page" is kept with the token and
+control port withheld from the served origin.
+
 ## 1. CRITICAL — a web page reads the local disk (`file:` from a remote document)
 
 A page on any origin navigates itself to a `file:` URL and the tab fetches and
