@@ -741,8 +741,19 @@ pub struct Tab {
     net_events: Arc<Mutex<Vec<NetEvent>>>,
     /// The fetch threads' DevTools **console** queue (source `"css"` today:
     /// wrong-`Content-Type` stylesheets — see `src/logging.rs`); drained
-    /// every poll tick exactly like `net_events`.
+    /// every poll tick exactly like `net_events`. The private-address rule
+    /// prints its warnings here too.
     console_events: ConsoleQueue,
+    /// AUDIT F5 — the **private-address rule** (see [`crate::private_addr`]):
+    /// one guard per tab, shared with the net provider and with every
+    /// document's JS host, so a page's `fetch`, `XMLHttpRequest`, subresource
+    /// and `location.href` hop into the local network are all refused by the
+    /// same rule — and announced once on the DevTools console.
+    private_guard: crate::private_addr::PrivateAddressGuard,
+    /// The document the provider's subresources belong to, written by
+    /// [`Tab::load_html`]: Blitz gives a `NetProvider` no way to ask which
+    /// document made a load, so the private-address rule needs the tab to say.
+    doc_cell: Arc<Mutex<Option<Url>>>,
     /// Per-document bookkeeping for the CSS re-parse seam (content hashes of
     /// already-reported `<style>` bodies / `style="…"` attributes).
     css_scan: CssScanState,
@@ -1056,6 +1067,12 @@ impl Tab {
         let net_events = provider.net_events();
         // …and the fetch-side console queue with it (css content-type seam).
         let console_events = provider.console_events();
+        // …and the private-address rule (AUDIT F5): the provider judges
+        // subresources with it, the tab judges page navigations, and every
+        // document's JS host judges `fetch`/XHR — one guard, one console, one
+        // "warn once per origin pair" set.
+        let private_guard = provider.private_guard();
+        let doc_cell = provider.document_cell();
         let out = Rc::new(RefCell::new(TabOut::new()));
         let stdin_pending = Rc::new(RefCell::new(Vec::new()));
         let dialog = Arc::new(DialogHost::new(
@@ -1132,6 +1149,8 @@ impl Tab {
             nav_from_shell: false,
             net_events,
             console_events,
+            private_guard,
+            doc_cell,
             css_scan: CssScanState::new(),
             find_query: String::new(),
             find_hits: Vec::new(),
@@ -1643,6 +1662,10 @@ impl Tab {
         // over — the click that brought the user here belongs to the page they
         // left.
         self.popups.set_document(url);
+        // AUDIT F5: from here on, every subresource the provider loads belongs
+        // to this document — that is the origin the private-address rule
+        // compares a local destination against.
+        *self.doc_cell.lock().expect("document cell mutex") = Some(url.clone());
         // The new document has nothing under the cursor yet; the next hover
         // transition must be allowed to report again.
         self.hover_status = None;
@@ -1861,7 +1884,13 @@ impl Tab {
         net_events: &Arc<Mutex<Vec<NetEvent>>>,
         user_agent: &netmod::SharedUserAgent,
         archive: &Arc<crate::archive::ArchiveState>,
+        private: &crate::private_addr::PrivateAddressGuard,
+        document: Option<&Url>,
     ) -> Result<String, String> {
+        // AUDIT F5: an external script body (a `<script src>`, an ES module,
+        // a worker's script) is a page-initiated read of a URL the page chose:
+        // a page on the web may not run code out of the browser's own network.
+        private.check(document, script_url, "script")?;
         let events = Arc::clone(net_events);
         netmod::fetch_document_report_shared(
             script_url,
@@ -1911,6 +1940,10 @@ impl Tab {
             let net_events = Arc::clone(&self.net_events);
             let user_agent = Arc::clone(&self.user_agent);
             let archive = Arc::clone(&self.archive);
+            // AUDIT F5: the rule every page-chosen request is judged by, and
+            // the origin the script bodies belong to.
+            let private = self.private_guard.clone();
+            let document = Some(url.clone());
 
             // Two-phase batch: the document walk hands us every `src` URL at
             // once, so a bounded pool of fetcher threads downloads them in
@@ -1946,6 +1979,8 @@ impl Tab {
                                 &net_events,
                                 &user_agent,
                                 &archive,
+                                &private,
+                                document.as_ref(),
                             )
                         })
                         .collect();
@@ -1980,6 +2015,8 @@ impl Tab {
                     let net_events = Arc::clone(&net_events);
                     let user_agent = Arc::clone(&user_agent);
                     let archive = Arc::clone(&archive);
+                    let private = private.clone();
+                    let document = document.clone();
                     let body = Self::fetch_script_body(
                         &script_url,
                         policy,
@@ -1988,6 +2025,8 @@ impl Tab {
                         &net_events,
                         &user_agent,
                         &archive,
+                        &private,
+                        document.as_ref(),
                     );
                     results.lock().expect("script results mutex")[index] = Some(body);
                 };
@@ -2072,6 +2111,9 @@ impl Tab {
         // queue, so a page `fetch()` lands in the DevTools network panel like
         // XHR and subresources (task: XHR/fetch in the network panel).
         host.borrow_mut().net_events = Some(Arc::clone(&self.net_events));
+        // AUDIT F5: the page's `fetch()`/`XMLHttpRequest` are refused by the
+        // very rule its subresources are, and warn on the same console queue.
+        host.borrow_mut().private_guard = Some(self.private_guard.clone());
         // `window.open`, and a script-activated `<a target="_blank">`, ask the
         // popup gate (task: block popups) — the very cell the poll loop drains
         // and that the shell's `SetPopupPolicy` writes into.
@@ -2126,6 +2168,8 @@ impl Tab {
             let net_events = Arc::clone(&self.net_events);
             let user_agent = Arc::clone(&self.user_agent);
             let archive = Arc::clone(&self.archive);
+            let private = self.private_guard.clone();
+            let document = url.clone();
             Rc::new(move |module_url: &Url| {
                 Self::fetch_script_body(
                     module_url,
@@ -2135,6 +2179,8 @@ impl Tab {
                     &net_events,
                     &user_agent,
                     &archive,
+                    &private,
+                    Some(&document),
                 )
             })
         };
@@ -2198,6 +2244,8 @@ impl Tab {
                 let net_events = Arc::clone(&self.net_events);
                 let user_agent = Arc::clone(&self.user_agent);
                 let archive = Arc::clone(&self.archive);
+                let private = self.private_guard.clone();
+                let document = url.clone();
                 Arc::new(move |script_url: &Url| {
                     Self::fetch_script_body(
                         script_url,
@@ -2207,9 +2255,12 @@ impl Tab {
                         &net_events,
                         &user_agent,
                         &archive,
+                        &private,
+                        Some(&document),
                     )
                 })
             },
+            private: self.private_guard.clone(),
             jar: Arc::clone(&self.jar),
             net_events: Arc::clone(&self.net_events),
             user_agent: Arc::clone(&self.user_agent),
@@ -2448,6 +2499,20 @@ impl Tab {
             // and the document on screen stays exactly where it was.
             return true;
         }
+        // AUDIT F5: the **private-address rule**. `location.href =
+        // "http://127.0.0.1:9/…"` from a page on the web used to be a request
+        // the tab made on the page's behalf — how a page discovers (and drives)
+        // the services on the user's own network, the tab's archive server
+        // included. A page-driven hop is refused unless it stays on the
+        // document's own origin; the address bar, Reload and a link the user
+        // clicked are the browser's own UI and still reach it. The refusal is
+        // queued as a DevTools console warning by the guard.
+        if let Err(reason) = self.private_guard.check(base.as_ref(), &resolved, "navigation") {
+            self.emit(FromTab::StatusText {
+                text: Some(format!("{reason} — open it from the address bar")),
+            });
+            return true;
+        }
         // From here the navigation is page-chosen, not user-chosen.
         self.nav_from_shell = false;
         info!(
@@ -2534,6 +2599,17 @@ impl Tab {
         }
         self.refresh_at = None;
         info!("following delayed refresh → {url}");
+        // AUDIT F5: a `Refresh:` the *page* answered with is the page's own
+        // hop, so the private-address rule applies to it — a public page may
+        // not bounce the tab onto a LAN address the user never typed. (A local
+        // page refreshing itself stays same-origin and is never refused.)
+        let from = self.doc.as_ref().map(|doc| doc.url().clone());
+        if let Err(reason) = self.private_guard.check(from.as_ref(), &url, "refresh") {
+            self.emit(FromTab::StatusText {
+                text: Some(format!("{reason} — open it from the address bar")),
+            });
+            return true;
+        }
         // A refresh is a real navigation: it pushes a history entry (browsers
         // do the same), and the destination's own `Refresh:` (if any) replaces
         // the deadline we just cleared.

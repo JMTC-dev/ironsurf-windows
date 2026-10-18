@@ -700,6 +700,29 @@ in `ironsurf-tab/src/netmod.rs` and pass `Arc<OurProvider>` as `DocumentConfig.n
   its own jar-computed `Cookie` header for its own origin, and each hop's
   `Set-Cookie`s bind to that hop; POST→GET conversion follows the browser
   rules (303 always, 301/302 convert; 307/308 keep method+body).
+- **Private addresses are the browser's own** (`src/private_addr.rs`, audit finding 5): a request
+  for an `http(s)` URL whose host is a loopback, RFC 1918, link-local, CGNAT, `0.0.0.0/8`, RFC 4193
+  unique-local or `.localhost` address is refused **unless it is same-origin with the document that
+  makes it**. Without the rule a page on the web turns the tab into an authenticated proxy into the
+  user's LAN — `fetch("http://127.0.0.1:631/print/job1")` reads a printer's job list into script,
+  and `location.href = "http://127.0.0.1:9/…"` walks the whole tab onto an address the user never
+  typed (the PoC `audit_poc_nav::f4`). The escape hatch is what keeps the rule usable: the user
+  opened `http://192.168.1.10:8080/` themselves, so that page may call its own API; `http:` vs
+  `https:`, `localhost` vs `127.0.0.1` and any two ports are different origins and stay refused.
+  What counts as "a page asked for it": `fetch`/`XMLHttpRequest`, `<script src>`/ES-module and
+  worker script bodies, the provider's subresources (`<img>`, `<link>`, `<iframe>`, fonts), a
+  worker's own requests, a page-driven `Refresh:` and a `location.href`/`location.assign`
+  navigation. What stays reachable is the browser's own UI: an address-bar navigation, Reload, an
+  internal page, the archive server, a download the user started — they ask with no document, and
+  no document is never refused. A refusal answers before the socket opens (nothing is fetched, so
+  nothing leaks) and is reported twice: a DevTools console **warning** through the tab's console
+  queue (`FromTab::ConsoleLog { source: "page", level: "warn" }`, one line per document→private
+  origin pair and method, so a page polling a dead port cannot flood the panel) naming the refused
+  URL, the page that asked and the port, and a status-bar line for the navigations. Decisions are
+  made by address, never by DNS lookup: a name of the attacker's choosing that resolves to
+  `10.0.0.1` still gets through, and the egress sandbox remains what actually stops packets.
+  Tested by `tests/private_addr.rs` (both directions on two live loopback ports) and by the
+  `private_addr` unit tests in `src/private_addr.rs`.
 - **`Refresh` navigations are honoured** (task: Anubis `metarefresh` gates): the
   non-standard HTTP `Refresh:` response header (`2; url=/pass-challenge?…`) and the
   semantically identical `<meta http-equiv="refresh" content="2; url=…">` both arm a

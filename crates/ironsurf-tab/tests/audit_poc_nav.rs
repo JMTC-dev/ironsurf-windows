@@ -203,10 +203,15 @@ fn f3_a_web_page_cannot_read_the_local_file_system() {
     );
 }
 
-/// FINDING 4: nothing keeps a page off loopback/private addresses. The request
-/// leaves the tab; only a dead port makes it fail, and the timing/status is
-/// observable — the usual way a browser-resident attacker maps the local
-/// network and the browser's own archive-server port.
+/// FINDING 4 (fixed by the private-address rule, `src/private_addr.rs`): a page
+/// used to be able to drive the tab straight onto loopback — `location.href =
+/// "http://127.0.0.1:9/…"` — and the request went out, its timing and status
+/// observable from script: the usual way a browser-resident attacker maps the
+/// local network and the browser's own archive-server port.
+/// A page-driven request for a private address is now refused before the socket
+/// opens (unless it is same-origin with the page), reported as a console warning
+/// and a status-bar line, and nothing is visited. The **user** may still open
+/// the address — see `tests/private_addr.rs` for the two directions of that.
 #[test]
 fn f4_a_page_may_reach_loopback() {
     let dir = tempfile::tempdir().expect("tempdir");

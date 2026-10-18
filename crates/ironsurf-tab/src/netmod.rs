@@ -1923,12 +1923,25 @@ pub struct BlitzNetProvider {
     /// body is queued here (`store` is a no-op while the mode is off) and
     /// shipped as `FromTab::ArchivedFetch` by the tab loop.
     archive: Arc<crate::archive::ArchiveState>,
+    /// The **private-address rule** (see [`crate::private_addr`], AUDIT
+    /// finding 5): refuses an http(s) subresource of a page on a public origin
+    /// that points at the browser's own network. Owns the tab's console queue,
+    /// so a refusal prints a DevTools warning.
+    private: crate::private_addr::PrivateAddressGuard,
+    /// The URL of the document the provider is loading for, written by the tab
+    /// on every navigation. Blitz hands a `NetProvider` no document handle, so
+    /// the origin the private-address rule compares against has to be kept
+    /// here — the top-level page's, which an `<iframe>` inherits (the
+    /// conservative reading; see the module docs).
+    document: Arc<Mutex<Option<Url>>>,
 }
 
 impl BlitzNetProvider {
     /// Jar + cache come from the container's profile dir
     /// (`ContainerStore::cookie_jar` / `::cache`).
     pub fn new(policy: NetPolicy, jar: CookieJar, cache: NetCache) -> Self {
+        let console_events = crate::logging::console_queue();
+        let private = crate::private_addr::PrivateAddressGuard::new(console_events.clone());
         BlitzNetProvider {
             policy,
             // One process-wide FetchWorker: documents, scripts, subresources
@@ -1943,8 +1956,10 @@ impl BlitzNetProvider {
             waker: Arc::new(Mutex::new(None)),
             user_agent: new_user_agent(None),
             net_events: Arc::new(Mutex::new(Vec::new())),
-            console_events: crate::logging::console_queue(),
+            console_events,
             archive: crate::archive::ArchiveState::shared(false),
+            private,
+            document: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -1958,6 +1973,25 @@ impl BlitzNetProvider {
     /// tick into `FromTab::ConsoleLog` entries (source `"css"` today).
     pub fn console_events(&self) -> crate::logging::ConsoleQueue {
         Arc::clone(&self.console_events)
+    }
+
+    /// The tab's handle on the **private-address rule** (also shared with the
+    /// JS host, so `fetch`/XHR and subresources report through one queue and
+    /// one de-duplication set).
+    pub fn private_guard(&self) -> crate::private_addr::PrivateAddressGuard {
+        self.private.clone()
+    }
+
+    /// The cell the tab writes the **current document URL** into: it is what
+    /// the private-address rule treats as the requesting origin for
+    /// subresources. Same `Arc`, so a write is seen by every fetch thread.
+    pub fn document_cell(&self) -> Arc<Mutex<Option<Url>>> {
+        Arc::clone(&self.document)
+    }
+
+    /// The document subresources are attributed to (see [`Self::document_cell`]).
+    fn document_url(&self) -> Option<Url> {
+        self.document.lock().expect("document cell mutex").clone()
     }
 
     /// A locally served subresource answered as an instant 200.
@@ -2181,6 +2215,14 @@ impl BlitzNetProvider {
 impl NetProvider for BlitzNetProvider {
     fn fetch(&self, doc_id: usize, request: Request, handler: Box<dyn NetHandler>) {
         let url = request.url.clone();
+        // AUDIT F5: a page on the web may not read the browser's own network.
+        // Refused before the request is built — nothing goes on the wire — and
+        // announced once on the DevTools console (see `crate::private_addr`).
+        if let Err(reason) = self.private.check(self.document_url().as_ref(), &url, "subresource") {
+            self.report_local_failed("GET", &url, reason);
+            deliver(None, String::new(), Vec::new());
+            return;
+        }
         match url.scheme() {
             // Local schemes complete inline — the doc thread will resolve again.
             "data" => match decode_data_url(&url) {
