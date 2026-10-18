@@ -8,3 +8,4 @@
 - Keep sessions shallow: touch only your task's files; `cargo test -p <crate>` (headless — never assume a display or network beyond localhost + example.com).
 - Do not git push; you do not have access to git remotes
 - Do not care about code fmt or linting, as long as it compiles
+- Do not git commit TASKLOG.md
