@@ -19,6 +19,7 @@ mod logging;
 mod media;
 mod netmod;
 mod popup;
+mod private_addr;
 mod reader;
 mod runtime;
 mod select;

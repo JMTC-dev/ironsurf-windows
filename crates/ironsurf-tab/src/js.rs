@@ -799,14 +799,29 @@ impl boa_runtime::fetch::Fetcher for TabFetcher {
         };
         // Clone the shared cells out of the host BEFORE the blocking exchange
         // (the XHR native's rule: no host borrow held across the request).
-        let (jar, net_events, user_agent) = {
+        let (jar, net_events, user_agent, document, private) = {
             let host = self.host.borrow();
             (
                 host.cookies.clone(),
                 host.net_events.clone(),
                 host.user_agent.clone(),
+                host.url.clone(),
+                host.private_guard.clone(),
             )
         };
+        // AUDIT F5: the **private-address rule**. A page on the web asks to
+        // `fetch("http://127.0.0.1:631/print/job1")` — a printer on the user's
+        // LAN — and gets the job list back into JS, where a remote script can
+        // read it. That is the leak; the refusal happens before the request,
+        // and the guard has already printed the console warning. The page sees
+        // a rejected promise (a network error, as if the port were closed).
+        if let Some(guard) = private.as_ref() {
+            let base = Url::parse(&document).ok();
+            if let Err(err) = guard.check(base.as_ref(), &parsed, "fetch") {
+                let text = err;
+                return std::future::ready(Err(JsNativeError::typ().with_message(text).into()));
+            }
+        }
         let Some(jar) = jar else {
             return std::future::ready(Err(JsNativeError::typ()
                 .with_message("fetch: no network host attached")
@@ -1255,6 +1270,16 @@ pub struct HostState {
     /// `None` (bare JS tests, no tab attached) makes `fetch()` report
     /// nowhere.
     pub net_events: Option<Arc<std::sync::Mutex<Vec<NetEvent>>>>,
+    /// The tab's **private-address rule** (AUDIT finding 5, see
+    /// [`crate::private_addr`]): what `fetch()` and `XMLHttpRequest` ask before
+    /// a page-chosen URL of theirs goes on the wire, and the queue a refusal is
+    /// announced on. `None` (bare JS tests, no tab attached) rules nothing: a
+    /// realm with no tab behind it has no local network to leak. The rule's
+    /// "who is asking" side is [`Self::url`], the document — a page that is
+    /// itself on a private address is same-origin with it, which is what lets a
+    /// local page (and the `ironsurf://archive` page's script) call its own
+    /// services.
+    pub private_guard: Option<crate::private_addr::PrivateAddressGuard>,
     /// The popup blocker's gate (task: block popups): what `window.open` and a
     /// script-activated `target="_blank"` link ask, and what the tab loop
     /// drains. `None` (bare JS tests, no tab behind the context) blocks: a page
@@ -9984,12 +10009,33 @@ fn build_context_with_modules(
                 ),
                 _ => None,
             };
-            let fetcher = with_host(|host| host.xhr.clone()).flatten();
-            let Some(fetcher) = fetcher else {
+            let handles = with_host(|host| {
+                host.xhr.as_ref().map(|fetcher| {
+                    (
+                        fetcher.clone(),
+                        host.url.clone(),
+                        host.private_guard.clone(),
+                    )
+                })
+            });
+            let Some((fetcher, document, private)) = handles.flatten() else {
                 return Err(JsNativeError::typ()
                     .with_message("XMLHttpRequest: no network host attached")
                     .into());
             };
+            // AUDIT F5: the same rule `fetch()` obeys — an `XMLHttpRequest` to a
+            // host on the browser's own network is a read a remote page arranges
+            // for itself, so it is refused before the socket opens (the guard
+            // prints the console warning). The page sees it as status 0 + an
+            // `error` event, i.e. exactly like a closed port.
+            if let Some(guard) = private.as_ref() {
+                let base = Url::parse(&document).ok();
+                if let Some(target) = crate::private_addr::resolve(base.as_ref(), &url) {
+                    if let Err(reason) = guard.check(base.as_ref(), &target, "xhr") {
+                        return Err(JsNativeError::typ().with_message(reason).into());
+                    }
+                }
+            }
             let parsed: Vec<(String, String)> = serde_json::from_str(&headers_json)
                 .unwrap_or_default();
             let reply = fetcher(&method, url.as_str(), &parsed, body.as_deref())

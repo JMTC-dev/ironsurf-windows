@@ -94,6 +94,11 @@ pub struct WorkerAttachment {
     pub base_url: String,
     /// The tab's script-body backend (managed policy + jar + queue + archive).
     pub fetch: WorkerFetch,
+    /// The tab's **private-address rule** (AUDIT finding 5, see
+    /// [`crate::private_addr`]): a worker is its document's script, so its
+    /// `fetch`/`XHR` may not read the browser's own network any more than the
+    /// page that built it can. Judged against `base_url` (the document).
+    pub private: crate::private_addr::PrivateAddressGuard,
     /// The tab's cookie jar: workers send cookies like any same-origin
     /// subresource, and Anubis-style gates that poll an authenticated endpoint
     /// from inside the worker depend on it.
@@ -161,6 +166,7 @@ struct Bus {
 #[derive(Clone)]
 struct Attached {
     base_url: String,
+    private: crate::private_addr::PrivateAddressGuard,
     fetch: WorkerFetch,
     jar: SharedCookieJar,
     net_events: Arc<Mutex<Vec<NetEvent>>>,
@@ -228,6 +234,7 @@ impl WorkerHost {
         }
         let WorkerAttachment {
             base_url,
+            private,
             fetch,
             jar,
             net_events,
@@ -237,6 +244,7 @@ impl WorkerHost {
         *self.bus.wake.lock().expect("js worker wake mutex") = Some(wake);
         shared.attached = Some(Attached {
             base_url,
+            private,
             fetch,
             jar,
             net_events,
@@ -820,6 +828,7 @@ fn post_to_bus(bus: &Arc<Bus>, message: WorkerMessage) {
 #[derive(Clone)]
 struct AttachedCells {
     fetch: WorkerFetch,
+    private: crate::private_addr::PrivateAddressGuard,
     jar: SharedCookieJar,
     net_events: Arc<Mutex<Vec<NetEvent>>>,
     user_agent: SharedUserAgent,
@@ -830,6 +839,7 @@ impl AttachedCells {
     fn new(attached: &Attached) -> Arc<Self> {
         Arc::new(Self {
             fetch: Arc::clone(&attached.fetch),
+            private: attached.private.clone(),
             jar: Arc::clone(&attached.jar),
             net_events: Arc::clone(&attached.net_events),
             user_agent: Arc::clone(&attached.user_agent),
@@ -928,6 +938,10 @@ fn exchange(
         event.initiator = Some("worker".to_owned());
         events.lock().expect("net events mutex").push(event);
     };
+    // AUDIT F5: the document is the worker's origin for the private-address
+    // rule; a hop into the local network is refused before the request runs.
+    let document = Url::parse(&cells.base_url).ok();
+    cells.private.check(document.as_ref(), url, "worker")?;
     let jar = Arc::clone(&cells.jar);
     let mut jar_access: &std::sync::Mutex<_> = &jar;
     let reply = netmod::xhr_fetch_report(
@@ -1933,6 +1947,7 @@ mod tests {
         let document = server.document_url();
         host.attach(WorkerAttachment {
             base_url: document,
+            private: crate::private_addr::PrivateAddressGuard::default(),
             // The tab's script-body contract, answered by the toy server with a
             // blocking localhost GET: what `fetch_script_body` gives the real
             // tab, minus the policy, the jar and the DevTools queue.
@@ -2024,6 +2039,7 @@ mod tests {
         let host = WorkerHost::default();
         host.attach(WorkerAttachment {
             base_url: "https://example.test/page/main.html".to_owned(),
+            private: crate::private_addr::PrivateAddressGuard::default(),
             fetch: Arc::new(|url: &Url| Err(format!("no bodies here: {url}"))),
             jar: Arc::new(Mutex::new(ironsurf_storage::CookieJar::new())),
             net_events: Arc::new(Mutex::new(Vec::new())),
@@ -2066,6 +2082,7 @@ mod tests {
         // module graph in its own realm).
         host.attach(WorkerAttachment {
             base_url: "https://example.test/main.html".to_owned(),
+            private: crate::private_addr::PrivateAddressGuard::default(),
             fetch: Arc::new(|_| Ok(String::new())),
             jar: Arc::new(Mutex::new(ironsurf_storage::CookieJar::new())),
             net_events: Arc::new(Mutex::new(Vec::new())),
