@@ -14,6 +14,9 @@
 //!   `FromTab::OpenLinkInNewTab`;
 //! * a user click on `<a target="_blank">` opens a new tab **and does not
 //!   navigate this one** — no `UrlChanged` for the href, the title stays home;
+//! * a **Ctrl-left click** on a plain link (`⌘-left` on macOS) asks for the same
+//!   new tab and does not move this one either — the middle click's gesture, from
+//!   the keyboard (`ToTab::Pointer` carries the modifiers for exactly this);
 //! * `ToTab::SetPopupPolicy` is the shell's hand on the lever: allow-list the
 //!   document's origin and the load-time popup opens with no input at all, and a
 //!   policy change reaches the page that is already loaded (no reload);
@@ -30,8 +33,8 @@ use std::sync::mpsc::{self, Receiver};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use ironsurf_common::{read_frame, write_frame, FromTab, MouseButton, PointerEvent, PointerKind,
-                      ToTab};
+use ironsurf_common::{read_frame, write_frame, FromTab, Modifiers, MouseButton, PointerEvent,
+                      PointerKind, ToTab};
 
 const DEADLINE: Duration = Duration::from_secs(60);
 /// How long the harness waits for a message that must **never** come. Kept
@@ -81,6 +84,28 @@ const PAGE_BLANK: &str = r##"<!doctype html>
   <head><title>home</title></head>
   <body style="margin:0;background:#ffffff">
     <a id="ext" href="/next" target="_blank" style="display:block;width:400px;height:80px;background:#00ff00">open elsewhere</a>
+  </body>
+</html>
+"##;
+
+/// A plain `<a href>` with no `target`: an ordinary click moves **this** tab, and
+/// the gesture this file cares about — a Ctrl-left click (⌘-left on macOS) —
+/// must open the href in a **new** tab instead of here. The document's own click
+/// listener logs each click's modifier flags, so the test sees what the page saw
+/// (`ctrlKey` / `metaKey`) — proof the chord reached the page's scripts and not
+/// only the tab. It logs rather than writes the title because the title is this
+/// test's navigation probe.
+const PAGE_PLAIN: &str = r##"<!doctype html>
+<html>
+  <head><title>plain</title></head>
+  <body style="margin:0;background:#ffffff">
+    <a id="plain" href="/next" style="display:block;width:400px;height:80px;background:#0000ff">plain link</a>
+    <script>
+      // After the anchor, or getElementById would answer null here.
+      document.getElementById("plain").addEventListener("click", function (e) {
+        document.title = "mods:" + e.ctrlKey + "/" + e.metaKey;
+      });
+    </script>
   </body>
 </html>
 "##;
@@ -140,6 +165,7 @@ fn spawn_local_http() -> u16 {
                 "/" | "/index.html" => http_response(200, "text/html", PAGE_ONLOAD.as_bytes()),
                 "/click" => http_response(200, "text/html", PAGE_CLICK.as_bytes()),
                 "/blank" => http_response(200, "text/html", PAGE_BLANK.as_bytes()),
+                "/plain" => http_response(200, "text/html", PAGE_PLAIN.as_bytes()),
                 "/next" => http_response(200, "text/html", PAGE_LANDED.as_bytes()),
                 "/scripts" => http_response(200, "text/html", PAGE_SCRIPT_TARGETS.as_bytes()),
                 // The popup target: it exists (a real tab would load it), but
@@ -189,7 +215,14 @@ impl TabChild {
     }
 
     fn click(&mut self, x: f32, y: f32) {
-        let at = |kind| ToTab::Pointer(PointerEvent { x, y, kind, button: MouseButton::Left });
+        self.click_with(x, y, Modifiers::NONE);
+    }
+
+    /// The same three events with the modifier bits the user was holding — the
+    /// shell forwards them verbatim from its `TouchArea`, and this is the only
+    /// way the tab can tell a click from a Ctrl-click.
+    fn click_with(&mut self, x: f32, y: f32, mods: Modifiers) {
+        let at = |kind| ToTab::Pointer(PointerEvent { x, y, kind, button: MouseButton::Left, mods });
         self.send(at(PointerKind::Move));
         self.send(at(PointerKind::Down));
         self.send(at(PointerKind::Up));
@@ -425,6 +458,72 @@ fn a_target_blank_click_opens_a_tab_without_navigating_this_one() {
     assert!(
         !tab.seen.iter().any(|msg| matches!(msg, FromTab::PopupBlocked { .. })),
         "the user clicked the link: that is the interaction the blocker waits for"
+    );
+}
+
+/// The keyboard's version of the middle click: **Ctrl-left** on a plain link
+/// (`⌘-left` on macOS) opens it in a new tab and leaves this tab on its page.
+/// The same link clicked plain still navigates, which is what makes the new tab
+/// above the modifier's doing and not "links never navigate here".
+#[test]
+fn a_ctrl_click_on_a_link_opens_a_new_tab_and_stays_put() {
+    let port = spawn_local_http();
+    let profile = tempfile::tempdir().expect("profile dir");
+    let url = format!("http://127.0.0.1:{port}/plain");
+    let mut tab = spawn_tab(Some(&url), profile.path());
+
+    tab.wait_for("the page's title", |msg| {
+        matches!(msg, FromTab::TitleChanged { title: Some(t) } if t == "plain")
+    });
+    tab.drain();
+    assert!(tab.opened().is_empty(), "no click yet: {:?}", tab.opened());
+
+    let (x, y) = BLOCK_CENTRE;
+    tab.click_with(x, y, Modifiers::NONE.with_ctrl());
+
+    tab.wait_for("OpenLinkInNewTab(/next) from the Ctrl-click", |msg| {
+        matches!(msg, FromTab::OpenLinkInNewTab { url } if url.ends_with("/next"))
+    });
+    tab.drain();
+    assert_eq!(tab.opened().len(), 1, "one Ctrl-click, one new tab: {:?}", tab.opened());
+    assert!(
+        !tab.seen.iter().any(|msg| matches!(
+            msg,
+            FromTab::UrlChanged { url: Some(u) } if u.ends_with("/next")
+        )),
+        "a Ctrl-click must not navigate the tab the user is on"
+    );
+    assert!(
+        !tab.titles().iter().any(|title| title == "landed"),
+        "the target must not load here: {:?}",
+        tab.titles()
+    );
+
+    // The page saw the modifier too — the gesture reached its scripts with the
+    // flags set, which is how a page gets to cancel it (`e.preventDefault()`).
+    // It says so in its own title, which only arrives because the chord path
+    // flushes the page's writes like every other JS turn does.
+    tab.wait_for("the page's own `ctrlKey === true`", |msg| {
+        matches!(msg, FromTab::TitleChanged { title: Some(t) } if t == "mods:true/false")
+    });
+
+    // The same modifier over what is not a link stays an ordinary click: still no
+    // new tab (the y below the link is the page's own background).
+    tab.click_with(x, y + 200.0, Modifiers::NONE.with_ctrl());
+    tab.drain();
+    assert_eq!(tab.opened().len(), 1, "a Ctrl-click on nothing opens nothing: {:?}", tab.opened());
+
+    // The control case: the very same link, clicked with nothing held, does move
+    // this tab.
+    tab.click(x, y);
+    tab.wait_for("the plain click navigating to /next", |msg| {
+        matches!(msg, FromTab::UrlChanged { url: Some(u) } if u.ends_with("/next"))
+    });
+    tab.drain();
+    assert!(
+        !tab.seen.iter().any(|msg| matches!(msg, FromTab::PopupBlocked { .. })),
+        "nothing in this test is a popup: {:?}",
+        tab.blocked()
     );
 }
 

@@ -70,8 +70,8 @@ fn menu(ui: &AppWindow) -> Vec<String> {
 /// Right-button press+release at (120, 60) — what Slint's TouchArea produces
 /// for a right-click; the scripted tab answers with a link target.
 fn right_click(ui: &AppWindow) {
-    ui.invoke_page_pointer(120.0, 60.0, 1, 1); // down, right
-    ui.invoke_page_pointer(120.0, 60.0, 2, 1); // up, right
+    ui.invoke_page_pointer(120.0, 60.0, 1, 1, false, false, false, false); // down, right
+    ui.invoke_page_pointer(120.0, 60.0, 2, 1, false, false, false, false); // up, right
 }
 
 /// Wait for the context menu, then pick a row by its label.

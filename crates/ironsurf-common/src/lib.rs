@@ -73,9 +73,10 @@ pub enum FromTab {
     StatusText {
         text: Option<String>,
     },
-    /// Middle-click on a link, or a **popup the blocker allowed** (task: popup
-    /// blocker): the shell must open `url` in a **new tab** (same container as
-    /// the requesting tab) without navigating this tab. The tab never spawns
+    /// Middle-click on a link (or a **primary-modifier left-click**: Ctrl on
+    /// Linux/Windows, ⌘ on macOS), or a **popup the blocker allowed** (task:
+    /// popup blocker): the shell must open `url` in a **new tab** (same
+    /// container as the requesting tab) without navigating this tab. The tab never spawns
     /// anything itself — the shell owns every tab — so this is the only way a
     /// page's `window.open`/`target="_blank"` becomes a window at all.
     OpenLinkInNewTab {
@@ -1041,6 +1042,12 @@ pub struct PointerEvent {
     pub y: f32,
     pub kind: PointerKind,
     pub button: MouseButton,
+    /// Keyboard modifiers held during the event (`ToTab::Pointer` carries the
+    /// shell's `TouchArea` modifiers; a synthesised event says `NONE`). The tab
+    /// reads it for the chords that live on the *mouse*: a
+    /// [`Modifiers::action`]-held left click on a link is "open in new tab".
+    #[serde(default)]
+    pub mods: Modifiers,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -1244,6 +1251,25 @@ impl Modifiers {
     #[inline]
     pub const fn union(self, other: Self) -> Self {
         Modifiers(self.0 | other.0)
+    }
+
+    /// The platform's **primary** ("action") modifier as it reaches this
+    /// process from the shell: `Ctrl` everywhere, `Command` on macOS.
+    ///
+    /// Why both flags on macOS: Slint swaps Command and Control in its own
+    /// modifier state (`KeyboardModifiers`: "on macOS, Slint maps the Command
+    /// key to the control modifier, and the Control key to the meta
+    /// modifier"), so a ⌘ chord arrives as `ctrl` there — while backends that
+    /// do not swap report it in `meta`. Accepting either is what makes one
+    /// chord work on both, and the real Control key answering the same chord
+    /// on a Mac costs nothing.
+    #[inline]
+    pub const fn action(self) -> bool {
+        if cfg!(target_os = "macos") {
+            self.ctrl() || self.meta()
+        } else {
+            self.ctrl() && !self.meta()
+        }
     }
 }
 
@@ -1488,6 +1514,7 @@ mod tests {
             y: -2.25,
             kind: PointerKind::Down,
             button: MouseButton::Left,
+            mods: Modifiers::NONE,
         }
     }
 
@@ -2127,6 +2154,35 @@ mod tests {
             let mut ev = base.clone();
             ev.mods = Modifiers::new(bits);
             frame_round_trip(ev);
+        }
+    }
+
+    #[test]
+    fn pointer_events_carry_their_modifiers() {
+        // The click chords (Ctrl-left / ⌘-left on a link) are decided tab-side
+        // from the modifiers the shell saw, so they have to survive the wire —
+        // and a peer that sends the older four-field event still decodes.
+        for bits in 0u8..=0b1111 {
+            frame_round_trip(ToTab::Pointer(PointerEvent {
+                mods: Modifiers::new(bits),
+                ..pointer_event()
+            }));
+        }
+    }
+
+    #[test]
+    fn the_action_modifier_is_ctrl_off_macos_and_command_on_it() {
+        // `action()` is what a click chord tests: Ctrl yes, Alt/Shift on their
+        // own never, and on macOS the Command key whichever flag the backend
+        // reported it in (Slint swaps the two, other backends do not).
+        assert!(!Modifiers::NONE.action());
+        assert!(!Modifiers::NONE.with_alt().action());
+        assert!(!Modifiers::NONE.with_shift().action());
+        assert!(Modifiers::NONE.with_ctrl().action());
+        if cfg!(target_os = "macos") {
+            assert!(Modifiers::NONE.with_meta().action(), "⌘ arrives as meta too");
+        } else {
+            assert!(!Modifiers::NONE.with_meta().action(), "the Windows key is not Ctrl");
         }
     }
 

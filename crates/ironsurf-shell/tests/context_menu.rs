@@ -31,8 +31,8 @@ fn labels(ui: &AppWindow) -> Vec<String> {
 /// Right-button press+release at (x, y): exactly what Slint's TouchArea
 /// produces for a right-click, forwarded through the same callback.
 fn right_click(ui: &AppWindow) {
-    ui.invoke_page_pointer(120.0, 60.0, 1, 1); // down, right
-    ui.invoke_page_pointer(120.0, 60.0, 2, 1); // up, right
+    ui.invoke_page_pointer(120.0, 60.0, 1, 1, false, false, false, false); // down, right
+    ui.invoke_page_pointer(120.0, 60.0, 2, 1, false, false, false, false); // up, right
 }
 
 #[test]

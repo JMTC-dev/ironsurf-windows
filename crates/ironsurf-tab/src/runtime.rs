@@ -4250,6 +4250,42 @@ impl Tab {
             }
         }
 
+        // The same gesture for readers whose mouse has no middle button: a
+        // **primary-modifier left release** over a link (Ctrl on Linux/Windows,
+        // ⌘ on macOS — `Modifiers::action`) opens it in a new tab instead of
+        // navigating here. Handled exactly like the middle click above, and for
+        // exactly the same reason: nothing of this release reaches blitz, so the
+        // link's default action (this tab changing page) never happens. Over
+        // anything that is not a link the modifiers are ignored and the click
+        // goes through to the page untouched — a Ctrl-click on a checkbox is the
+        // page's own business.
+        if matches!(ev.kind, PointerKind::Up)
+            && ev.button == MouseButton::Left
+            && ev.mods.action()
+        {
+            if let Some(url) = self.hover_link() {
+                // The page still sees its gesture — `mouseup` and `click`, with
+                // the modifier flags set — and it may still say no: a handler
+                // calling `preventDefault()` keeps this tab where it is.
+                self.fire_js_pointer("mouseup", ev);
+                let cancelled = self.fire_js_pointer("click", ev);
+                // A handler that wrote to the page (its own usual thing) has to
+                // be flushed the way every other JS turn is, or its title change
+                // sits in the hook until something else repaints.
+                self.needs_paint = true;
+                self.take_js_title();
+                self.check_meta();
+                self.maybe_repaint();
+                if cancelled {
+                    debug!("action-modifier link click cancelled by the page: {url} stays put");
+                } else {
+                    debug!("action-modifier link click \u{2192} new tab: {url}");
+                    self.emit(FromTab::OpenLinkInNewTab { url });
+                }
+                return true;
+            }
+        }
+
         // A left release over a link whose `target` names another window
         // (task: block popups): blitz ignores `target`, so the click's default
         // action comes back as a navigation **of this tab** — the one thing
@@ -4390,7 +4426,9 @@ impl Tab {
                 ironsurf_common::MouseButton::Middle => MouseEventButton::Auxiliary,
             },
             buttons,
-            mods: KMods::empty(), // ironsurf PointerEvent carries no modifiers
+            // The flags the user held (Ctrl-left / ⌘-left clicks, shift-clicks)
+            // — `to_blitz_mods` does the one macOS swap the shell's flags need.
+            mods: to_blitz_mods(ev.mods),
             details: PointerDetails::default(),
             // The event driver overwrites `element` from the target's
             // bounding rect (driver.rs::adjust_element_coords).
@@ -4574,7 +4612,12 @@ impl Tab {
     /// event's `defaultPrevented`.
     fn fire_js_pointer(&mut self, kind: &str, ev: &PointerEvent) -> bool {
         let node = self.doc.as_ref().and_then(|doc| doc.get_hover_node_id());
-        let init = format!("{{ clientX: {}, clientY: {}, button: 0 }}", ev.x, ev.y);
+        let init = format!(
+            "{{ clientX: {}, clientY: {}, button: 0{} }}",
+            ev.x,
+            ev.y,
+            js_modifier_init(ev.mods)
+        );
         self.fire_js_event(node, kind, &init)
     }
 
@@ -5885,10 +5928,48 @@ fn is_clickable_element(el: &ElementData) -> bool {
     )
 }
 
+/// The DOM `*Key` flags of a pointer event, as a fragment of the JS object
+/// literal handed to `__ironsurfFire` (`""` when nothing is held, so the
+/// common case reads exactly as it used to).
+///
+/// macOS needs one swap: the shell forwards Command in `ctrl` (Slint swaps
+/// Command and Control so that cross-platform `Control-…` bindings read as ⌘),
+/// while a page testing `event.metaKey` means that very Command key.
+fn js_modifier_init(m: Modifiers) -> String {
+    let (ctrl, meta) = if cfg!(target_os = "macos") {
+        (m.meta(), m.ctrl())
+    } else {
+        (m.ctrl(), m.meta())
+    };
+    let mut out = String::new();
+    if ctrl {
+        out.push_str(", ctrlKey: true");
+    }
+    if meta {
+        out.push_str(", metaKey: true");
+    }
+    if m.shift() {
+        out.push_str(", shiftKey: true");
+    }
+    if m.alt() {
+        out.push_str(", altKey: true");
+    }
+    out
+}
+
 fn to_blitz_mods(m: Modifiers) -> KMods {
     let mut k = KMods::empty();
     if m.ctrl() {
         k |= KMods::CONTROL;
+        // macOS: this flag *is* Command. The shell forwards Slint's flags
+        // untouched and Slint swaps the two keys on Apple platforms (Command →
+        // `control`, Control → `meta`) so that cross-platform `Control-…`
+        // bindings read as ⌘ — while blitz spells the platform's editing chord
+        // `util::ACTION_MOD` = SUPER. Swap it back or ⌘-A / ⌘-C / ⌘-V in a text
+        // field read as Control-letters and the editor never moves.
+        if cfg!(target_os = "macos") {
+            k |= KMods::SUPER;
+        }
     }
     if m.shift() {
         k |= KMods::SHIFT;
@@ -5898,9 +5979,8 @@ fn to_blitz_mods(m: Modifiers) -> KMods {
     }
     if m.meta() {
         k |= KMods::META;
-        // macOS: blitz's editing chords run on Cmd (`util::ACTION_MOD = SUPER`),
-        // and the shell forwards the Command key to us as `meta`, so it must
-        // also arrive as SUPER or the editor never sees its paste/copy/select.
+        // macOS: a backend that does *not* swap hands over Command here, and it
+        // means the same chord (`Modifiers::action` accepts both spellings).
         if cfg!(target_os = "macos") {
             k |= KMods::SUPER;
         }
@@ -5910,9 +5990,15 @@ fn to_blitz_mods(m: Modifiers) -> KMods {
 
 /// The modifier the tab itself keys its editing chords on — mirrors
 /// `blitz-dom`: Ctrl everywhere, Cmd on macOS.
+///
+/// macOS accepts **either** spelling: the shell forwards Command in `ctrl`
+/// because Slint swaps the two keys on Apple platforms (`KeyboardModifiers`:
+/// Command → `control`, Control → `meta`) so that cross-platform
+/// `@keys(Control-…)` bindings read as ⌘, while backends that do not swap keep
+/// Command in `meta`. See [`Modifiers::action`].
 #[cfg(target_os = "macos")]
 fn is_action_chord(ev: &KeyEvent) -> bool {
-    ev.mods.meta() && !ev.mods.ctrl()
+    ev.mods.action()
 }
 
 /// The modifier the tab itself keys its editing chords on — mirrors
@@ -6185,6 +6271,7 @@ mod input_shaping_tests {
             y,
             kind: PointerKind::Move,
             button: ironsurf_common::MouseButton::Left,
+            mods: Modifiers::NONE,
         })
     }
 
@@ -6194,6 +6281,7 @@ mod input_shaping_tests {
             y,
             kind: PointerKind::Down,
             button: ironsurf_common::MouseButton::Left,
+            mods: Modifiers::NONE,
         })
     }
 
@@ -6536,6 +6624,21 @@ mod tests {
         );
     }
 
+    /// What a page sees of a chord click: the flags pass through to its event,
+    /// and on macOS the primary key is spelled the way a page spells it.
+    #[test]
+    fn pointer_events_carry_their_modifiers_into_the_page() {
+        assert_eq!(js_modifier_init(Modifiers::NONE), "");
+        assert_eq!(js_modifier_init(Modifiers::NONE.with_shift()), ", shiftKey: true");
+        assert_eq!(js_modifier_init(Modifiers::NONE.with_alt()), ", altKey: true");
+        // Here the shell forwards Ctrl in `ctrl` and a page calls it `ctrlKey`…
+        #[cfg(not(target_os = "macos"))]
+        assert_eq!(js_modifier_init(Modifiers::NONE.with_ctrl()), ", ctrlKey: true");
+        // …on macOS it forwards ⌘ there, and a page calls that `metaKey`.
+        #[cfg(target_os = "macos")]
+        assert_eq!(js_modifier_init(Modifiers::NONE.with_ctrl()), ", metaKey: true");
+    }
+
     #[test]
     fn parse_input_url_rejects_free_text() {
         assert!(parse_input_url("not a url").is_err());
@@ -6630,6 +6733,52 @@ mod tests {
         assert!(poll_inputs(-1, pipe.read_fd(), Duration::from_millis(0)));
         pipe.drain();
         assert!(!poll_inputs(-1, pipe.read_fd(), Duration::from_millis(0)));
+    }
+
+    // ------------------------------------------------------------------
+    // Chord clicks (Ctrl/⌘-left, middle) and what the page is told
+    // ------------------------------------------------------------------
+
+    const CHORD_PAGE: &str = r#"<!doctype html>
+<html><head><title>CH</title></head>
+<body style="margin:0">
+  <a id="l" href="next.html" style="display:block;width:200px;height:40px">link</a>
+  <p id="out">-</p>
+  <script>
+    document.getElementById("l").addEventListener("click", function (e) {
+      document.getElementById("out").textContent = "ctrl=" + e.ctrlKey + " meta=" + e.metaKey;
+    });
+  </script>
+</body></html>"#;
+
+    /// The page must see the modifiers of the click the shell forwarded — that
+    /// is how a page gets a chance to cancel the chord (`e.preventDefault()`).
+    /// The same event that opens the new tab, in other words.
+    #[test]
+    fn a_chord_click_reports_its_modifiers_to_the_page() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let page = dir.path().join("chord.html");
+        std::fs::write(&page, CHORD_PAGE).expect("write page");
+        let mut tab = form_tab(dir.path());
+        tab.handle_to_tab(ToTab::Resize { width: 800, height: 600, scale: 1.0 });
+        tab.navigate(
+            url::Url::from_file_path(&page).expect("file url").as_str(),
+            NavHistory::Fresh,
+        );
+
+        // Held-Ctrl release over the link: the click reaches the page, with the
+        // primary key spelled the way a page spells it (⌘ on macOS, Ctrl here).
+        tab.handle_to_tab(ptr_mods(100.0, 20.0, PointerKind::Move, Modifiers::NONE.with_ctrl()));
+        tab.handle_to_tab(ptr_mods(100.0, 20.0, PointerKind::Down, Modifiers::NONE.with_ctrl()));
+        tab.handle_to_tab(ptr_mods(100.0, 20.0, PointerKind::Up, Modifiers::NONE.with_ctrl()));
+        let seen = tab
+            .document_mut()
+            .and_then(|doc| text_of(doc, "#out"))
+            .unwrap_or_default();
+        #[cfg(not(target_os = "macos"))]
+        assert_eq!(seen, "ctrl=true meta=false", "the page saw Ctrl-click");
+        #[cfg(target_os = "macos")]
+        assert_eq!(seen, "ctrl=false meta=true", "the page saw ⌘-click");
     }
 
     // ------------------------------------------------------------------
@@ -6898,7 +7047,11 @@ mod tests {
     }
 
     fn ptr(x: f32, y: f32, kind: PointerKind) -> ToTab {
-        ToTab::Pointer(PointerEvent { x, y, kind, button: ironsurf_common::MouseButton::Left })
+        ptr_mods(x, y, kind, Modifiers::NONE)
+    }
+
+    fn ptr_mods(x: f32, y: f32, kind: PointerKind, mods: Modifiers) -> ToTab {
+        ToTab::Pointer(PointerEvent { x, y, kind, button: ironsurf_common::MouseButton::Left, mods })
     }
 
     /// Tag name of the currently focused node (if it is an element).
@@ -7901,6 +8054,7 @@ mod tests {
                 y: 12.0,
                 kind,
                 button: ironsurf_common::MouseButton::Right,
+                mods: Modifiers::NONE,
             }));
         }
         let target = emitted(&sink)

@@ -405,6 +405,7 @@ fn the_real_tab_hands_the_pane_a_real_document_and_a_real_pick() {
         y: centre.1,
         kind: PointerKind::Move,
         button: MouseButton::Left,
+        mods: ironsurf_common::Modifiers::NONE,
     }))
     .expect("send the hover the armed crosshair needs");
     wait_for("the hover report reaches the pane", &mut pump, &mut feed, |f| {

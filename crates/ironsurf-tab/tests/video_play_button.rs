@@ -140,6 +140,7 @@ fn video_autoplay_and_click() {
     // at x=12, y=height-11 = 229 on the 320x240 element at the page origin.
     let click = |kind, x, y| ToTab::Pointer(ironsurf_common::PointerEvent {
         x, y, kind, button: ironsurf_common::MouseButton::Left,
+        mods: ironsurf_common::Modifiers::NONE,
     });
     tab.send(click(ironsurf_common::PointerKind::Move, 12.0, 229.0));
     tab.send(click(ironsurf_common::PointerKind::Down, 12.0, 229.0));

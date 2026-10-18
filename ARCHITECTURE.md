@@ -98,7 +98,7 @@ pub enum FromTab {
     LoadingChanged   { loading: bool },
     HistoryChanged   { can_go_back: bool, can_go_forward: bool },
     StatusText       { text: Option<String> },
-    OpenLinkInNewTab { url: String },      // middle-click a link → shell opens url in a new tab (same container)
+    OpenLinkInNewTab { url: String },      // middle-click / Ctrl-(⌘-)click a link → shell opens url in a new tab (same container)
     // (task: block popups) this tab **refused** to open a window: the page asked
     // for one with no user interaction behind it, and its origin is not allowed.
     // Nothing was fetched and nothing changed in this tab. `url` is the target,
@@ -345,7 +345,12 @@ pub struct Userscript {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
-pub struct PointerEvent { pub x: f32, pub y: f32, pub kind: PointerKind, pub button: MouseButton }
+pub struct PointerEvent {
+    pub x: f32, pub y: f32,
+    pub kind: PointerKind,
+    pub button: MouseButton,
+    pub mods: Modifiers, // modifiers held during the event (0 = none): the mouse chords read it
+}
 pub enum PointerKind { Move, Down, Up, Over, Out }
 pub enum MouseButton  { Left, Right, Middle }
 
@@ -1460,14 +1465,35 @@ UI (`crates/ironsurf-shell/ui/ironsurf.slint`):
   the status line counts the saves, failures are logged, never fatal.
 - Menu (native or in-toolbar): New Window(v1: new tab), Close Tab (Ctrl-W), Tab Next/Prev
   (Ctrl-Tab), Open Container Manager, Clear Container Data.
-- **Alt-`1` … Alt-`9` jump to the N-th tab** (Chrome/Firefox convention): `keymap::shortcut_for`
-  reports the digit only (`Shortcut::SelectTab(n)`) and `tab_index_for_digit(n, tab_count)` resolves
-  it **at press time** against the live tab list — `Alt-1`…`Alt-8` address those positions while they
-  exist, `Alt-9` selects the **last** tab from nine tabs on, a digit with no tab behind it does
-  nothing. The mapping is therefore dynamic by construction (no stored per-tab key): closing a tab
-  re-slots every remaining shortcut. The inverse, `tab_shortcut_digit(index, tab_count)`, feeds
-  `TabInfo.shortcut` so each tab paints the Alt-key that reaches it today (tabs 9+ behind the last
-  show none).
+- **Alt-`1` … Alt-`9` jump to the N-th tab** (⌘-`1` … ⌘-`9` on macOS; Chrome/Firefox
+  convention): `keymap::shortcut_for` reports the digit only (`Shortcut::SelectTab(n)`)
+  and `tab_index_for_digit(n, tab_count)` resolves it **at press time** against the live
+  tab list — `Alt-1`…`Alt-8` address those positions while they exist, `Alt-9` selects
+  the **last** tab from nine tabs on, a digit with no tab behind it does nothing. The
+  mapping is therefore dynamic by construction (no stored per-tab key): closing a tab
+  re-slots every remaining shortcut. The inverse, `tab_shortcut_digit(index, tab_count)`,
+  feeds `TabInfo.shortcut` so each tab paints the Alt-key that reaches it today (tabs 9+
+  behind the last show none).
+- **macOS spells every browser chord with Command** (`keymap::Chords`): `Chords::CURRENT`
+  is `Cmd` on macOS and `Ctrl` everywhere else, and `shortcut_for` folds that key into
+  the one flag every chord arm already reads — ⌘-L / ⌘-W / ⌘-T / ⌘-R / ⌘-Shift-C / ⌘-F /
+  ⌘-S / ⌘-`+`-`-`-`0` / ⌘-Tab are the same `Shortcut`s (Option is a *typing* key on a Mac
+  — `Option-2` is `™` — so it loses the tab strip: the digit badges themselves do not
+  change, only the key that presses them). Both flags are accepted as Command because
+  Slint swaps the two keys on Apple platforms (`KeyboardModifiers`: Command → `control`,
+  Control → `meta`) while the tab IPC keeps Command in `meta` — which is also why the tab
+  swaps `ctrl` back to blitz's `SUPER` chord on macOS (`to_blitz_mods`), so ⌘-A / ⌘-C /
+  ⌘-V still edit a text field. `shortcut_on(Chords::Cmd, …)` keeps the mac spelling
+  testable on a Linux box; nothing else in the shell branches on the platform.
+- **The same gesture from the mouse: Ctrl-left-click a link (⌘-left on a Mac) opens it in
+  a new tab.** `ToTab::Pointer` carries `Modifiers` for exactly this: the tab cannot tell
+  a click from a chord without them, and only the tab knows whether a link is under the
+  cursor. A primary-modifier (`Modifiers::action`) left release over a hovered link is
+  handled like the middle click — `FromTab::OpenLinkInNewTab`, this tab does not
+  navigate — after the page has been given its JS `mouseup`/`click` with `ctrlKey` /
+  `metaKey` set, so a handler calling `preventDefault()` keeps the tab where it is. Over
+  anything that is not a link the modifiers are ignored and the click reaches the page
+  as an ordinary click.
 
 Process/tab management (`src/tabs.rs`):
 - `struct TabProc { id, container, child: Child, stdin, stdout, title, url, loading, can_back, can_fwd, frame: slint::Image, last_frame_age }`
@@ -1506,7 +1532,8 @@ Process/tab management (`src/tabs.rs`):
   rows return as `ToTab::ContextAction` (Paste = cache push + synthesized Ctrl+V in the tab).
   The clipboard is session-private by design: nothing crosses to the OS clipboard.
 - **A new tab opens in the address bar**: every tab open (`Ctrl-T`, the ＋ button, the
-  container manager's New tab, a middle-click / `FromTab::OpenLinkInNewTab`, a context-menu
+  container manager's New tab, a middle-click or Ctrl/⌘-click /
+  `FromTab::OpenLinkInNewTab`, a context-menu
   Open link in new tab) fills the bar with the tab's start URL, bumps the same
   `focus-url-token` Ctrl-L / F6 use — so the bar takes keyboard focus with the **whole
   address highlighted** and the first keystroke replaces it — and activates the tab. (The

@@ -503,6 +503,7 @@ fn tab_link_click_navigates() {
             y: 20.0,
             kind,
             button: ironsurf_common::MouseButton::Left,
+            mods: ironsurf_common::Modifiers::NONE,
         })
     };
     tab.send(click(ironsurf_common::PointerKind::Move));
@@ -577,6 +578,7 @@ fn tab_survives_input_events() {
             y,
             kind,
             button: ironsurf_common::MouseButton::Left,
+            mods: ironsurf_common::Modifiers::NONE,
         })
     };
     use ironsurf_common::PointerKind;
@@ -1397,6 +1399,7 @@ fn search_bar_with_hidden_inputs_is_clickable_and_typeable() {
             y,
             kind,
             button,
+            mods: ironsurf_common::Modifiers::NONE,
         })
     };
     use ironsurf_common::{MouseButton, PointerKind};
@@ -1589,7 +1592,7 @@ fn anomaly_modal_tile_click_checks_the_hidden_checkbox() {
     assert!(before > 8_000, "tile interior red area = {before}");
 
     let pointer = |kind, button, x, y| {
-        ToTab::Pointer(ironsurf_common::PointerEvent { x, y, kind, button })
+        ToTab::Pointer(ironsurf_common::PointerEvent { x, y, kind, button, mods: ironsurf_common::Modifiers::NONE })
     };
     use ironsurf_common::{MouseButton, PointerKind};
     tab.send(pointer(PointerKind::Move, MouseButton::Left, centre.0, centre.1));

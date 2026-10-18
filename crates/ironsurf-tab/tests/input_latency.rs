@@ -158,7 +158,7 @@ fn start_page1(dir: &std::path::Path) -> TabChild {
 }
 
 fn ptr(x: f32, y: f32, kind: PointerKind) -> ToTab {
-    ToTab::Pointer(PointerEvent { x, y, kind, button: MouseButton::Left })
+    ToTab::Pointer(PointerEvent { x, y, kind, button: MouseButton::Left, mods: ironsurf_common::Modifiers::NONE })
 }
 
 /// The user gesture the bug was reported against: move across the page (hover

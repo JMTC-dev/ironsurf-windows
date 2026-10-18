@@ -315,6 +315,7 @@ pub fn run(args: &[String]) -> Result<(), Box<dyn Error>> {
                 y,
                 kind,
                 button: ironsurf_common::MouseButton::Left,
+                mods: ironsurf_common::Modifiers::NONE,
             }));
         }
         tab.headless_pump();

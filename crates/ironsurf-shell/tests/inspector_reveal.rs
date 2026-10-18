@@ -201,8 +201,8 @@ fn row_node(ui: &AppWindow, n: usize) -> i32 {
 /// (`ToTab::InspectPickAt`). ⌖ armed with Ctrl-Shift-C reaches the same answer by
 /// the other route, which `inspector.rs` drives.
 fn inspect_element_at(ui: &AppWindow, core: &Rc<Core>, x: f32, y: f32) {
-    ui.invoke_page_pointer(x, y, 1, 1);
-    ui.invoke_page_pointer(x, y, 2, 1);
+    ui.invoke_page_pointer(x, y, 1, 1, false, false, false, false);
+    ui.invoke_page_pointer(x, y, 2, 1, false, false, false, false);
     wait_for("the context menu to open", || {
         core.drain();
         ui.get_menu_open()

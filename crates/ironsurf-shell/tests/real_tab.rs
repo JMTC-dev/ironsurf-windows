@@ -125,7 +125,7 @@ fn app_browses_with_the_real_tab_binary() {
     // Keyboard/mouse events traverse the whole path without killing the tab
     // (the tab-side semantics are covered by ironsurf-tab's own e2e).
     ui.invoke_page_key(true, "x".into(), false, false, false, false, false);
-    ui.invoke_page_pointer(120.0, 90.0, 0, 0);
+    ui.invoke_page_pointer(120.0, 90.0, 0, 0, false, false, false, false);
     ui.invoke_page_wheel(120.0, 90.0, 0.0, 40.0);
     std::thread::sleep(Duration::from_millis(200));
     app.core().drain();
