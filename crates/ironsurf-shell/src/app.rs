@@ -1208,6 +1208,17 @@ impl Core {
                 self.select_tab_by_digit(digit);
                 return;
             }
+            // History: the same messages the ‹ › toolbar buttons send, so the tab
+            // answers a chord exactly as it answers a click, and a tab with
+            // nothing left in its history simply has nothing to do.
+            Some(Shortcut::GoBack) => {
+                self.send_active(ToTab::Back);
+                return;
+            }
+            Some(Shortcut::GoForward) => {
+                self.send_active(ToTab::Forward);
+                return;
+            }
             Some(Shortcut::ZoomIn) => {
                 self.step_zoom(keymap::zoom_in);
                 return;

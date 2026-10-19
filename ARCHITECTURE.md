@@ -1485,6 +1485,26 @@ UI (`crates/ironsurf-shell/ui/ironsurf.slint`):
   swaps `ctrl` back to blitz's `SUPER` chord on macOS (`to_blitz_mods`), so ⌘-A / ⌘-C /
   ⌘-V still edit a text field. `shortcut_on(Chords::Cmd, …)` keeps the mac spelling
   testable on a Linux box; nothing else in the shell branches on the platform.
+- **History on the arrow keys: Alt-`←` / Alt-`→`** (`⌘-←` / `⌘-→` on macOS, the same
+  `Chords` fold — one arm in `shortcut_on`, no second binding and no `cfg!`):
+  `Shortcut::GoBack` / `Shortcut::GoForward`, dispatched to `ToTab::Back` /
+  `ToTab::Forward` — the very messages the ‹ › toolbar buttons send, so a chord and a
+  click are the same request and a tab with nothing left in its history has nothing to
+  do. History and not the tab strip: the arrows say which way the reader wants to go,
+  and the strip already has Ctrl-Tab and the digit chords. Only the platform's own key
+  *alone* is the chord — `Ctrl-←` off a Mac and `⌥-←` on one keep moving a text caret a
+  word at a time, so the page gets them — and the chord is read from the page surface
+  only, which is why `⌘-←` inside the URL bar still goes to the start of the line.
+- **PageUp / PageDown scroll the page, and `Ctrl`/`⌘`-PageDown is bound to nothing.**
+  blitz has no page-level binding for either key — its keymap spells them as editor
+  no-ops (`node/text.rs`: `"scrollPageDown:"` — which is why they did nothing at all
+  outside a text field) — so the *tab* scrolls the document viewport: one viewport of
+  travel less the tenth kept as overlap so the reader keeps their place, clamped at the
+  top, and stopped by the ceiling `FromTab::ScrollState` reports — the geometry the
+  shell's scroll bar is drawn from, so the bar follows the keystroke. The shell claims
+  no chord here (deliberately *not* Chrome's Ctrl-PageDown = next tab), so the modifiers
+  are the page's own business and a `keydown` handler that `preventDefault()`s the press
+  still cancels the scroll.
 - **The same gesture from the mouse: Ctrl-left-click a link (⌘-left on a Mac) opens it in
   a new tab.** `ToTab::Pointer` carries `Modifiers` for exactly this: the tab cannot tell
   a click from a chord without them, and only the tab knows whether a link is under the

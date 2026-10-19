@@ -2968,6 +2968,50 @@ impl Tab {
         self.emit(FromTab::ScrollState { state });
     }
 
+    /// One screen of PageUp/PageDown travel, in the direction the key names.
+    ///
+    /// blitz has no page-level binding for either key — its keymap spells them as
+    /// editor no-ops (`node/text.rs`: `"scrollPageDown:" => {}`) — so unless the
+    /// tab does it itself the keys do nothing at all outside a text field. A
+    /// viewport of travel less a tenth kept as overlap, so a line or two stays in
+    /// sight and the reader knows they have not fallen off the page; clamped to
+    /// the range [`Self::viewport_scroll_state`] reports, which is also what says
+    /// whether the document scrolls at all (a page that fits its window has
+    /// `range == 0` and stays exactly where it is).
+    ///
+    /// This is the *document* viewport — the thing the wheel and the shell's
+    /// scroll bar move — so an `overflow: scroll` box inside the page keeps its
+    /// own keys, and `Ctrl`/`⌘`-PageDown scrolls the same as the bare key: that
+    /// chord is deliberately not bound (it is not the shell's to take).
+    fn scroll_page(&mut self, up: bool) {
+        let Some(state) = self.viewport_scroll_state() else {
+            return;
+        };
+        if state.range <= 0.0 {
+            return;
+        }
+        let travel = (f64::from(state.viewport_h) * 0.9).max(1.0);
+        let y = if up {
+            (f64::from(state.y) - travel).max(0.0)
+        } else {
+            (f64::from(state.y) + travel).min(f64::from(state.range))
+        };
+        let Some(doc) = self.doc.as_mut() else {
+            return;
+        };
+        let mut scroll = doc.viewport_scroll();
+        scroll.y = y;
+        doc.set_viewport_scroll(scroll);
+        // The scroll bar follows through `report_scroll_state` on the next tick;
+        // the pixels are this tab's job.
+        self.needs_paint = true;
+        debug!(
+            "page {} scroll \u{2192} y = {y:.0} of {:.0}",
+            if up { "up" } else { "down" },
+            f64::from(state.range)
+        );
+    }
+
     // -- painting -----------------------------------------------------------
 
     /// Paint the document into an RGBA8 buffer and emit `FromTab::Frame`,
@@ -4554,6 +4598,16 @@ impl Tab {
                     .unwrap_or(0);
                 debug!("select-all: {chars} char(s) of page text selected");
             }
+        }
+        // PageUp / PageDown: the page moves a screen at a time (see
+        // [`Self::scroll_page`]). Done between the press and the release so the
+        // page still sees the whole gesture — and sees nothing of the scroll
+        // itself, because a `keydown` handler that `preventDefault()`ed the press
+        // returned out of this function before ever getting here.
+        match ev.key.as_str() {
+            "PageUp" => self.scroll_page(true),
+            "PageDown" => self.scroll_page(false),
+            _ => {}
         }
         let release = BlitzKeyEvent {
             state: KeyState::Released,
@@ -9308,6 +9362,83 @@ mod tests {
             states[2].range > 0.0,
             "the page is still scrollable: {:?}",
             states[2]
+        );
+    }
+
+    /// PageUp / PageDown move the document one screen at a time: a viewport of
+    /// travel less the tenth kept as overlap, clamped at the top, with the
+    /// geometry the shell's bar draws from following. blitz binds neither key at
+    /// page level (`node/text.rs` spells them as editor no-ops), so the gesture
+    /// is the tab's own — and a chord key held while paging changes nothing,
+    /// because Ctrl/⌘-PageDown is deliberately not bound as a chord anywhere.
+    #[test]
+    fn page_keys_scroll_one_screen_at_a_time() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (mut tab, sink) = scroll_tab(
+            dir.path(),
+            "tall.html",
+            "<!doctype html><meta charset=utf-8><style>body{margin:0;height:1600px}</style><p>tall</p>",
+        );
+        tab.report_scroll_state();
+        assert_eq!(scroll_states(&sink).len(), 1, "the fresh geometry");
+
+        let page_key = |key: &str, mods: Modifiers| {
+            ToTab::Key(KeyEvent {
+                key: key.into(),
+                code: key.into(),
+                text: None,
+                repeat: false,
+                mods,
+            })
+        };
+        let screen = SCROLL_WINDOW_H * 0.9;
+
+        // One press, one screen down — and the shell hears about it.
+        tab.handle_to_tab(page_key("PageDown", Modifiers::NONE));
+        tab.settle();
+        let one = scroll_y(&mut tab);
+        assert!(
+            (one - screen).abs() < 1.0,
+            "PageDown travels a viewport less its overlap ({screen}): {one}"
+        );
+        tab.report_scroll_state();
+        let states = scroll_states(&sink);
+        assert_eq!(states.len(), 2, "the bar follows the page");
+        assert!(
+            (f64::from(states[1].y) - one).abs() < 1.0,
+            "the report is the page: {:?} vs {one}",
+            states[1]
+        );
+
+        // PageUp: the same travel back, stopping at the top instead of using the
+        // engine's half-window of overscroll.
+        tab.handle_to_tab(page_key("PageUp", Modifiers::NONE));
+        tab.settle();
+        assert!(scroll_y(&mut tab).abs() < 1.0, "PageUp is back at the top");
+        tab.handle_to_tab(page_key("PageUp", Modifiers::NONE));
+        tab.settle();
+        assert!(scroll_y(&mut tab).abs() < 1.0, "and it does not go past it");
+
+        // Ctrl held is not a chord: it pages exactly the same way.
+        tab.handle_to_tab(page_key("PageDown", Modifiers::NONE.with_ctrl()));
+        tab.settle();
+        let held = scroll_y(&mut tab);
+        assert!(
+            (held - screen).abs() < 1.0,
+            "Ctrl-PageDown scrolls like the bare key: {held}"
+        );
+
+        // Walking down the page stops at the reported ceiling.
+        for _ in 0..10 {
+            tab.handle_to_tab(page_key("PageDown", Modifiers::NONE));
+        }
+        tab.settle();
+        let ceiling = f64::from(scroll_states(&sink).last().expect("geometry").range);
+        let bottom = scroll_y(&mut tab);
+        assert!(bottom > screen, "ten presses went down the page: {bottom}");
+        assert!(
+            bottom <= ceiling + 1.0,
+            "the last press stopped at the reported ceiling {ceiling}: {bottom}"
         );
     }
 

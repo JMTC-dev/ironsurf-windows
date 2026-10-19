@@ -33,6 +33,13 @@ pub enum Shortcut {
     /// count, so the mapping follows every open and close (digit `9` is "the
     /// last tab" from nine tabs on, exactly like Chrome/Firefox).
     SelectTab(u8),
+    /// `Alt-←` / `Alt-→` (`⌘-←` / `⌘-→` on macOS, see [`Chords`]): back / forward
+    /// in the active tab's history. History and not the tab strip — the arrows
+    /// say which way the reader wants to go, and the strip already has Ctrl-Tab
+    /// and the digit chords. PageUp/PageDown are **not** here: they scroll the
+    /// page (and the tab does that, so no chord claims them).
+    GoBack,
+    GoForward,
     /// Ctrl-`+` (Ctrl-`=`, Ctrl-`+`): zoom the page in one step.
     ZoomIn,
     /// Ctrl-`-`: zoom the page out one step.
@@ -148,9 +155,10 @@ impl Chords {
         }
     }
 
-    /// Does `Alt` still own the tab-number chords? Yes on Linux/Windows
-    /// (`Alt-1` … `Alt-9`), no on macOS: Option is a *typing* key there
-    /// (`Option-2` is `™`) and ⌘ runs the tab strip instead.
+    /// Does `Alt` still own the *navigation* chords — the tab-number chords
+    /// (`Alt-1` … `Alt-9`) and `←`/`→` for history? Yes on Linux/Windows, no on
+    /// macOS: Option is a *typing* key there (`Option-2` is `™`, `Option-←` moves
+    /// a word) and ⌘ runs the tab strip and the history instead.
     #[inline]
     pub fn digits_on_alt(self) -> bool {
         matches!(self, Chords::Ctrl)
@@ -182,6 +190,11 @@ fn alt_tab_digit(c: char) -> Option<u8> {
         _ => None,
     }
 }
+
+/// Slint's key text for `←` and `→`: private-use keysyms, one character each
+/// (`i-slint-common::key_codes`, mirrored by the table in [`dom_key`]).
+const KEY_ARROW_LEFT: char = '\u{F702}';
+const KEY_ARROW_RIGHT: char = '\u{F703}';
 
 /// Which tab does the digit chord (`Alt-{digit}`, `⌘{digit}` on macOS) select
 /// in a strip of `tab_count` tabs?
@@ -288,13 +301,27 @@ pub fn shortcut_on(
             _ => None,
         };
     }
+    // The platform's chord key held *alone*: `Alt` off a Mac, `⌘` on one — and
+    // `Chords` has already folded Command into `ctrl`, which is why one expression
+    // answers both spellings. It owns the history arrows here and the tab-number
+    // chords below.
+    let chord = if chords.digits_on_alt() { alt && !ctrl && !meta } else { ctrl && !alt };
+    // History on the arrows — and only on the plain chord of the platform's own
+    // key: `Ctrl-←` off a Mac and `⌥-←` on one keep moving a text caret a word at a
+    // time, so those presses belong to the page.
+    if chord {
+        match c {
+            KEY_ARROW_LEFT => return Some(Shortcut::GoBack),
+            KEY_ARROW_RIGHT => return Some(Shortcut::GoForward),
+            _ => {}
+        }
+    }
     // The digit chords: switch to the N-th tab — `Alt-1` … `Alt-9` where Ctrl is
     // the chord key, `⌘1` … `⌘9` on macOS. Resolution against the live tab list
     // happens in the shell, so the chord stays valid as tabs open and close, and
     // a digit that is not a digit (⌘0 stays zoom reset, see below) falls
     // through to the letter chords rather than being swallowed here.
-    let want_digit = if chords.digits_on_alt() { alt && !ctrl && !meta } else { ctrl && !alt };
-    if want_digit {
+    if chord {
         if let Some(digit) = alt_tab_digit(c) {
             return Some(Shortcut::SelectTab(digit));
         }
@@ -488,6 +515,55 @@ mod tests {
             shortcut_for("t", true, false, false),
             shortcut_on(Chords::CURRENT, "t", true, false, false)
         );
+    }
+
+    /// Back / forward on the arrows: `Alt-←` / `Alt-→` on Linux/Windows, `⌘-←` /
+    /// `⌘-→` on macOS — one rule, because `Chords` folds the platform's chord key
+    /// before anything is matched. PageUp/PageDown are bound to *nothing* here on
+    /// purpose: they scroll the page, which the tab does itself (modifier held or
+    /// not), so no chord may claim them.
+    #[test]
+    fn the_arrows_are_history_and_paging_is_no_chord() {
+        let (left, right, up, down) = ("\u{F702}", "\u{F703}", "\u{F72C}", "\u{F72D}");
+        // Linux/Windows: Alt owns the arrows…
+        assert_eq!(
+            shortcut_on(Chords::Ctrl, left, false, true, false),
+            Some(Shortcut::GoBack)
+        );
+        assert_eq!(
+            shortcut_on(Chords::Ctrl, right, false, true, false),
+            Some(Shortcut::GoForward)
+        );
+        // …while Ctrl-← (a word at a time in a field) and the same arrow under the
+        // Windows key stay the page's.
+        assert_eq!(shortcut_on(Chords::Ctrl, left, true, false, false), None);
+        assert_eq!(shortcut_on(Chords::Ctrl, right, false, false, true), None);
+        // macOS: ⌘ owns them, in whichever of the two flags the backend reported
+        // Command, and `⌥-←` keeps moving words instead.
+        for (ctrl, meta) in [(true, false), (false, true)] {
+            assert_eq!(
+                shortcut_on(Chords::Cmd, left, ctrl, false, meta),
+                Some(Shortcut::GoBack),
+                "\u{2318}-left ctrl={ctrl} meta={meta}"
+            );
+            assert_eq!(
+                shortcut_on(Chords::Cmd, right, ctrl, false, meta),
+                Some(Shortcut::GoForward)
+            );
+        }
+        assert_eq!(shortcut_on(Chords::Cmd, left, false, true, false), None);
+        // Paging: no chord on either spelling, bare or with a modifier held.
+        for text in [up, down] {
+            for chords in [Chords::Ctrl, Chords::Cmd] {
+                for (ctrl, alt, meta) in [(false, false, false), (true, false, false), (false, true, false)] {
+                    assert_eq!(
+                        shortcut_on(chords, text, ctrl, alt, meta),
+                        None,
+                        "{text:?} {chords:?} ctrl={ctrl} alt={alt} meta={meta}"
+                    );
+                }
+            }
+        }
     }
 
     // Ctrl-Alt-`R` (task: reader mode): the reader toggle. Plain Ctrl-`R`

@@ -1624,3 +1624,107 @@ fn anomaly_modal_tile_click_checks_the_hidden_checkbox() {
 
     exit_cleanly(&mut tab);
 }
+
+/// A page four screens tall: its last line is out of reach without scrolling.
+const TALL_PAGE: &str = r#"<!doctype html>
+<html>
+  <head><title>Tall Page</title></head>
+  <body style="margin: 0; background: #ffffff">
+    <div style="height: 3000px; background: #000064"></div>
+  </body>
+</html>
+"#;
+
+/// The newest scroll geometry the tab reported, newest-first over `msgs`.
+fn scroll_y_of(msgs: &[FromTab]) -> Option<f32> {
+    msgs.iter().rev().find_map(|m| match m {
+        FromTab::ScrollState { state } => Some(state.y),
+        _ => None,
+    })
+}
+
+/// PageUp / PageDown move the document a screen at a time. blitz has no
+/// page-level binding for either key — its keymap spells them as editor no-ops
+/// (`node/text.rs`) — so the tab scrolls the viewport itself, and the geometry
+/// the shell's scroll bar draws from (`FromTab::ScrollState`) follows.
+///
+/// `Ctrl`-PageDown is deliberately **not** a browser chord here, so it scrolls
+/// exactly the same: the modifier is the page's own business, not the shell's.
+#[test]
+fn page_keys_scroll_the_document() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let profile = dir.path().join("profile");
+    std::fs::create_dir_all(&profile).expect("profile dir");
+    let fixture = profile.join("tall.html");
+    std::fs::write(&fixture, TALL_PAGE).expect("write fixture");
+
+    let deadline = Instant::now() + DEADLINE;
+    let mut tab = spawn_tab(&fixture, &profile);
+    let mut seen = Vec::new();
+
+    tab.wait_for(
+        "rendered Frame(1024x768)",
+        |m| {
+            matches!(m, FromTab::Frame { width, height, .. }
+                if *width == 1024 && *height == 768)
+        },
+        deadline,
+        &mut seen,
+    );
+
+    let page_key = |key: &str, mods: ironsurf_common::Modifiers| {
+        ToTab::Key(ironsurf_common::KeyEvent {
+            key: key.into(),
+            code: key.into(),
+            text: None,
+            repeat: false,
+            mods,
+        })
+    };
+
+    // Scrollable at all — the numbers the shell's bar is drawn from.
+    let geometry = tab.wait_for_new(
+        "a scroll range for a 3000px page in a 768px window",
+        |m| matches!(m, FromTab::ScrollState { state } if state.range > 1000.0),
+        deadline,
+        &mut seen,
+    );
+    let FromTab::ScrollState { state } = geometry else {
+        unreachable!("the predicate matched a ScrollState")
+    };
+    assert!(state.y < 1.0, "a fresh page sits at the top ({state:?})");
+
+    // PageDown: one screen (a viewport less the tenth kept as overlap).
+    tab.send(page_key("PageDown", ironsurf_common::Modifiers::NONE));
+    tab.wait_for_new(
+        "PageDown scrolled a screen down",
+        |m| matches!(m, FromTab::ScrollState { state } if state.y > state.viewport_h * 0.8),
+        deadline,
+        &mut seen,
+    );
+
+    // PageUp: the same travel back, stopping at the top (the engine's own
+    // sub-pixel remainder is as far up as a document goes).
+    tab.send(page_key("PageUp", ironsurf_common::Modifiers::NONE));
+    tab.wait_for_new(
+        "PageUp scrolled back to the top",
+        |m| matches!(m, FromTab::ScrollState { state } if state.y < 1.0),
+        deadline,
+        &mut seen,
+    );
+
+    // With the chord key held the key is still just paging (no binding eats it).
+    tab.send(page_key(
+        "PageDown",
+        ironsurf_common::Modifiers::NONE.with_ctrl(),
+    ));
+    let held = tab.collect(Duration::from_millis(1500));
+    assert!(
+        matches!(scroll_y_of(&held), Some(y) if y > 0.0),
+        "Ctrl-PageDown must scroll like the bare key: {:?}",
+        scroll_y_of(&held)
+    );
+
+    // And it stays responsive to the rest of the protocol.
+    exit_cleanly(&mut tab);
+}

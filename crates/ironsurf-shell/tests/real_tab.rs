@@ -122,6 +122,42 @@ fn app_browses_with_the_real_tab_binary() {
         snap()[0].url.as_deref() == Some(page2.as_str())
     });
 
+    // The arrow chord, end to end through a real tab: `Alt-←` / `Alt-→` on this
+    // platform (macOS spells the same chord `⌘-←` / `⌘-→` — the one spelling
+    // `keymap::Chords` folds, tested in the keymap's own tests). Arrows reach the
+    // shell as Slint's private-use keysyms, and the tab answers the chord out of
+    // its own session history, exactly as it answered the toolbar buttons.
+    ui.invoke_page_key(true, "\u{F702}".into(), false, false, true, false, false);
+    wait_for("Alt-\u{2190} history back", &app, || {
+        snap()[0].url.as_deref() == Some(page1.as_str())
+    });
+    ui.invoke_page_key(true, "\u{F703}".into(), false, false, true, false, false);
+    wait_for("Alt-\u{2192} history forward", &app, || {
+        snap()[0].url.as_deref() == Some(page2.as_str())
+    });
+    // Ctrl-\u{2190} is not the chord off a Mac (it moves a text caret a word at a
+    // time), so the page keeps it and the history does not move.
+    ui.invoke_page_key(true, "\u{F702}".into(), true, false, false, false, false);
+    std::thread::sleep(Duration::from_millis(300));
+    app.core().drain();
+    assert_eq!(
+        snap()[0].url.as_deref(),
+        Some(page2.as_str()),
+        "Ctrl-\u{2190} belongs to the page, not to history"
+    );
+    // PageUp/PageDown scroll (see `ironsurf-tab`'s page-scroll tests); as shell
+    // keys they may not disturb anything else, and PageDown bound to a tab switch
+    // would have been the bug.
+    ui.invoke_page_key(true, "\u{F72D}".into(), false, false, false, false, false);
+    std::thread::sleep(Duration::from_millis(300));
+    app.core().drain();
+    assert_eq!(snap().len(), 1, "PageDown switched away from the only tab");
+    assert_eq!(
+        snap()[0].url.as_deref(),
+        Some(page2.as_str()),
+        "PageDown navigated instead of scrolling"
+    );
+
     // Keyboard/mouse events traverse the whole path without killing the tab
     // (the tab-side semantics are covered by ironsurf-tab's own e2e).
     ui.invoke_page_key(true, "x".into(), false, false, false, false, false);
