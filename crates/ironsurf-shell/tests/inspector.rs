@@ -123,8 +123,8 @@ fn press_escape(ui: &AppWindow) {
 
 /// Right-button press+release at (x, y) — a right-click into the page.
 fn right_click(ui: &AppWindow, x: f32, y: f32) {
-    ui.invoke_page_pointer(x, y, 1, 1);
-    ui.invoke_page_pointer(x, y, 2, 1);
+    ui.invoke_page_pointer(x, y, 1, 1, false, false, false, false);
+    ui.invoke_page_pointer(x, y, 2, 1, false, false, false, false);
 }
 
 /// The Inspector pane of the active tab: F12, then the third pane.

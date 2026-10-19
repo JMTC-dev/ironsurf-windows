@@ -1111,18 +1111,20 @@ impl Core {
         }
     }
 
-    /// `Alt-1` … `Alt-9`: activate the N-th tab, resolved against the tab list
-    /// **as it is right now** (see [`keymap::tab_index_for_digit`]): `Alt-9` is
-    /// the last tab from nine tabs on, so the mapping slides with every tab
-    /// that opens or closes. A digit with no tab behind it does nothing.
+    /// `Alt-1` … `Alt-9` (`⌘1` … `⌘9` on macOS): activate the N-th tab, resolved
+    /// against the tab list **as it is right now** (see
+    /// [`keymap::tab_index_for_digit`]): digit 9 is the last tab from nine tabs
+    /// on, so the mapping slides with every tab that opens or closes. A digit
+    /// with no tab behind it does nothing.
     fn select_tab_by_digit(&self, digit: u8) {
+        let mod_label = keymap::Chords::CURRENT.digit_mod_label();
         let count = self.procs.borrow().len();
         let Some(idx) = keymap::tab_index_for_digit(digit, count) else {
-            debug!("Alt-{digit} dropped: no tab for that key with {count} tab(s)");
+            debug!("{mod_label}-{digit} dropped: no tab for that key with {count} tab(s)");
             return;
         };
         if Some(idx) == self.active_proc_index() {
-            debug!("Alt-{digit}: tab {idx} is already active");
+            debug!("{mod_label}-{digit}: tab {idx} is already active");
             return;
         }
         self.activate_tab(idx);
@@ -1204,6 +1206,17 @@ impl Core {
             }
             Some(Shortcut::SelectTab(digit)) => {
                 self.select_tab_by_digit(digit);
+                return;
+            }
+            // History: the same messages the ‹ › toolbar buttons send, so the tab
+            // answers a chord exactly as it answers a click, and a tab with
+            // nothing left in its history simply has nothing to do.
+            Some(Shortcut::GoBack) => {
+                self.send_active(ToTab::Back);
+                return;
+            }
+            Some(Shortcut::GoForward) => {
+                self.send_active(ToTab::Forward);
                 return;
             }
             Some(Shortcut::ZoomIn) => {
@@ -2203,7 +2216,22 @@ impl Core {
         }
     }
 
-    fn page_pointer(&self, x: f32, y: f32, kind: i32, button: i32) {
+    /// Forward one page pointer event. The modifiers come along because two of
+    /// the browser's gestures are chords of the *mouse*: a middle click and a
+    /// primary-modifier left click (Ctrl here, ⌘ on macOS) both mean "open the
+    /// link under the cursor in a new tab", and only the tab knows whether a
+    /// link is under the cursor.
+    fn page_pointer(
+        &self,
+        x: f32,
+        y: f32,
+        kind: i32,
+        button: i32,
+        ctrl: bool,
+        shift: bool,
+        alt: bool,
+        meta: bool,
+    ) {
         use ironsurf_common::{MouseButton, PointerKind};
         let kind = match kind {
             1 => PointerKind::Down,
@@ -2239,7 +2267,13 @@ impl Core {
             self.pending_move.set(None);
             self.last_move_at.set(Some(Instant::now()));
         }
-        self.send_active(ToTab::Pointer(ironsurf_common::PointerEvent { x, y, kind, button }));
+        self.send_active(ToTab::Pointer(ironsurf_common::PointerEvent {
+            x,
+            y,
+            kind,
+            button,
+            mods: keymap::mods(ctrl, shift, alt, meta),
+        }));
     }
 
     /// Forward the newest hover move that was dropped as too soon after the
@@ -2258,6 +2292,9 @@ impl Core {
             y,
             kind: ironsurf_common::PointerKind::Move,
             button: ironsurf_common::MouseButton::Left,
+            // A hover move that was late, not a different one: the modifiers it
+            // was dropped under are nobody's business (only clicks read them).
+            mods: ironsurf_common::Modifiers::NONE,
         }));
     }
 
@@ -4807,7 +4844,9 @@ impl Core {
         }
         {
             let c = self.clone();
-            ui.on_page_pointer(move |x, y, kind, button| c.page_pointer(x, y, kind, button));
+            ui.on_page_pointer(move |x, y, kind, button, ctrl, shift, alt, meta| {
+                c.page_pointer(x, y, kind, button, ctrl, shift, alt, meta)
+            });
         }
         {
             let c = self.clone();

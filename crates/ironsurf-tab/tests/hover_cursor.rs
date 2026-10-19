@@ -144,6 +144,7 @@ impl TabChild {
             y,
             kind: PointerKind::Move,
             button: MouseButton::Left,
+            mods: ironsurf_common::Modifiers::NONE,
         }));
     }
 }
@@ -231,6 +232,7 @@ fn the_hand_appears_over_a_link_and_css_outranks_the_heuristics() {
         y: 120.0,
         kind: PointerKind::Out,
         button: MouseButton::Left,
+        mods: ironsurf_common::Modifiers::NONE,
     }));
     tab.pump(Duration::from_millis(300));
     let feed = tab.cursors();

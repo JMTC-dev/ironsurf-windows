@@ -36,7 +36,7 @@ fn fake_tab_reports_the_cursor_only_on_change() {
     assert!(!msgs.is_empty(), "fake_tab never said Ready");
 
     let pointer = |x: f32, kind: PointerKind| {
-        proc.send(ToTab::Pointer(PointerEvent { x, y: 20.0, kind, button: MouseButton::Left }))
+        proc.send(ToTab::Pointer(PointerEvent { x, y: 20.0, kind, button: MouseButton::Left, mods: ironsurf_common::Modifiers::NONE }))
             .unwrap()
     };
 

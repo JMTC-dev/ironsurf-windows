@@ -36,8 +36,8 @@ fn labels(ui: &AppWindow) -> Vec<String> {
 
 /// Right-button press+release at (x, y) through the page's pointer callback.
 fn right_click(ui: &AppWindow) {
-    ui.invoke_page_pointer(120.0, 60.0, 1, 1); // down, right
-    ui.invoke_page_pointer(120.0, 60.0, 2, 1); // up, right
+    ui.invoke_page_pointer(120.0, 60.0, 1, 1, false, false, false, false); // down, right
+    ui.invoke_page_pointer(120.0, 60.0, 2, 1, false, false, false, false); // up, right
 }
 
 /// A page key press through the FocusScope callback.

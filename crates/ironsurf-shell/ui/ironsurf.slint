@@ -16,9 +16,10 @@ export struct TabInfo {
     title: string,
     color: color,
     active: bool,
-    /// Digit of the Alt-chord that reaches this tab today ("1" … "9"; empty
-    /// when no chord does). Rust recomputes it from the live tab order, so the
-    /// badge always shows where Alt-1 … Alt-9 land right now.
+    /// Digit of the tab-switch chord that reaches this tab today ("1" … "9";
+    /// empty when no chord does) — Alt on Linux/Windows, ⌘ on macOS. Rust
+    /// recomputes it from the live tab order, so the badge always shows where
+    /// Alt-1 … Alt-9 (⌘1 … ⌘9) land right now.
     shortcut: string,
 }
 
@@ -887,7 +888,13 @@ export component AppWindow inherits Window {
     // raw keyboard/pointer events from the page; Rust decides chords
     callback page-key(pressed: bool, text: string, ctrl: bool, shift: bool, alt: bool, meta: bool, repeat: bool);
     // kind: 0 move, 1 down, 2 up, 4 out — button: 0 left, 1 right, 2 middle
-    callback page-pointer(x: length, y: length, kind: int, button: int);
+    // The modifiers ride along for the mouse chords: a middle click, or a
+    // Ctrl-left / (macOS) ⌘-left click on a link, opens it in a new tab — and
+    // only the tab can tell whether a link is under the cursor at all.
+    // Slint reports Command in `control` on macOS and Control in `meta`, so the
+    // tab is given both flags and decides per platform.
+    callback page-pointer(x: length, y: length, kind: int, button: int,
+                          ctrl: bool, shift: bool, alt: bool, meta: bool);
     callback page-wheel(x: length, y: length, delta-x: length, delta-y: length);
     // context-menu intents (index into `menu-items`)
     callback menu-pick(idx: int);
@@ -1253,7 +1260,8 @@ export component AppWindow inherits Window {
                         // derive with ternaries; coords come from the TouchArea)
                         let kind = ev.kind == PointerEventKind.down ? 1 : ev.kind == PointerEventKind.up ? 2 : ev.kind == PointerEventKind.cancel ? 4 : 0;
                         let btn = ev.button == PointerEventButton.right ? 1 : ev.button == PointerEventButton.middle ? 2 : 0;
-                        root.page-pointer(ta.mouse-x, ta.mouse-y, kind, btn);
+                        root.page-pointer(ta.mouse-x, ta.mouse-y, kind, btn,
+                            ev.modifiers.control, ev.modifiers.shift, ev.modifiers.alt, ev.modifiers.meta);
                     }
                     // Slint hands over winit's wheel deltas untouched, and the
                     // tab's engine (blitz) consumes that very convention

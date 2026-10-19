@@ -68,7 +68,7 @@ fn wait_for(what: &str, app: &App, cond: impl Fn() -> bool) {
 fn wheel(ui: &AppWindow, dy: f32) {
     // The pointer has to be *on* the page for the wheel to belong to it, so
     // move it in first, exactly as a reader's hand would.
-    ui.invoke_page_pointer(200.0, 150.0, 0, 0);
+    ui.invoke_page_pointer(200.0, 150.0, 0, 0, false, false, false, false);
     ui.invoke_page_wheel(200.0, 150.0, 0.0, dy);
 }
 
