@@ -222,7 +222,7 @@ impl TabChild {
 }
 
 fn spawn_tab(url: &str, profile_dir: &std::path::Path) -> TabChild {
-    let exe = env!("CARGO_BIN_EXE_ironsurf-tab");
+    let exe = env!("CARGO_BIN_EXE_ironsurf");
     let mut child = Command::new(exe)
         .env_remove("DISPLAY")
         .env_remove("WAYLAND_DISPLAY")

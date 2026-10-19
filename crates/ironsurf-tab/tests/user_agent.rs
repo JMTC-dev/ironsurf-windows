@@ -200,7 +200,7 @@ fn wait_js_count(tab: &mut TabChild, expected: &str, count: usize) {
 }
 
 fn spawn_tab(url: &str, profile_dir: &std::path::Path, extra_args: &[&str]) -> TabChild {
-    let exe = env!("CARGO_BIN_EXE_ironsurf-tab");
+    let exe = env!("CARGO_BIN_EXE_ironsurf");
     let mut command = Command::new(exe);
     command
         .env_remove("DISPLAY")

@@ -28,7 +28,7 @@ use std::time::{Duration, Instant};
 
 use ironsurf_common::{read_frame, write_frame, FromTab, ToTab};
 
-const BIN: &str = env!("CARGO_BIN_EXE_ironsurf-tab");
+const BIN: &str = env!("CARGO_BIN_EXE_ironsurf");
 const COLLECT: Duration = Duration::from_millis(1_800);
 
 /// A name, not an address, so a page served from it is not itself on a private

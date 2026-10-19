@@ -18,7 +18,9 @@
 #
 # Needs: $DISPLAY (Xvfb is enough: `Xvfb :99 -screen 0 1280x900x24`), xdotool,
 # import/compare (ImageMagick), python3, and a built workspace
-# (`cargo build -p ironsurf-shell --bin fake_tab`). No GPU, nothing off-box.
+# (`cargo build --workspace` — the browser is the single
+# `target/debug/ironsurf`, and `fake_tab` is the scripted harness the shell is
+# pointed at with `--tab-bin`). No GPU, nothing off-box.
 set -u
 cd "$(dirname "$0")/.."
 export PATH="$HOME/.cargo/bin:$PATH"
@@ -29,7 +31,7 @@ mkdir -p docs/screenshots
 
 # ---- the browser, on the scripted fake tab (the page is not the subject) ----
 IRONSURF_SMOKE=1 IRONSURF_DATA_DIR="$DATA/profile" \
-  target/debug/ironsurf-shell --software --log debug --tab-bin target/debug/fake_tab \
+  target/debug/ironsurf --software --log debug --tab-bin target/debug/fake_tab \
   >"$DATA/out.log" 2>"$DATA/shell.log" &
 SHELL_PID=$!
 trap 'kill $SHELL_PID 2>/dev/null' EXIT

@@ -302,7 +302,7 @@ impl TabChild {
 /// what the policy tests use so they can install a policy *before* navigating
 /// to the page that asks for a window.
 fn spawn_tab(url: Option<&str>, profile_dir: &std::path::Path) -> TabChild {
-    let exe = env!("CARGO_BIN_EXE_ironsurf-tab");
+    let exe = env!("CARGO_BIN_EXE_ironsurf");
     let mut command = Command::new(exe);
     command
         .env_remove("DISPLAY")

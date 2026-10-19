@@ -34,7 +34,13 @@ apt install -y --no-install-recommends libxkbcommon0 libxkbcommon-x11-0 libx11-x
 cargo build --workspace && cargo test --workspace
 ```
 
-Full prerequisite list, why each package is needed, and troubleshooting: `docs/BUILD_DEBIAN.md`.
+The build produces **one** executable, `target/release/ironsurf`: the Slint
+shell and the sandboxed per-tab Blitz/Boa host are linked into the same binary,
+and the shell simply re-executes itself per tab (`ironsurf --tab-id …`). So a
+release is one file to download and run — `./ironsurf` — and the tab half is
+still a separate OS process per tab, only now it is a copy of the same binary.
+Full prerequisite list, why each package is needed, and troubleshooting:
+`docs/BUILD_DEBIAN.md`.
 
 ## Debugging (stderr diagnostics)
 
@@ -42,9 +48,9 @@ Everything the browser knows goes to **stderr** — never stdout, which is the
 binary IPC channel between the shell and a tab.
 
 ```sh
-IRONSURF_LOG=debug ironsurf-shell --tab-stderr   # shell + every tab, interleaved
-ironsurf-shell --log trace                      # + frames, pointer events, IPC noise
-ironsurf-shell --log off                        # quiet
+IRONSURF_LOG=debug ironsurf --tab-stderr   # shell + every tab, interleaved
+ironsurf --log trace                      # + frames, pointer events, IPC noise
+ironsurf --log off                        # quiet
 ```
 
 `off|error|warn|info|debug|trace` (default `info`); `--log`/`-v` win over

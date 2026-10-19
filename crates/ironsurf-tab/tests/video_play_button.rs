@@ -80,7 +80,7 @@ fn video_autoplay_and_click() {
     .expect("write page");
     let dir = std::env::temp_dir().join(format!("vidplay-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
-    let exe = env!("CARGO_BIN_EXE_ironsurf-tab");
+    let exe = env!("CARGO_BIN_EXE_ironsurf");
     let mut child = Command::new(exe)
         .env_remove("DISPLAY")
         .arg("--tab-id").arg("7")

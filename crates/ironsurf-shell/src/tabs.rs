@@ -1,5 +1,5 @@
-//! Tab process management: spawn `ironsurf-tab` children, pump their
-//! `FromTab` stream, send `ToTab` commands.
+//! Tab process management: spawn tab children (copies of the single `ironsurf`
+//! binary), pump their `FromTab` stream, send `ToTab` commands.
 //!
 //! One reader thread per tab decodes length-prefixed frames straight into
 //! an unbounded channel tagged with the [`TabId`]; the UI drains the channel

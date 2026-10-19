@@ -16,14 +16,18 @@ use ironsurf_shell::app::App;
 use ironsurf_shell::AppWindow;
 use slint::Model;
 
-/// The workspace-built `ironsurf-tab`: test binaries live in
+/// The workspace-built `ironsurf` binary (the tab host lives inside it): test binaries live in
 /// `target/<profile>/deps/`, the tab sits one level up. `None` when running
 /// `cargo test -p ironsurf-shell` alone (then this test skips).
 fn real_tab_bin() -> Option<PathBuf> {
     let exe = std::env::current_exe().ok()?;
     let profile_dir = exe.parent()?.parent()?; // target/<profile>
-    let candidate = profile_dir.join(format!("ironsurf-tab{}", std::env::consts::EXE_SUFFIX));
-    candidate.is_file().then_some(candidate)
+    // The single `ironsurf` binary hosts the tab half; the pre-merge
+    // `ironsurf-tab` name is still accepted for a stale target directory.
+    ["ironsurf", "ironsurf-tab"]
+        .iter()
+        .map(|n| profile_dir.join(format!("{n}{}", std::env::consts::EXE_SUFFIX)))
+        .find(|c| c.is_file())
 }
 
 fn wait_for(what: &str, app: &App, cond: impl Fn() -> bool) {
@@ -45,7 +49,7 @@ fn wait_for(what: &str, app: &App, cond: impl Fn() -> bool) {
 #[test]
 fn app_browses_with_the_real_tab_binary() {
     let Some(tab_bin) = real_tab_bin() else {
-        eprintln!("skip: ironsurf-tab not built (cargo build --workspace first)");
+        eprintln!("skip: ironsurf not built (cargo build --workspace first)");
         return;
     };
     i_slint_backend_testing::init_no_event_loop();

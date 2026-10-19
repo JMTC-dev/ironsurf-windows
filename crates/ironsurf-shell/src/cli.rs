@@ -1,10 +1,11 @@
-//! ironsurf-shell — Slint GUI for IronSurf.
+//! The shell half of the single `ironsurf` binary: CLI parsing, renderer
+//! choice and the Slint boot (this is [`run`], called by `ironsurf`'s `main`).
 //!
 //! Usage:
-//!   ironsurf-shell [-h|--help] [-u|--url URL] [--smoke] [--managed-net]
-//!                 [--no-sandbox] [--fake-tab] [--tab-bin PATH]
-//!                 [--software] [--linuxkms]
-//!                 [--log LEVEL|--verbose|-v] [--tab-stderr|--no-tab-stderr]
+//!   ironsurf [-h|--help] [-u|--url URL] [--smoke] [--managed-net]
+//!            [--no-sandbox] [--fake-tab] [--tab-bin PATH]
+//!            [-V|--version] [--software] [--linuxkms]
+//!            [--log LEVEL|--verbose|-v] [--tab-stderr|--no-tab-stderr]
 //!
 //! `-h`/`--help` prints [`USAGE`] and exits 0; `-u`/`--url` picks the start
 //! address instead of the default start page (`ironsurf://welcome`), with
@@ -24,23 +25,24 @@
 //! that path, `--linuxkms` pins the KMS backend, and an explicit
 //! `SLINT_BACKEND` (e.g. `linuxkms/femtovg`, `winit/software`) always wins.
 
-use std::path::PathBuf;
-use std::process::ExitCode;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use ironsurf_common::logging;
-use ironsurf_shell::app::App;
-use ironsurf_shell::tabs::{set_tab_stderr, TabStderr};
-use ironsurf_shell::AppWindow;
-use ironsurf_common::{error, info, warn};
+use crate::app::App;
+use crate::tabs::{set_tab_stderr, TabStderr};
+use crate::AppWindow;
+use ironsurf_common::{info, warn};
 use slint::ComponentHandle;
 
 /// The full CLI help, printed verbatim for `-h`/`--help`.
-pub(crate) const USAGE: &str = "\
-ironsurf-shell — the IronSurf browser shell (Slint GUI, one tab process per tab)
+pub const USAGE: &str = "\
+ironsurf — the IronSurf browser (one binary: Slint shell + Blitz/Boa tab host)
 
 USAGE:
-    ironsurf-shell [OPTIONS]
+    ironsurf [OPTIONS]              start the shell (the GUI)
+    ironsurf tab [TAB-OPTIONS]      run one tab host process — what the shell
+                                    does per tab; see `ironsurf tab --help`
 
 OPTIONS:
     -u, --url URL         open URL at startup instead of the default start page
@@ -51,8 +53,9 @@ OPTIONS:
         --no-sandbox      start tabs without the sandbox (dev/debug escape hatch)
         --fake-tab        drive the scripted fake tab instead of the real engine
                           (dev harness; the IPC contract exercised unchanged)
-        --tab-bin PATH    use PATH as the tab host binary (default: sibling
-                          ironsurf-tab, else PATH lookup)
+        --tab-bin PATH    use PATH as the tab host binary (default: this same
+                          executable — every tab is a copy of `ironsurf`)
+        -V, --version     print the version and exit
         --software        pin Slint's software renderer (no GPU required)
         --linuxkms        pin the DRM/KMS backend (bare virtual console)
         --log LEVEL       logging level: off|error|warn|info|debug|trace
@@ -68,37 +71,28 @@ ENVIRONMENT:
 ";
 
 /// `-h`/`--help` anywhere in the arguments (first match, like every flag here).
-pub(crate) fn wants_help(args: &[String]) -> bool {
+pub fn wants_help(args: &[String]) -> bool {
     args.iter().any(|a| a == "-h" || a == "--help")
 }
 
-fn main() -> ExitCode {
-    match run() {
-        Ok(()) => ExitCode::SUCCESS,
-        Err(err) => {
-            // `run` initialises logging before it can fail, so this lands as a
-            // proper ERROR line (stderr) rather than a bare write.
-            error!("fatal: {err}");
-            ExitCode::FAILURE
-        }
-    }
-}
-
-fn run() -> Result<(), Box<dyn std::error::Error>> {
-    let args: Vec<String> = std::env::args().collect();
+/// Boot the shell. `args` is the full argv (`args[0]` = program name).
+///
+/// Errors are fatal start-up errors (bad flags, no store, no window); the
+/// binary's `main` logs them and exits non-zero.
+pub fn run(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     // Help is pure output: no logging init, no window, no tab.
-    if wants_help(&args) {
+    if wants_help(args) {
         print!("{USAGE}");
         return Ok(());
     }
     let flag = |f: &str| args.iter().any(|a| a == f);
     let smoke = flag("--smoke");
     // `-u`/`--url` picks the start page; validated up front so a bare
-    // `ironsurf-shell -u` is a usage error, not a silently opened welcome.
-    let url = start_url_from(&args)?;
+    // `ironsurf -u` is a usage error, not a silently opened welcome.
+    let url = start_url_from(args)?;
 
     // Level from --log/-v, then IRONSURF_LOG/RUST_LOG, then `info`.
-    let level = logging::level_from_args(&args)
+    let level = logging::level_from_args(args)
         .or_else(|| {
             [logging::ENV_VAR, "RUST_LOG"]
                 .iter()
@@ -108,7 +102,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         .unwrap_or(logging::DEFAULT_LEVEL);
     logging::init("shell", Some(level));
     info!(
-        "ironsurf-shell starting: smoke={} url={:?} managed-net={} no-sandbox={} fake-tab={} log {}",
+        "ironsurf shell starting: smoke={} url={:?} managed-net={} no-sandbox={} fake-tab={} log {}",
         smoke,
         url.as_deref(),
         flag("--managed-net"),
@@ -118,7 +112,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     // Tab children inherit our environment; the explicit flag also relays the
-    // level so `ironsurf-shell --log debug` traces the whole browser.
+    // level so `ironsurf --log debug` traces the whole browser.
     let mut extra_tab_args: Vec<String> = Vec::new();
     if flag("--managed-net") {
         extra_tab_args.push("--managed-net".into());
@@ -126,7 +120,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     if flag("--no-sandbox") {
         extra_tab_args.push("--no-sandbox".into());
     }
-    if logging::level_from_args(&args).is_some() {
+    if logging::level_from_args(args).is_some() {
         extra_tab_args.push("--log".into());
         extra_tab_args.push(level.as_str().to_ascii_lowercase());
     }
@@ -255,30 +249,44 @@ fn backend_choice(software: bool, linuxkms: bool) -> Option<BackendChoice> {
     }
 }
 
-/// Locate the tab host binary: next to our own executable first (workspace
-/// `target/<profile>/` layout puts both side by side), then `PATH`.
-/// `prefer_fake` (dev escape hatch) tries the scripted `fake_tab` first.
+/// Locate the tab host binary.
+///
+/// The single `ironsurf` binary hosts both halves of the browser, so the
+/// default is **our own executable**: each tab is another copy of the same
+/// file, launched with `--tab-id …` (see the `ironsurf` binary's `dispatch`).
+/// That is what keeps a release down to one downloaded file — no sibling
+/// `ironsurf-tab` to fetch and no way for the two halves to drift.
+///
+/// `prefer_fake` (the `--fake-tab` dev escape hatch) instead drives the
+/// scripted harness; `--tab-bin PATH` (handled by the caller) overrides both
+/// and may name this very binary again.
 fn resolve_tab_bin(prefer_fake: bool) -> Result<PathBuf, Box<dyn std::error::Error>> {
-    let real = std::env::consts::EXE_SUFFIX;
-    let names: Vec<String> = {
-        let mut v = vec![format!("ironsurf-tab{real}"), format!("fake_tab{real}")];
-        if prefer_fake {
-            v.reverse();
-        }
-        v
-    };
+    if prefer_fake {
+        // Not found next to us → the bare name, so the spawn fails loudly
+        // (`cannot spawn fake_tab`) instead of quietly running the real engine.
+        return Ok(find_sibling("fake_tab"));
+    }
+    Ok(std::env::current_exe()?)
+}
+
+/// `name` next to our own executable, then a couple of levels up (integration
+/// tests run from `target/<profile>/deps/` while the workspace binaries sit in
+/// `target/<profile>`), else the bare name for a `PATH` lookup.
+fn find_sibling(name: &str) -> PathBuf {
+    let name = format!("{name}{}", std::env::consts::EXE_SUFFIX);
     if let Ok(exe) = std::env::current_exe() {
-        if let Some(dir) = exe.parent() {
-            for name in &names {
-                let candidate = dir.join(name);
-                if candidate.is_file() {
-                    return Ok(candidate);
-                }
+        let mut dir = exe.parent().map(Path::to_path_buf);
+        // Bounded walk: sibling, parent, grandparent — never the whole route.
+        for _ in 0..3 {
+            let Some(d) = dir else { break };
+            let candidate = d.join(&name);
+            if candidate.is_file() {
+                return candidate;
             }
+            dir = d.parent().map(Path::to_path_buf);
         }
     }
-    // Fall back to a PATH lookup by bare name (Command::new does this).
-    Ok(PathBuf::from(&names[0]))
+    PathBuf::from(name)
 }
 
 #[cfg(test)]
@@ -308,10 +316,10 @@ mod tests {
         let argv = |argv: &[&str]| -> Vec<String> {
             argv.iter().map(|a| a.to_string()).collect()
         };
-        assert!(wants_help(&argv(&["ironsurf-shell", "-h"])));
-        assert!(wants_help(&argv(&["ironsurf-shell", "--help"])));
-        assert!(wants_help(&argv(&["ironsurf-shell", "--smoke", "-h"])));
-        assert!(!wants_help(&argv(&["ironsurf-shell", "-u", "https://example.com"])));
+        assert!(wants_help(&argv(&["ironsurf", "-h"])));
+        assert!(wants_help(&argv(&["ironsurf", "--help"])));
+        assert!(wants_help(&argv(&["ironsurf", "--smoke", "-h"])));
+        assert!(!wants_help(&argv(&["ironsurf", "-u", "https://example.com"])));
         // The usage text stays in sync with the flags this binary accepts —
         // every long flag named in it must exist as a string above too.
         assert!(USAGE.contains("-u, --url URL"));
@@ -326,9 +334,12 @@ mod tests {
             "--linuxkms",
             "--log",
             "--tab-stderr",
+            "--version",
         ] {
             assert!(USAGE.contains(flag), "help must document {flag}");
         }
+        // …and the tab half of the one binary is advertised too.
+        assert!(USAGE.contains("ironsurf tab [TAB-OPTIONS]"));
     }
 
     #[test]
@@ -338,36 +349,47 @@ mod tests {
             start_url_from(&args).map(|url| url.as_deref().map(str::to_owned))
         };
         // No flag → the default start page.
-        assert_eq!(parse(&["ironsurf-shell", "--software"]), Ok(None));
+        assert_eq!(parse(&["ironsurf", "--software"]), Ok(None));
         // Both spellings, and the value is taken verbatim (any scheme the
         // shell's URL contract accepts: https, about, file, data…).
         assert_eq!(
-            parse(&["ironsurf-shell", "--url", "https://example.com/x"]),
+            parse(&["ironsurf", "--url", "https://example.com/x"]),
             Ok(Some("https://example.com/x".to_string()))
         );
         assert_eq!(
-            parse(&["ironsurf-shell", "-u", "about:blank"]),
+            parse(&["ironsurf", "-u", "about:blank"]),
             Ok(Some("about:blank".to_string()))
         );
         // The first occurrence wins over later ones.
         assert_eq!(
-            parse(&["ironsurf-shell", "-u", "https://a.test", "--url", "https://b.test"]),
+            parse(&["ironsurf", "-u", "https://a.test", "--url", "https://b.test"]),
             Ok(Some("https://a.test".to_string()))
         );
         // A flag without a value — missing or followed by another flag — is a
         // usage error, never a silently ignored welcome page.
-        assert!(parse(&["ironsurf-shell", "-u"]).is_err());
-        assert!(parse(&["ironsurf-shell", "--url", "--smoke"]).is_err());
-        assert!(parse(&["ironsurf-shell", "--url", ""]).is_err());
+        assert!(parse(&["ironsurf", "-u"]).is_err());
+        assert!(parse(&["ironsurf", "--url", "--smoke"]).is_err());
+        assert!(parse(&["ironsurf", "--url", ""]).is_err());
     }
 
     #[test]
-    fn tab_bin_resolution_prefers_sibling_real_tab() {
-        // This test binary lives in target/debug alongside ironsurf-tab once
-        // built; but it must not require ironsurf-tab, so just assert the
-        // fallback is a bare resolvable name.
+    fn tab_host_defaults_to_this_very_executable() {
+        // The single-binary contract: tabs are copies of ourselves, so the
+        // default tab binary is our own path — no sibling to install.
         let p = resolve_tab_bin(false).unwrap();
+        assert_eq!(p, std::env::current_exe().unwrap());
+    }
+
+    #[test]
+    fn fake_tab_is_looked_for_next_to_us_then_on_path() {
+        // The dev harness sits in target/<profile>/ while this test binary runs
+        // from target/<profile>/deps/, so the upward walk finds it when built;
+        // if it is not built the answer is the bare name (a loud spawn error).
+        let p = resolve_tab_bin(true).unwrap();
         let name = p.file_name().unwrap().to_string_lossy().to_string();
-        assert!(name == "ironsurf-tab" || name.starts_with("ironsurf-tab"));
+        assert!(name == "fake_tab" || name == format!("fake_tab{}", std::env::consts::EXE_SUFFIX));
+        if p != PathBuf::from(name.clone()) {
+            assert!(p.is_file(), "{} exists or was not chosen", p.display());
+        }
     }
 }

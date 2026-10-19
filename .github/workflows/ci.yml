@@ -69,6 +69,15 @@ jobs:
       - name: Build release binary
         run: cargo build --release --verbose --locked --workspace
 
+      - name: Smoke the single binary
+        # One executable ships: it is the shell, and (re-executed per tab) the
+        # tab host. Both halves answer their own help without a display.
+        shell: bash
+        run: |
+          ./target/release/ironsurf --version
+          ./target/release/ironsurf --help >/dev/null
+          ./target/release/ironsurf tab --help >/dev/null
+
       - name: Free release build artifacts
         run: cargo clean --release
 
