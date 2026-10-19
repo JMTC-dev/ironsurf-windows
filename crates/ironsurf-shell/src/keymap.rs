@@ -249,6 +249,40 @@ pub fn shortcut_for(text: &str, ctrl: bool, alt: bool, meta: bool) -> Option<Sho
     shortcut_on(Chords::CURRENT, text, ctrl, alt, meta)
 }
 
+/// The browser chords that stay live while the URL/find bar holds focus
+/// (task: keep keyboard shortcuts usable while the URL bar is focused).
+/// The bars keep everything local — plain typing, caret motion, and their own
+/// editing chords (Ctrl-A/C/V/X/Y/Z are not in [`shortcut_for`] at all, so
+/// select-all, copy and paste keep working mid-URL) — while the tabled
+/// browser chords fire as usual: Ctrl-T new tab, the tab-number digits,
+/// Ctrl-Tab, Ctrl-W, Ctrl-R, the zoom chords, Ctrl-F, F12, history and the
+/// menus. The one exception is Esc ([`Shortcut::PageFocus`]): inside a bar it
+/// belongs to the bar (it closes the completion dropdown), not to the page.
+pub fn bar_shortcut(text: &str, ctrl: bool, alt: bool, meta: bool) -> Option<Shortcut> {
+    bar_shortcut_on(Chords::CURRENT, text, ctrl, alt, meta)
+}
+
+/// [`bar_shortcut`] with the platform's chord spelling chosen by the caller
+/// (parity with [`shortcut_on`]).
+pub fn bar_shortcut_on(
+    chords: Chords,
+    text: &str,
+    ctrl: bool,
+    alt: bool,
+    meta: bool,
+) -> Option<Shortcut> {
+    match shortcut_on(chords, text, ctrl, alt, meta) {
+        // Esc belongs to the bar (completion dropdown); the history arrows
+        // belong to the caret — on macOS ⌘-← is “home”, and a bar that ate it
+        // would break the one promise the history chords make to text
+        // fields (see the history-arrow bullet in ARCHITECTURE.md).
+        Some(Shortcut::PageFocus) | Some(Shortcut::GoBack) | Some(Shortcut::GoForward) | None => {
+            None
+        }
+        Some(sc) => Some(sc),
+    }
+}
+
 /// [`shortcut_for`] with the platform's chord spelling chosen by the caller —
 /// `Chords::Cmd` is how the macOS chords get tested on a Linux box.
 pub fn shortcut_on(
@@ -899,6 +933,45 @@ mod tests {
         assert_eq!(dom_key("Z"), ("Z".into(), "KeyZ".into()));
         assert_eq!(dom_key("7"), ("7".into(), "Digit7".into()));
         assert_eq!(dom_key(" "), (" ".into(), "Space".into()));
+    }
+
+    #[test]
+    fn the_url_bar_keeps_typing_and_loses_the_browser_chords_to_nobody() {
+        use super::*;
+        // The task: with the URL bar focused, Ctrl-T still makes a tab and the
+        // digits still switch tabs…
+        assert_eq!(bar_shortcut("t", true, false, false), Some(Shortcut::NewTab));
+        assert_eq!(bar_shortcut("2", false, true, false), Some(Shortcut::SelectTab(2)));
+        assert_eq!(bar_shortcut("\t", true, false, false), Some(Shortcut::CycleTab));
+        assert_eq!(bar_shortcut("w", true, false, false), Some(Shortcut::CloseTab));
+        assert_eq!(bar_shortcut("r", true, false, false), Some(Shortcut::Reload));
+        assert_eq!(bar_shortcut("f", true, false, false), Some(Shortcut::Find));
+        // …the modifierless function chords work too (F12 = U+F70F, F6 = U+F709)…
+        assert_eq!(bar_shortcut("\u{F70F}", false, false, false), Some(Shortcut::ToggleDevTools));
+        assert_eq!(bar_shortcut("\u{F709}", false, false, false), Some(Shortcut::FocusUrl));
+        // …while plain typing, bare Enter/Tab and the entry's own editing chords
+        // belong to the LineEdit…
+        assert_eq!(bar_shortcut("a", false, false, false), None);
+        assert_eq!(bar_shortcut("\t", false, false, false), None);
+        assert_eq!(bar_shortcut("a", true, false, false), None); // Ctrl-A select-all
+        assert_eq!(bar_shortcut("c", true, false, false), None); // Ctrl-C copy
+        assert_eq!(bar_shortcut("v", true, false, false), None); // Ctrl-V paste
+        // …and Esc stays the bar's own (it closes the completion dropdown).
+        assert_eq!(bar_shortcut("\u{1b}", false, false, false), None);
+        // …and so do the history arrows, which the caret needs (macOS ⌘-← is
+        // “home”; Linux Ctrl-← was never a chord) — while the bar holds focus
+        // the entry moves, the shell does not navigate.
+        assert_eq!(bar_shortcut_on(Chords::Cmd, "\u{F702}", false, false, true), None);
+        assert_eq!(bar_shortcut_on(Chords::Cmd, "\u{F703}", false, false, true), None);
+        // macOS spells the same with ⌘.
+        assert_eq!(
+            bar_shortcut_on(Chords::Cmd, "t", false, false, true),
+            Some(Shortcut::NewTab)
+        );
+        assert_eq!(
+            bar_shortcut_on(Chords::Cmd, "3", false, false, true),
+            Some(Shortcut::SelectTab(3))
+        );
     }
 
     #[test]

@@ -392,6 +392,11 @@ component UrlBar inherits Rectangle {
     callback suggest-move(delta: int);
     callback suggest-pick(idx: int);
     callback suggest-close();
+    /// Browser chords asked of Rust while the entry is focused (task: keep
+    /// keyboard shortcuts usable while the URL bar is focused): Rust answers
+    /// whether the chord is one of the browser's and has acted on it — in
+    /// which case the key is consumed and the LineEdit never sees it.
+    callback chord(text: string, ctrl: bool, shift: bool, alt: bool, meta: bool) -> bool;
     // the entry's live focus state, so AppWindow can gate the dropdown on it:
     // clicking into the page hides the panel even before Rust clears the flag
     out property <bool> edit-focus: edit.has-focus;
@@ -419,6 +424,19 @@ component UrlBar inherits Rectangle {
                 }
                 if (ev.text == Key.Escape) {
                     root.suggest-close();
+                    return EventResult.accept;
+                }
+            }
+            // Task: keep keyboard shortcuts usable while the URL bar is
+            // focused — a modifier chord (and the modifierless function-key
+            // chords: F1 = U+F704 … F12 = U+F70F, F6 included, Esc excluded)
+            // is offered to Rust before the LineEdit's own editing swallows
+            // it. Plain typing, caret motion and the entry's editing chords
+            // (Ctrl-A/C/V/X/Y/Z) answer "not mine" and edit as always.
+            if (ev.modifiers.control || ev.modifiers.alt || ev.modifiers.meta
+                || (ev.text >= "\u{F704}" && ev.text <= "\u{F70F}")) {
+                if (root.chord(ev.text, ev.modifiers.control, ev.modifiers.shift,
+                        ev.modifiers.alt, ev.modifiers.meta)) {
                     return EventResult.accept;
                 }
             }
@@ -452,6 +470,10 @@ component FindBar inherits Rectangle {
     callback next();
     callback previous();
     callback close();
+    /// Browser chords while this bar is focused (task: keep keyboard
+    /// shortcuts usable while the URL bar is focused) — same contract as the
+    /// URL bar's `chord`; Rust answers whether it acted.
+    callback chord(text: string, ctrl: bool, shift: bool, alt: bool, meta: bool) -> bool;
 
     width: 372px;
     height: 40px;
@@ -498,6 +520,15 @@ component FindBar inherits Rectangle {
                     if (ev.text == Key.DownArrow) {
                         root.next();
                         return EventResult.accept;
+                    }
+                    // Browser chords reach the shell from here too (task:
+                    // keep keyboard shortcuts usable while a bar is focused).
+                    if (ev.modifiers.control || ev.modifiers.alt || ev.modifiers.meta
+                        || (ev.text >= "\u{F704}" && ev.text <= "\u{F70F}")) {
+                        if (root.chord(ev.text, ev.modifiers.control, ev.modifiers.shift,
+                                ev.modifiers.alt, ev.modifiers.meta)) {
+                            return EventResult.accept;
+                        }
                     }
                     return EventResult.reject;
                 }
@@ -873,6 +904,12 @@ export component AppWindow inherits Window {
     callback reload();
     callback new-tab();
     callback navigate(url: string);
+    /// URL-bar-focused browser chords (task: keep keyboard shortcuts usable
+    /// while the URL bar is focused): Rust answers true when the chord is a
+    /// browser one (from `keymap::bar_shortcut`) and has just acted on it.
+    callback url-chord(text: string, ctrl: bool, shift: bool, alt: bool, meta: bool) -> bool;
+    /// The find bar's mirror of `url-chord`.
+    callback find-chord(text: string, ctrl: bool, shift: bool, alt: bool, meta: bool) -> bool;
     callback activate-tab(idx: int);
     callback close-tab(idx: int);
     callback open-manager();
@@ -1077,6 +1114,7 @@ export component AppWindow inherits Window {
                     suggest-move(d) => { root.suggest-move(d); }
                     suggest-pick(i) => { root.suggest-pick(i); }
                     suggest-close() => { root.suggest-close(); }
+                    chord(t, c, s, a, m) => { return root.url-chord(t, c, s, a, m); }
                 }
 
                 MiniButton { label: "＋"; clicked => { root.new-tab(); } }
@@ -1860,6 +1898,7 @@ export component AppWindow inherits Window {
         next() => { root.find-next(); }
         previous() => { root.find-previous(); }
         close() => { root.find-close(); }
+        chord(t, c, s, a, m) => { return root.find-chord(t, c, s, a, m); }
     }
 
     // ------------------------------------------------------------------------

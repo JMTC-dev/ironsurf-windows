@@ -1559,8 +1559,11 @@ UI (`crates/ironsurf-shell/ui/ironsurf.slint`):
   do. History and not the tab strip: the arrows say which way the reader wants to go,
   and the strip already has Ctrl-Tab and the digit chords. Only the platform's own key
   *alone* is the chord — `Ctrl-←` off a Mac and `⌥-←` on one keep moving a text caret a
-  word at a time, so the page gets them — and the chord is read from the page surface
-  only, which is why `⌘-←` inside the URL bar still goes to the start of the line.
+  word at a time, so the page gets them — and a focused text bar keeps the arrow on
+  the caret's side too (`bar_shortcut` drops `GoBack`/`GoForward` where the page's
+  `shortcut_for` takes them), which is why `⌘-←` inside the URL bar still goes to
+  the start of the line even with the other browser chords live there (task: keep
+  keyboard shortcuts usable while the URL bar is focused).
 - **The wheel is damped and glides** (task: slower and smoother scrolling).
   The tab turns a `ScrollEvent` into half the travel blitz would have made of
   it — one notch nudges 10 CSS px, a flick moves lines rather than screens —
@@ -1612,7 +1615,8 @@ Process/tab management (`src/tabs.rs`):
 - `Frame` → `slint::Image` from raw RGBA buffer (`slint::Image::from_rgba8_slab`/PixelBuffer API — verify name).
 - Keyboard focus routing: Slint focus on page area → forward keys; Ctrl-L focuses URL bar;
   Esc unfocuses; F12 / Ctrl-Shift-I toggle the DevTools panel (consumed by the shell, never sent
-  to the page; they act on the focused page, i.e. not while the URL bar holds focus);
+  to the page; they act on the focused page — and since the task *keyboard shortcuts stay
+  usable while the URL bar is focused* (next bullet) they fire from a focused bar too);
   Ctrl-Shift-K / Ctrl-Shift-Y open the Console / Network panes and **Ctrl-Shift-C** arms
   *inspect element* (opening the panel + Inspector pane if needed, toggling off when armed); the
   same chord with the picker armed disarms it. `Esc` also disarms the picker before it
@@ -1629,6 +1633,28 @@ Process/tab management (`src/tabs.rs`):
   so plain Ctrl-R (reload, in both its spellings) is untouched; it is the same
   command as the 📄 toolbar button beside ＋, and the tab's `ReaderState` answer
   is what moves the button.
+- **Keyboard shortcuts survive a focused bar** (task: keyboard shortcuts such
+  as new tab and switching tabs by number stay usable while the top URL bar
+  is focused). A LineEdit swallows every keystroke it is given, and the URL
+  and find bars' `key-pressed` handlers used to swallow chords the browser
+  owns. Before eating one the bar now offers it to Rust — any modifier chord
+  plus the modifierless function-key chords (Slint sends F1…F12 as the
+  private-use range U+F704…U+F70F; plain Esc excluded) — through `chord(...)`
+  bound to the root's `url-chord` / `find-chord` and answered by
+  `app::App::bar_chord` over `keymap::bar_shortcut`: the one table
+  `shortcut_for` minus the keys the entry keeps. Consumed chords never reach
+  the entry's text. What the entry keeps: plain typing, caret motion, its own
+  editing chords (A/C/V/X/Y/Z are not in the table on either platform's
+  spelling — select-all, copy and paste mid-URL are untouched), Esc (whose
+  job here is closing the completion dropdown, `Shortcut::PageFocus`
+  excluded), and the history arrows — `⌘-←`/`⌘-→` stay caret-to-home on a Mac
+  bar because `bar_shortcut` drops `GoBack`/`GoForward` even though
+  `shortcut_for` claims them. Everything else fires exactly as over the page:
+  Ctrl-T new tab, the Alt-digit / ⌘-digit tab-number switches, Ctrl-Tab,
+  Ctrl-W, Ctrl-R, the zoom chords, Ctrl-F, F12 — one shared dispatch table
+  (`dispatch_page_shortcut`) behind both routes. Tests: the `bar_shortcut`
+  unit tests in `keymap` plus `tests/bar_shortcuts.rs` (chords driven through
+  the real root callbacks against live fake tabs).
 - **Text selection & copy/paste — the shell owns the session clipboard**: copy chords are
   never consumed (Ctrl-C/V/X/A always reach the tab — `keymap::clipboard_chords_always_reach_the_page`),
   every `FromTab::ClipboardText` (page Ctrl+C, editor copy/cut) is filed on the shell's

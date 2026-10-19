@@ -1182,7 +1182,36 @@ impl Core {
             Some(sc) => debug!("shortcut {sc:?} (key {text:?} ctrl={ctrl} alt={alt} meta={meta})"),
             None => trace!("key {text:?} ctrl={ctrl} alt={alt} meta={meta} → page"),
         }
-        match keymap::shortcut_for(text, ctrl, alt, meta) {
+        if let Some(sc) = keymap::shortcut_for(text, ctrl, alt, meta) {
+            self.dispatch_page_shortcut(sc);
+            return;
+        }
+        self.forward_page_key(text, ctrl, shift, alt, meta, repeat);
+    }
+
+    /// A plain (non-chord) key goes to the page — clipboard pre-push for the
+    /// paste chord included.
+    fn forward_page_key(&self, text: &str, ctrl: bool, shift: bool, alt: bool, meta: bool, repeat: bool) {
+        // Ctrl+V: the sandboxed tab cannot read the session clipboard, so
+        // push it in before the keystroke is relayed (blitz's editors pull
+        // the paste from `ShellProvider::get_clipboard_text`, which answers
+        // from this cache).
+        if is_paste_chord(text, ctrl, alt, meta) {
+            // The system clipboard wins when it has text (the user copied
+            // from another app a moment ago); else the session copy stands.
+            let clip = self.paste_text();
+            debug!("clipboard: pushed {} char(s) ahead of Ctrl+V", clip.chars().count());
+            self.send_active(ToTab::Clipboard { text: clip });
+        }
+        let ev = keymap::to_ipc_key(text, ctrl, shift, alt, meta, repeat);
+        self.send_active(ToTab::Key(ev));
+    }
+
+    /// The browser-chord table, shared by page focus and by the text bars'
+    /// [`bar_chord`] (task: keep keyboard shortcuts usable while the URL bar
+    /// is focused).
+    fn dispatch_page_shortcut(&self, sc: Shortcut) {
+        match Some(sc) {
             Some(Shortcut::FocusUrl) => {
                 self.focus_url_bar();
                 return;
@@ -1237,10 +1266,11 @@ impl Core {
                 return;
             }
             Some(Shortcut::ToggleDevTools) => {
-                // Page focus only: the chord arrives from the page's `FocusScope`.
-                // Catching it while the URL bar is focused would need a second
-                // `FocusScope` wrapped around the `LineEdit`, which risks
-                // swallowing ordinary typing — and the panel is a page tool.
+                // Over the page the chord arrives from the page's
+                // `FocusScope`; while a text bar holds focus the bar offers it
+                // to `bar_chord` first (task: keep keyboard shortcuts usable
+                // while the URL bar is focused) — no second `FocusScope`
+                // around the `LineEdit`, so ordinary typing stays untouched.
                 self.toggle_devtools();
                 return;
             }
@@ -1325,19 +1355,22 @@ impl Core {
             }
             None => {}
         }
-        // Ctrl+V: the sandboxed tab cannot read the session clipboard, so
-        // push it in before the keystroke is relayed (blitz's editors pull
-        // the paste from `ShellProvider::get_clipboard_text`, which answers
-        // from this cache).
-        if is_paste_chord(text, ctrl, alt, meta) {
-            // The system clipboard wins when it has text (the user copied
-            // from another app a moment ago); else the session copy stands.
-            let clip = self.paste_text();
-            debug!("clipboard: pushed {} char(s) ahead of Ctrl+V", clip.chars().count());
-            self.send_active(ToTab::Clipboard { text: clip });
-        }
-        let ev = keymap::to_ipc_key(text, ctrl, shift, alt, meta, repeat);
-        self.send_active(ToTab::Key(ev));
+    }
+
+    /// A chord delivered while a text bar (URL or find) holds focus
+    /// (task: keep keyboard shortcuts usable while the URL bar is focused):
+    /// the tabled browser chords fire exactly as they do over the page —
+    /// Ctrl-T still makes a tab, the digits still switch tabs — while plain
+    /// typing, caret motion and the entry's own editing chords stay local to
+    /// the entry (Esc included, so the completion dropdown keeps its
+    /// controls). `true` means the chord was consumed.
+    fn bar_chord(&self, text: &str, ctrl: bool, alt: bool, meta: bool) -> bool {
+        let Some(sc) = keymap::bar_shortcut(text, ctrl, alt, meta) else {
+            return false;
+        };
+        debug!("shortcut {sc:?} (key {text:?}) with a text bar focused");
+        self.dispatch_page_shortcut(sc);
+        true
     }
 
     /// One zoom step (in/out) from the active tab's current factor.
@@ -4852,6 +4885,23 @@ impl Core {
         {
             let c = self.clone();
             ui.on_page_wheel(move |x, y, dx, dy| c.page_wheel(x, y, dx, dy));
+        }
+        {
+            // Task: keep keyboard shortcuts usable while the URL bar is
+            // focused — the entry offers every chord it could swallow, and
+            // Rust answers whether the browser claimed it.
+            let c = self.clone();
+            ui.on_url_chord(move |text, ctrl, shift, alt, meta| {
+                let _ = shift;
+                c.bar_chord(text.as_str(), ctrl, alt, meta)
+            });
+        }
+        {
+            let c = self.clone();
+            ui.on_find_chord(move |text, ctrl, shift, alt, meta| {
+                let _ = shift;
+                c.bar_chord(text.as_str(), ctrl, alt, meta)
+            });
         }
         {
             let c = self.clone();
