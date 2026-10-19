@@ -3151,6 +3151,12 @@ impl Tab {
             false => 0.0,
         };
         let y = doc.viewport_scroll().y;
+        // Snap the top edge: a glide feeds its slices through f32-crunched
+        // engine deltas, so a document brought to the top can rest on a
+        // float residue (5.7e-14 observed) rather than on zero. Below a
+        // millionth of a CSS px *is* the top; the shell's scroll-bar test
+        // — and its readers — may say so.
+        let y = if y < 1e-6 { 0.0 } else { y };
         Some(ScrollState {
             y: y.clamp(0.0, range) as f32,
             range: range as f32,
@@ -3166,7 +3172,13 @@ impl Tab {
     /// slices of ≥1 px), so the gate never misses a scroll.
     fn report_scroll_state(&mut self) {
         let Some(state) = self.viewport_scroll_state() else { return };
-        if self.scroll_report.is_some_and(|prev| prev.same_within(&state, 0.5)) {
+        // An edge reached is news even under the half-px gate: the shell may
+        // hold the last 0.4 px of a glide as "the" offset, and only the
+        // report of a parked 0.0 tells it the page came home.
+        let reached_edge = self.scroll_report.is_some_and(|prev| {
+            (state.y == 0.0 && prev.y != 0.0) || (state.y == state.range && prev.y != state.range)
+        });
+        if !reached_edge && self.scroll_report.is_some_and(|prev| prev.same_within(&state, 0.5)) {
             return;
         }
         self.scroll_report = Some(state);
