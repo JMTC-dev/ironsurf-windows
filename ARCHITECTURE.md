@@ -465,8 +465,12 @@ pub const MAX_FRAME_BYTES: usize = 64 * 1024 * 1024; // guard against corrupt st
 `ScrollEvent` deltas speak the winit/AccessKit convention both ends of the pipe
 already use: **positive `delta_y` scrolls UP** (`scrollTop` shrinks), a negative
 one scrolls DOWN; likewise `delta_x` and LEFT. The shell forwards the toolkit's
-deltas untouched and the tab hands them to blitz untouched — neither side negates
-(a negation on either side inverts the wheel).
+deltas untouched and neither side negates (a negation on either side inverts the
+wheel). The tab *does* reinterpret the magnitude — a damped, gliding wheel is a
+speed policy, not a sign policy: `|d| ≤ 3` counts as notches of 20 CSS px each,
+larger values as logical-pixel travel, the result is halved
+(`runtime::WHEEL_SPEED`) and queued onto the document's glide
+(`runtime::WHEEL_STEP`, `runtime::WHEEL_TAU`) instead of being applied whole.
 
 Also export `const WELCOME_URL: &str` (`"ironsurf://welcome"`) and
 `fn default_url() -> String` (= `WELCOME_URL` — the built-in start page, answered locally by
@@ -1528,10 +1532,24 @@ UI (`crates/ironsurf-shell/ui/ironsurf.slint`):
   *alone* is the chord — `Ctrl-←` off a Mac and `⌥-←` on one keep moving a text caret a
   word at a time, so the page gets them — and the chord is read from the page surface
   only, which is why `⌘-←` inside the URL bar still goes to the start of the line.
+- **The wheel is damped and glides** (task: slower and smoother scrolling).
+  The tab turns a `ScrollEvent` into half the travel blitz would have made of
+  it — one notch nudges 10 CSS px, a flick moves lines rather than screens —
+  and *glides* that travel in: each event queues onto the tab's smooth
+  scroller, whose first slice rides with the event itself (≈40%, the page
+  feels attached to the wheel) and the rest eases out over the next frames on
+  a ~30 ms exponential (`runtime::WHEEL_TAU`), fed by the poll loop at ≤ one
+  slice per `runtime::WHEEL_STEP` and landing the remainder whole when a
+  frame takes longer than four τ. Successive events join the same glide, so a
+  spinning wheel flows and a reversal partly cancels; the slices are real
+  scrolls, so blitz's hovered scroll chain, the overscroll ceiling, and
+  `FromTab::ScrollState` (which the shell's scroll bar rides) all apply
+  unchanged. Keystroke scrolls — arrows, PageUp/PageDown, `window.scrollBy`
+  — are unaffected.
 - **`↑` / `↓` scroll the page a line at a time** — 40 CSS px per press
-  (`runtime::ARROW_SCROLL_PX`, twice the wheel's line unit and the step
-  `window.scrollBy(0, 40)` takes, so a few presses move a paragraph and a dozen
-  move a screen): the fine motion to PageUp/PageDown's screen, for putting one
+  (`runtime::ARROW_SCROLL_PX`, four times the damped wheel's line unit and the
+  step `window.scrollBy(0, 40)` takes, so a few presses move a paragraph and a
+  dozen move a screen): the fine motion to PageUp/PageDown's screen, for putting one
   exact line in view. blitz binds the arrows for editors only, so this is the tab's
   gesture too — and with a text control focused the caret answers instead and the
   document does not move at all, which is what a reader filling a form at the

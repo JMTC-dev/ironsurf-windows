@@ -121,11 +121,66 @@ const IDLE_TICK: Duration = Duration::from_millis(250);
 /// `RUNNING_POLL_INTERVAL` role of the JS-timer cap, for media.
 const MEDIA_TICK: Duration = Duration::from_millis(40);
 /// How far `↑` / `↓` take the document, CSS px — "a line", and the same step
-/// `window.scrollBy(0, 40)` takes. Twice the wheel's line unit (blitz multiplies
-/// one notch by 20 CSS px, `events/pointer.rs`), which is about two lines of body
-/// text at the default font size: enough to see that the page moved, small enough
-/// that a paragraph is a few presses and a screen is a dozen.
+/// `window.scrollBy(0, 40)` takes. Four times the wheel's damped line unit
+/// ([`WHEEL_SPEED`] on blitz's 20 CSS px notch, `events/pointer.rs`), which is
+/// about two lines of body text at the default font size: enough to see that
+/// the page moved, small enough that a paragraph is a few presses and a screen
+/// is a dozen.
 const ARROW_SCROLL_PX: f64 = 40.0;
+/// Wheel speed-up factor (task: slower and smoother wheel): the travel the
+/// document makes per wheel event, relative to what blitz would make of it
+/// (20 CSS px per notch, a raw pixel delta verbatim). Half turns one notch
+/// into a gentle 10 px nudge and a fast flick into lines, not screens.
+const WHEEL_SPEED: f64 = 0.5;
+/// The smooth scroller's cadence: the poll loop never sleeps past one slice
+/// interval while a glide is in flight, so at rest slices are fed at ~60 Hz.
+const WHEEL_STEP: Duration = Duration::from_millis(16);
+/// The glide's decay constant: a slice settles the fraction of what is still
+/// owed that `dt` of an exponential of this time constant covers — small
+/// quick slices on a fast machine, bigger rarer ones when a software repaint
+/// eats the frame, and the same ~3τ (~⅑ s) landing either way. The page is
+/// therefore *always* still moving with the first slice (40%+ of the travel)
+/// and at rest shortly after the last notch, whatever the paint costs.
+const WHEEL_TAU: Duration = Duration::from_millis(30);
+
+/// The tab-side smooth scroller's state (task: slower and smoother wheel):
+/// wheel travel — already damped by [`WHEEL_SPEED`] — queued here and gliding
+/// into the document one eased slice per [`WHEEL_STEP`] instead of teleporting.
+#[derive(Clone, Copy)]
+struct WheelGlide {
+    /// Travel still owed to the page, CSS px, winit convention (positive =
+    /// up, so the usual negative wheel-down delta glides the document down).
+    pending: (f64, f64),
+    /// When the last slice was fed — the slice size is the travel a window
+    /// this wide eases out, so the glide lands on wall-clock, not on how
+    /// many times the loop happened to turn.
+    last: Instant,
+    /// Earliest moment the next slice may be fed.
+    next: Instant,
+    /// Where the wheel was last turned — replayed with every slice so blitz
+    /// resolves the hovered scroll chain from the same hover state. `None`
+    /// until the first wheel event, which is also the only writer of
+    /// `pending`, so a running glide always has a place.
+    at: Option<PointerCoords>,
+    /// The same point in logical px — what [`Tab::report_cursor`] hit-tests.
+    over: (f32, f32),
+}
+
+/// One slice of the glide: what a window of `dt` settles under an
+/// exponential of [`WHEEL_TAU`], the last CSS px fed whole and a window of
+/// four τ (or more) just landing the rest — the glide terminates instead of
+/// asymptoting, and a starved scroller catches up instead of crawling.
+fn wheel_glide_step(remaining: f64, dt: Duration) -> f64 {
+    if remaining.abs() <= 1.0 || dt >= 4 * WHEEL_TAU {
+        return remaining;
+    }
+    // Never smaller than one cadence step: the first slice of a gesture has
+    // a `dt` of ~0 (the gesture armed the clock “now”), and a kick of ~40%
+    // is exactly what makes the page feel attached to the wheel.
+    let dt = dt.max(WHEEL_STEP).as_secs_f64();
+    let fraction = 1.0 - (-(dt / WHEEL_TAU.as_secs_f64())).exp();
+    remaining * fraction
+}
 
 // ---------------------------------------------------------------------------
 // CLI
@@ -692,6 +747,9 @@ pub struct Tab {
     /// `cursor_status`'s: the shell's overlay bar needs the numbers, a page
     /// that sits still needs no messages.
     scroll_report: Option<ScrollState>,
+    /// The wheel's glide queue ([`WheelGlide`]); fed by [`Tab::pump_wheel`]
+    /// (task: slower and smoother wheel).
+    wheel_glide: WheelGlide,
     /// Popup blocker (task: block popups — a website opening new tabs without a
     /// user interaction). One shared cell: the `window.open` native answers
     /// through it synchronously, real input arms its engagement credit, and the
@@ -1139,6 +1197,13 @@ impl Tab {
             hover_status: None,
             cursor_status: None,
             scroll_report: None,
+            wheel_glide: WheelGlide {
+                pending: (0.0, 0.0),
+                last: Instant::now(),
+                next: Instant::now(),
+                at: None,
+                over: (0.0, 0.0),
+            },
             pending_form: None,
             form_press: None,
             label_press: None,
@@ -1684,6 +1749,10 @@ impl Tab {
         // offset with the next poll step whatever the old one had said (task:
         // scroll bar).
         self.scroll_report = None;
+        // …and an unfinished wheel glide belongs to the document it scrolled:
+        // the new page starts at its own top, not halfway down a gesture that
+        // was travelling through the old one (task: slower and smoother wheel).
+        self.wheel_glide.pending = (0.0, 0.0);
         // The previous document's players die with it (their widgets die with
         // its node tree; their decode threads end when the players drop).
         self.reset_media();
@@ -2963,8 +3032,9 @@ impl Tab {
     /// Tell the shell what the page's scroll geometry is, but only when it
     /// moved ([`ScrollState::same_within`], half a CSS px): the overlay scroll
     /// bar the shell draws over the page needs the numbers to place its thumb,
-    /// and a page that sits still must not cost a message per poll tick. One
-    /// wheel notch moves the document ~20 px, so the gate never misses a scroll.
+    /// and a page that sits still must not cost a message per poll tick. Even
+    /// one damped wheel notch moves the document ~10 px (and the glide feeds
+    /// slices of ≥1 px), so the gate never misses a scroll.
     fn report_scroll_state(&mut self) {
         let Some(state) = self.viewport_scroll_state() else { return };
         if self.scroll_report.is_some_and(|prev| prev.same_within(&state, 0.5)) {
@@ -3027,6 +3097,67 @@ impl Tab {
         } else {
             ARROW_SCROLL_PX
         });
+    }
+
+    // -- smooth wheel --------------------------------------------------------
+
+    /// Cap the poll sleep at the next slice of the wheel glide: while a glide
+    /// is in flight the loop must wake to feed it even when the page and the
+    /// shell are otherwise silent.
+    fn wheel_poll_tick(&self, base: Duration) -> Duration {
+        let (x, y) = self.wheel_glide.pending;
+        if x == 0.0 && y == 0.0 {
+            return base;
+        }
+        self.wheel_glide
+            .next
+            .saturating_duration_since(Instant::now())
+            .min(base)
+    }
+
+    /// Feed one eased slice of the queued wheel travel into the document:
+    /// the page *chases* the wheel instead of teleporting, and a stream of
+    /// events flows — each event adds to what is owed, each slice takes a
+    /// step toward it. A slice is an ordinary wheel event in pixel units,
+    /// so blitz's scroll-chain resolution and clamping are untouched; only
+    /// the step size is ours now. `force` runs the whole remainder at once
+    /// (tests and any caller that must know the final offset now); the poll
+    /// loop never forces.
+    fn pump_wheel(&mut self, force: bool) {
+        let (px, py) = self.wheel_glide.pending;
+        if px == 0.0 && py == 0.0 {
+            return;
+        }
+        let now = Instant::now();
+        if !force && now < self.wheel_glide.next {
+            return;
+        }
+        let dt = now.saturating_duration_since(self.wheel_glide.last);
+        self.wheel_glide.last = now;
+        self.wheel_glide.next = now + WHEEL_STEP;
+        let (cx, cy) = if force {
+            (px, py)
+        } else {
+            (wheel_glide_step(px, dt), wheel_glide_step(py, dt))
+        };
+        self.wheel_glide.pending = (px - cx, py - cy);
+        let Some(coords) = self.wheel_glide.at else {
+            self.wheel_glide.pending = (0.0, 0.0);
+            return;
+        };
+        let (ox, oy) = self.wheel_glide.over;
+        self.feed_ui_event(UiEvent::Wheel(BlitzWheelEvent {
+            delta: BlitzWheelDelta::Pixels(cx, cy),
+            coords,
+            buttons: self.mouse_buttons,
+            mods: KMods::empty(),
+            element: Point::default(),
+        }));
+        // The page moved under a stationary pointer: what sits under the
+        // cursor — and its cursor shape — is in question again, exactly as
+        // for the wheel event itself (`handle_input`).
+        self.report_cursor(ox, oy, false);
+        self.needs_paint = true;
     }
 
     // -- painting -----------------------------------------------------------
@@ -4666,26 +4797,39 @@ impl Tab {
     /// arriving here need no sign surgery.
     ///
     /// The contract doesn't pin units, so: deltas with magnitude ≤ 3 are
-    /// treated as wheel notches (lines), everything else as CSS-px pixel
-    /// deltas.
+    /// treated as wheel notches — one line of content each, whatever the
+    /// zoom (blitz's 20 CSS px `Lines` unit, spelled out here because the
+    /// glide feeds everything as pixel deltas) — and everything else as
+    /// logical-px pixel deltas, divided by the zoom so the page moves the
+    /// same *visual* distance at every zoom.
+    ///
+    /// Slower and smoother (task): the travel is damped by [`WHEEL_SPEED`]
+    /// and queued onto [`Tab::pump_wheel`] instead of being applied whole —
+    /// the page glides to the new offset over a few frames, and a wheel in
+    /// motion keeps queueing onto the same glide. The first slice is fed with
+    /// the event, so a gesture never waits a frame to start moving.
     fn handle_scroll(&mut self, ev: &ScrollEvent) {
         let z = self.zoom() as f64;
-        let delta = if ev.delta_x.abs().max(ev.delta_y.abs()) <= 3.0 {
-            // Wheel notches scroll one line of content whatever the zoom.
-            BlitzWheelDelta::Lines(ev.delta_x as f64, ev.delta_y as f64)
+        let unit = if ev.delta_x.abs().max(ev.delta_y.abs()) <= 3.0 {
+            20.0 // one notch, CSS px — blitz's `Lines` unit, baked in
         } else {
-            // Pixel deltas are logical px; the page moves the same visual
-            // distance, which is delta/zoom in CSS px.
-            BlitzWheelDelta::Pixels(ev.delta_x as f64 / z, ev.delta_y as f64 / z)
+            1.0 / z // logical px → CSS px
         };
-        let ui = UiEvent::Wheel(BlitzWheelEvent {
-            delta,
-            coords: self.pointer_coords(ev.x, ev.y),
-            buttons: self.mouse_buttons,
-            mods: KMods::empty(),
-            element: Point::default(),
-        });
-        self.feed_ui_event(ui);
+        let glide = &mut self.wheel_glide;
+        if glide.pending == (0.0, 0.0) {
+            // A resting glide restarts its clock with the gesture, so the
+            // first slice is the kick, not the whole travel.
+            glide.last = Instant::now();
+        }
+        glide.pending = (
+            glide.pending.0 + f64::from(ev.delta_x) * unit * WHEEL_SPEED,
+            glide.pending.1 + f64::from(ev.delta_y) * unit * WHEEL_SPEED,
+        );
+        let coords = self.pointer_coords(ev.x, ev.y);
+        let glide = &mut self.wheel_glide;
+        glide.at = Some(coords);
+        glide.over = (ev.x, ev.y);
+        self.pump_wheel(false);
     }
 
     /// The single document-input funnel: everything below (7e Boa scripting,
@@ -6503,6 +6647,9 @@ pub fn run(args: TabArgs) -> i32 {
         // Never sleep past the earliest JS timer deadline (task: real timers),
         // nor past the media cadence while a video is alive (task: playback).
         let tick = tab.media_poll_tick(tab.timer_poll_tick(tick));
+        // …nor past the next slice of a gliding wheel (task: slower and
+        // smoother wheel) — the glide is fed on its own clock, not on wakes.
+        let tick = tab.wheel_poll_tick(tick);
         poll_inputs(stdin_fd, wake_fd, tick);
         // Wake-ups from ShellProvider::request_redraw / the NetWaker.
         let woken = pipe.drain() > 0;
@@ -6575,6 +6722,11 @@ pub fn run(args: TabArgs) -> i32 {
         // every player, forward page events, and refresh the snapshots the
         // page's media properties read (task: playback).
         tab.pump_media();
+
+        // 2c′. The wheel glide: feed one eased slice of the travel the wheel
+        // events queued since the last slice (task: slower and smoother
+        // wheel); the pixels it earns are step 3's business.
+        tab.pump_wheel(false);
 
         // 3. Settle net completions / redraw requests and coalesce frames.
         //    Invisible tabs stay idle — repaints resume on SetVisible(true).
@@ -7811,14 +7963,17 @@ mod tests {
             NavHistory::Fresh,
         );
 
-        // Wheel down far enough that paragraph two sits in the viewport.
+        // Wheel down far enough that paragraph two sits in the viewport
+        // (the glide is landed with `pump_wheel(true)` — the test harness
+        // has no poll loop to feed it).
         tab.handle_to_tab(ptr(400.0, 300.0, PointerKind::Move));
         tab.handle_to_tab(ToTab::Scroll(ScrollEvent {
             x: 400.0,
             y: 300.0,
             delta_x: 0.0,
-            delta_y: -1300.0,
+            delta_y: -2600.0,
         }));
+        tab.pump_wheel(true);
         let y = scroll_y(&mut tab);
         assert!(y > 0.0, "the wheel scrolled the page down: scroll_y={y}");
 
@@ -7919,8 +8074,9 @@ mod tests {
                 height: 600,
                 scale: 1.0,
             });
-            // Wheel far down the page (logical px: the page moves delta/zoom CSS px),
-            // after winding the page back to the top from the previous zoom.
+            // Wheel far down the page (logical px: the page moves
+            // delta/zoom CSS px, half of that at the damped wheel), after
+            // winding the page back to the top from the previous zoom.
             tab.handle_to_tab(ptr(400.0 * zoom, 300.0 * zoom, PointerKind::Move));
             tab.handle_to_tab(ToTab::Scroll(ScrollEvent {
                 x: 400.0 * zoom,
@@ -7928,12 +8084,14 @@ mod tests {
                 delta_x: 0.0,
                 delta_y: 9000.0 * zoom,
             }));
+            tab.pump_wheel(true);
             tab.handle_to_tab(ToTab::Scroll(ScrollEvent {
                 x: 400.0 * zoom,
                 y: 300.0 * zoom,
                 delta_x: 0.0,
-                delta_y: -1500.0 * zoom,
+                delta_y: -3000.0 * zoom,
             }));
+            tab.pump_wheel(true);
             let y = scroll_y(&mut tab);
             assert!(y > 1400.0, "the page is scrolled down at zoom {zoom}: {y}");
 
@@ -8005,8 +8163,9 @@ mod tests {
             x: 400.0,
             y: 300.0,
             delta_x: 0.0,
-            delta_y: -1300.0,
+            delta_y: -2600.0,
         }));
+        tab.pump_wheel(true);
         assert!(scroll_y(&mut tab) > 1000.0, "the page is scrolled down");
 
         let doctype = tab.inspect_doctype.clone();
@@ -8085,6 +8244,7 @@ mod tests {
         // One huge wheel reaches the overscroll limit: half a viewport past
         // the bottom, no further.
         tab.handle_to_tab(wheel(-100000.0));
+        tab.pump_wheel(true);
         let y = scroll_y(&mut tab);
         assert!(
             (y - (base + 300.0)).abs() < 1.0,
@@ -8098,6 +8258,7 @@ mod tests {
             "the bottom of the page sits at the window's middle, not its edge: {y}"
         );
         tab.handle_to_tab(wheel(-1000.0));
+        tab.pump_wheel(true);
         assert_eq!(scroll_y(&mut tab), y, "there is nothing past the overscroll limit");
 
         // A page that fits the window never scrolls at all.
@@ -8109,6 +8270,7 @@ mod tests {
         );
         tab.handle_to_tab(ptr(400.0, 300.0, PointerKind::Move));
         tab.handle_to_tab(wheel(-5000.0));
+        tab.pump_wheel(true);
         assert_eq!(scroll_y(&mut tab), 0.0, "a page that fits the window does not scroll");
     }
 
@@ -8458,8 +8620,10 @@ mod tests {
     /// moves the document down (`scrollTop` grows), a positive one moves it up —
     /// and winit (hence Slint's `scroll-event`) produces deltas in that very
     /// convention, so the shell forwards them unchanged. Pinned here for both
-    /// delta flavours (pixel deltas, and `|d| <= 3` notches = 20 CSS px each),
-    /// plus the clamp at the top of the document.
+    /// delta flavours (pixel deltas, and `|d| <= 3` notches = 10 CSS px each
+    /// at the damped wheel), plus the clamp at the top of the document. The
+    /// glide is landed with `pump_wheel(true)` — where it stops and what it
+    /// travels is [`the_wheel_glides_instead_of_jumping`]'s business.
     #[test]
     fn wheel_down_scrolls_the_document_down_and_wheel_up_back_up() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -8494,25 +8658,120 @@ mod tests {
 
         assert_eq!(scroll_y(&mut tab), 0.0, "documents start at the top");
 
-        // Wheel down (negative pixel delta) → content moves up, scrollTop grows.
+        // Wheel down (negative pixel delta) → content moves up, scrollTop
+        // grows — by half the delta at the damped wheel.
         tab.handle_to_tab(wheel(-200.0));
+        tab.pump_wheel(true);
         tab.settle();
-        assert_eq!(scroll_y(&mut tab), 200.0, "wheel down scrolls down");
+        assert_eq!(scroll_y(&mut tab), 100.0, "wheel down scrolls down");
 
         // Wheel up (positive pixel delta) → back towards the top.
         tab.handle_to_tab(wheel(50.0));
+        tab.pump_wheel(true);
         tab.settle();
-        assert_eq!(scroll_y(&mut tab), 150.0, "wheel up scrolls up");
+        assert_eq!(scroll_y(&mut tab), 75.0, "wheel up scrolls up");
 
-        // A `|d| <= 3` delta is a wheel notch: 20 CSS px, same direction.
+        // A `|d| <= 3` delta is a wheel notch: 10 CSS px (half blitz's
+        // 20 px line unit), same direction.
         tab.handle_to_tab(wheel(-1.0));
+        tab.pump_wheel(true);
         tab.settle();
-        assert_eq!(scroll_y(&mut tab), 170.0, "one notch down = 20 px down");
+        assert_eq!(scroll_y(&mut tab), 85.0, "one notch down = 10 px down");
 
         // Clamped at the top (a positive notch at scroll 0 does not go negative).
         tab.handle_to_tab(wheel(1000.0));
+        tab.pump_wheel(true);
         tab.settle();
         assert_eq!(scroll_y(&mut tab), 0.0, "scrolling up clamps at the top");
+    }
+
+    /// Slower *and* smoother (task): one wheel event starts the page moving
+    /// with the event itself, but lands only part of its damped travel; the
+    /// rest follows over the next few [`WHEEL_STEP`]s, easing out. The poll
+    /// loop feeds those slices; this harness plays the loop's part.
+    #[test]
+    fn the_wheel_glides_instead_of_jumping() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let page = dir.path().join("glide.html");
+        std::fs::write(
+            &page,
+            "<!doctype html><meta charset=utf-8><style>body{margin:0;height:4000px}</style><p>tall</p>",
+        )
+        .expect("write");
+        let mut tab = form_tab(dir.path());
+        tab.handle_to_tab(ToTab::Resize {
+            width: 800,
+            height: 600,
+            scale: 1.0,
+        });
+        tab.navigate(
+            url::Url::from_file_path(&page).expect("url").as_str(),
+            NavHistory::Fresh,
+        );
+        tab.settle();
+        tab.handle_to_tab(ptr(100.0, 100.0, PointerKind::Move));
+        let scroll_y = |tab: &mut Tab| tab.document_mut().expect("doc").viewport_scroll().y;
+
+        tab.handle_to_tab(ToTab::Scroll(ScrollEvent {
+            x: 100.0,
+            y: 100.0,
+            delta_x: 0.0,
+            delta_y: -400.0,
+        }));
+        // The event itself moves the page — but not all the way: the kick
+        // slice is only a fraction of the damped travel, so a wheel event
+        // never teleports the document again.
+        let mid = scroll_y(&mut tab);
+        let total = WHEEL_SPEED * 400.0;
+        assert!(mid > 0.0, "the gesture moves with the event: {mid}");
+        assert!(
+            f64::from(mid) < total - 1.0,
+            "the first slice is part of the travel, not all of it: {mid} of {total}"
+        );
+
+        // The rest follows over the next slices — busy-pumping (cheap: only
+        // the pump, no layout read per turn) until the scroller falls
+        // silent — and the glide comes to rest on the damped travel, never
+        // past it. How many slices lie between kick and rest is a question
+        // for the machine's frame clock; that every slice is only a
+        // fraction of what remains is pinned by
+        // [`wheel_glide_slices_shrink_and_terminate`].
+        let start = Instant::now();
+        while start.elapsed() < Duration::from_millis(500) {
+            tab.pump_wheel(false);
+        }
+        let rest = scroll_y(&mut tab);
+        assert!(rest >= mid, "the glide never reverses: {mid} → {rest}");
+        assert!(
+            (f64::from(rest) - total).abs() < 0.5,
+            "the glide lands on the damped travel: {rest} vs {total}"
+        );
+    }
+
+    /// The glide's slice function: shrink-only, signed, and terminating —
+    /// the last CSS px is fed whole, so a glide always ends rather than
+    /// asymptoting into sub-pixel slices forever — and it lands on
+    /// wall-clock: a window of four τ or more just settles the rest.
+    #[test]
+    fn wheel_glide_slices_shrink_and_terminate() {
+        let mut remaining = 200.0_f64;
+        let mut fed = 0.0;
+        let mut steps = 0;
+        while remaining != 0.0 {
+            let slice = wheel_glide_step(remaining, WHEEL_STEP);
+            assert!(slice.abs() <= remaining.abs() && slice.signum() == remaining.signum());
+            remaining -= slice;
+            fed += slice;
+            steps += 1;
+            assert!(steps < 32, "the glide must terminate, sat at {remaining}");
+        }
+        assert!((fed - 200.0).abs() < 1e-9, "the slices sum to the travel: {fed}");
+        assert!(
+            steps as u64 * 16 <= 400,
+            "a 60 Hz glide comes to rest within a few frames: {steps} steps"
+        );
+        // A starved scroller (one slice after 200 ms of paint) lands the rest.
+        assert_eq!(wheel_glide_step(120.0, Duration::from_millis(200)), 120.0);
     }
 
     // -------------------------------------------------------------------
@@ -9352,6 +9611,7 @@ mod tests {
             })
         };
         tab.handle_to_tab(wheel(-100000.0));
+        tab.pump_wheel(true);
         tab.settle();
         let scrolled = scroll_y(&mut tab);
         tab.report_scroll_state();
@@ -9389,6 +9649,7 @@ mod tests {
 
         // Back to the top is a change like any other.
         tab.handle_to_tab(wheel(100000.0));
+        tab.pump_wheel(true);
         tab.settle();
         tab.report_scroll_state();
         let states = scroll_states(&sink);
