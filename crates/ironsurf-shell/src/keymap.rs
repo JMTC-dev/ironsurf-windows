@@ -306,6 +306,18 @@ pub fn shortcut_on(
     alt: bool,
     meta: bool,
 ) -> Option<Shortcut> {
+    // A bare mac modifier tap is an echo, not a chord:
+    // i-slint-backend-winit swaps the logical Control key for Super
+    // (`swap_cmd_ctrl` in its event_loop.rs), and i-slint-common's
+    // `key_codes.rs` reports Super as its *control character* `"\u{17}"` —
+    // which is precisely the Linux spelling of Ctrl+W. Without this guard a
+    // simple Ctrl tap closes a tab on macOS (and its swap-side Control code
+    // `"\u{11}"` — plus both right-hand forms — echoes off the same table).
+    // The Cmd spelling takes Command chords as plain letters, never as these
+    // bytes, so refusing them here costs nothing.
+    if chords == Chords::Cmd && matches!(text, "\u{11}" | "\u{16}" | "\u{17}" | "\u{18}") {
+        return None;
+    }
     // Keep the raw press: the fold below deliberately blurs Ctrl and ⌘ on
     // macOS, and two arms must tell them apart again — a press holding BOTH
     // is somebody else's chord (Ctrl-⌘-W closes nothing on either platform,
@@ -561,6 +573,33 @@ mod tests {
         // And the same holds for the bar-facing table.
         assert_eq!(bar_shortcut_on(Chords::Cmd, "w", true, false, true), None);
         assert_eq!(bar_shortcut_on(Chords::Cmd, "w", false, false, true), Some(Shortcut::CloseTab));
+    }
+
+    /// macOS bug: pressing the Ctrl key closed tabs. Slint's winit backend
+    /// swaps the logical Control key for Super (`swap_cmd_ctrl`), and the key
+    /// table reports Super as its control character `"\u{17}"` — the very
+    /// byte the Linux table uses for Ctrl+W. A bare modifier tap must fire
+    /// nothing, whichever flags the backend reports the key under; Linux keeps
+    /// its Ctrl+W spelling untouched.
+    #[test]
+    fn mac_modifier_taps_echo_nothing_but_linux_ctrl_w_closes() {
+        for (text, ctrl, meta) in [
+            ("\u{17}", true, false),  // Ctrl — flag-folded backend
+            ("\u{17}", false, true),  // Ctrl — mac meta spelling
+            ("\u{17}", true, true),   // Ctrl — both-flag backend
+            ("\u{18}", true, false),  // right Ctrl
+            ("\u{11}", true, false),  // bare ⌘ (the swap-side Control code)
+            ("\u{16}", true, false),  // right ⌘
+        ] {
+            assert_eq!(shortcut_on(Chords::Cmd, text, ctrl, false, meta), None,
+                "modifier echo {text:?} ctrl={ctrl} meta={meta} fired a chord");
+            assert_eq!(bar_shortcut_on(Chords::Cmd, text, ctrl, false, meta), None);
+        }
+        // Off the Mac these bytes stay the ordinary Ctrl+W spelling…
+        assert_eq!(shortcut_on(Chords::Ctrl, "\u{17}", true, false, false), Some(Shortcut::CloseTab));
+        // …and the mac letters are untouched: ⌘-W still closes, as does the
+        // unix Ctrl-W habit.
+        assert_eq!(shortcut_on(Chords::Cmd, "w", true, false, false), Some(Shortcut::CloseTab));
     }
 
     #[test]
