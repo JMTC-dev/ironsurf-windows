@@ -124,6 +124,10 @@ pub enum FromTab {
     TitleChanged     { title: Option<String> },
     UrlChanged       { url: Option<String> },
     LoadingChanged   { loading: bool },
+    // (task: faster, responsive loading) the window between `true` and
+    // `false` is no longer a frozen tab: the `http(s)` main-document fetch
+    // runs on a network worker thread, and the tab keeps painting, scrolling
+    // and answering events (against the page still on screen) throughout.
     HistoryChanged   { can_go_back: bool, can_go_forward: bool },
     StatusText       { text: Option<String> },
     OpenLinkInNewTab { url: String },      // middle-click / Ctrl-(⌘-)click a link → shell opens url in a new tab (same container)
@@ -669,6 +673,31 @@ Lifecycle:
 3. One `Document` per navigation: fetch HTML (see Network layer), then
    `HtmlDocument::from_html(&html, DocumentConfig { base_url, net_provider: Arc<ours>,
    viewport: Some(Viewport::new(w*scale, h*scale, scale, ColorScheme::Light)), ..Default })`.
+   3a. **The fetch never stalls the tab** (task: faster, responsive loading).
+   An `http(s)` main-document fetch runs on a network worker thread
+   (`netmod::spawn_document_fetch_post_report_shared` — the same
+   `fetch_document_post_report_shared` exchange, only off-loop): `navigate_post`
+   emits `LoadingChanged(true)`/the “Waiting for…” status, parks the receiver
+   in `Tab::pending_nav` and returns; the poll loop keeps ticking (`nav_poll_tick`
+   caps the sleep while a fetch is in flight), so the page still on screen
+   stays scrollable and clickable and other documents' subresources keep
+   flowing. `Tab::drain_pending_navigation` adopts the outcome between ticks:
+   the fetch's `NetEvent`s ship first (document requests still precede every
+   subresource event) and `Tab::finish_main_doc_fetch` runs the adoption tail —
+   download sniffing, archive store, `load_html`, refresh arming, the
+   `LoadingChanged(false)` bookkeeping — exactly as the synchronous path did.
+   Local schemes (`file:`/`data:`/`about:`/`ironsurf:`) fetch inline; their
+   “fetch” is a read(). `Tab::wait_for_navigation(timeout)` drives the same
+   adoption synchronously for the headless harness and tests.
+   3b. **Content shows before the page is “done”**: after parse and the
+   critical-resource settle (stylesheets/fonts — images are never waited
+   for), the tab **paints the laid-out document before running its scripts**.
+   Boa can spend seconds in `run_scripts` on a script-heavy page, and that
+   first frame is the difference between “loading” and “frozen”; whatever the
+   scripts mutate queues a repaint through the Shell provider's invalidation,
+   so the post-script state follows immediately. Async subresources (images,
+   late CSS) keep landing frames after the navigation reports loaded — no
+   part of the page has to finish before the user sees it.
    After every input event / net completion / JS tick call `document.resolve(scale)`; if the
    doc reports changes (or a scripted/animation tick is pending), repaint and emit
    `FromTab::Frame` (throttle ≤ 30 fps). Emit `TitleChanged`/`UrlChanged` on change (compare

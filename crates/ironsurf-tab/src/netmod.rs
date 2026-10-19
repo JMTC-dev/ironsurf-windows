@@ -2629,6 +2629,63 @@ pub fn fetch_document_report_shared(
     fetch_document_post_report_shared(url, None, policy, jar, cache, now, user_agent, report)
 }
 
+/// The main-document fetch on its own thread (task: faster, responsive
+/// loading): the `http(s)` bytes arrive on a worker thread and the outcome
+/// returns through the receiver, so the tab loop keeps ticking — painting,
+/// answering events, scrolling the page still on screen — while a slow host
+/// is mid-response, instead of freezing inside
+/// [`fetch_document_post_report_shared`] (which is exactly what this call
+/// replaces, and it runs it unchanged, only off-loop). The reporter runs on
+/// the worker and its [`NetEvent`]s are collected and returned with the
+/// result, so the tab emits them itself on arrival — document fetches still
+/// precede every subresource event, exactly as the synchronous path did.
+pub fn spawn_document_fetch_post_report_shared(
+    url: Url,
+    post: Option<MainDocPost>,
+    policy: NetPolicy,
+    jar: Arc<Mutex<CookieJar>>,
+    cache: Arc<Mutex<NetCache>>,
+    now: i64,
+    user_agent: SharedUserAgent,
+) -> Result<
+    std::sync::mpsc::Receiver<(Result<DocFetch, NetError>, Vec<NetEvent>)>,
+    NetError,
+> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let err_url = url.clone();
+    let spawned = std::thread::Builder::new()
+        .name("ironsurf-maindoc".to_owned())
+        .spawn(move || {
+            let events = Mutex::new(Vec::<NetEvent>::new());
+            let res = fetch_document_post_report_shared(
+                &url,
+                post.as_ref(),
+                policy,
+                &jar,
+                &cache,
+                now,
+                &user_agent,
+                Some(&|mut event: NetEvent| {
+                    event.initiator = Some("document".to_owned());
+                    events.lock().expect("doc net events mutex").push(event);
+                }),
+            );
+            let events = events
+                .lock()
+                .expect("doc net events mutex")
+                .drain(..)
+                .collect();
+            let _ = tx.send((res, events));
+        });
+    match spawned {
+        Ok(_) => Ok(rx),
+        Err(e) => Err(NetError::Transport {
+            url: err_url,
+            message: format!("cannot start document fetch thread: {e}"),
+        }),
+    }
+}
+
 #[allow(dead_code)] // quiet convenience wrapper (tests drive it; the runtime reports)
 fn fetch_document_with_worker(
     url: &Url,

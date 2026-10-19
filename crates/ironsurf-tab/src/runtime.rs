@@ -146,6 +146,16 @@ const WHEEL_TAU: Duration = Duration::from_millis(30);
 /// The tab-side smooth scroller's state (task: slower and smoother wheel):
 /// wheel travel — already damped by [`WHEEL_SPEED`] — queued here and gliding
 /// into the document one eased slice per [`WHEEL_STEP`] instead of teleporting.
+/// A main-document fetch in flight on the network worker (task: faster,
+/// responsive loading): the receiver delivers `(fetch result, DevTools
+/// events)` for the poll loop to adopt.
+struct PendingNavigation {
+    rx: mpsc::Receiver<(Result<netmod::DocFetch, netmod::NetError>, Vec<NetEvent>)>,
+    url: Url,
+    history: NavHistory,
+    started: Instant,
+}
+
 #[derive(Clone, Copy)]
 struct WheelGlide {
     /// Travel still owed to the page, CSS px, winit convention (positive =
@@ -632,6 +642,9 @@ pub struct Tab {
     zoom: f32,
     visible: bool,
     doc: Option<HtmlDocument>,
+    /// A main-document fetch still in flight on the network worker
+    /// (task: faster, responsive loading); `None` when nothing is fetching.
+    pending_nav: Option<PendingNavigation>,
     /// The container's cookie jar — the very same `Arc<Mutex<..>>` the
     /// Blitz provider mutates for subresources. One jar per container per
     /// tab: main-document `Set-Cookie`s reach subresource requests (and
@@ -1197,6 +1210,7 @@ impl Tab {
             hover_status: None,
             cursor_status: None,
             scroll_report: None,
+            pending_nav: None,
             wheel_glide: WheelGlide {
                 pending: (0.0, 0.0),
                 last: Instant::now(),
@@ -1502,6 +1516,40 @@ impl Tab {
             "fetching main document {url} (net policy {:?})",
             self_provider_policy(&self.provider)
         );
+        // Task: faster, responsive loading — an `http(s)` document must not
+        // stall the tab while its bytes cross the network: the fetch (the
+        // very exchange the synchronous path below performs) moves onto its
+        // own worker thread, and the loop keeps ticking — the page still on
+        // screen stays scrollable, clickable and animating, and other
+        // documents' subresources keep flowing — until the poll loop picks
+        // the result up and runs the same adoption tail a sync load had.
+        if matches!(url.scheme(), "http" | "https") {
+            let spawned = netmod::spawn_document_fetch_post_report_shared(
+                url.clone(),
+                post.cloned(),
+                self_provider_policy(&self.provider),
+                Arc::clone(&self.jar),
+                Arc::clone(&self.cache),
+                netmod::now_unix(),
+                Arc::clone(&self.user_agent),
+            );
+            match spawned {
+                Ok(rx) => {
+                    self.pending_nav = Some(PendingNavigation {
+                        rx,
+                        url,
+                        history,
+                        started,
+                    });
+                    return true;
+                }
+                Err(err) => {
+                    return self.finish_main_doc_fetch(&url, history, Err(err), started)
+                }
+            }
+        }
+        // Local schemes (`file:`/`data:`/`about:`/`ironsurf:`) answer
+        // instantly — their fetch is a read(), so it stays on-thread.
         // DevTools network reporting: the document fetch runs synchronously
         // on the tab thread, so its events (one per completed/failed request,
         // one per redirect hop) queue locally and ship right after the fetch
@@ -1529,6 +1577,21 @@ impl Tab {
         for event in doc_events.lock().expect("doc net events mutex").drain(..) {
             self.emit(FromTab::NetworkEvent { event });
         }
+        self.finish_main_doc_fetch(&url, history, fetch, started)
+    }
+
+    /// The adoption tail of a main-document fetch: the bytes (or the block
+    /// page) become the new document, scripts run, and the load bookkeeping
+    /// ships. Reached when an on-thread fetch returned (`file:` and friends)
+    /// or when the poll loop collected an `http(s)` worker result (task:
+    /// faster, responsive loading).
+    fn finish_main_doc_fetch(
+        &mut self,
+        url: &Url,
+        history: NavHistory,
+        fetch: Result<netmod::DocFetch, netmod::NetError>,
+        started: Instant,
+    ) -> bool {
         match fetch {
             Ok(mut doc_fetch) => {
                 debug!(
@@ -1625,6 +1688,61 @@ impl Tab {
                     }
                 }
             }
+        }
+    }
+
+    /// A main-document fetch that returned from the network worker: its
+    /// DevTools events ship first, then the document is adopted. The poll
+    /// loop calls this every cycle; while the bytes are still arriving the
+    /// `try_recv` is empty and this returns immediately (task: faster,
+    /// responsive loading).
+    fn drain_pending_navigation(&mut self) {
+        let arrived = match self.pending_nav.as_ref() {
+            None => return,
+            Some(p) => match p.rx.try_recv() {
+                Ok(v) => Some(v),
+                Err(mpsc::TryRecvError::Disconnected) => Some((
+                    Err(netmod::NetError::Transport {
+                        url: p.url.clone(),
+                        message: "document fetch worker died".to_owned(),
+                    }),
+                    Vec::new(),
+                )),
+                Err(mpsc::TryRecvError::Empty) => None,
+            },
+        };
+        let Some((res, events)) = arrived else { return };
+        let Some(p) = self.pending_nav.take() else { return };
+        for event in events {
+            self.emit(FromTab::NetworkEvent { event });
+        }
+        self.finish_main_doc_fetch(&p.url, p.history, res, p.started);
+    }
+
+    /// Drive a main-document fetch to completion (headless harness and
+    /// tests — places where no poll loop is turning). Returns false if the
+    /// navigation is still in flight when the timeout expires.
+    pub fn wait_for_navigation(&mut self, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        while self.pending_nav.is_some() {
+            self.drain_pending_navigation();
+            if self.pending_nav.is_some() {
+                if Instant::now() >= deadline {
+                    return false;
+                }
+                std::thread::sleep(Duration::from_millis(2));
+            }
+        }
+        true
+    }
+
+    /// While a main-document fetch is in flight, keep the poll tick short so
+    /// its result is adopted promptly (task: faster, responsive loading).
+    fn nav_poll_tick(&self, base: Duration) -> Duration {
+        if self.pending_nav.is_some() {
+            base.min(Duration::from_millis(16))
+        } else {
+            base
         }
     }
 
@@ -1802,6 +1920,17 @@ impl Tab {
             html.len(),
             parsed.elapsed().as_millis()
         );
+        // Task: faster, responsive loading — show content before scripts
+        // finish: the document is parsed, its CSS settled (stylesheets,
+        // webfonts) and laid out, so paint that first and the user sees the
+        // page while a script-heavy document is still coming alive — boa can
+        // spend seconds in `run_scripts`, and the pre-script frame is the
+        // difference between "loading" and "frozen". Anything a script then
+        // mutates queues a repaint through the Shell provider's
+        // invalidation, so the post-script state follows immediately after.
+        self.needs_paint = true;
+        self.last_paint = None;
+        self.maybe_repaint();
         // JavaScript runs on the settled DOM (ARCHITECTURE §JavaScript (Boa)).
         self.run_scripts(url);
         // Video (task: playback): every `<video>` gets its widget and its
@@ -6650,6 +6779,7 @@ pub fn run(args: TabArgs) -> i32 {
         // …nor past the next slice of a gliding wheel (task: slower and
         // smoother wheel) — the glide is fed on its own clock, not on wakes.
         let tick = tab.wheel_poll_tick(tick);
+        let tick = tab.nav_poll_tick(tick);
         poll_inputs(stdin_fd, wake_fd, tick);
         // Wake-ups from ShellProvider::request_redraw / the NetWaker.
         let woken = pipe.drain() > 0;
@@ -6674,6 +6804,10 @@ pub fn run(args: TabArgs) -> i32 {
         if !pending.borrow().is_empty() {
             stdin_frames = true;
         }
+
+        // 1b. A main-document fetch that finished while the rest of this
+        // cycle was handled (task: faster, responsive loading).
+        tab.drain_pending_navigation();
 
         // 2. Link clicks / form submits (NavigationProvider hook).
         if tab.drain_nav_hook() {
@@ -7138,6 +7272,60 @@ mod tests {
         Tab::new_headless(&args, pipe)
     }
 
+    /// Task: faster, responsive loading — an `http(s)` main-document fetch
+    /// runs on the network worker, not on the tab thread: `navigate` returns
+    /// once the fetch is *in flight* (the page on screen stays alive and
+    /// interactive), and `wait_for_navigation` adopts the result — the very
+    /// `drain_pending_navigation` the poll loop runs between ticks. Local
+    /// schemes stay synchronous (their fetch is a read).
+    #[test]
+    fn an_http_document_loads_on_the_network_worker() {
+        use std::io::{Read, Write};
+        let dir = tempfile::tempdir().expect("tempdir");
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("loopback test server");
+        let port = listener.local_addr().expect("test addr").port();
+        let server = std::thread::spawn(move || {
+            for stream in listener.incoming().take(1) {
+                let mut s = match stream {
+                    Ok(s) => s,
+                    Err(_) => return,
+                };
+                let mut buf = [0u8; 2048];
+                let _ = s.read(&mut buf).ok();
+                let _ = s.write_all(
+                    b"HTTP/1.1 200 OK\r\ncontent-type: text/html\r\nconnection: close\r\n\r\n\
+                       <!doctype html><html><head><title>Worker page</title>\
+                       <style>body{margin:0;height:4000px}</style></head>\
+                       <body><p>served off-thread</p></body></html",
+                );
+            }
+        });
+        let mut tab = form_tab(dir.path());
+        tab.handle_to_tab(ToTab::Resize {
+            width: 800,
+            height: 600,
+            scale: 1.0,
+        });
+        let url = format!("http://127.0.0.1:{port}/served");
+        assert!(tab.navigate(&url, NavHistory::Fresh), "the navigation starts");
+        assert!(
+            tab.wait_for_navigation(std::time::Duration::from_secs(15)),
+            "the worker fetch completes"
+        );
+        tab.settle();
+        assert_eq!(
+            text_of(tab.document_mut().expect("doc"), "title").unwrap_or_default(),
+            "Worker page",
+            "the served document is the loaded one at {url}"
+        );
+        assert_eq!(
+            text_of(tab.document_mut().expect("doc"), "p").unwrap_or_default(),
+            "served off-thread",
+            "the served document is laid out and painted"
+        );
+        server.join().ok();
+    }
+
     /// A tab whose tab→shell frames land in a buffer the test can decode
     /// (`new_headless` sends them to a discarding sink).
     fn capturing_tab(dir: &std::path::Path) -> (Tab, Arc<std::sync::Mutex<Vec<u8>>>) {
@@ -7259,6 +7447,10 @@ mod tests {
             address: "http://127.0.0.1:1".into(), // deliberately dead: the *intent* is asserted
             error: None,
         });
+        // The hand-off is an `http(s)` navigation on the network worker
+        // (task: faster, responsive loading) — let it land (here: refuse) so
+        // its network events ship before the assertions read them.
+        tab.wait_for_navigation(std::time::Duration::from_secs(5));
         // The tab asked the server's own page: a fetch of
         // `<address>/ironsurf/serve` leaves this tab (the address itself is
         // dead here on purpose — only the intent is under test).

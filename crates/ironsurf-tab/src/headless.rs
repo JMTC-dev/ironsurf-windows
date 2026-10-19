@@ -285,6 +285,10 @@ pub fn run(args: &[String]) -> Result<(), Box<dyn Error>> {
     // The one navigation: fetch (managed/passthrough policy per flags) →
     // parse → settle → `<script>` run (`crate::js`), exactly as live tabs.
     tab.navigate(&args.tab_args.url.clone(), NavHistory::Fresh);
+    // An `http(s)` navigation is in flight on the network worker (task:
+    // faster, responsive loading) — a live tab's poll loop would adopt it
+    // between ticks; here, wait for it before the timers window opens.
+    tab.wait_for_navigation(std::time::Duration::from_secs(120));
 
     // --wait window: this IS the poll loop for JS timers — each pump runs
     // every due setTimeout/setInterval/rAF callback (real timers task) and
