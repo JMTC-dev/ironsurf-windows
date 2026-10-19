@@ -142,7 +142,7 @@ impl Drop for TabChild {
 fn probe_infosec_trending() {
     let port = spawn_local_http();
     let profile = tempfile::tempdir().expect("profile dir");
-    let exe = env!("CARGO_BIN_EXE_ironsurf-tab");
+    let exe = env!("CARGO_BIN_EXE_ironsurf");
     let mut child = Command::new(exe)
         .env_remove("DISPLAY")
         .env_remove("WAYLAND_DISPLAY")

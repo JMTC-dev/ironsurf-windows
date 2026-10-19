@@ -1,4 +1,9 @@
-//! ironsurf-tab — sandboxed per-tab Blitz host process.
+//! ironsurf-tab — the sandboxed per-tab Blitz + Boa engine host.
+//!
+//! This crate is the tab half of the single `ironsurf` binary (see
+//! [`src/bin/ironsurf.rs`], whose `main` calls [`run`]): the same executable
+//! that shows the Slint shell re-executes *itself* once per tab, and the copy
+//! that gets `--tab-id …` comes through here as the tab host process.
 //!
 //! The full `ToTab`/`FromTab` IPC lifecycle on Blitz (task 7c): OS sandbox
 //! at startup, one `HtmlDocument` per navigation driven on a single thread,
@@ -32,11 +37,13 @@ mod worker;
 use ironsurf_common::logging as stderr_logging;
 use ironsurf_common::error;
 
-fn usage() -> String {
-    "usage: ironsurf-tab --tab-id N --container-id N --profile-dir PATH \
+/// The tab host's CLI help (also what `ironsurf tab --help` prints, with the
+/// `ironsurf tab` invocation spelled out by the caller).
+pub fn usage() -> String {
+    "usage: ironsurf tab --tab-id N --container-id N --profile-dir PATH \
      [--url URL] [--offline-fixtures DIR] [--user-agent UA] [--archive-mode] [--managed-net] [--no-sandbox] [--log LEVEL|-v|-vv]\n\
-     \x20      ironsurf-tab --spike --url <file:///...> --out <out.ppm> [--size WxH] [--out-rgba out.rgba]\n\
-     \x20      ironsurf-tab --headless --url URL [--wait MS] [--body-out FILE] [--shot out.ppm] [--size WxH] [--find QUERY] [--reader]\n\
+     \x20      ironsurf tab --spike --url <file:///...> --out <out.ppm> [--size WxH] [--out-rgba out.rgba]\n\
+     \x20      ironsurf tab --headless --url URL [--wait MS] [--body-out FILE] [--shot out.ppm] [--size WxH] [--find QUERY] [--reader]\n\
      \x20      log LEVEL: off|error|warn|info|debug|trace (default info; also IRONSURF_LOG)"
         .to_owned()
 }
@@ -57,16 +64,22 @@ fn install_crash_hook() {
     }));
 }
 
-fn main() {
+/// Run one tab host process: `argv[0]` is the program name, the rest the tab
+/// CLI (see [`usage`]). Returns the exit code the caller must pass to
+/// `libc::_exit` — never `std::process::exit`, see the binary's `main`.
+///
+/// Spelled as a function (rather than `main`) so the single `ironsurf` binary
+/// can host both halves: the shell re-executes itself per tab and the child
+/// lands here.
+pub fn run(args: &[String]) -> i32 {
     install_crash_hook();
-    let args: Vec<String> = std::env::args().collect();
     // Logging first: every line after this goes to stderr (never stdout, which
     // is the IPC channel). `runtime::run` relabels the lines with the tab id.
-    stderr_logging::init("tab", stderr_logging::level_from_args(&args));
-    let code = if args.iter().any(|a| a == "--headless") {
+    stderr_logging::init("tab", stderr_logging::level_from_args(args));
+    if args.iter().any(|a| a == "--headless") {
         // One-shot ACID-test harness: navigate, wait, dump body HTML + PPM,
         // summary on stderr, stdout unused (see `crate::headless`).
-        match headless::run(&args) {
+        match headless::run(args) {
             Ok(()) => 0,
             Err(err) => {
                 error!("headless run failed: {err}");
@@ -74,7 +87,7 @@ fn main() {
             }
         }
     } else if args.iter().any(|a| a == "--spike") {
-        match spike::run(&args) {
+        match spike::run(args) {
             Ok(()) => 0,
             Err(err) => {
                 error!("spike failed: {err}");
@@ -82,18 +95,12 @@ fn main() {
             }
         }
     } else {
-        match runtime::TabArgs::parse(&args) {
+        match runtime::TabArgs::parse(args) {
             Ok(tab_args) => runtime::run(tab_args),
             Err(err) => {
                 error!("bad arguments: {err}\n{}", usage());
                 2
             }
         }
-    };
-    // `_exit`, not `exit`: keep the shell-visible shutdown path identical to
-    // the previous runtime (no atexit handlers, no teardown races). Runtime
-    // state (cookie jars, the frame BufWriter) is flushed explicitly by the
-    // runtime before we get here.
-    // SAFETY: nothing else needs to run; stdout has been flushed.
-    unsafe { libc::_exit(code) }
+    }
 }

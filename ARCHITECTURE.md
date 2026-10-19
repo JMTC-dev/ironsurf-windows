@@ -21,11 +21,11 @@ contracts; extend, don't contradict. Keep all crates compiling and `cargo test -
 ```
 ┌────────────────────────── ironsurf-shell (Slint GUI, main process) ─────────────────────────┐
 │  tab bar (container-colored) · URL bar · container manager · frame compositor · input       │
-│      │ spawn child process per tab (stdio pipes)                                            │
+│      │ re-execute this same binary per tab (stdio pipes)                                    │
 └──────┼───────────────────────────────────────────────────────────────────────────────────── ┘
        │ ToTab / FromTab (length-prefixed bincode over stdin/stdout)
 ┌──────▼──────────────────────────────┐        ┌──────────────────────────────┐
-│ ironsurf-tab (child process #1, …N)  │   …    │ ironsurf-tab (child process N)│
+│ ironsurf --tab-id (child proc #1…)  │   …    │ ironsurf --tab-id (child N)   │
 │  - applies OS sandbox at startup    │        │  (different container ⇒       │
 │  - embeds Blitz + Stylo + Boa       │        │   different OS process ⇒      │
 │  - renders via vello_cpu (software) │        │   memory can't be shared)     │
@@ -34,6 +34,9 @@ contracts; extend, don't contradict. Keep all crates compiling and `cargo test -
 └──────────────┬──────────────────────┘        └───────────────────────────────┘
                │ profile dir (~/.local/share/ironsurf/profiles/<container>/) used as tab data path
      ironsurf-storage: container registry + per-container cookie jar / cache / local storage
+
+(shell and tab host are the SAME `ironsurf` executable — one binary is downloaded and run;
+see §One binary, two modes)
 ```
 
 **Why this shape**
@@ -62,11 +65,36 @@ crates/
   ironsurf-common/     # types + IPC codec. NO heavy deps (serde, bincode, thiserror only)
   ironsurf-storage/    # container registry, profiles, cookie jar, cache, local storage
   ironsurf-sandbox/    # Landlock + rlimits + prctl sandbox application
-  ironsurf-tab/        # BIN: sandboxed per-tab Blitz+Boa host speaking ironsurf-common IPC
-  ironsurf-shell/      # BIN: Slint GUI, tab/container management, frame compositor
+  ironsurf-tab/        # LIB + THE SHIPPED BIN `ironsurf`: sandboxed per-tab Blitz+Boa host
+                       # speaking ironsurf-common IPC; src/bin/ironsurf.rs is the executable
+  ironsurf-shell/      # LIB: Slint GUI, tab/container management, frame compositor
+                       # (+ the `fake_tab` dev-harness bin; no binary of its own)
 ```
 
 MSRV: latest stable. Edition 2021. `resolver = "2"`.
+
+### One binary, two modes (distribution contract)
+
+IronSurf ships **exactly one executable**, `target/<profile>/ironsurf` (built by the
+`ironsurf-tab` package, which links this crate's engine host together with the
+`ironsurf-shell` GUI library). Downloading and running that one file is the whole install
+— there is no sibling tab binary to fetch and no way for the two halves to drift.
+
+A tab is still a **separate OS process per tab** (that is what the sandbox and the
+separate address spaces are for): the shell re-executes *itself*. Which half a process
+becomes is decided from `argv` by `dispatch()` in `crates/ironsurf-tab/src/bin/ironsurf.rs`:
+
+| invocation | mode |
+|---|---|
+| `ironsurf [OPTIONS]` | shell (the Slint GUI) |
+| `ironsurf tab [TAB OPTIONS]` | tab host; the subcommand is consumed and `ironsurf tab --help` prints its usage |
+| `ironsurf --tab-id N …` (also `--headless`, `--spike`) | tab host — how the shell spawns children: no subcommand is injected, so `--tab-bin` stays free to name any tab-IPC binary |
+| `ironsurf-tab [TAB OPTIONS]` | tab host — an `argv[0]` of `ironsurf-tab` (copy or symlink) is the pre-merge name |
+
+`-V`/`--version` is answered by the binary itself: one artifact, one version string. The
+GUI is entered in shell mode only, so a tab process never touches Slint, and
+`ironsurf_tab::run(argv) -> i32` still ends in `libc::_exit` exactly as the standalone tab
+binary did (no atexit handlers, no teardown races against the IPC stdout).
 
 ---
 
@@ -575,7 +603,7 @@ Linux-only core, compiles everywhere with a no-op fallback (`available() == fals
 pub struct SandboxPolicy {
     pub readable_ro: Vec<PathBuf>, // e.g. /usr/share/fonts, /etc/ssl/certs, /nix?, binary dir
     pub writable_rw: Vec<PathBuf>, // exactly ONE: the container profile dir (+ /tmp? NO)
-    pub exec_ro:     Vec<PathBuf>, // the ironsurf-tab executable path
+    pub exec_ro:     Vec<PathBuf>, // the executable path (the one `ironsurf` binary, which is also the tab host)
     pub max_open_files: u64,       // default 1024
     pub max_processes:  u64,       // default 128 — per-UID headroom on Linux (RLIMIT_NPROC is uid-wide;
                                    // applied as current-task-count + N, never below the uid's live tasks)
@@ -599,9 +627,11 @@ binary or a test-only bin here) that applies the sandbox and exits 42 iff openin
 
 ---
 
-## ironsurf-tab (binary) — the Blitz + Boa host
+## ironsurf-tab (library + the `ironsurf` binary) — the Blitz + Boa host
 
-CLI: `ironsurf-tab --tab-id N --container-id N --profile-dir PATH [--url URL] [--offline-fixtures DIR] [--managed-net] [--no-sandbox]`
+CLI (tab host): `ironsurf tab --tab-id N --container-id N --profile-dir PATH [--url URL] [--offline-fixtures DIR] [--managed-net] [--no-sandbox]` — the shell itself
+skips the `tab` word and passes straight `--tab-id …` (§One binary, two modes). The
+library entry point is `ironsurf_tab::run(argv) -> i32`, `argv[0]` = program name.
 
 Engine stack (pinned; all pure Rust — **no C/C++ toolchain, no mozjs, no wgpu/GPU**):
 
@@ -1310,7 +1340,10 @@ gets to *ask*. Two questions decide every request and nothing else does:
 
 ---
 
-## ironsurf-shell (binary) — Slint GUI
+## ironsurf-shell (library) — Slint GUI
+
+The shell has no binary of its own: `ironsurf_shell::cli::run(argv)` boots it, called by
+the single `ironsurf` executable (§One binary, two modes).
 
 Slint `1.x` with **GPU acceleration, software fallback** (task: GPU): build with default
 features **plus `backend-linuxkms-noseat`**, which compiles the LinuxKMS backend (DRM/KMS +
@@ -1525,7 +1558,8 @@ UI (`crates/ironsurf-shell/ui/ironsurf.slint`):
 
 Process/tab management (`src/tabs.rs`):
 - `struct TabProc { id, container, child: Child, stdin, stdout, title, url, loading, can_back, can_fwd, frame: slint::Image, last_frame_age }`
-- Spawn `ironsurf-tab` (resolve sibling of current exe; `--tab-id`…) with piped stdio;
+- Spawn the tab host — by default **our own executable** (`current_exe()`, so `ironsurf
+  --tab-id …`; `--tab-bin PATH` names another, e.g. the scripted `fake_tab` harness) with piped stdio;
   reader thread per tab → `mpsc::UnboundedSender<FromTab>` drained by Slint timer (UI updates
   via `slint::Weak<AppWindow>` invoke; throttle Frame messages: coalesce to newest).
 - `Frame` → `slint::Image` from raw RGBA buffer (`slint::Image::from_rgba8_slab`/PixelBuffer API — verify name).
@@ -1974,6 +2008,10 @@ Each task MUST end with its own check passing:
    Secure-over-HTTPS-only, cache LRU eviction, **container isolation of profiles**)
 3. sandbox: `cargo test -p ironsurf-sandbox` (probe child proves forbidden dir unreadable when Landlock is available; degrades gracefully otherwise)
 4. tab/blitz: `cargo build -p ironsurf-tab && cargo test -p ironsurf-tab` (headless frame test;
-   `cargo tree -p ironsurf-tab` must contain no `mozjs`/`wgpu`/`servo v` entries)
+   `cargo tree -p ironsurf-tab` must contain no `mozjs`/`wgpu`/`servo v` entries). This is also
+   what builds **the** artifact, `target/<profile>/ironsurf`.
 5. shell: `cargo test -p ironsurf-shell` (+ smoke with fake tab proc; GUI check if display)
+5b. one binary: `./target/<profile>/ironsurf --version`, `--help` (shell) and `tab --help`
+   (tab host) all answer without a display; `./target/<profile>/ironsurf --smoke` boots the
+   shell and drives a tab out of the same file.
 6. end-to-end: shell driving two containers side-by-side (scripted), README + docs complete.

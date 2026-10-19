@@ -50,7 +50,7 @@ fn spike_captures_local_html_page() {
     let out = dir.path().join("spike.ppm");
     let out_rgba = dir.path().join("spike.rgba");
 
-    let exe = env!("CARGO_BIN_EXE_ironsurf-tab");
+    let exe = env!("CARGO_BIN_EXE_ironsurf");
     let status = Command::new(exe)
         // Prove the pure-CPU path: no display of any kind.
         .env_remove("DISPLAY")

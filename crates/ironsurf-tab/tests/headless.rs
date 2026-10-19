@@ -26,7 +26,7 @@ const FIXTURE: &str = r#"<!doctype html>
 fn run_headless(dir: &Path, extra: &[&str]) -> std::process::Output {
     let fixture = dir.join("fixture.html");
     fs::write(&fixture, FIXTURE).expect("write fixture");
-    let output = Command::new(env!("CARGO_BIN_EXE_ironsurf-tab"))
+    let output = Command::new(env!("CARGO_BIN_EXE_ironsurf"))
         .arg("--headless")
         .arg("--url")
         .arg(
@@ -107,7 +107,7 @@ fn headless_mode_dumps_body_shot_and_summary() {
 
 #[test]
 fn headless_requires_url_and_fails_cleanly_without_it() {
-    let output = Command::new(env!("CARGO_BIN_EXE_ironsurf-tab"))
+    let output = Command::new(env!("CARGO_BIN_EXE_ironsurf"))
         .arg("--headless")
         .arg("--wait")
         .arg("10")
@@ -144,7 +144,7 @@ fn headless_wait_window_runs_js_timers() {
 "#,
     )
     .expect("write timers page");
-    let output = Command::new(env!("CARGO_BIN_EXE_ironsurf-tab"))
+    let output = Command::new(env!("CARGO_BIN_EXE_ironsurf"))
         .arg("--headless")
         .arg("--url")
         .arg(
@@ -202,7 +202,7 @@ fn dom_bridge_paints_red_box_and_serializes_it() {
     let body_out = dir.path().join("body.html");
     let shot = dir.path().join("shot.ppm");
 
-    let output = Command::new(env!("CARGO_BIN_EXE_ironsurf-tab"))
+    let output = Command::new(env!("CARGO_BIN_EXE_ironsurf"))
         .arg("--headless")
         .arg("--url")
         .arg(url::Url::from_file_path(&fixture).expect("file url").as_str())
@@ -344,7 +344,7 @@ fn shoot(dir: &std::path::Path, name: &str, html: &str) -> (Vec<u8>, String) {
     let fixture = dir.join(name);
     fs::write(&fixture, html).expect("write fixture");
     let shot = dir.join(format!("{name}.ppm"));
-    let output = Command::new(env!("CARGO_BIN_EXE_ironsurf-tab"))
+    let output = Command::new(env!("CARGO_BIN_EXE_ironsurf"))
         .arg("--headless")
         .arg("--url")
         .arg(url::Url::from_file_path(&fixture).expect("file url").as_str())
@@ -528,7 +528,7 @@ fn svg_viewbox_case_survives_setattribute_and_icons_paint_their_size() {
     let fixture = dir.path().join("svg.html");
     fs::write(&fixture, SVG_FIXTURE).expect("write fixture");
     let body_out = dir.path().join("body.html");
-    let output = Command::new(env!("CARGO_BIN_EXE_ironsurf-tab"))
+    let output = Command::new(env!("CARGO_BIN_EXE_ironsurf"))
         .env("IRONSURF_FILL_MIN_AREA", "1") // also report the 24px icon fills
         .arg("--headless")
         .arg("--url")
@@ -613,7 +613,7 @@ fn inspect_run(dir: &Path, name: &str, extra: &[&str]) -> (Vec<u8>, Option<Vec<u
     fs::write(&fixture, INSPECT_FIXTURE).expect("write fixture");
     let out = dir.join(format!("{name}.json"));
     let shot = dir.join(format!("{name}.ppm"));
-    let output = Command::new(env!("CARGO_BIN_EXE_ironsurf-tab"))
+    let output = Command::new(env!("CARGO_BIN_EXE_ironsurf"))
         .arg("--headless")
         .arg("--url")
         .arg(

@@ -1,7 +1,8 @@
 //! ironsurf-shell — the Slint GUI shell.
 //!
-//! Owns the container registry view, spawns one `ironsurf-tab` child process
-//! per tab (stdio pipes, `ironsurf-common` framing), pumps `FromTab` messages
+//! Owns the container registry view, spawns one tab child process per tab — a
+//! re-executed copy of the single `ironsurf` binary (stdio pipes,
+//! `ironsurf-common` framing) — pumps `FromTab` messages
 //! into a per-tab state machine, and composites the newest RGBA frame of the
 //! active tab into the Slint window.
 //!
@@ -14,6 +15,9 @@ slint::include_modules!();
 
 pub mod archive;
 pub mod archive_server;
+/// The shell's CLI + boot (`ironsurf`'s `main` calls [`cli::run`] for the GUI
+/// half of the single binary).
+pub mod cli;
 pub mod classify;
 pub mod downloads;
 pub mod clipboard;

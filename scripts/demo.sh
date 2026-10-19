@@ -62,8 +62,8 @@ echo "fixture: http://127.0.0.1:$PORT/"
 
 # ---- launch the browser (software rendering, no GPU) -------------------------
 IRONSURF_SMOKE=1 IRONSURF_DATA_DIR="$DATA/profile" \
-  target/debug/ironsurf-shell --software --log debug \
-  --tab-bin target/debug/ironsurf-tab >"$DATA/out.log" 2>"$DATA/shell.log" &
+  target/debug/ironsurf --software --log debug \
+    >"$DATA/out.log" 2>"$DATA/shell.log" &
 SHELL_PID=$!
 trap 'kill $SHELL_PID 2>/dev/null; kill $FIXTURE 2>/dev/null' EXIT
 

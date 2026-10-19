@@ -348,7 +348,7 @@ impl TabChild {
 }
 
 fn spawn_tab(url: &str, profile_dir: &Path) -> TabChild {
-    let exe = env!("CARGO_BIN_EXE_ironsurf-tab");
+    let exe = env!("CARGO_BIN_EXE_ironsurf");
     let mut argv: Vec<String> = vec![
         "--tab-id".into(),
         "42".into(),

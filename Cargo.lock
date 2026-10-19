@@ -3808,6 +3808,7 @@ dependencies = [
  "http",
  "ironsurf-common",
  "ironsurf-sandbox",
+ "ironsurf-shell",
  "ironsurf-storage",
  "jpeg-decoder",
  "keyboard-types",

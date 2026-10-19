@@ -51,8 +51,9 @@ use crate::user_agents::{normalize_custom_ua, ua_display, ua_menu_rows};
 
 /// The tab's built-in User-Agent — what a container **without** an override
 /// sends, and what the UA menu's Copy button copies in that case. Duplicate
-/// of `ironsurf-tab`'s `netmod::USER_AGENT` (the tab binary is not a library
-/// dependency); keep the two strings in sync.
+/// of `ironsurf-tab`'s `netmod::USER_AGENT` — `ironsurf-tab` depends on this crate
+/// to build the single `ironsurf` binary, so this crate must not depend back on
+/// it; keep the two strings in sync.
 pub const DEFAULT_USER_AGENT: &str = "Mozilla/5.0 (X11; Linux x86_64; IronSurf/0.1)";
 
 /// The stored UA override of `container` (trimmed; blank stored values are

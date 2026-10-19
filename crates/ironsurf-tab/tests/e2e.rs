@@ -236,7 +236,7 @@ impl TabChild {
 }
 
 fn spawn_tab(fixture: &std::path::Path, profile_dir: &std::path::Path) -> TabChild {
-    let exe = env!("CARGO_BIN_EXE_ironsurf-tab");
+    let exe = env!("CARGO_BIN_EXE_ironsurf");
     let mut child = Command::new(exe)
         // Prove the fully software path: no display of any kind.
         .env_remove("DISPLAY")
@@ -427,7 +427,7 @@ fn tab_exits_cleanly_on_stdin_eof() {
     let fixture = profile.join("index.html");
     std::fs::write(&fixture, FIXTURE).expect("write fixture");
 
-    let mut child = Command::new(env!("CARGO_BIN_EXE_ironsurf-tab"))
+    let mut child = Command::new(env!("CARGO_BIN_EXE_ironsurf"))
         .env_remove("DISPLAY")
         .env_remove("WAYLAND_DISPLAY")
         .arg("--tab-id")

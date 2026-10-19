@@ -8,6 +8,10 @@ publish = false
 ironsurf-common = { path = "../ironsurf-common" }
 ironsurf-storage = { path = "../ironsurf-storage" }
 ironsurf-sandbox = { path = "../ironsurf-sandbox" }
+# Only the `ironsurf` binary below needs it: the single shipped executable is
+# this crate's engine host *plus* the Slint shell, so a release is one file.
+# The library itself never touches the GUI.
+ironsurf-shell = { path = "../ironsurf-shell" }
 url = { workspace = true }
 # `<script type="importmap">` bodies are JSON (task: importmap support); the
 # crate is already locked and compiled in the graph (boa_engine's `deser`).

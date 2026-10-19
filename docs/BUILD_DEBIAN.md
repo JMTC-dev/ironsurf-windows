@@ -17,7 +17,7 @@ apt install -y --no-install-recommends \
   build-essential pkg-config git curl ca-certificates \
   libssl-dev libfontconfig-dev libudev-dev libinput-dev libgbm-dev libxkbcommon-dev
 
-# 3. Runtime libraries for `cargo run -p ironsurf-shell` (X11, software rendering)
+# 3. Runtime libraries for `cargo run -p ironsurf-tab --bin ironsurf` (X11, software rendering)
 apt install -y --no-install-recommends \
   libx11-6 libx11-xcb1 libxcb1 libxcb-xkb1 libxkbcommon0 libxkbcommon-x11-0 \
   libxi6 libxrender1 libxcursor1 libfontconfig1 fonts-dejavu-core
@@ -31,9 +31,9 @@ cd /workspace && cargo build --workspace && cargo test --workspace
 |---|---|---|
 | `build-essential` | linking every crate; `ring` 0.17 (via `rustls` ← our `reqwest 0.12`) compiles C/asm with `cc` | `cargo tree -i ring`; `cc` from Debian 14.2.0 |
 | `pkg-config` | `openssl-sys` and `yeslogic-fontconfig-sys` build scripts resolve libs through it | both `build.rs` call `pkg_config::find_library(..)` |
-| `libssl-dev` | **`openssl-sys` ← `native-tls` ← `reqwest 0.13` ← `blitz-net`** — the engine's network stack uses OpenSSL, even though our own `reqwest 0.12` uses rustls | `objdump -p target/debug/ironsurf-tab` → `NEEDED libssl.so.3`, `libcrypto.so.3` |
+| `libssl-dev` | **`openssl-sys` ← `native-tls` ← `reqwest 0.13` ← `blitz-net`** — the engine's network stack uses OpenSSL, even though our own `reqwest 0.12` uses rustls | `objdump -p target/debug/ironsurf` → `NEEDED libssl.so.3`, `libcrypto.so.3` |
 | `libfontconfig-dev` | `yeslogic-fontconfig-sys` ← `usvg` `system-fonts` ← `blitz-paint`/`anyrender_svg` and Slint's `fontique` | its `build.rs`: `pkg_config::find_library("fontconfig").unwrap()` → hard failure without `fontconfig.pc`; binary `NEEDED libfontconfig.so.1` |
-| `libudev-dev`, `libinput-dev`, `libgbm-dev`, `libxkbcommon-dev` | Slint's **LinuxKMS backend** (`backend-linuxkms-noseat` — GPU acceleration on a bare VT): `libudev-sys`/`input` link `-ludev -linput`, `gbm-sys` links `-lgbm`, `xkbcommon` links `-lxkbcommon` — **directly, not dlopen'd** | `pkg-config: Package libudev was not found` without them; `ironsurf-shell` `NEEDED libudev.so.1 libinput.so.10 libgbm.so.1 libxkbcommon.so.0` |
+| `libudev-dev`, `libinput-dev`, `libgbm-dev`, `libxkbcommon-dev` | Slint's **LinuxKMS backend** (`backend-linuxkms-noseat` — GPU acceleration on a bare VT): `libudev-sys`/`input` link `-ludev -linput`, `gbm-sys` links `-lgbm`, `xkbcommon` links `-lxkbcommon` — **directly, not dlopen'd** | `pkg-config: Package libudev was not found` without them; `ironsurf` `NEEDED libudev.so.1 libinput.so.10 libgbm.so.1 libxkbcommon.so.0` |
 | `git` | cargo git deps, and all repo work | — |
 | `curl`, `ca-certificates` | rustup download; **runtime** TLS roots for the OpenSSL path (root store is read from `/etc/ssl/certs`) | `ca-certificates` 20250419 installed here |
 
@@ -50,9 +50,9 @@ unneeded: FemtoVG's GL is resolved via glutin at runtime.
 
 ## Runtime packages (running the shell, not building it)
 
-`ironsurf-shell` is **GPU-first**: FemtoVG/GL via winit on a desktop session, FemtoVG on
+`ironsurf` (the shell half of the one binary) is **GPU-first**: FemtoVG/GL via winit on a desktop session, FemtoVG on
 EGL/GBM via LinuxKMS on a bare VT, with Slint's automatic **software fallback** where no GL
-exists (`--software` pins it; see `crates/ironsurf-shell/src/main.rs`). The X11 libs below
+exists (`--software` pins it; see `crates/ironsurf-shell/src/cli.rs`). The X11 libs below
 are loaded lazily (`strings` on the binary shows the exact soname list):
 
 | Soname (dlopen'd) | Debian package |

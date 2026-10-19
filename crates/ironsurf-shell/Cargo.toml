@@ -23,9 +23,8 @@ slint-build = "1"
 i-slint-backend-testing = "1.17.1"
 tempfile = "3"
 
-[[bin]]
-name = "ironsurf-shell"
-path = "src/main.rs"
+# No shell binary of its own: the Slint GUI links into the single `ironsurf`
+# binary (built by ../ironsurf-tab, which depends on this crate as a library).
 
 # A scripted stand-in for ironsurf-tab used by the headless pump tests
 # (see ARCHITECTURE.md §ironsurf-shell "Tests"). It also doubles as an

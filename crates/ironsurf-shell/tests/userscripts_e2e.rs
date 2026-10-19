@@ -96,12 +96,16 @@ fn http_response(status: u16, content_type: &str, body: &[u8]) -> String {
     ) + &String::from_utf8_lossy(body)
 }
 
-/// The workspace-built `ironsurf-tab` (same resolution as `devtools_e2e.rs`).
+/// The workspace-built `ironsurf` binary — the tab host lives inside it (same resolution as `devtools_e2e.rs`).
 fn real_tab_bin() -> Option<PathBuf> {
     let exe = std::env::current_exe().ok()?;
     let profile_dir = exe.parent()?.parent()?; // target/<profile>
-    let candidate = profile_dir.join(format!("ironsurf-tab{}", std::env::consts::EXE_SUFFIX));
-    candidate.is_file().then_some(candidate)
+    // The single `ironsurf` binary hosts the tab half; the pre-merge
+    // `ironsurf-tab` name is still accepted for a stale target directory.
+    ["ironsurf", "ironsurf-tab"]
+        .iter()
+        .map(|n| profile_dir.join(format!("{n}{}", std::env::consts::EXE_SUFFIX)))
+        .find(|c| c.is_file())
 }
 
 /// The feed accumulated off the wire (console entries in arrival order, one
@@ -174,7 +178,7 @@ fn wait_for(
 #[test]
 fn real_tab_runs_stored_userscripts_and_their_removal_is_observable() {
     let Some(tab_bin) = real_tab_bin() else {
-        eprintln!("skip: ironsurf-tab not built (cargo build --workspace first)");
+        eprintln!("skip: ironsurf not built (cargo build --workspace first)");
         return;
     };
     let port = spawn_local_http();

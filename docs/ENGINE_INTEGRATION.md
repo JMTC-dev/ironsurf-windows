@@ -67,12 +67,14 @@ still apply to the tab process today; their API specifics are obsolete.
 * **Cargo gotcha:** `CARGO_BIN_EXE_<name>` is *not* defined for the lib's unit-test
   target — any test that spawns a sibling bin must live under `tests/` (the shell's
   fake-tab pump test moved to `tests/pump.rs`). Integration tests can locate
-  workspace sibling bins via `current_exe()/../../ironsurf-tab`.
+  workspace sibling bins via `current_exe()/../../ironsurf` (the shell e2e tests do exactly
+  that to reach the tab host, which now lives inside the one binary).
 * **Slint 1.17 drift:** `Color` channels are `u8` (`color.green() > 150`, not `> 0.6`);
   `Image` exposes `size() -> IntSize`, not `width()/height()` methods.
 * End-to-end proof lives in `crates/ironsurf-shell/tests/real_tab.rs`: the real Slint
-  window + real `ironsurf-tab` binary + Blitz frames, headless on file fixtures in the
-  container profile dir; the live `https://example.com` leg runs with `IRONSURF_ONLINE=1`.
+  window + the real `ironsurf` binary (re-executed as the tab host) + Blitz frames, headless
+  on file fixtures in the container profile dir; the live `https://example.com` leg runs with
+  `IRONSURF_ONLINE=1`.
 
 ## E. Input latency & perceived feedback (task 10)
 
@@ -238,7 +240,7 @@ servo = { version = "0.5", default-features = false,
 
 ## Spike behaviour (proof)
 
-`ironsurf-tab --spike --url file:///… --out out.ppm --size 800x600`
+`ironsurf tab --spike --url file:///… --out out.ppm --size 800x600`
 
 * loads, fires `notify_url_changed` / `notify_page_title_changed` (title captured),
   reaches `LoadStatus::Complete`, captures after render-up-to-date
@@ -350,10 +352,11 @@ logger has no stdout path at all.
     `FromTab` reduced (url/title/loading/error at info), address-bar
     classification, shortcuts, reaped tabs, history writes.
 * **Try it:**
-  `IRONSURF_LOG=debug ./target/debug/ironsurf-shell --tab-stderr` (whole
+  `IRONSURF_LOG=debug ./target/debug/ironsurf --tab-stderr` (whole
   browser, interleaved, `shell`/`tab N` prefixed), or a single tab under
-  `printf '' | IRONSURF_LOG=debug ./target/debug/ironsurf-tab --tab-id 1 \
-  --profile-dir /tmp/p --managed-net --url https://example.com --no-sandbox >/dev/null`.
+  `printf '' | IRONSURF_LOG=debug ./target/debug/ironsurf --tab-id 1 \
+  --profile-dir /tmp/p --managed-net --url https://example.com --no-sandbox >/dev/null`
+  (the same binary, in its tab-host mode).
 
 ## G. `data:` URLs and media types (task 14)
 
