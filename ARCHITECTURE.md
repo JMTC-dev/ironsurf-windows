@@ -1495,6 +1495,14 @@ UI (`crates/ironsurf-shell/ui/ironsurf.slint`):
   *alone* is the chord — `Ctrl-←` off a Mac and `⌥-←` on one keep moving a text caret a
   word at a time, so the page gets them — and the chord is read from the page surface
   only, which is why `⌘-←` inside the URL bar still goes to the start of the line.
+- **`↑` / `↓` scroll the page a line at a time** — 40 CSS px per press
+  (`runtime::ARROW_SCROLL_PX`, twice the wheel's line unit and the step
+  `window.scrollBy(0, 40)` takes, so a few presses move a paragraph and a dozen
+  move a screen): the fine motion to PageUp/PageDown's screen, for putting one
+  exact line in view. blitz binds the arrows for editors only, so this is the tab's
+  gesture too — and with a text control focused the caret answers instead and the
+  document does not move at all, which is what a reader filling a form at the
+  bottom of a long page expects.
 - **PageUp / PageDown scroll the page, and `Ctrl`/`⌘`-PageDown is bound to nothing.**
   blitz has no page-level binding for either key — its keymap spells them as editor
   no-ops (`node/text.rs`: `"scrollPageDown:"` — which is why they did nothing at all

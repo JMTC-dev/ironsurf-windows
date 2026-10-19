@@ -1713,6 +1713,16 @@ fn page_keys_scroll_the_document() {
         &mut seen,
     );
 
+    // `↓` is the fine motion to that: one line (40 CSS px), so a reader can put an
+    // exact line in view instead of a screenful at a time.
+    tab.send(page_key("ArrowDown", ironsurf_common::Modifiers::NONE));
+    tab.wait_for_new(
+        "ArrowDown scrolled one line",
+        |m| matches!(m, FromTab::ScrollState { state } if (state.y - 40.0).abs() < 1.0),
+        deadline,
+        &mut seen,
+    );
+
     // With the chord key held the key is still just paging (no binding eats it).
     tab.send(page_key(
         "PageDown",

@@ -120,6 +120,12 @@ const IDLE_TICK: Duration = Duration::from_millis(250);
 /// alive, so players keep advancing (~25×/s) with no other events — the
 /// `RUNNING_POLL_INTERVAL` role of the JS-timer cap, for media.
 const MEDIA_TICK: Duration = Duration::from_millis(40);
+/// How far `↑` / `↓` take the document, CSS px — "a line", and the same step
+/// `window.scrollBy(0, 40)` takes. Twice the wheel's line unit (blitz multiplies
+/// one notch by 20 CSS px, `events/pointer.rs`), which is about two lines of body
+/// text at the default font size: enough to see that the page moved, small enough
+/// that a paragraph is a few presses and a screen is a dozen.
+const ARROW_SCROLL_PX: f64 = 40.0;
 
 // ---------------------------------------------------------------------------
 // CLI
@@ -2968,34 +2974,22 @@ impl Tab {
         self.emit(FromTab::ScrollState { state });
     }
 
-    /// One screen of PageUp/PageDown travel, in the direction the key names.
+    /// Scroll the document's viewport by `travel` CSS px (positive = down),
+    /// clamped to the range [`Self::viewport_scroll_state`] reports — which is
+    /// also what says whether the document scrolls at all: a page that fits its
+    /// window has `range == 0` and stays exactly where it is.
     ///
-    /// blitz has no page-level binding for either key — its keymap spells them as
-    /// editor no-ops (`node/text.rs`: `"scrollPageDown:" => {}`) — so unless the
-    /// tab does it itself the keys do nothing at all outside a text field. A
-    /// viewport of travel less a tenth kept as overlap, so a line or two stays in
-    /// sight and the reader knows they have not fallen off the page; clamped to
-    /// the range [`Self::viewport_scroll_state`] reports, which is also what says
-    /// whether the document scrolls at all (a page that fits its window has
-    /// `range == 0` and stays exactly where it is).
-    ///
-    /// This is the *document* viewport — the thing the wheel and the shell's
-    /// scroll bar move — so an `overflow: scroll` box inside the page keeps its
-    /// own keys, and `Ctrl`/`⌘`-PageDown scrolls the same as the bare key: that
-    /// chord is deliberately not bound (it is not the shell's to take).
-    fn scroll_page(&mut self, up: bool) {
+    /// This is the *document* viewport, the same thing the wheel and the shell's
+    /// scroll bar move, so an `overflow: scroll` box inside the page keeps its own
+    /// keys and [`FromTab::ScrollState`] (the bar's geometry) follows the keystroke.
+    fn scroll_viewport(&mut self, travel: f64) {
         let Some(state) = self.viewport_scroll_state() else {
             return;
         };
-        if state.range <= 0.0 {
+        if state.range <= 0.0 || travel == 0.0 {
             return;
         }
-        let travel = (f64::from(state.viewport_h) * 0.9).max(1.0);
-        let y = if up {
-            (f64::from(state.y) - travel).max(0.0)
-        } else {
-            (f64::from(state.y) + travel).min(f64::from(state.range))
-        };
+        let y = (f64::from(state.y) + travel).clamp(0.0, f64::from(state.range));
         let Some(doc) = self.doc.as_mut() else {
             return;
         };
@@ -3005,11 +2999,34 @@ impl Tab {
         // The scroll bar follows through `report_scroll_state` on the next tick;
         // the pixels are this tab's job.
         self.needs_paint = true;
-        debug!(
-            "page {} scroll \u{2192} y = {y:.0} of {:.0}",
-            if up { "up" } else { "down" },
-            f64::from(state.range)
-        );
+        debug!("key scroll \u{2192} y = {y:.0} of {:.0}", f64::from(state.range));
+    }
+
+    /// One screen of PageUp/PageDown travel: a viewport less the tenth kept as
+    /// overlap, so a line or two stays in sight and the reader knows they have not
+    /// fallen off the page.
+    ///
+    /// blitz has no page-level binding for either key — its keymap spells them as
+    /// editor no-ops (`node/text.rs`: `"scrollPageDown:" => {}`) — so unless the tab
+    /// does it itself the keys do nothing at all outside a text field. And
+    /// `Ctrl`/`⌘`-PageDown scrolls the same as the bare key: that chord is
+    /// deliberately not bound (it is not the shell's to take).
+    fn scroll_page(&mut self, up: bool) {
+        let Some(state) = self.viewport_scroll_state() else {
+            return;
+        };
+        let screen = (f64::from(state.viewport_h) * 0.9).max(1.0);
+        self.scroll_viewport(if up { -screen } else { screen });
+    }
+
+    /// One line of `↑` / `↓` travel ([`ARROW_SCROLL_PX`]) — the fine motion to
+    /// PageUp/PageDown's screen, for keeping an exact line in view.
+    fn scroll_line(&mut self, up: bool) {
+        self.scroll_viewport(if up {
+            -ARROW_SCROLL_PX
+        } else {
+            ARROW_SCROLL_PX
+        });
     }
 
     // -- painting -----------------------------------------------------------
@@ -4496,6 +4513,20 @@ impl Tab {
             && ev.key.eq_ignore_ascii_case("a")
     }
 
+    /// Is a text control (`<input>` / `<textarea>`) the focused element? Then the
+    /// caret answers the arrows and Ctrl-A before the page does: blitz moves the
+    /// caret on the key it was given (`node/text.rs`), and the document keeps its
+    /// scroll offset.
+    fn editor_focused(&self) -> bool {
+        let Some(doc) = self.doc.as_ref() else {
+            return false;
+        };
+        doc.get_focussed_node_id()
+            .and_then(|id| doc.get_node(id))
+            .and_then(|node| node.element_data())
+            .is_some_and(|data| data.text_input_data().is_some())
+    }
+
     /// Keyboard input: `ToTab::Key` is a key *press* (the contract has no
     /// release direction). blitz beta.2 has no separate `UnicodeInput`
     /// variant — printable text rides on `BlitzKeyEvent.text` and the whole
@@ -4583,13 +4614,9 @@ impl Tab {
         // `preventDefault()`ed the key never gets here — the `keydown` gate
         // at the top of this function returns first.
         if Self::is_select_all_chord(ev) {
-            let editor_focused = self.doc.as_ref().is_some_and(|doc| {
-                doc.get_focussed_node_id()
-                    .and_then(|id| doc.get_node(id))
-                    .and_then(|node| node.element_data())
-                    .is_some_and(|data| data.text_input_data().is_some())
-            });
-            if !editor_focused && self.doc.as_mut().is_some_and(|doc| select::select_all(doc)) {
+            if !self.editor_focused()
+                && self.doc.as_mut().is_some_and(|doc| select::select_all(doc))
+            {
                 let chars = self
                     .doc
                     .as_ref()
@@ -4604,9 +4631,18 @@ impl Tab {
         // page still sees the whole gesture — and sees nothing of the scroll
         // itself, because a `keydown` handler that `preventDefault()`ed the press
         // returned out of this function before ever getting here.
+        // `↑` / `↓` take the page a line at a time (see [`Self::scroll_line`]) —
+        // but only with no text control under the caret: with one focused the arrow
+        // moves the caret and the page stays put (blitz's own edit default,
+        // `node/text.rs`), which is what a reader filling a form at the bottom of a
+        // long page expects. PageUp/PageDown do scroll the document either way,
+        // because a textarea answers neither key and a screen is a screen.
         match ev.key.as_str() {
             "PageUp" => self.scroll_page(true),
             "PageDown" => self.scroll_page(false),
+            "ArrowUp" | "ArrowDown" if !self.editor_focused() => {
+                self.scroll_line(ev.key == "ArrowUp")
+            }
             _ => {}
         }
         let release = BlitzKeyEvent {
@@ -9439,6 +9475,97 @@ mod tests {
         assert!(
             bottom <= ceiling + 1.0,
             "the last press stopped at the reported ceiling {ceiling}: {bottom}"
+        );
+    }
+
+    /// `↑` / `↓` move the document a line at a time ([`ARROW_SCROLL_PX`] — 40 CSS
+    /// px, twice the wheel's line unit): the fine motion to PageUp/PageDown's
+    /// screen, so a reader can put one exact line in view. blitz binds the arrows
+    /// for editors only, so without this the keys do nothing at page level. With a
+    /// text control focused the caret answers instead and the page does not move.
+    #[test]
+    fn arrow_keys_scroll_a_line_at_a_time() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (mut tab, sink) = scroll_tab(
+            dir.path(),
+            "tall.html",
+            "<!doctype html><meta charset=utf-8><style>body{margin:0;height:1600px}</style>\
+             <input style=\"width:200px;height:40px\">",
+        );
+        tab.report_scroll_state();
+        assert!(!tab.editor_focused(), "the page has the caret to start with");
+
+        let arrow = |key: &str| {
+            ToTab::Key(KeyEvent {
+                key: key.into(),
+                code: key.into(),
+                text: None,
+                repeat: false,
+                mods: Modifiers::NONE,
+            })
+        };
+
+        // One press, one line …
+        tab.handle_to_tab(arrow("ArrowDown"));
+        tab.settle();
+        assert!(
+            (scroll_y(&mut tab) - ARROW_SCROLL_PX).abs() < 1.0,
+            "one press is one line ({ARROW_SCROLL_PX} CSS px): {}",
+            scroll_y(&mut tab)
+        );
+        // … and presses add up.
+        for _ in 0..3 {
+            tab.handle_to_tab(arrow("ArrowDown"));
+        }
+        tab.settle();
+        let four = scroll_y(&mut tab);
+        assert!(
+            (four - 4.0 * ARROW_SCROLL_PX).abs() < 1.0,
+            "four presses went four lines: {four}"
+        );
+        tab.report_scroll_state();
+        let states = scroll_states(&sink);
+        assert!(
+            states.len() >= 2,
+            "the bar followed the page down"
+        );
+        assert!(
+            (f64::from(states[states.len() - 1].y) - four).abs() < 1.0,
+            "the report is the page: {:?} vs {four}",
+            states[states.len() - 1]
+        );
+
+        // Up is the same step back, and the top is as far up as a page goes.
+        tab.handle_to_tab(arrow("ArrowUp"));
+        tab.settle();
+        assert!(
+            (scroll_y(&mut tab) - 3.0 * ARROW_SCROLL_PX).abs() < 1.0,
+            "one line back: {}",
+            scroll_y(&mut tab)
+        );
+        for _ in 0..10 {
+            tab.handle_to_tab(arrow("ArrowUp"));
+        }
+        tab.settle();
+        assert!(
+            scroll_y(&mut tab).abs() < 1.0,
+            "the arrows stop at the top: {}",
+            scroll_y(&mut tab)
+        );
+
+        // With the caret in a text control the arrow belongs to the editor: blitz
+        // moves the caret and the document keeps its offset.
+        tab.handle_to_tab(ptr(60.0, 20.0, PointerKind::Move));
+        tab.handle_to_tab(ptr(60.0, 20.0, PointerKind::Down));
+        tab.handle_to_tab(ptr(60.0, 20.0, PointerKind::Up));
+        tab.settle();
+        assert!(tab.editor_focused(), "the click focused the field");
+        tab.handle_to_tab(arrow("ArrowDown"));
+        tab.settle();
+        assert!(
+            scroll_y(&mut tab).abs() < 1.0,
+            "the caret answered, the page did not move: {}",
+            scroll_y(&mut tab)
         );
     }
 

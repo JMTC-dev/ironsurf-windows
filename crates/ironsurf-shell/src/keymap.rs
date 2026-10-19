@@ -36,8 +36,8 @@ pub enum Shortcut {
     /// `Alt-←` / `Alt-→` (`⌘-←` / `⌘-→` on macOS, see [`Chords`]): back / forward
     /// in the active tab's history. History and not the tab strip — the arrows
     /// say which way the reader wants to go, and the strip already has Ctrl-Tab
-    /// and the digit chords. PageUp/PageDown are **not** here: they scroll the
-    /// page (and the tab does that, so no chord claims them).
+    /// and the digit chords. `↑`/`↓` and PageUp/PageDown are **not** here: they
+    /// scroll the page, and the tab does that, so no chord may claim them.
     GoBack,
     GoForward,
     /// Ctrl-`+` (Ctrl-`=`, Ctrl-`+`): zoom the page in one step.
@@ -552,8 +552,10 @@ mod tests {
             );
         }
         assert_eq!(shortcut_on(Chords::Cmd, left, false, true, false), None);
-        // Paging: no chord on either spelling, bare or with a modifier held.
-        for text in [up, down] {
+        // Paging is no chord on either spelling, bare or with a modifier held — and
+        // neither are `↑` / `↓`, which are the page's to scroll a line at a time:
+        // the tab does that, watching the scroll offset (its own tests).
+        for text in [up, down, "\u{F700}", "\u{F701}"] {
             for chords in [Chords::Ctrl, Chords::Cmd] {
                 for (ctrl, alt, meta) in [(false, false, false), (true, false, false), (false, true, false)] {
                     assert_eq!(
