@@ -763,6 +763,10 @@ pub struct Tab {
     /// The wheel's glide queue ([`WheelGlide`]); fed by [`Tab::pump_wheel`]
     /// (task: slower and smoother wheel).
     wheel_glide: WheelGlide,
+    /// Wheel-travel multiplier from the settings menu's slider
+    /// (`ToTab::SetScrollSpeed`): the default damping ([`WHEEL_SPEED`])
+    /// scaled, folded into every queued glide. `WHEEL_SPEED` until told.
+    wheel_speed: f64,
     /// Popup blocker (task: block popups — a website opening new tabs without a
     /// user interaction). One shared cell: the `window.open` native answers
     /// through it synchronously, real input arms its engagement credit, and the
@@ -1218,6 +1222,7 @@ impl Tab {
                 at: None,
                 over: (0.0, 0.0),
             },
+            wheel_speed: WHEEL_SPEED,
             pending_form: None,
             form_press: None,
             label_press: None,
@@ -4042,6 +4047,17 @@ impl Tab {
             ToTab::InspectPickAt { x, y } => self.inspect_pick_at(x, y),
             ToTab::SetReader { enabled } => self.set_reader(enabled),
             ToTab::SetPopupPolicy { block, allowed } => self.set_popup_policy(block, allowed),
+            ToTab::SetScrollSpeed { speed } => {
+                // The settings menu's slider: a multiplier on the default
+                // damping (like zoom, the shell owns the policy — the tab
+                // only rejects nonsense and clamps hard).
+                self.wheel_speed = if speed.is_finite() && speed > 0.0 {
+                    WHEEL_SPEED * (speed as f64).clamp(0.1, 4.0)
+                } else {
+                    WHEEL_SPEED
+                };
+                info!("wheel speed → {speed:.2}× ({:.2} px per unit)", self.wheel_speed);
+            }
             ToTab::DialogResponse { dialog_id, .. } => {
                 // A reply with no modal open: it either raced the tab-side
                 // cancel (shell quit mid-dialog) or is stale — nothing to
@@ -4945,7 +4961,9 @@ impl Tab {
     /// same *visual* distance at every zoom.
     ///
     /// Slower and smoother (task): the travel is damped by [`WHEEL_SPEED`]
-    /// and queued onto [`Tab::pump_wheel`] instead of being applied whole —
+    /// — scaled by the settings menu's scroll-speed slider, see
+    /// [`Tab::wheel_speed`] — and queued onto [`Tab::pump_wheel`] instead of
+    /// being applied whole —
     /// the page glides to the new offset over a few frames, and a wheel in
     /// motion keeps queueing onto the same glide. The first slice is fed with
     /// the event, so a gesture never waits a frame to start moving.
@@ -4963,8 +4981,8 @@ impl Tab {
             glide.last = Instant::now();
         }
         glide.pending = (
-            glide.pending.0 + f64::from(ev.delta_x) * unit * WHEEL_SPEED,
-            glide.pending.1 + f64::from(ev.delta_y) * unit * WHEEL_SPEED,
+            glide.pending.0 + f64::from(ev.delta_x) * unit * self.wheel_speed,
+            glide.pending.1 + f64::from(ev.delta_y) * unit * self.wheel_speed,
         );
         let coords = self.pointer_coords(ev.x, ev.y);
         let glide = &mut self.wheel_glide;
@@ -8887,6 +8905,79 @@ mod tests {
         tab.pump_wheel(true);
         tab.settle();
         assert_eq!(scroll_y(&mut tab), 0.0, "scrolling up clamps at the top");
+    }
+
+    /// Settings menu (task): the scroll-speed slider travels every tab's
+    /// wheel — `ToTab::SetScrollSpeed { speed }` multiplies the damped
+    /// travel (`2.0×` doubles it, `0.5×` halves it), and nonsense values
+    /// (`NaN`, zero, negative) fall back to the default damping.
+    #[test]
+    fn settings_scroll_speed_scales_the_wheel_travel() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let page = dir.path().join("tall.html");
+        std::fs::write(
+            &page,
+            "<!doctype html><meta charset=utf-8><style>body{margin:0;height:4000px}</style><p>tall</p>",
+        )
+        .expect("write");
+        let mut tab = form_tab(dir.path());
+        tab.handle_to_tab(ToTab::Resize {
+            width: 800,
+            height: 600,
+            scale: 1.0,
+        });
+        tab.navigate(
+            url::Url::from_file_path(&page).expect("url").as_str(),
+            NavHistory::Fresh,
+        );
+        tab.settle();
+        tab.handle_to_tab(ptr(100.0, 100.0, PointerKind::Move));
+        let wheel = |d: f32| {
+            ToTab::Scroll(ScrollEvent {
+                x: 100.0,
+                y: 100.0,
+                delta_x: 0.0,
+                delta_y: d,
+            })
+        };
+        let scroll_y = |tab: &mut Tab| tab.document_mut().expect("doc").viewport_scroll().y;
+        let at_top = |tab: &mut Tab| {
+            tab.handle_to_tab(wheel(10000.0));
+            tab.pump_wheel(true);
+            tab.settle();
+        };
+
+        // Default damping: a −200 px wheel travels 100 px (half the delta).
+        tab.handle_to_tab(wheel(-200.0));
+        tab.pump_wheel(true);
+        tab.settle();
+        assert_eq!(scroll_y(&mut tab), 100.0, "default travel is unchanged");
+
+        // The slider at 2×: the same turn travels twice as far.
+        tab.handle_to_tab(ToTab::SetScrollSpeed { speed: 2.0 });
+        at_top(&mut tab);
+        tab.handle_to_tab(wheel(-200.0));
+        tab.pump_wheel(true);
+        tab.settle();
+        assert_eq!(scroll_y(&mut tab), 200.0, "2× doubles the wheel travel");
+
+        // And at 50%: half as far.
+        tab.handle_to_tab(ToTab::SetScrollSpeed { speed: 0.5 });
+        at_top(&mut tab);
+        tab.handle_to_tab(wheel(-200.0));
+        tab.pump_wheel(true);
+        tab.settle();
+        assert_eq!(scroll_y(&mut tab), 50.0, "0.5× halves the wheel travel");
+
+        // Nonsense is not a speed: the default damping stands.
+        for junk in [f32::NAN, 0.0, -1.0] {
+            tab.handle_to_tab(ToTab::SetScrollSpeed { speed: junk });
+            at_top(&mut tab);
+            tab.handle_to_tab(wheel(-200.0));
+            tab.pump_wheel(true);
+            tab.settle();
+            assert_eq!(scroll_y(&mut tab), 100.0, "{junk} falls back to default");
+        }
     }
 
     /// Slower *and* smoother (task): one wheel event starts the page moving

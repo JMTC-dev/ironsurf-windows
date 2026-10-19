@@ -231,6 +231,7 @@ pub enum ToTab {
     Forward,
     Resize       { width: u32, height: u32, scale: f32 },
     SetZoom      { zoom: f32 },           // page zoom, 1.0 = 100% (Ctrl-+/Ctrl--/Ctrl-0)
+    SetScrollSpeed { speed: f32 },        // wheel-speed multiplier from the settings menu's ☰ slider; 1.0 = default damping, tab clamps (0.1×–4×)
     SetVisible   { visible: bool },        // throttle background rendering
     Pointer      (PointerEvent),
     Key          (KeyEvent),
@@ -1626,7 +1627,8 @@ Process/tab management (`src/tabs.rs`):
   blank tabs not worth reopening) before killing the process; the chord respawns at the
   address in the container it died in and focuses it. Deliberate deviation from the
   original Ctrl-Shift-T spec: that chord belongs to the Console pane. **Ctrl-Alt-H**
-  toggles the History menu (Ctrl-Shift-H is the user's *history* pane in DevTools). Both
+  toggles the ☰ History-&-settings menu (Ctrl-Shift-H is the user's *history*
+  pane in DevTools). Both
   chords resolve ahead of the plain-Ctrl table, both X11 spellings (letter and
   control-char) accepted, plain Ctrl-T (new tab) untouched. **Ctrl-Alt-R** (task:
   reader mode) toggles **reader view** on the active tab — letter spellings only,
@@ -1688,6 +1690,14 @@ Process/tab management (`src/tabs.rs`):
   page (never a fetch, never a history entry), instead of silently becoming a search.
 - Container default from registry; per-container "remember last chosen container for new tabs"
   in `~/.local/share/ironsurf/ui.json` (best-effort).
+- **The settings menu is the ☰ panel** (task: settings menu): the three-lines button that
+  used to open only the browsing history is the browser's one settings area (its header
+  reads "History & settings"). The bottom item is the **scrolling-speed slider** —
+  0.2× … 3× in 0.1 steps, stamped as a percentage of the default wheel travel. Every
+  change persists at once to `ui.json` (`settings.scroll_speed`, absent = `1.0`), applies
+  browser-wide live (`ToTab::SetScrollSpeed` to each running tab — the tab multiplies its
+  default wheel damping, clamping nonsense back), and seeds fresh tabs at spawn, so a new
+  tab's wheel already turns at the chosen speed.
 - **Crashed tabs are loud, never silent**: child stderr is captured (bounded tail; `RUST_BACKTRACE=full`
   is set for children and the tab binary force-prints a backtrace on panic), the drain tick polls every
   child (`try_wait`), and a process that dies without `Closed` — or a send that fails (broken pipe, os

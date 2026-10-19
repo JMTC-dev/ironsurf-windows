@@ -9,7 +9,7 @@
 // cannot declare custom properties — so the two focus() watchers live in
 // the small custom components `UrlBar` and `PageSurface` instead.
 
-import { LineEdit, ListView, CheckBox } from "std-widgets.slint";
+import { LineEdit, ListView, CheckBox, Slider } from "std-widgets.slint";
 
 export struct TabInfo {
     id: int,
@@ -870,6 +870,11 @@ export component AppWindow inherits Window {
     in property <[HistoryItem]> history-items;
     in property <string> history-status: "";
 
+    // Settings (task: settings menu): the ☰ panel doubles as the browser's
+    // one settings area, and the wheel scroll-speed slider down at its bottom
+    // writes this multiplier — `1.0` is the default damping.
+    in-out property <float> scroll-speed: 1.0;
+
     // "Save page" dialog (task: save-page selector). Ctrl-S opens it —
     // pressing it again closes it. `save-page` is the page about to be saved
     // (its address, for the header line); `save-dir-text` is the folder draft
@@ -1017,6 +1022,7 @@ export component AppWindow inherits Window {
     callback close-history-menu();
     callback history-pick(idx: int);
     callback history-clear();
+    callback scroll-speed-set(speed: float);
 
     // "Save page" dialog callbacks (task: save-page selector): Choose
     // validates the typed folder (the ⬇ panel's rules); Save confirms the
@@ -2386,7 +2392,7 @@ export component AppWindow inherits Window {
                     spacing: 8px;
                     height: 26px;
                     Hamburger { width: 14px; height: 14px; tint: #f0f0f0; }
-                    Text { text: "History"; color: #f0f0f0; font-weight: 600; vertical-alignment: center; }
+                    Text { text: "History & settings"; color: #f0f0f0; font-weight: 600; vertical-alignment: center; }
                     Rectangle { horizontal-stretch: 1; }
                     MiniButton { label: "×"; clicked => { root.close-history-menu(); } }
                 }
@@ -2450,6 +2456,36 @@ export component AppWindow inherits Window {
                     text: "History is shared by all containers: one visit in one container is listed (and can be cleared) from all of them. Ctrl-Alt-T reopens the last closed tab.";
                     color: #888888;
                     wrap: word-wrap;
+                }
+
+                // The settings area (task: settings menu): this panel is the
+                // browser's one settings spot, and the wheel's speed sits at
+                // the bottom of it — a slider from a gentle 0.2× to a quick
+                // 3×, stamped as a percentage of the default travel. Every
+                // change applies browser-wide, persists, and survives a
+                // restart; the tab side is `ToTab::SetScrollSpeed`.
+                Rectangle { height: 1px; background: #3a3a3a; }
+                HorizontalLayout {
+                    spacing: 8px;
+                    height: 24px;
+                    Text { text: "Scrolling speed"; color: #f0f0f0; vertical-alignment: center; }
+                    Rectangle { horizontal-stretch: 1; }
+                    Text {
+                        text: Math.round(root.scroll-speed * 100) + "%";
+                        color: #a8b8c8;
+                        vertical-alignment: center;
+                    }
+                }
+                HorizontalLayout {
+                    height: 26px;
+                    speed-slider := Slider {
+                        horizontal-stretch: 1;
+                        minimum: 0.2;
+                        maximum: 3.0;
+                        step: 0.1;
+                        value: root.scroll-speed;
+                        changed(v) => { root.scroll-speed-set(v); }
+                    }
                 }
             }
         }

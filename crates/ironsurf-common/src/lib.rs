@@ -312,6 +312,13 @@ pub enum ToTab {
     SetZoom {
         zoom: f32,
     },
+    /// Scroll-speed multiplier from the settings menu's slider (the ☰ panel):
+    /// `1.0` = the tab's default wheel damping. A browser-wide setting — the
+    /// shell pushes it to every running tab when the slider moves and seeds
+    /// fresh tabs with it at spawn; the tab clamps nonsense to its sane range.
+    SetScrollSpeed {
+        speed: f32,
+    },
     /// Throttle background rendering.
     SetVisible {
         visible: bool,

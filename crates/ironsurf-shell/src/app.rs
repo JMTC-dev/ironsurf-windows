@@ -830,6 +830,11 @@ impl Core {
                 // A tab process starts with an empty script set: seed it with
                 // the enabled userscripts at once (task: userscript menu).
                 self.seed_userscripts(id);
+                // …and with the settings menu's scroll speed (task: settings
+                // menu), so a fresh wheel turns at the chosen speed too.
+                if let Some(speed) = self.settings.borrow().scroll_speed {
+                    let _ = self.send_to(id, ToTab::SetScrollSpeed { speed });
+                }
                 true
             }
             Err(err) => {
@@ -4221,6 +4226,30 @@ impl Core {
         let _ = settings.save(&self.ui_path); // best-effort
     }
 
+    /// The settings menu's scroll-speed slider (the ☰ panel): a browser-wide
+    /// wheel-travel multiplier, `1.0` = the default damping. Clamped to the
+    /// slider's own range, persisted to ui.json at once, and pushed to every
+    /// running tab — fresh ones are seeded at spawn, so the choice is global
+    /// and outlives the session.
+    fn set_scroll_speed(&self, speed: f32) {
+        let speed = if speed.is_finite() {
+            speed.clamp(0.2, 3.0)
+        } else {
+            1.0
+        };
+        info!("settings: scroll speed → {:.0}%", speed * 100.0);
+        self.settings.borrow_mut().scroll_speed = Some(speed);
+        self.save_settings();
+        for p in self.procs.borrow().iter() {
+            if let Err(err) = p.tab.send(ToTab::SetScrollSpeed { speed }) {
+                warn!("tab {} could not set scroll speed: {err}", p.tab.id);
+            }
+        }
+        if let Some(ui) = self.ui() {
+            ui.set_scroll_speed(speed);
+        }
+    }
+
     // ---- message pump --------------------------------------------------------------
 
     /// Drain every queued `FromTab` message: reduce per-tab state, keep only
@@ -4699,6 +4728,9 @@ impl Core {
             })
             .collect();
         ui.set_containers(ModelRc::from(Rc::new(VecModel::from(conts))));
+        // The settings menu's slider reads the persisted speed (task: settings
+        // menu) — the panel opens wherever the last session left it.
+        ui.set_scroll_speed(self.settings.borrow().scroll_speed.unwrap_or(1.0));
 
         if let Some(p) = procs.get(active) {
             ui.set_can_back(p.state.can_back);
@@ -5070,6 +5102,12 @@ impl Core {
                     c.history_pick(idx as usize);
                 }
             });
+        }
+        // Settings (task: settings menu): the ☰ panel's scroll-speed slider,
+        // live as it drags — apply, persist, broadcast (see `set_scroll_speed`).
+        {
+            let c = self.clone();
+            ui.on_scroll_speed_set(move |speed| c.set_scroll_speed(speed as f32));
         }
         // URL bar autocomplete (task: URL bar autocomplete suggestions): every
         // keystroke in the bar re-ranks the dropdown from the shared visit log

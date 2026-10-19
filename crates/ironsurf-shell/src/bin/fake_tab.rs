@@ -498,6 +498,7 @@ fn main() {
                 text: Some("video-toggled".into()),
             }),
             ToTab::SetZoom { .. } => {} // no real layout to rescale
+            ToTab::SetScrollSpeed { .. } => {} // no wheel here to feel the difference
             // DevTools Inspector (task: Inspector — shell side): the fake tab has no
             // DOM, so the pane's commands are accepted and answered the way the real
             // tab would at best — an empty tree of a blank document, and status-line
