@@ -155,6 +155,10 @@ fn main() {
     // the real runtime does while rendering that page (and like the fake does
     // on a later Navigate to it).
     ask_archive(&mut emit, &url);
+    // …and the same for the browsing-history page: the visit log is the shell's,
+    // so a tab launched onto it asks for the list right away (the real runtime
+    // asks while rendering the page, launch URL included).
+    ask_history(&mut emit, &url);
     announce(&mut emit, &url, false);
     emit(frame(size)); // like the real tab: a first frame without any Resize
 
@@ -264,6 +268,7 @@ fn main() {
                 // (the same message the real runtime emits when it renders
                 // that page) and waits for the address back.
                 ask_archive(&mut emit, &new);
+                ask_history(&mut emit, &new);
                 url = new;
                 announce(&mut emit, &url, true);
                 // The scripted "popup page": one window asked for, one refusal
@@ -293,6 +298,21 @@ fn main() {
                         format!("archive server failed: {}", error.as_deref().unwrap_or("unknown"))
                     },
                 });
+            }
+            // The browsing-history page's answer (`ironsurf://history`): the
+            // fake reports the count the shell handed over, which is what a test
+            // reads as the page having been fed.
+            ToTab::HistoryList { ref entries, total, .. } => {
+                emit(FromTab::StatusText {
+                    text: Some(format!("history:{total}:{}", entries.len())),
+                });
+                for visit in entries.iter().take(3) {
+                    emit(FromTab::ConsoleLog {
+                        source: "log".into(),
+                        level: "info".into(),
+                        message: format!("visit {} {}", visit.url, visit.title.as_deref().unwrap_or("-")),
+                    });
+                }
             }
             ToTab::Reload => {
                 announce(&mut emit, &url, true);
@@ -674,6 +694,25 @@ fn ask_archive(emit: &mut impl FnMut(FromTab), url: &str) {
         port,
         open_in_new_tab: open,
     });
+}
+
+/// `ironsurf://history` stands in for the real page: the visit log belongs to
+/// the shell, so the page asks for it (and says so when the row it opened was
+/// "Clear history") and waits for the list back.
+fn ask_history(emit: &mut impl FnMut(FromTab), url: &str) {
+    if !url.starts_with("ironsurf://history") {
+        return;
+    }
+    let clear = url
+        .split_once('?')
+        .map(|(_, query)| {
+            query.split('&').any(|pair| {
+                let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
+                key == "clear" && !value.is_empty() && value != "0"
+            })
+        })
+        .unwrap_or(false);
+    emit(FromTab::HistoryListRequest { clear });
 }
 
 /// Read the `ironsurf://archive` page's query the way the real page does:

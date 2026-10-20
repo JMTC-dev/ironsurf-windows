@@ -29,19 +29,11 @@ export struct ContainerInfo {
     isDefault: bool,
 }
 
-/// One browsing-history row (task: browsing history), reduced from the shared
-/// `<root>/history.jsonl` by `Core::history_state`: newest visit first, and
-/// `title` falls back to the URL in Rust when the page had no title, so a row
-/// always reads as something.
-export struct HistoryItem {
-    title: string,
-    url: string,
-}
-
-/// One URL-bar autocomplete candidate (task: URL bar autocomplete): the same
-/// shape as a history row, but a *filtered, ranked* subset of the visit log
-/// for what the user has typed so far (`title` falls back to the URL in Rust,
-/// exactly like `HistoryItem`).
+/// One URL-bar autocomplete candidate (task: URL bar autocomplete): a
+/// *filtered, ranked* subset of the visit log for what the user has typed so
+/// far (`title` falls back to the URL in Rust, so a row always reads as
+/// something). The browsing-history list itself is a page —
+/// `ironsurf://history` — not a row model of this UI.
 export struct SuggestItem {
     title: string,
     url: string,
@@ -860,14 +852,14 @@ export component AppWindow inherits Window {
     in property <string> download-error: "";
     in property <[DownloadItem]> downloads;
 
-    // Browsing-history menu (task: browsing history): opened by the ☰ button
-    // at the right-hand end of the toolbar, next to the container dropdown.
-    // `history-items` is the shared visit log (newest first — the log lives
-    // at the data root and every container reads and writes the SAME file);
-    // `history-status` is the one-line count under the header. Clearing is
+    // Settings drawer (task: browsing history), opened by the ☰ button at the
+    // right-hand end of the toolbar, next to the container dropdown. It is
+    // **settings** — the visits are not listed here any more, they have their
+    // own page (`ironsurf://history`, opened by the drawer's History button);
+    // `history-status` is the one-line count of the shared log under the
+    // header, so Clear says what it is about to delete. Clearing is
     // all-or-nothing: it wipes the shared log, never one container's slice.
     in property <bool> history-menu-open: false;
-    in property <[HistoryItem]> history-items;
     in property <string> history-status: "";
 
     // Settings (task: settings menu): the ☰ panel doubles as the browser's
@@ -1015,12 +1007,11 @@ export component AppWindow inherits Window {
     callback download-apply-dir(text: string);
     callback download-clear-finished();
 
-    // History-menu intents (task: browsing history): a row click opens that
-    // URL in a new tab; Clear wipes the whole shared log. Row indices are
-    // rows of `history-items`, which Rust caps at a display window.
+    // Settings-drawer intents (task: browsing history): **History** opens the
+    // `ironsurf://history` page in a new tab; Clear wipes the whole shared log.
     callback toggle-history-menu();
     callback close-history-menu();
-    callback history-pick(idx: int);
+    callback history-page();
     callback history-clear();
     callback scroll-speed-set(speed: float);
 
@@ -2361,14 +2352,16 @@ export component AppWindow inherits Window {
     }
 
     // ------------------------------------------------------------------------
-    // Browsing-history overlay (task: browsing history)
+    // Settings drawer (task: browsing history)
     //
     // The same right-docked Rectangle as the other four menus (never a
     // PopupWindow: LinuxKMS has none), opened by the ☰ toolbar button and
     // never stacked — Rust closes it when any other menu opens, and closes
-    // the others when this one opens. The log it lists is shared by every
-    // container; picking a row opens that URL in a new tab, Clear empties
-    // the whole shared log at once.
+    // the others when this one opens. It is the browser's one settings spot,
+    // and the visit log is **not** in it: the log is a page of its own
+    // (`ironsurf://history`), which the History button opens in a new tab, so
+    // this panel only counts the shared log and offers the two buttons.
+    // Clear empties the whole shared log at once, from every container.
     // ------------------------------------------------------------------------
     Rectangle {
         x: 0; y: 0;
@@ -2392,7 +2385,7 @@ export component AppWindow inherits Window {
                     spacing: 8px;
                     height: 26px;
                     Hamburger { width: 14px; height: 14px; tint: #f0f0f0; }
-                    Text { text: "History & settings"; color: #f0f0f0; font-weight: 600; vertical-alignment: center; }
+                    Text { text: "Settings"; color: #f0f0f0; font-weight: 600; vertical-alignment: center; }
                     Rectangle { horizontal-stretch: 1; }
                     MiniButton { label: "×"; clicked => { root.close-history-menu(); } }
                 }
@@ -2404,56 +2397,18 @@ export component AppWindow inherits Window {
                     wrap: word-wrap;
                 }
 
-                hist-list := ListView {
-                    vertical-stretch: 1;
-                    for hi[i] in root.history-items: Rectangle {
-                        height: 40px;
-                        width: parent.width;
-                        hbg := Rectangle { background: hba.has-hover ? #2c2c2c : transparent; border-radius: 4px; }
-                        // declared before the text ⇒ bottom z-order: the
-                        // click-transparent Texts pass their clicks here
-                        hba := TouchArea {
-                            clicked => { root.history-pick(i); }
-                        }
-                        VerticalLayout {
-                            x: 6px; y: 2px;
-                            width: parent.width - 12px;
-                            spacing: 0px;
-                            Text {
-                                text: hi.title;
-                                color: #e8e8e8;
-                                font-weight: 600;
-                                horizontal-alignment: left;
-                                overflow: elide;
-                            }
-                            Text {
-                                text: hi.url;
-                                color: #8a8a8a;
-                                font-size: 11px;
-                                horizontal-alignment: left;
-                                overflow: elide;
-                            }
-                        }
-                    }
-                }
-
-                if root.history-items.length == 0: Text {
-                    text: "No browsing history — visits land here as tabs navigate, shared by every container.";
-                    color: #888888;
-                    wrap: word-wrap;
-                }
-
-                Rectangle { vertical-stretch: 1; }
-
+                // The visits themselves: a page of their own
+                // (`ironsurf://history`), not a list inside the drawer.
                 HorizontalLayout {
                     height: 28px;
                     spacing: 6px;
+                    MiniButton { label: "History"; clicked => { root.history-page(); } }
                     MiniButton { label: "Clear history"; clicked => { root.history-clear(); } }
                     Rectangle { horizontal-stretch: 1; }
                 }
 
                 Text {
-                    text: "History is shared by all containers: one visit in one container is listed (and can be cleared) from all of them. Ctrl-Alt-T reopens the last closed tab.";
+                    text: "History is shared by all containers: one visit in one container is listed (and can be cleared) from all of them, on the history page. Ctrl-Alt-T reopens the last closed tab.";
                     color: #888888;
                     wrap: word-wrap;
                 }

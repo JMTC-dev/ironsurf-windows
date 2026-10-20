@@ -97,3 +97,44 @@ fn corrupt_lines_are_skipped_on_read() {
     h.record("https://newer.example/", None).unwrap();
     assert_eq!(urls(&h.entries()), ["https://newer.example/", "https://good.example/"]);
 }
+
+#[test]
+fn a_late_title_lands_on_the_visit_it_belongs_to() {
+    // A visit is written the moment the address changes — before the document
+    // has been fetched and parsed, so there is no `<title>` to read yet (task:
+    // half the log was titled after whatever page was open beforehand). The
+    // title arrives a moment later and stamps that one entry.
+    let tmp = tempfile::tempdir().unwrap();
+    let h = History::open(tmp.path());
+    h.record("https://example.org/one", None).unwrap();
+    assert_eq!(h.entries()[0].title, None, "written untitled, never mislabelled");
+
+    assert!(
+        h.set_latest_title("https://example.org/one", Some("First page")).unwrap(),
+        "the entry had no title yet"
+    );
+    assert_eq!(h.entries()[0].title.as_deref(), Some("First page"));
+
+    // The same title again changes nothing — a page that renames itself every
+    // second must not rewrite the log each time.
+    assert!(!h.set_latest_title("https://example.org/one", Some("First page")).unwrap());
+
+    // Revisiting the same address is a separate visit: the title goes to the
+    // visit being read now (the newest line) and the older one keeps its own.
+    h.record("https://example.org/two", Some("Second page")).unwrap();
+    h.record("https://example.org/one", None).unwrap();
+    assert!(h.set_latest_title("https://example.org/one", Some("First page, again")).unwrap());
+    let entries = h.entries();
+    assert_eq!(urls(&entries), ["https://example.org/one", "https://example.org/two", "https://example.org/one"]);
+    assert_eq!(entries[0].title.as_deref(), Some("First page, again"));
+    assert_eq!(entries[1].title.as_deref(), Some("Second page"));
+    assert_eq!(entries[2].title.as_deref(), Some("First page"));
+
+    // A page with no title of its own wipes the one that leaked in from the
+    // page before it — whitespace-only counts as no title.
+    assert!(h.set_latest_title("https://example.org/one", Some("   ")).unwrap());
+    assert_eq!(h.entries()[0].title, None);
+
+    // An address that was never visited has nothing to re-title.
+    assert!(!h.set_latest_title("https://example.org/never", Some("Ghost")).unwrap());
+}

@@ -209,6 +209,13 @@ pub enum FromTab {
     // the server's own control page applied a new folder/host/port: the shell mirrors and
     // persists it (`port` 0 = stopped).
     ArchiveServerSettingsChanged { root: String, host: String, port: u16 },
+    // **browsing history page** (`ironsurf://history`): the tab renders the page and asks
+    // the shell for the visit log — one `history.jsonl` at the data root, shared by every
+    // container and outside the tab's sandbox, so only the shell reads it. `clear` (a link
+    // written `ironsurf://history?clear=1`) empties the whole log first. Answered with
+    // `ToTab::HistoryList`: on every load of the page, and again whenever the log moves
+    // under a page that is showing it (a Clear, a visit from another tab).
+    HistoryListRequest { clear: bool },
     Closed,
     Error            { message: String },
 }
@@ -277,6 +284,12 @@ pub enum ToTab {
     // (port busy, folder refused). The tab renders it on `ironsurf://archive`, and steps
     // itself to `address + "/ironsurf/serve"` unless the request asked for a new tab.
     ArchiveServerInfo { tab_id: TabId, ok: bool, address: String, error: Option<String> },
+    // **browsing history page** reply: `entries` are the newest
+    // [`MAX_HISTORY_PAGE_ROWS`] visits of the shared log, newest first, and `total` counts
+    // the **whole** log so the page can admit it truncated the list. The tab re-renders
+    // `ironsurf://history` only when the answer differs from what it drew, which is what
+    // keeps an unchanged broadcast from reloading the page in a loop.
+    HistoryList      { tab_id: TabId, entries: Vec<HistoryVisit>, total: usize },
     // find in page (`Ctrl-F`): install/replace the live query and re-run it from
     // the top. The shell owns the bar; the **tab** matches over the text it laid
     // out (case-insensitive, document order, visible text only) and paints it —
@@ -837,7 +850,10 @@ in `ironsurf-tab/src/netmod.rs` and pass `Arc<OurProvider>` as `DocumentConfig.n
   `ironsurf://archive`), `archive` renders the summary of the shell's
   [archive browsing server](#archive-browsing-server-srcarchive_serversrc) — an address-less
   page by itself: it asks the shell (see `FromTab::ArchiveServerStart`) and shows what comes
-  back, any other name renders an
+  back, `history` renders the **shared browsing history** page (the visit log is the shell's
+  file too, so the page asks with `FromTab::HistoryListRequest` and draws the
+  `ToTab::HistoryList` answer; its `?clear=1` query empties the log and re-renders the plain
+  page), any other name renders an
   honest internal "no such page" that never left the process. All output escapes the requested
   URL — page names are user text, never markup.
 - Container isolation holds even in Passthrough: one process = one container; its on-disk

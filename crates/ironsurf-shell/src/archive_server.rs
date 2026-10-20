@@ -1960,7 +1960,13 @@ mod tests {
         ));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("sandbox");
-        dir
+        // Canonical, so the paths the tests compare are the paths the server
+        // reports. A served root always goes through `canonicalize` (a symlinked
+        // folder must be pinned to the tree it really lives in), and on macOS
+        // the temporary directory is a symlink — `/var/folders/…` resolves to
+        // `/private/var/folders/…`, so a raw `temp_dir()` path could never
+        // compare equal to a root the server had resolved.
+        dir.canonicalize().unwrap_or(dir)
     }
 
     fn page(root: PathBuf) -> PageState {

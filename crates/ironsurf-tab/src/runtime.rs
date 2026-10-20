@@ -899,6 +899,17 @@ pub struct Tab {
     /// page emits [`FromTab::ArchiveServerStart`] and the shell's
     /// [`ToTab::ArchiveServerInfo`] is what the page shows.
     archive_page: Option<String>,
+    /// The `ironsurf://history` page this tab is sitting on, when it is one (the
+    /// URL as asked for, `?clear=1` included). The visit log is the shell's —
+    /// one `<data-root>/history.jsonl` shared by every container, outside every
+    /// sandbox — so rendering the page emits [`FromTab::HistoryListRequest`] and
+    /// the page shows the shell's answer to [`ToTab::HistoryList`].
+    history_page: Option<String>,
+    /// The listing the history page on screen was **rendered** from (`None` =
+    /// the "asking the browser" placeholder). An answer that differs from it is
+    /// worth a re-render; one that repeats it is not, which is what stops the
+    /// page from reloading itself forever.
+    history_rendered: Option<netmod::HistoryListing>,
     /// `true` while the live navigation is one the **user** asked for (typed in
     /// the shell's address bar, Reload). Page script clears it: only a
     /// user-chosen address may ask the shell to re-point the archive server or
@@ -1236,6 +1247,8 @@ impl Tab {
             media_enabled: args.media_enabled,
             media_next_pump: None,
             archive_page: None,
+            history_page: None,
+            history_rendered: None,
             nav_from_shell: false,
             net_events,
             console_events,
@@ -1475,7 +1488,7 @@ impl Tab {
             // becomes a history entry.)
             return self.run_javascript_url(&code);
         }
-        let url = match parse_input_url(raw) {
+        let mut url = match parse_input_url(raw) {
             Ok(url) => url,
             Err(err) => {
                 warn!("bad url {raw:?}: {err}");
@@ -1495,6 +1508,29 @@ impl Tab {
         // reply (`ToTab::ArchiveServerInfo`) is rendered by the next visit.
         if netmod::is_archive_page(&url) {
             self.ask_archive_server(&url);
+        }
+
+        // `ironsurf://history`: rendered locally like every other internal page,
+        // but from a log this process may not even read (it belongs to the
+        // shell), so ask for it now; the answer arrives as [`ToTab::HistoryList`]
+        // and a page that has nothing to show re-renders when it lands. What the
+        // fetch below will paint is the listing remembered *right now*.
+        if netmod::is_history_page(&url) {
+            let clear = url
+                .query_pairs()
+                .any(|(key, value)| key == "clear" && value != "0");
+            // The query is a one-shot instruction (the row clicked was "Clear
+            // history"), not part of the page's address: drop it, so the bar
+            // reads plain `ironsurf://history` and a **Reload** re-reads the log
+            // instead of clearing it a second time.
+            if clear {
+                url.set_query(None);
+            }
+            self.history_page = Some(url.as_str().to_string());
+            self.history_rendered = netmod::history_listing();
+            self.emit(FromTab::HistoryListRequest { clear });
+        } else {
+            self.history_page = None;
         }
 
         self.emit(FromTab::LoadingChanged { loading: true });
@@ -3984,6 +4020,25 @@ impl Tab {
                     }
                 }
             }
+            ToTab::HistoryList { ref entries, total, .. } => {
+                let fresh =
+                    netmod::HistoryListing { entries: entries.clone(), total };
+                // A page still showing the answer it asked with (`None`, or an
+                // older log) renders the new one in place — same session slot,
+                // so Back still steps over the history page once. An answer that
+                // repeats what is on screen changes nothing, and that is what
+                // keeps the reload after the request from looping.
+                let stale =
+                    self.history_page.is_some() && self.history_rendered.as_ref() != Some(&fresh);
+                info!("history page: {total} visit(s) in the shared log");
+                netmod::set_history_listing(Some(fresh));
+                if stale {
+                    // `?clear=1` (the page's "Clear history" link) is a one-shot:
+                    // the re-render asks for the plain page, or it would clear
+                    // the freshly emptied log again on every reload.
+                    self.navigate(netmod::HISTORY_URL, NavHistory::Session(self.history_index));
+                }
+            }
             ToTab::Clipboard { text } => {
                 // The shell pushes the session clipboard just before it
                 // relays Ctrl+V; blitz's editors read it back through
@@ -4894,6 +4949,13 @@ impl Tab {
             text,
         };
         self.feed_ui_event(UiEvent::KeyDown(base.clone()));
+        // macOS: the delete key has to be named as an AppKit editing command as
+        // well, or the engine ignores it (see [`apple_keybinding`]).
+        if APPLE_KEYBINDINGS {
+            if let Some(command) = apple_keybinding(ev) {
+                self.feed_ui_event(UiEvent::AppleStandardKeybinding(command.into()));
+            }
+        }
         // Ctrl+A outside an editor selects all the text on screen (task:
         // select all). blitz's own Ctrl+A is editor-only (`node/text.rs`) and
         // ran on the feed above, so with a text control focused we stay out
@@ -6401,6 +6463,41 @@ fn is_action_chord(ev: &KeyEvent) -> bool {
     ev.mods.ctrl() && !ev.mods.meta()
 }
 
+/// The AppKit standard-keybinding command this key press stands for, or `None`
+/// when it is not an editing command.
+///
+/// Why the tab has to say it: blitz-dom's text-input key handling skips
+/// `Key::Backspace` on macOS outright — "On macOS this is handled by the apple
+/// standard keybindings" (`node/text.rs`) — and expects its embedder to send the
+/// `deleteBackward:`-style command instead. Blitz's own winit provider gets
+/// those from Cocoa; IronSurf's window is a Slint window, whose delete key
+/// arrives here as an ordinary key event. Without this the key did nothing at
+/// all in a page's `<input>` on a Mac (task: backspace no longer works on mac
+/// forms), while working on every other platform.
+///
+/// Only the deleting key is translated — it is the one the engine cfg's out.
+/// Arrows, Home/End, forward Delete and character input all reach blitz from
+/// the key event itself, and the page's own `keydown` is fired separately by
+/// [`Runtime::fire_js_key`], so nothing is dropped and nothing happens twice.
+pub fn apple_keybinding(ev: &KeyEvent) -> Option<&'static str> {
+    match ev.key.as_str() {
+        // The key labelled `delete` on an Apple keyboard *is* Backspace; with ⌥
+        // it deletes a word, matching the word-delete the other platforms get
+        // from the same chord.
+        "Backspace" => Some(if ev.mods.alt() {
+            "deleteWordBackward:"
+        } else {
+            "deleteBackward:"
+        }),
+        _ => None,
+    }
+}
+
+/// Whether this build must feed the AppKit commands at all: elsewhere blitz-dom
+/// handles `Key::Backspace` from the key event, so feeding the command too would
+/// delete twice.
+pub const APPLE_KEYBINDINGS: bool = cfg!(target_os = "macos");
+
 /// A freshly-synthesized editing chord (context-menu Paste) must carry the
 /// platform's action modifier exactly as blitz expects it.
 #[cfg(target_os = "macos")]
@@ -7300,6 +7397,81 @@ mod tests {
         };
         let pipe = Arc::new(SelfPipe::new().expect("pipe"));
         Tab::new_headless(&args, pipe)
+    }
+
+    /// Text the history page is showing (its `<body>`), for asserting the shell's
+    /// answer actually reached the screen.
+    fn body_text(tab: &mut Tab) -> String {
+        match tab.doc.as_mut().and_then(|doc| doc.query_selector("body").ok()) {
+            Some(Some(id)) => tab
+                .doc
+                .as_mut()
+                .and_then(|doc| doc.get_node(id))
+                .map(|n| n.text_content())
+                .unwrap_or_default(),
+            _ => String::new(),
+        }
+    }
+
+    fn visit(url: &str, title: &str) -> ironsurf_common::HistoryVisit {
+        ironsurf_common::HistoryVisit {
+            url: url.into(),
+            title: Some(title.into()),
+            at: 1_700_000_000,
+        }
+    }
+
+    /// The history page (task: `ironsurf://history`): rendered locally, but the
+    /// visit log is the shell's file, so navigating there remembers the page,
+    /// asks (the emit goes to the harness's null sink; the shell's own test
+    /// covers the wire), and shows the shell's answer when it lands — with the
+    /// page on screen re-rendering in place, so Back still steps over it once.
+    #[test]
+    fn the_history_page_shows_the_shell_answer_and_its_revisions() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut tab = form_tab(dir.path());
+        netmod::set_history_listing(None);
+
+        assert!(tab.navigate(netmod::HISTORY_URL, NavHistory::Fresh));
+        assert_eq!(tab.history_page.as_deref(), Some(netmod::HISTORY_URL));
+        assert!(
+            body_text(&mut tab).contains("Asking the browser for the visit log"),
+            "the page waits honestly, inventing neither rows nor a count"
+        );
+
+        // The shell answers: the listing lands on the screen that asked for it.
+        tab.handle_to_tab(ToTab::HistoryList {
+            tab_id: TabId(1),
+            entries: vec![visit("https://example.org/one", "One")],
+            total: 1,
+        });
+        let text = body_text(&mut tab);
+        assert!(text.contains("https://example.org/one"), "the visit is not on screen: {text}");
+        assert!(text.contains("One"), "the page's own title should head the row: {text}");
+
+        // The same answer again changes nothing on screen — which is what keeps
+        // the request/answer pair from reloading the page in a loop.
+        let before = text;
+        tab.handle_to_tab(ToTab::HistoryList {
+            tab_id: TabId(1),
+            entries: vec![visit("https://example.org/one", "One")],
+            total: 1,
+        });
+        assert_eq!(body_text(&mut tab), before);
+
+        // The log emptied under the page (Clear history in the settings drawer):
+        // the open page is told and redraws itself empty.
+        tab.handle_to_tab(ToTab::HistoryList { tab_id: TabId(1), entries: vec![], total: 0 });
+        let text = body_text(&mut tab);
+        assert!(text.contains("Nothing yet."), "the emptied log is not on screen: {text}");
+        assert!(!text.contains("example.org/one"));
+
+        // The page's own address is the plain one, query and all: a link to
+        // `?clear=1` empties the log and stays on `ironsurf://history`, so a
+        // later Reload re-reads the log instead of clearing it again.
+        assert!(tab.navigate(&format!("{}?clear=1", netmod::HISTORY_URL), NavHistory::Fresh));
+        assert_eq!(tab.history_page.as_deref(), Some(netmod::HISTORY_URL));
+        netmod::set_history_listing(None);
     }
 
     /// Task: faster, responsive loading — an `http(s)` main-document fetch
@@ -10156,6 +10328,39 @@ mod tests {
             1,
             "nothing moved, so nothing was reported"
         );
+    }
+
+    #[test]
+    fn the_mac_delete_key_names_its_appkit_command() {
+        // The engine skips `Key::Backspace` on macOS and waits for the AppKit
+        // editing command from its embedder instead, so the tab names it —
+        // task: backspace no longer works on mac forms.
+        let press = |key: &str, mods: Modifiers| KeyEvent {
+            key: key.into(),
+            code: key.into(),
+            text: Some("\u{8}".into()),
+            repeat: false,
+            mods,
+        };
+        assert_eq!(
+            apple_keybinding(&press("Backspace", Modifiers::NONE)),
+            Some("deleteBackward:")
+        );
+        assert_eq!(
+            apple_keybinding(&press("Backspace", Modifiers::NONE.with_alt())),
+            Some("deleteWordBackward:"),
+            "⌥ + delete deletes a word, like the word-delete of every other platform"
+        );
+        // Forward delete, the caret keys and plain characters are not commands:
+        // they reach blitz from the key event, and naming them too would act twice.
+        assert_eq!(apple_keybinding(&press("Delete", Modifiers::NONE)), None);
+        assert_eq!(
+            apple_keybinding(&press("ArrowLeft", Modifiers::NONE.with_alt())),
+            None
+        );
+        assert_eq!(apple_keybinding(&press("a", Modifiers::NONE)), None);
+        // Only a Mac build feeds them at all.
+        assert_eq!(APPLE_KEYBINDINGS, cfg!(target_os = "macos"));
     }
 }
 

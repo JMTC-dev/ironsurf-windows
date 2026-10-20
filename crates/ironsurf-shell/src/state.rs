@@ -265,6 +265,9 @@ impl TabState {
             // acts on it (bind the server / mirror the settings), the tab's
             // own line never changes.
             FromTab::ArchiveServerStart { .. } | FromTab::ArchiveServerSettingsChanged { .. } => false,
+            // Same for the browsing-history page: the pump reads the shared log
+            // and answers the tab; the page's own line does not move.
+            FromTab::HistoryListRequest { .. } => false,
             // File downloads: rows live on the owning `Proc` (they die with
             // its process), not on the tab's line, so nothing here changes.
             // The pump writes bytes and files the row; `sync_ui` shows it.

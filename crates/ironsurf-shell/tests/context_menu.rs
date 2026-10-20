@@ -68,15 +68,15 @@ fn right_click_opens_the_menu_the_target_deserves_and_the_rows_act() {
     assert_eq!(
         labels(&ui),
         [
-            "⟳ Reload",
             "Open link in new tab",
+            "⟳ Reload",
             "Copy",
             "Copy link address",
             "⬇ Download linked file",
             "Copy page address",
             "⌖ Inspect Element",
         ],
-        "empty clipboard ⇒ no Paste row yet"
+        "empty clipboard ⇒ no Paste row yet; the link's own row leads"
     );
     // Whatever was right-clicked, the tree of the page it landed in is
     // reachable from the last row.
@@ -100,8 +100,8 @@ fn right_click_opens_the_menu_the_target_deserves_and_the_rows_act() {
     assert_eq!(
         second,
         [
-            "⟳ Reload",
             "Open link in new tab",
+            "⟳ Reload",
             "Copy",
             "Copy link address",
             "⬇ Download linked file",
@@ -126,7 +126,7 @@ fn right_click_opens_the_menu_the_target_deserves_and_the_rows_act() {
         pump();
         ui.get_menu_open()
     });
-    ui.invoke_menu_pick(1);
+    ui.invoke_menu_pick(0); // "Open link in new tab" — the leading row
     wait_for("second tab opened the link URL", || {
         pump();
         snap().iter().any(|s| {

@@ -720,9 +720,24 @@ mod tests {
             shortcut_for("w", true, false, false),
             Some(Shortcut::CloseTab)
         );
+        // The control-character spellings are named, not trusted from the host:
+        // ETX-form Ctrl-W arrives as `\u{17}` on Linux/Windows, while on macOS
+        // that very byte is what a bare ⌘ tap reports (see the modifier-echo
+        // tests) and is therefore never a chord there. The mac form of the same
+        // chord — `⌘W` as a plain letter — is asserted below.
         assert_eq!(
-            shortcut_for("\u{17}", true, false, false),
+            shortcut_on(Chords::Ctrl, "\u{17}", true, false, false),
             Some(Shortcut::CloseTab)
+        );
+        assert_eq!(
+            shortcut_on(Chords::Cmd, "\u{17}", true, false, false),
+            None,
+            "on macOS that byte is a modifier tap, not Ctrl-W"
+        );
+        assert_eq!(
+            shortcut_for("w", true, false, false),
+            Some(Shortcut::CloseTab),
+            "the letter form is the one spelling macOS delivers"
         );
         assert_eq!(shortcut_for("r", true, false, false), Some(Shortcut::Reload));
         assert_eq!(shortcut_for("t", true, false, false), Some(Shortcut::NewTab));
