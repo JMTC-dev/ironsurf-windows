@@ -1407,8 +1407,10 @@ software-only path; `--linuxkms` pins the KMS backend; explicit `SLINT_BACKEND`
 
 UI (`crates/ironsurf-shell/ui/ironsurf.slint`):
 - `AppWindow` with: toolbar row [back, forward, reload, URL `LineEdit`, "New tab",
-  container dropdown], tab bar (horizontal scroll; each tab = container-colored stripe +
-  title + ✕), page area (`Image` fed by active tab frame, `TouchArea`/`PointerAreaHandler`
+  container dropdown], tab bar (tabs sized to an even share of the bar once they no longer
+  fit it, horizontal scroll only past that point; each tab = container-colored stripe +
+  title (elided to its tab) + ✕, and the elided part is read out by a hover tooltip),
+  page area (`Image` fed by active tab frame, `TouchArea`/`PointerAreaHandler`
   forwarding pointer+wheel events; keyboard `key-pressed`/`key-released` → `KeyEvent`).
 - Container manager popup: list containers (color swatch), add/rename/choose color (fixed
   palette), "delete container (+ data)", per-tab "Move tab to container ▸" submenu (move =
@@ -1548,6 +1550,20 @@ UI (`crates/ironsurf-shell/ui/ironsurf.slint`):
   the status line counts the saves, failures are logged, never fatal.
 - Menu (native or in-toolbar): New Window(v1: new tab), Close Tab (Ctrl-W), Tab Next/Prev
   (Ctrl-Tab), Open Container Manager, Clear Container Data.
+- **The tab strip stays inside the bar, and a tab says its whole title when hovered**
+  (task: tab strip fits the bar): a tab takes the width its title wants (90…220 px) while
+  every tab can have that, and once they cannot, every tab takes an even share of the bar —
+  `share = (bar − 6 px left padding − 16 px of Flickable viewport slack − 4 px gaps) / tab
+  count` — with a floor (74 px, 92 px under an Alt-digit badge: stripe + badge + ✕ + a
+  syllable of title) below which the tabs stop shrinking and the Flickable pans the row
+  again. A title never paints past its own tab: the `Text` is given an explicit `width`
+  (stripe/badge on the left, the ✕ on the right), because a bare `max-width` leaves it its
+  full preferred width here and the words run over the neighbour. What the ellipsis hides,
+  the hover hands back — the tab reports its hover the way `MiniButton` does and the
+  window's one tooltip overlay draws `tip-text` (the tab's full title, `New Tab` when there
+  is none) below the tab, clamped inside the window; pointing at the ✕ asks for nothing.
+  `ironsurf-shell/tests/tab_strip.rs` pins the geometry on the testing backend (even share,
+  row inside the bar, elided label, tip wider than the label, tip off on the ✕).
 - **Alt-`1` … Alt-`9` jump to the N-th tab** (⌘-`1` … ⌘-`9` on macOS; Chrome/Firefox
   convention): `keymap::shortcut_for` reports the digit only (`Shortcut::SelectTab(n)`)
   and `tab_index_for_digit(n, tab_count)` resolves it **at press time** against the live

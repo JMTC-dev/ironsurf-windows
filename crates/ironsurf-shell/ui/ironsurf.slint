@@ -656,6 +656,12 @@ export component AppWindow inherits Window {
     in-out property <bool> tip-on: false;
     in-out property <length> tip-x: 0px;
     in-out property <length> tip-y: 0px;
+    /// The words a *non-toolbar* control has to say (task: tab strip fits the
+    /// bar): a tab's hover puts the tab's full, un-elided title here and the one
+    /// overlay shows it, because the row itself can only ever show as much of a
+    /// title as the tab's share of the bar holds. Empty everywhere else, which
+    /// is what lets ⛔ keep speaking through `popup-tip` untouched.
+    in-out property <string> tip-text: "";
 
     in-out property<string> url-text <=> url-bar.text;
     in property <string> status-text;
@@ -1187,7 +1193,15 @@ export component AppWindow inherits Window {
         }
 
         // ---- tab strip ----------------------------------------------------
-        Rectangle {
+        // Tabs share the bar instead of running off its right end: a tab takes
+        // the width its title wants while there is room for every tab to have
+        // that, and once there is not, every tab takes an even share of what the
+        // bar has left and its title is elided to fit. Only when even a share
+        // would come out narrower than the stripe, a badge and the ✕ do the tabs
+        // stop shrinking and the Flickable pans the row. Nothing is hidden by
+        // the ellipsis: hovering a tab hands its full title to the window's one
+        // tooltip (task: tab strip fits the bar).
+        stripr := Rectangle {
             height: 30px;
             background: #252525;
 
@@ -1203,9 +1217,22 @@ export component AppWindow inherits Window {
                     padding-left: 6px;
                     padding-top: 3px;
 
-                    for tab[idx] in tabs: Rectangle {
+                    for tab[idx] in tabs: tabrect := Rectangle {
+                        // What this tab would take if every tab were treated
+                        // alike: the bar less its 6 px of left padding, the 16 px
+                        // of slack the Flickable adds to its viewport (and
+                        // centers the row in, so a row that claims the whole bar
+                        // hangs 8 px over the end) and the 4 px gaps between
+                        // neighbours, split evenly. Measured off the bar, never
+                        // off the row — the row is exactly as wide as its tabs
+                        // are, which is the thing being solved for.
+                        property <length> share: (stripr.width - 22px - 4px * Math.max(0, tabs.length - 1)) / Math.max(1, tabs.length);
+                        // Stripe + badge + ✕ + at least a syllable of title:
+                        // the point below which squeezing turns a tab into a
+                        // glyph, so the row overflows and scrolls instead.
+                        property <length> squeeze-floor: tab.shortcut == "" ? 74px : 92px;
                         height: 24px;
-                        width: Math.min(220px, Math.max(90px, tt.preferred-width + (tab.shortcut == "" ? 44px : 61px)));
+                        width: Math.max(self.squeeze-floor, Math.min(Math.min(220px, Math.max(90px, tt.preferred-width + (tab.shortcut == "" ? 44px : 61px))), self.share));
                         tbgr := Rectangle {
                             background: tab.active ? #3a3a3a : #2e2e2e;
                             border-radius: 4px;
@@ -1230,14 +1257,23 @@ export component AppWindow inherits Window {
                             vertical-alignment: center;
                             horizontal-alignment: right;
                         }
+                        // A `max-width` leaves a Text its full preferred width
+                        // in this layout (measured, not guessed), so the title
+                        // is told how wide it is: everything past the tab's own
+                        // edge — stripe and badge on the left, the ✕ on the
+                        // right — is an ellipsis, never a word drawn over the
+                        // neighbour.
                         tt := Text {
                             text: tab.title == "" ? "New Tab" : tab.title;
                             color: tab.active ? #f0f0f0 : #999999;
                             x: tab.shortcut == "" ? 16px : 33px;
+                            width: Math.max(0px, parent.width - (tab.shortcut == "" ? 40px : 57px));
                             vertical-alignment: center;
-                            max-width: parent.width - (tab.shortcut == "" ? 40px : 57px);
                             overflow: elide;
                         }
+                        // The title in full, for the hover tooltip: exactly the
+                        // string `tt` may have shortened.
+                        property <string> full-title: tab.title == "" ? "New Tab" : tab.title;
                         xbtn := Text {
                             text: "×";
                             color: xt.has-hover ? #ffffff : #888888;
@@ -1250,6 +1286,23 @@ export component AppWindow inherits Window {
                         // fill the whole tab) closes it instead
                         tabta := TouchArea {
                             clicked => { root.activate-tab(idx); }
+                            // Same house rule as the toolbar buttons: the hover
+                            // is reported and the window's single overlay draws
+                            // it (a tooltip inside the tab would be a descendant
+                            // of the strip and paint under the page). The ✕ sits
+                            // on top with its own zone, so pointing at it asks
+                            // nothing of the title.
+                            changed has-hover => {
+                                if (tabta.has-hover) {
+                                    root.tip-text = tabrect.full-title;
+                                    root.tip-x = tabrect.absolute-position.x;
+                                    root.tip-y = tabrect.absolute-position.y + tabrect.height + 6px;
+                                    root.tip-on = true;
+                                } else {
+                                    root.tip-on = false;
+                                    root.tip-text = "";
+                                }
+                            }
                         }
                         xzone := Rectangle {
                             x: parent.width - 24px;
@@ -2728,10 +2781,13 @@ export component AppWindow inherits Window {
     // never eats the hover it is drawn from, and it disappears the moment the
     // pointer leaves the control it came from.
     tip-layer := Rectangle {
-        visible: root.tip-on && root.popup-tip != "";
+        visible: root.tip-on && (root.tip-text != "" || root.popup-tip != "");
         x: Math.min(root.tip-x, parent.width - self.width - 8px);
         y: root.tip-y;
-        width: tip-lbl.preferred-width + 16px;
+        // A whole page title is longer than a toolbar word and can outgrow the
+        // window: the box stops at its edges and the words are elided there
+        // rather than drawn off-screen.
+        width: Math.min(tip-lbl.preferred-width + 16px, parent.width - 16px);
         height: tip-lbl.preferred-height + 10px;
         background: #1b1b1bf7;
         border-radius: 4px;
@@ -2741,7 +2797,9 @@ export component AppWindow inherits Window {
         tip-lbl := Text {
             x: 8px;
             y: 5px;
-            text: root.popup-tip;
+            width: parent.width - 16px;
+            overflow: elide;
+            text: root.tip-text != "" ? root.tip-text : root.popup-tip;
             color: #e0e0e0;
             font-size: 11px;
         }
