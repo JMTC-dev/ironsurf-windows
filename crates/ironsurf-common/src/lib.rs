@@ -283,11 +283,36 @@ pub enum FromTab {
     PopupBlocked {
         url: String,
     },
+    /// **Browsing history page** (`ironsurf://history`): the tab renders the
+    /// visit list, but the log belongs to the **shell** (it lives at the data
+    /// root, outside every container's sandbox), so the page asks over IPC and
+    /// the shell answers with [`ToTab::HistoryList`] — the same favour
+    /// `ironsurf://archive` asks of its server. `clear` (the page's
+    /// `?clear=1` row) means "delete the whole shared log, then read it back".
+    HistoryListRequest {
+        clear: bool,
+    },
     Closed,
     Error {
         message: String,
     },
 }
+
+/// One visit as the `ironsurf://history` page sees it: the address, the page
+/// title the shell learned for it (`None`/blank = title the URL), and the
+/// moment of the visit in whole seconds since the Unix epoch. The shell reads
+/// the shared `history.jsonl` and formats; tabs never see that file.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HistoryVisit {
+    pub url: String,
+    pub title: Option<String>,
+    pub at: i64,
+}
+
+/// Visits one `ToTab::HistoryList` carries: the newest N, newest first. The
+/// log itself is bounded by `ironsurf_storage::MAX_HISTORY_ENTRIES`; the page
+/// shows this many and says so (`total` is the whole log).
+pub const MAX_HISTORY_PAGE_ROWS: usize = 500;
 
 /// One shell-to-tab message.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -311,6 +336,13 @@ pub enum ToTab {
     /// it. The factor persists across navigations for the tab's lifetime.
     SetZoom {
         zoom: f32,
+    },
+    /// Scroll-speed multiplier from the settings menu's slider (the ☰ panel):
+    /// `1.0` = the tab's default wheel damping. A browser-wide setting — the
+    /// shell pushes it to every running tab when the slider moves and seeds
+    /// fresh tabs with it at spawn; the tab clamps nonsense to its sane range.
+    SetScrollSpeed {
+        speed: f32,
     },
     /// Throttle background rendering.
     SetVisible {
@@ -485,6 +517,15 @@ pub enum ToTab {
     SetPopupPolicy {
         block: bool,
         allowed: Vec<String>,
+    },
+    /// Reply to [`FromTab::HistoryListRequest`] (the `ironsurf://history`
+    /// page): `entries` are the newest [`MAX_HISTORY_PAGE_ROWS`] visits in the
+    /// shared log, newest first, and `total` counts the **whole** log so the
+    /// page can admit it truncated the list.
+    HistoryList {
+        tab_id: TabId,
+        entries: Vec<HistoryVisit>,
+        total: usize,
     },
     Destroy,
 }
@@ -1288,6 +1329,12 @@ pub const MAX_FRAME_BYTES: usize = 64 * 1024 * 1024;
 /// every `ironsurf://…` URL is answered locally by the tab process (see
 /// `ironsurf_tab::netmod::internal_page_bytes`) and never touches the network.
 pub const WELCOME_URL: &str = "ironsurf://welcome";
+
+/// The browsing-history page (`ironsurf://history`): the shared visit log as a
+/// page of its own, rendered by the tab from the shell's answer to
+/// [`FromTab::HistoryListRequest`] and opened by the ☰ settings panel's
+/// **History** button.
+pub const HISTORY_URL: &str = "ironsurf://history";
 
 /// Default start page URL (the built-in `ironsurf://welcome` page).
 pub fn default_url() -> String {

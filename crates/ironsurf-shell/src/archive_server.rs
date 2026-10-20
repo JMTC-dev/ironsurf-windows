@@ -165,6 +165,12 @@ pub fn normalize_host(raw: &str) -> Result<String, String> {
 /// system tree and the machine root are not archives, and an unauthenticated
 /// server pointed at them leaks the machine rather than the session. Checked
 /// before anything is created, so a hostile `root` cannot plant directories.
+///
+/// The deny list matches the system folders *themselves*, not everything
+/// hanging under them: `/etc` is the machine, `/var/www/releases` is an
+/// archive. A subtree rule would reject macOS's own temporary tree (its
+/// `$TMPDIR` is `/var/folders/…/T/…`, and `/run/user/…` does the same on
+/// Linux) — the very place per-test archive folders get made.
 fn forbidden_root(raw: &str) -> bool {
     const DENY: [&str; 15] = [
         "/", "/etc", "/usr", "/bin", "/sbin", "/lib", "/lib64", "/dev", "/proc", "/sys",
@@ -172,9 +178,7 @@ fn forbidden_root(raw: &str) -> bool {
     ];
     let trimmed = raw.trim_end_matches('/');
     let candidate = if trimmed.is_empty() { "/" } else { trimmed };
-    DENY.iter().any(|denied| {
-        candidate == *denied || candidate.starts_with(&format!("{denied}/"))
-    })
+    DENY.iter().any(|denied| candidate == *denied)
 }
 
 /// Parse a port field: empty / `0` / `random` → [`RANDOM_PORT`], else 1–65535.
@@ -1956,7 +1960,13 @@ mod tests {
         ));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("sandbox");
-        dir
+        // Canonical, so the paths the tests compare are the paths the server
+        // reports. A served root always goes through `canonicalize` (a symlinked
+        // folder must be pinned to the tree it really lives in), and on macOS
+        // the temporary directory is a symlink — `/var/folders/…` resolves to
+        // `/private/var/folders/…`, so a raw `temp_dir()` path could never
+        // compare equal to a root the server had resolved.
+        dir.canonicalize().unwrap_or(dir)
     }
 
     fn page(root: PathBuf) -> PageState {
@@ -2339,6 +2349,17 @@ mod tests {
             normalize_root(&fresh.display().to_string()).unwrap(),
             fresh.canonicalize().unwrap()
         );
+        // The system folders themselves are refused…
+        assert!(normalize_root("/").is_err());
+        assert!(normalize_root("/etc").is_err());
+        assert!(normalize_root("/var/").is_err());
+        // …but folders *under* a system folder are archives: macOS keeps its
+        // whole $TMPDIR under /var (and Linux its per-user one under /run),
+        // so a subtree refusal rejects the machine's own scratch space.
+        assert!(!forbidden_root("/var/folders/dg/n9/T/ironsurf-serve-1"));
+        assert!(!forbidden_root("/var/folders"));
+        assert!(!forbidden_root("/run/user/1000/archive"));
+        assert!(!forbidden_root("/usr/ironsurf/archive"));
     }
 
     #[test]

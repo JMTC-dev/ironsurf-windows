@@ -2,20 +2,23 @@
 //!
 //! One shared `history.jsonl` at the data-root, fed by every tab's
 //! `UrlChanged`: visits from container 1 and container 2 land in the **same**
-//! log (the seeded second container proves it is not per-profile), the ☰
-//! toolbar button opens the overlay listing them newest-first, a row click
-//! reopens that address in a new tab, "Clear history" deletes the log whole,
-//! and the Ctrl-Alt-T chord reopens the last closed tab — its address
-//! restored and recorded as a fresh visit. `about:blank` is plumbing, never
-//! a visit. The log format, dedup, trimming, and clearing round trips are
-//! covered by `ironsurf-storage/tests/history.rs`; this is the shell's flow.
+//! log (the seeded second container proves it is not per-profile). The log is
+//! read on a **page** — `ironsurf://history` — which the ☰ settings drawer's
+//! History button opens; the drawer itself only counts the log in one line and
+//! offers the buttons. The page asks the shell for the list (the file is out of
+//! reach of the tab's sandbox) and is told again whenever the log moves; "Clear
+//! history" deletes the log whole, and the Ctrl-Alt-T chord reopens the last
+//! closed tab — its address restored and recorded as a fresh visit.
+//! `about:blank` and `ironsurf://…` are plumbing, never a visit. The log format,
+//! dedup, trimming, late titles and clearing round trips are covered by
+//! `ironsurf-storage/tests/history.rs`; the page's own markup by
+//! `ironsurf-tab`'s `netmod` tests; this is the shell's flow.
 
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use ironsurf_shell::app::App;
 use ironsurf_shell::AppWindow;
-use slint::Model;
 
 fn wait_for(what: &str, cond: impl Fn() -> bool) {
     let deadline = Instant::now() + Duration::from_secs(10);
@@ -93,19 +96,16 @@ fn history_is_shared_cleared_and_ctrl_alt_t_reopens_closed_tabs() {
             ]
     });
 
-    // ── The ☰ overlay: newest first, status counts the shared whole ──────────
+    // ── The ☰ drawer: settings and a one-line count of the shared whole. The
+    //    visits themselves are no longer rows in here — they are a page ───────
     assert!(!ui.get_history_menu_open());
     ui.invoke_toggle_history_menu();
     assert!(ui.get_history_menu_open());
-    let rows = |ui: &AppWindow| {
-        let items = ui.get_history_items();
-        (0..items.row_count())
-            .map(|i| items.row_data(i).unwrap().url.to_string())
-            .collect::<Vec<_>>()
-    };
-    assert_eq!(rows(&ui).len(), 2);
-    assert_eq!(rows(&ui)[0], "https://html.duckduckgo.com/html/?q=rustlang+news");
-    assert_eq!(ui.get_history_status().as_str(), "2 visits shared by every container");
+    assert_eq!(
+        ui.get_history_status().as_str(),
+        "2 visits shared by every container",
+        "the drawer counts the log it no longer lists"
+    );
 
     // ── Overlays never stack: each neighbour's open closes this one, and
     //    opening History closes all of them ──────────────────────────────────
@@ -114,20 +114,39 @@ fn history_is_shared_cleared_and_ctrl_alt_t_reopens_closed_tabs() {
     ui.invoke_toggle_history_menu();
     assert!(ui.get_history_menu_open() && !ui.get_manager_open(), "and vice versa");
 
-    // ── A row click opens that address in a new tab (menu closes) ────────────
-    ui.invoke_history_pick(1); // "one", visited from container 1
-    assert!(!ui.get_history_menu_open());
-    wait_for("the picked address reopens in a new tab", || {
+    // ── The drawer's History button opens the visit log as a page, and puts
+    //    the drawer away ─────────────────────────────────────────────────────
+    ui.invoke_history_page();
+    assert!(!ui.get_history_menu_open(), "the drawer steps aside for its page");
+    wait_for("a tab opens on the history page", || {
         pump();
-        tabs().len() == 3 && tabs()[2].url.as_deref() == Some("https://example.org/one")
+        tabs().last().is_some_and(|t| t.url.as_deref() == Some(ironsurf_common::HISTORY_URL))
+    });
+    assert_eq!(
+        log_urls().len(),
+        2,
+        "opening the page is not a visit — the internal scheme is plumbing"
+    );
+
+    // The page cannot read the log itself (it lives at the data root, outside
+    // the tab's sandbox), so it asks on the way in and the shell answers; the
+    // fake tab prints the answer it was given as its status line:
+    // "history:<rows in the log>:<rows shown>".
+    wait_for("the shell answers the page's request for the log", || {
+        pump();
+        tabs().last().is_some_and(|t| t.status.as_deref() == Some("history:2:2"))
     });
 
-    // ── Clear history: the whole shared log goes, menu re-reads as empty ─────
+    // ── Clear history: the whole shared log goes, the drawer re-reads as empty,
+    //    and the open page is told the log moved under it ────────────────────
     ui.invoke_history_clear();
     assert!(!log.path().exists(), "the log file is removed");
     assert!(log_urls().is_empty());
-    assert!(rows(&ui).is_empty(), "the open menu shows itself empty");
     assert_eq!(ui.get_history_status().as_str(), "0 visits shared by every container");
+    wait_for("the open history page sees the emptied log", || {
+        pump();
+        tabs().last().is_some_and(|t| t.status.as_deref() == Some("history:0:0"))
+    });
     ui.invoke_history_clear(); // clearing twice is fine
     assert!(log_urls().is_empty());
 

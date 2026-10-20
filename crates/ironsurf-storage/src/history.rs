@@ -98,6 +98,42 @@ impl History {
         Ok(())
     }
 
+    /// Re-title the **newest** entry for `url` — the visit log's late arrival.
+    /// A navigation is recorded the moment the address changes, and the page's
+    /// own `<title>` only exists a moment later (the document has to be fetched
+    /// and parsed first, and scripts may rename it afterwards), so the shell
+    /// writes the visit and then corrects it here as the title lands. `None`/
+    /// blank means the page has no title and any stale one carried over from
+    /// the previous page is wiped, so an entry never shows a title its address
+    /// never had. The newest match is the one this call is about: an older
+    /// visit to the same address keeps the title it had. The file is only
+    /// rewritten when a title actually changes — an unchanged title costs one
+    /// read, so a page that renames itself every second does not hammer disk.
+    pub fn set_latest_title(&self, url: &str, title: Option<&str>) -> Result<bool, StoreError> {
+        let mut lines = read_lines(&self.path)?;
+        let clean = title.map(str::trim).filter(|t| !t.is_empty()).map(str::to_string);
+        for index in (0..lines.len()).rev() {
+            let Ok(mut entry) = serde_json::from_str::<HistoryEntry>(&lines[index]) else {
+                continue; // a corrupt line is not an entry, and not an owner
+            };
+            if entry.url != url {
+                continue;
+            }
+            if entry.title == clean {
+                return Ok(false);
+            }
+            entry.title = clean;
+            lines[index] =
+                serde_json::to_string(&entry).map_err(|e| StoreError::json(&self.path, e))?;
+            let mut body = lines.join("\n");
+            body.push('\n');
+            std::fs::write(&self.path, body.as_bytes())
+                .map_err(|e| StoreError::io(&self.path, e))?;
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
     /// Every entry, **newest first**. Unparseable lines are skipped (they die
     /// on the next trim).
     pub fn entries(&self) -> Vec<HistoryEntry> {

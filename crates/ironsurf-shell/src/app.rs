@@ -14,8 +14,8 @@ use std::sync::mpsc::{channel, Receiver, Sender};
 
 use ironsurf_common::{debug, error, info, trace, warn};
 use ironsurf_common::{
-    default_url, ContextAction, ContextTarget, ContainerId, DialogKind, FromTab, ScrollState,
-    TabId, ToTab, Userscript,
+    default_url, ContextAction, ContextTarget, ContainerId, DialogKind, FromTab, HistoryVisit,
+    ScrollState, TabId, ToTab, Userscript, HISTORY_URL, MAX_HISTORY_PAGE_ROWS,
 };
 use ironsurf_storage::default_data_root;
 use slint::{
@@ -39,7 +39,7 @@ use crate::state::{
 use crate::tabs::{PumpedMessage, TabProc};
 use crate::uisettings::UiSettings;
 use crate::{
-    AppWindow, ContainerInfo, DownloadItem, HistoryItem, MenuItem, SuggestItem, TabInfo,
+    AppWindow, ContainerInfo, DownloadItem, MenuItem, SuggestItem, TabInfo,
 };
 // The Slint-side row structs the DevTools panel renders (`state`'s own
 // view-models of the same name are converted into these).
@@ -495,9 +495,11 @@ struct ClosedTabRecord {
 /// How many closed tabs Ctrl-Alt-T can walk back through.
 const CLOSED_TABS_MAX: usize = 50;
 
-/// How many entries the History menu lists (newest first). Clearing is
-/// all-or-nothing on the whole shared log regardless of this display window.
-const HISTORY_MENU_ROWS: usize = 200;
+/// How many visits the `ironsurf://history` page lists (newest first) — the
+/// shell-side half of [`ironsurf_common::MAX_HISTORY_PAGE_ROWS`], which says
+/// how many it will hand over. Clearing is all-or-nothing on the whole shared
+/// log regardless of this display window.
+const HISTORY_PAGE_ROWS: usize = MAX_HISTORY_PAGE_ROWS;
 
 /// Rows the URL bar dropdown shows at most (task: URL bar autocomplete) —
 /// Chrome's own count; the rest of the visit log stays reachable through the
@@ -830,6 +832,11 @@ impl Core {
                 // A tab process starts with an empty script set: seed it with
                 // the enabled userscripts at once (task: userscript menu).
                 self.seed_userscripts(id);
+                // …and with the settings menu's scroll speed (task: settings
+                // menu), so a fresh wheel turns at the chosen speed too.
+                if let Some(speed) = self.settings.borrow().scroll_speed {
+                    let _ = self.send_to(id, ToTab::SetScrollSpeed { speed });
+                }
                 true
             }
             Err(err) => {
@@ -1182,7 +1189,36 @@ impl Core {
             Some(sc) => debug!("shortcut {sc:?} (key {text:?} ctrl={ctrl} alt={alt} meta={meta})"),
             None => trace!("key {text:?} ctrl={ctrl} alt={alt} meta={meta} → page"),
         }
-        match keymap::shortcut_for(text, ctrl, alt, meta) {
+        if let Some(sc) = keymap::shortcut_for(text, ctrl, alt, meta) {
+            self.dispatch_page_shortcut(sc);
+            return;
+        }
+        self.forward_page_key(text, ctrl, shift, alt, meta, repeat);
+    }
+
+    /// A plain (non-chord) key goes to the page — clipboard pre-push for the
+    /// paste chord included.
+    fn forward_page_key(&self, text: &str, ctrl: bool, shift: bool, alt: bool, meta: bool, repeat: bool) {
+        // Ctrl+V: the sandboxed tab cannot read the session clipboard, so
+        // push it in before the keystroke is relayed (blitz's editors pull
+        // the paste from `ShellProvider::get_clipboard_text`, which answers
+        // from this cache).
+        if is_paste_chord(text, ctrl, alt, meta) {
+            // The system clipboard wins when it has text (the user copied
+            // from another app a moment ago); else the session copy stands.
+            let clip = self.paste_text();
+            debug!("clipboard: pushed {} char(s) ahead of Ctrl+V", clip.chars().count());
+            self.send_active(ToTab::Clipboard { text: clip });
+        }
+        let ev = keymap::to_ipc_key(text, ctrl, shift, alt, meta, repeat);
+        self.send_active(ToTab::Key(ev));
+    }
+
+    /// The browser-chord table, shared by page focus and by the text bars'
+    /// [`bar_chord`] (task: keep keyboard shortcuts usable while the URL bar
+    /// is focused).
+    fn dispatch_page_shortcut(&self, sc: Shortcut) {
+        match Some(sc) {
             Some(Shortcut::FocusUrl) => {
                 self.focus_url_bar();
                 return;
@@ -1237,10 +1273,11 @@ impl Core {
                 return;
             }
             Some(Shortcut::ToggleDevTools) => {
-                // Page focus only: the chord arrives from the page's `FocusScope`.
-                // Catching it while the URL bar is focused would need a second
-                // `FocusScope` wrapped around the `LineEdit`, which risks
-                // swallowing ordinary typing — and the panel is a page tool.
+                // Over the page the chord arrives from the page's
+                // `FocusScope`; while a text bar holds focus the bar offers it
+                // to `bar_chord` first (task: keep keyboard shortcuts usable
+                // while the URL bar is focused) — no second `FocusScope`
+                // around the `LineEdit`, so ordinary typing stays untouched.
                 self.toggle_devtools();
                 return;
             }
@@ -1325,19 +1362,22 @@ impl Core {
             }
             None => {}
         }
-        // Ctrl+V: the sandboxed tab cannot read the session clipboard, so
-        // push it in before the keystroke is relayed (blitz's editors pull
-        // the paste from `ShellProvider::get_clipboard_text`, which answers
-        // from this cache).
-        if is_paste_chord(text, ctrl, alt, meta) {
-            // The system clipboard wins when it has text (the user copied
-            // from another app a moment ago); else the session copy stands.
-            let clip = self.paste_text();
-            debug!("clipboard: pushed {} char(s) ahead of Ctrl+V", clip.chars().count());
-            self.send_active(ToTab::Clipboard { text: clip });
-        }
-        let ev = keymap::to_ipc_key(text, ctrl, shift, alt, meta, repeat);
-        self.send_active(ToTab::Key(ev));
+    }
+
+    /// A chord delivered while a text bar (URL or find) holds focus
+    /// (task: keep keyboard shortcuts usable while the URL bar is focused):
+    /// the tabled browser chords fire exactly as they do over the page —
+    /// Ctrl-T still makes a tab, the digits still switch tabs — while plain
+    /// typing, caret motion and the entry's own editing chords stay local to
+    /// the entry (Esc included, so the completion dropdown keeps its
+    /// controls). `true` means the chord was consumed.
+    fn bar_chord(&self, text: &str, ctrl: bool, alt: bool, meta: bool) -> bool {
+        let Some(sc) = keymap::bar_shortcut(text, ctrl, alt, meta) else {
+            return false;
+        };
+        debug!("shortcut {sc:?} (key {text:?}) with a text bar focused");
+        self.dispatch_page_shortcut(sc);
+        true
     }
 
     /// One zoom step (in/out) from the active tab's current factor.
@@ -3640,35 +3680,63 @@ impl Core {
 
     // ---- browsing history & reopen closed tab (task: browsing history) ----
 
-    /// Rebuild the History menu's rows and status line from the shared log.
-    /// Rows are the newest [`HISTORY_MENU_ROWS`] visits, each titled by page
-    /// title falling back to the URL (Rust side, so a row always reads as
-    /// something); the status line counts the **whole** log, which every
-    /// container contributes to and reads from alike.
+    /// Rebuild the settings drawer's one-line history summary from the shared
+    /// log. The visits themselves live on their own page
+    /// ([`HISTORY_URL`], a tab like any other) — the drawer is settings, and
+    /// all it keeps of the log is the count that explains what **Clear
+    /// history** is about to delete.
     fn history_state(&self, ui: &AppWindow) {
-        let entries = ironsurf_storage::History::open(self.store.borrow().root()).entries();
-        let rows: Vec<HistoryItem> = entries
-            .iter()
-            .take(HISTORY_MENU_ROWS)
-            .map(|e| {
-                let title = e
-                    .title
-                    .as_deref()
-                    .filter(|t| !t.is_empty())
-                    .unwrap_or(&e.url);
-                HistoryItem { title: title.into(), url: e.url.as_str().into() }
-            })
-            .collect();
-        let n = entries.len();
-        ui.set_history_items(ModelRc::from(Rc::new(VecModel::from(rows))));
+        let n = ironsurf_storage::History::open(self.store.borrow().root())
+            .entries()
+            .len();
         ui.set_history_status(
-            if n > HISTORY_MENU_ROWS {
-                format!("{n} visits shared by every container \u{2014} newest {HISTORY_MENU_ROWS} listed")
-            } else {
-                format!("{n} visit{} shared by every container", if n == 1 { "" } else { "s" })
-            }
-            .into(),
+            format!("{n} visit{} shared by every container", if n == 1 { "" } else { "s" })
+                .into(),
         );
+    }
+
+    /// Answer the `ironsurf://history` page (task: history page). The log is
+    /// the shell's — one `<data-root>/history.jsonl` for every container, out
+    /// of reach of every sandbox — so the page asks and this replies with the
+    /// newest [`HISTORY_PAGE_ROWS`] visits and the size of the whole log.
+    /// `clear` (the page's `?clear=1` link) empties the log **first**, so the
+    /// answer that follows is the truth after the deletion.
+    fn history_list_for(&self, tid: TabId, clear: bool) {
+        if clear {
+            let history = ironsurf_storage::History::open(self.store.borrow().root());
+            match history.clear() {
+                Ok(n) => info!("history page: cleared {n} shared history entries"),
+                Err(err) => warn!("clearing browsing history failed: {err}"),
+            }
+        }
+        let (visits, total) = self.history_page_rows();
+        let _ = self.send_to(tid, ToTab::HistoryList { tab_id: tid, entries: visits, total });
+    }
+
+    /// The `ironsurf://history` page's body: the newest [`HISTORY_PAGE_ROWS`] visits of the
+    /// shared log, newest first, plus the size of the **whole** log so the page can say what
+    /// it left out. Reading that file is this process's job — a tab never sees it.
+    fn history_page_rows(&self) -> (Vec<HistoryVisit>, usize) {
+        let entries = ironsurf_storage::History::open(self.store.borrow().root()).entries();
+        let total = entries.len();
+        (
+            entries
+                .into_iter()
+                .take(HISTORY_PAGE_ROWS)
+                .map(|e| HistoryVisit { url: e.url, title: e.title, at: e.at })
+                .collect(),
+            total,
+        )
+    }
+
+    /// The settings drawer's **History** button: open the browsing-history page
+    /// (`ironsurf://history`) in a new tab of the container new tabs open in,
+    /// and put the drawer away — the visits are a page now, not a panel.
+    fn open_history_page(&self) {
+        self.history_menu(false);
+        let container = self.new_tab_container();
+        info!("history: opening {HISTORY_URL} in a new tab (container {})", container.0);
+        self.open_tab(container, Some(HISTORY_URL));
     }
 
     /// Open/close the History overlay. Opening closes the manager, the
@@ -3696,24 +3764,6 @@ impl Core {
         self.history_menu(!open);
     }
 
-    /// A History row was clicked: open that address in a **new** tab of the
-    /// container new tabs open in (history itself stays shared — the row came
-    /// from the global log regardless of who visited it).
-    fn history_pick(&self, idx: usize) {
-        let url = self
-            .ui()
-            .and_then(|ui| ui.get_history_items().row_data(idx).map(|it| it.url.to_string()))
-            .filter(|u| !u.is_empty());
-        let Some(url) = url else {
-            warn!("history row {idx} is gone \u{2014} nothing opened");
-            return;
-        };
-        self.history_menu(false);
-        let container = self.new_tab_container();
-        info!("history: opening {url} in a new tab (container {})", container.0);
-        self.open_tab(container, Some(&url));
-    }
-
     /// Clear: delete the **entire shared log** at once (there is no
     /// per-container slice to clear — that is the point of the task), then
     /// re-read so the open menu shows itself empty. The reopen stack is
@@ -3726,6 +3776,37 @@ impl Core {
         }
         if let Some(ui) = self.ui() {
             self.history_state(&ui);
+        }
+        self.refresh_history_pages();
+    }
+
+    /// Tell every tab sitting on `ironsurf://history` that the log moved under
+    /// it (a Clear from the drawer, a visit from another window), so the page
+    /// on screen is never left holding an older list. The tab compares the
+    /// answer with what it rendered, so a broadcast that changes nothing costs
+    /// a re-render of nothing.
+    fn refresh_history_pages(&self) {
+        let open: Vec<TabId> = self
+            .procs
+            .borrow()
+            .iter()
+            .filter(|p| {
+                p.state
+                    .url
+                    .as_deref()
+                    .is_some_and(|u| u.starts_with(HISTORY_URL))
+            })
+            .map(|p| p.tab.id)
+            .collect();
+        if open.is_empty() {
+            return;
+        }
+        let (visits, total) = self.history_page_rows();
+        for tid in open {
+            let _ = self.send_to(
+                tid,
+                ToTab::HistoryList { tab_id: tid, entries: visits.clone(), total },
+            );
         }
     }
 
@@ -4188,6 +4269,30 @@ impl Core {
         let _ = settings.save(&self.ui_path); // best-effort
     }
 
+    /// The settings menu's scroll-speed slider (the ☰ panel): a browser-wide
+    /// wheel-travel multiplier, `1.0` = the default damping. Clamped to the
+    /// slider's own range, persisted to ui.json at once, and pushed to every
+    /// running tab — fresh ones are seeded at spawn, so the choice is global
+    /// and outlives the session.
+    fn set_scroll_speed(&self, speed: f32) {
+        let speed = if speed.is_finite() {
+            speed.clamp(0.2, 3.0)
+        } else {
+            1.0
+        };
+        info!("settings: scroll speed → {:.0}%", speed * 100.0);
+        self.settings.borrow_mut().scroll_speed = Some(speed);
+        self.save_settings();
+        for p in self.procs.borrow().iter() {
+            if let Err(err) = p.tab.send(ToTab::SetScrollSpeed { speed }) {
+                warn!("tab {} could not set scroll speed: {err}", p.tab.id);
+            }
+        }
+        if let Some(ui) = self.ui() {
+            ui.set_scroll_speed(speed);
+        }
+    }
+
     // ---- message pump --------------------------------------------------------------
 
     /// Drain every queued `FromTab` message: reduce per-tab state, keep only
@@ -4312,6 +4417,12 @@ impl Core {
                 FromTab::ArchiveServerSettingsChanged { root, host, port } => {
                     info!("tab {tid} reports the archive server moved to {host}:{port} ({root})")
                 }
+                // `ironsurf://history`: the page asked for the visit log (with
+                // `clear` when the row it clicked was "Clear history"); the
+                // reply goes out below.
+                FromTab::HistoryListRequest { clear } => {
+                    info!("tab {tid} asked for the browsing history (clear: {clear})")
+                }
                 FromTab::ClipboardText { text } => {
                     // Page copy (Ctrl+C/X, editor cut): the shell owns the
                     // session clipboard (task: context menu).
@@ -4369,25 +4480,49 @@ impl Core {
                 if !worth_recording(url) {
                     continue;
                 }
-                let title = {
-                    let procs = self.procs.borrow();
-                    procs.iter().find(|p| p.tab.id == tid).map(|p| p.state.title.clone())
-                };
-                if let Some(title) = title {
-                    let history = ironsurf_storage::History::open(self.store.borrow().root());
-                    let title = if title.is_empty() { None } else { Some(title.as_str()) };
-                    if let Err(err) = history.record(url, title) {
-                        warn!("history entry for {url} not written: {err}");
-                    } else {
-                        debug!("history: recorded {url} (shared log)");
-                    }
-                    // Keep an open History menu current as visits land.
-                    if let Some(ui) = self.ui() {
-                        if ui.get_history_menu_open() {
-                            self.history_state(&ui);
-                        }
+                // The title is deliberately **not** read from the tab here: at
+                // the moment the address changes the new document has not been
+                // parsed, so the tab's title is still the *previous* page's —
+                // which is how half the log ended up titled "Welcome to
+                // IronSurf". The visit is written untitled (the page and the
+                // completions fall back to the URL) and `TitleChanged` below
+                // stamps the real one as soon as it exists.
+                let history = ironsurf_storage::History::open(self.store.borrow().root());
+                if let Err(err) = history.record(url, None) {
+                    warn!("history entry for {url} not written: {err}");
+                } else {
+                    debug!("history: recorded {url} (shared log, title to follow)");
+                }
+                // Keep the drawer's count and any open history page current.
+                if let Some(ui) = self.ui() {
+                    if ui.get_history_menu_open() {
+                        self.history_state(&ui);
                     }
                 }
+                self.refresh_history_pages();
+            }
+            // The page's own `<title>` landed (or a script renamed the document):
+            // stamp it on the visit that is being read right now. Blank means
+            // the page has no title, and an entry must not keep the one that
+            // leaked in from the page before it.
+            if let FromTab::TitleChanged { title } = &msg {
+                let url = {
+                    let procs = self.procs.borrow();
+                    procs
+                        .iter()
+                        .find(|p| p.tab.id == tid)
+                        .and_then(|p| p.state.url.clone())
+                        .filter(|u| worth_recording(u))
+                };
+                let Some(url) = url else { continue };
+                let history = ironsurf_storage::History::open(self.store.borrow().root());
+                let clean = title.as_deref().map(str::trim).filter(|t| !t.is_empty());
+                match history.set_latest_title(&url, clean) {
+                    Ok(true) => debug!("history: {url} titled {clean:?}"),
+                    Ok(false) => {}
+                    Err(err) => warn!("titling the history entry for {url} failed: {err}"),
+                }
+                self.refresh_history_pages();
             }
             // Middle-click "open link in new tab": spawn a sibling tab in the
             // requesting tab's container; the requester itself never navigates
@@ -4411,6 +4546,11 @@ impl Core {
             // beside it in a new tab.
             if let FromTab::ArchiveServerStart { root, host, port, open_in_new_tab } = &msg {
                 self.start_archive_server(tid, root.as_deref(), host.as_deref(), *port, *open_in_new_tab);
+            }
+            // `ironsurf://history`: the visit log lives here, so the page reads
+            // it through this process.
+            if let FromTab::HistoryListRequest { clear } = &msg {
+                self.history_list_for(tid, *clear);
             }
             // The server's own control page applied a new folder/host/port:
             // remember it (the server reports the change itself; this is the
@@ -4666,6 +4806,9 @@ impl Core {
             })
             .collect();
         ui.set_containers(ModelRc::from(Rc::new(VecModel::from(conts))));
+        // The settings menu's slider reads the persisted speed (task: settings
+        // menu) — the panel opens wherever the last session left it.
+        ui.set_scroll_speed(self.settings.borrow().scroll_speed.unwrap_or(1.0));
 
         if let Some(p) = procs.get(active) {
             ui.set_can_back(p.state.can_back);
@@ -4854,6 +4997,23 @@ impl Core {
             ui.on_page_wheel(move |x, y, dx, dy| c.page_wheel(x, y, dx, dy));
         }
         {
+            // Task: keep keyboard shortcuts usable while the URL bar is
+            // focused — the entry offers every chord it could swallow, and
+            // Rust answers whether the browser claimed it.
+            let c = self.clone();
+            ui.on_url_chord(move |text, ctrl, shift, alt, meta| {
+                let _ = shift;
+                c.bar_chord(text.as_str(), ctrl, alt, meta)
+            });
+        }
+        {
+            let c = self.clone();
+            ui.on_find_chord(move |text, ctrl, shift, alt, meta| {
+                let _ = shift;
+                c.bar_chord(text.as_str(), ctrl, alt, meta)
+            });
+        }
+        {
             let c = self.clone();
             ui.on_menu_pick(move |idx| {
                 if idx >= 0 {
@@ -5008,18 +5168,18 @@ impl Core {
         }
 
         // Browsing history (task: browsing history): the ☰ toolbar toggle, the
-        // scrim/✕ close, a row pick (reopen the visit in a new tab), and Clear
-        // (wipe the log shared by every container) — all pure Core state.
+        // scrim/✕ close, **History** (open the `ironsurf://history` page in a
+        // new tab — the visits are a page of their own now), and Clear (wipe
+        // the log shared by every container) — all pure Core state.
         bind0!(on_toggle_history_menu, |c: &Rc<Core>| c.toggle_history_menu());
         bind0!(on_close_history_menu, |c: &Rc<Core>| c.history_menu(false));
         bind0!(on_history_clear, |c: &Rc<Core>| c.history_clear());
+        bind0!(on_history_page, |c: &Rc<Core>| c.open_history_page());
+        // Settings (task: settings menu): the ☰ panel's scroll-speed slider,
+        // live as it drags — apply, persist, broadcast (see `set_scroll_speed`).
         {
             let c = self.clone();
-            ui.on_history_pick(move |idx| {
-                if idx >= 0 {
-                    c.history_pick(idx as usize);
-                }
-            });
+            ui.on_scroll_speed_set(move |speed| c.set_scroll_speed(speed as f32));
         }
         // URL bar autocomplete (task: URL bar autocomplete suggestions): every
         // keystroke in the bar re-ranks the dropdown from the shared visit log
@@ -5123,6 +5283,22 @@ pub fn context_menu_items(
     clipboard_empty: bool,
 ) -> Vec<(String, MenuAction)> {
     let mut items: Vec<(String, MenuAction)> = Vec::new();
+    // **What to do with the thing under the cursor comes first** (task: a
+    // link's right-click opens with "Open link in new tab"): the row the click
+    // was about leads the menu, and the page's own navigation rows follow it.
+    // An image leads the same way, but only when there is no link to lead with
+    // — a link wrapped around an image is a link first.
+    if let Some(link) = &target.link {
+        items.push((
+            "Open link in new tab".into(),
+            MenuAction::OpenNewTab(link.clone()),
+        ));
+    } else if let Some(image) = &target.image {
+        items.push((
+            "Open image in new tab".into(),
+            MenuAction::OpenNewTab(image.clone()),
+        ));
+    }
     if can_back {
         items.push(("← Back".into(), MenuAction::Back));
     }
@@ -5130,17 +5306,15 @@ pub fn context_menu_items(
         items.push(("→ Forward".into(), MenuAction::Forward));
     }
     items.push(("⟳ Reload".into(), MenuAction::Reload));
-    if let Some(link) = &target.link {
-        items.push((
-            "Open link in new tab".into(),
-            MenuAction::OpenNewTab(link.clone()),
-        ));
-    }
-    if let Some(image) = &target.image {
-        items.push((
-            "Open image in new tab".into(),
-            MenuAction::OpenNewTab(image.clone()),
-        ));
+    // A link around an image gets both rows: the link's led the menu, and the
+    // image's stays down here with the image's other entries.
+    if target.link.is_some() {
+        if let Some(image) = &target.image {
+            items.push((
+                "Open image in new tab".into(),
+                MenuAction::OpenNewTab(image.clone()),
+            ));
+        }
     }
     if let Some(selection) = &target.selection {
         items.push(("Copy".into(), MenuAction::CopyText(selection.clone())));
@@ -5433,16 +5607,17 @@ mod tests {
         assert_eq!(
             labels,
             [
-                "⟳ Reload",
                 "Open link in new tab",
+                "⟳ Reload",
                 "Copy link address",
                 "⬇ Download linked file",
                 "Copy page address",
                 "⌖ Inspect Element",
             ]
         );
+        // The row the click was about leads the menu (task: first item).
         assert_eq!(
-            items[1].1,
+            items[0].1,
             MenuAction::OpenNewTab("https://example.com/a".into())
         );
         assert_eq!(
@@ -5470,9 +5645,9 @@ mod tests {
         assert_eq!(
             labels,
             [
+                "Open image in new tab",
                 "→ Forward",
                 "⟳ Reload",
-                "Open image in new tab",
                 "Copy",
                 "Copy image address",
                 "▶ Play video",

@@ -56,6 +56,12 @@ pub mod uisettings {
         /// default": folder = the archive root, host `127.0.0.1`, port random.
         #[serde(default)]
         pub archive_server: ArchiveServerSettings,
+        /// Wheel scroll-speed multiplier — the settings menu's slider (the ☰
+        /// panel). `None` or `Some(1.0)` is the default damping; the shell
+        /// clamps the slider's own range (`0.2× … 3×`) and every tab clamps
+        /// again at the wheel.
+        #[serde(default)]
+        pub scroll_speed: Option<f32>,
     }
 
     /// What the archive server serves and from where (see

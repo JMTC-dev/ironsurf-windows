@@ -124,6 +124,10 @@ pub enum FromTab {
     TitleChanged     { title: Option<String> },
     UrlChanged       { url: Option<String> },
     LoadingChanged   { loading: bool },
+    // (task: faster, responsive loading) the window between `true` and
+    // `false` is no longer a frozen tab: the `http(s)` main-document fetch
+    // runs on a network worker thread, and the tab keeps painting, scrolling
+    // and answering events (against the page still on screen) throughout.
     HistoryChanged   { can_go_back: bool, can_go_forward: bool },
     StatusText       { text: Option<String> },
     OpenLinkInNewTab { url: String },      // middle-click / Ctrl-(⌘-)click a link → shell opens url in a new tab (same container)
@@ -205,6 +209,13 @@ pub enum FromTab {
     // the server's own control page applied a new folder/host/port: the shell mirrors and
     // persists it (`port` 0 = stopped).
     ArchiveServerSettingsChanged { root: String, host: String, port: u16 },
+    // **browsing history page** (`ironsurf://history`): the tab renders the page and asks
+    // the shell for the visit log — one `history.jsonl` at the data root, shared by every
+    // container and outside the tab's sandbox, so only the shell reads it. `clear` (a link
+    // written `ironsurf://history?clear=1`) empties the whole log first. Answered with
+    // `ToTab::HistoryList`: on every load of the page, and again whenever the log moves
+    // under a page that is showing it (a Clear, a visit from another tab).
+    HistoryListRequest { clear: bool },
     Closed,
     Error            { message: String },
 }
@@ -227,6 +238,7 @@ pub enum ToTab {
     Forward,
     Resize       { width: u32, height: u32, scale: f32 },
     SetZoom      { zoom: f32 },           // page zoom, 1.0 = 100% (Ctrl-+/Ctrl--/Ctrl-0)
+    SetScrollSpeed { speed: f32 },        // wheel-speed multiplier from the settings menu's ☰ slider; 1.0 = default damping, tab clamps (0.1×–4×)
     SetVisible   { visible: bool },        // throttle background rendering
     Pointer      (PointerEvent),
     Key          (KeyEvent),
@@ -272,6 +284,12 @@ pub enum ToTab {
     // (port busy, folder refused). The tab renders it on `ironsurf://archive`, and steps
     // itself to `address + "/ironsurf/serve"` unless the request asked for a new tab.
     ArchiveServerInfo { tab_id: TabId, ok: bool, address: String, error: Option<String> },
+    // **browsing history page** reply: `entries` are the newest
+    // [`MAX_HISTORY_PAGE_ROWS`] visits of the shared log, newest first, and `total` counts
+    // the **whole** log so the page can admit it truncated the list. The tab re-renders
+    // `ironsurf://history` only when the answer differs from what it drew, which is what
+    // keeps an unchanged broadcast from reloading the page in a loop.
+    HistoryList      { tab_id: TabId, entries: Vec<HistoryVisit>, total: usize },
     // find in page (`Ctrl-F`): install/replace the live query and re-run it from
     // the top. The shell owns the bar; the **tab** matches over the text it laid
     // out (case-insensitive, document order, visible text only) and paints it —
@@ -465,8 +483,12 @@ pub const MAX_FRAME_BYTES: usize = 64 * 1024 * 1024; // guard against corrupt st
 `ScrollEvent` deltas speak the winit/AccessKit convention both ends of the pipe
 already use: **positive `delta_y` scrolls UP** (`scrollTop` shrinks), a negative
 one scrolls DOWN; likewise `delta_x` and LEFT. The shell forwards the toolkit's
-deltas untouched and the tab hands them to blitz untouched — neither side negates
-(a negation on either side inverts the wheel).
+deltas untouched and neither side negates (a negation on either side inverts the
+wheel). The tab *does* reinterpret the magnitude — a damped, gliding wheel is a
+speed policy, not a sign policy: `|d| ≤ 3` counts as notches of 20 CSS px each,
+larger values as logical-pixel travel, the result is halved
+(`runtime::WHEEL_SPEED`) and queued onto the document's glide
+(`runtime::WHEEL_STEP`, `runtime::WHEEL_TAU`) instead of being applied whole.
 
 Also export `const WELCOME_URL: &str` (`"ironsurf://welcome"`) and
 `fn default_url() -> String` (= `WELCOME_URL` — the built-in start page, answered locally by
@@ -665,6 +687,31 @@ Lifecycle:
 3. One `Document` per navigation: fetch HTML (see Network layer), then
    `HtmlDocument::from_html(&html, DocumentConfig { base_url, net_provider: Arc<ours>,
    viewport: Some(Viewport::new(w*scale, h*scale, scale, ColorScheme::Light)), ..Default })`.
+   3a. **The fetch never stalls the tab** (task: faster, responsive loading).
+   An `http(s)` main-document fetch runs on a network worker thread
+   (`netmod::spawn_document_fetch_post_report_shared` — the same
+   `fetch_document_post_report_shared` exchange, only off-loop): `navigate_post`
+   emits `LoadingChanged(true)`/the “Waiting for…” status, parks the receiver
+   in `Tab::pending_nav` and returns; the poll loop keeps ticking (`nav_poll_tick`
+   caps the sleep while a fetch is in flight), so the page still on screen
+   stays scrollable and clickable and other documents' subresources keep
+   flowing. `Tab::drain_pending_navigation` adopts the outcome between ticks:
+   the fetch's `NetEvent`s ship first (document requests still precede every
+   subresource event) and `Tab::finish_main_doc_fetch` runs the adoption tail —
+   download sniffing, archive store, `load_html`, refresh arming, the
+   `LoadingChanged(false)` bookkeeping — exactly as the synchronous path did.
+   Local schemes (`file:`/`data:`/`about:`/`ironsurf:`) fetch inline; their
+   “fetch” is a read(). `Tab::wait_for_navigation(timeout)` drives the same
+   adoption synchronously for the headless harness and tests.
+   3b. **Content shows before the page is “done”**: after parse and the
+   critical-resource settle (stylesheets/fonts — images are never waited
+   for), the tab **paints the laid-out document before running its scripts**.
+   Boa can spend seconds in `run_scripts` on a script-heavy page, and that
+   first frame is the difference between “loading” and “frozen”; whatever the
+   scripts mutate queues a repaint through the Shell provider's invalidation,
+   so the post-script state follows immediately. Async subresources (images,
+   late CSS) keep landing frames after the navigation reports loaded — no
+   part of the page has to finish before the user sees it.
    After every input event / net completion / JS tick call `document.resolve(scale)`; if the
    doc reports changes (or a scripted/animation tick is pending), repaint and emit
    `FromTab::Frame` (throttle ≤ 30 fps). Emit `TitleChanged`/`UrlChanged` on change (compare
@@ -803,7 +850,10 @@ in `ironsurf-tab/src/netmod.rs` and pass `Arc<OurProvider>` as `DocumentConfig.n
   `ironsurf://archive`), `archive` renders the summary of the shell's
   [archive browsing server](#archive-browsing-server-srcarchive_serversrc) — an address-less
   page by itself: it asks the shell (see `FromTab::ArchiveServerStart`) and shows what comes
-  back, any other name renders an
+  back, `history` renders the **shared browsing history** page (the visit log is the shell's
+  file too, so the page asks with `FromTab::HistoryListRequest` and draws the
+  `ToTab::HistoryList` answer; its `?clear=1` query empties the log and re-renders the plain
+  page), any other name renders an
   honest internal "no such page" that never left the process. All output escapes the requested
   URL — page names are user text, never markup.
 - Container isolation holds even in Passthrough: one process = one container; its on-disk
@@ -1357,8 +1407,10 @@ software-only path; `--linuxkms` pins the KMS backend; explicit `SLINT_BACKEND`
 
 UI (`crates/ironsurf-shell/ui/ironsurf.slint`):
 - `AppWindow` with: toolbar row [back, forward, reload, URL `LineEdit`, "New tab",
-  container dropdown], tab bar (horizontal scroll; each tab = container-colored stripe +
-  title + ✕), page area (`Image` fed by active tab frame, `TouchArea`/`PointerAreaHandler`
+  container dropdown], tab bar (tabs sized to an even share of the bar once they no longer
+  fit it, horizontal scroll only past that point; each tab = container-colored stripe +
+  title (elided to its tab) + ✕, and the elided part is read out by a hover tooltip),
+  page area (`Image` fed by active tab frame, `TouchArea`/`PointerAreaHandler`
   forwarding pointer+wheel events; keyboard `key-pressed`/`key-released` → `KeyEvent`).
 - Container manager popup: list containers (color swatch), add/rename/choose color (fixed
   palette), "delete container (+ data)", per-tab "Move tab to container ▸" submenu (move =
@@ -1498,6 +1550,20 @@ UI (`crates/ironsurf-shell/ui/ironsurf.slint`):
   the status line counts the saves, failures are logged, never fatal.
 - Menu (native or in-toolbar): New Window(v1: new tab), Close Tab (Ctrl-W), Tab Next/Prev
   (Ctrl-Tab), Open Container Manager, Clear Container Data.
+- **The tab strip stays inside the bar, and a tab says its whole title when hovered**
+  (task: tab strip fits the bar): a tab takes the width its title wants (90…220 px) while
+  every tab can have that, and once they cannot, every tab takes an even share of the bar —
+  `share = (bar − 6 px left padding − 16 px of Flickable viewport slack − 4 px gaps) / tab
+  count` — with a floor (74 px, 92 px under an Alt-digit badge: stripe + badge + ✕ + a
+  syllable of title) below which the tabs stop shrinking and the Flickable pans the row
+  again. A title never paints past its own tab: the `Text` is given an explicit `width`
+  (stripe/badge on the left, the ✕ on the right), because a bare `max-width` leaves it its
+  full preferred width here and the words run over the neighbour. What the ellipsis hides,
+  the hover hands back — the tab reports its hover the way `MiniButton` does and the
+  window's one tooltip overlay draws `tip-text` (the tab's full title, `New Tab` when there
+  is none) below the tab, clamped inside the window; pointing at the ✕ asks for nothing.
+  `ironsurf-shell/tests/tab_strip.rs` pins the geometry on the testing backend (even share,
+  row inside the bar, elided label, tip wider than the label, tip off on the ✕).
 - **Alt-`1` … Alt-`9` jump to the N-th tab** (⌘-`1` … ⌘-`9` on macOS; Chrome/Firefox
   convention): `keymap::shortcut_for` reports the digit only (`Shortcut::SelectTab(n)`)
   and `tab_index_for_digit(n, tab_count)` resolves it **at press time** against the live
@@ -1526,12 +1592,29 @@ UI (`crates/ironsurf-shell/ui/ironsurf.slint`):
   do. History and not the tab strip: the arrows say which way the reader wants to go,
   and the strip already has Ctrl-Tab and the digit chords. Only the platform's own key
   *alone* is the chord — `Ctrl-←` off a Mac and `⌥-←` on one keep moving a text caret a
-  word at a time, so the page gets them — and the chord is read from the page surface
-  only, which is why `⌘-←` inside the URL bar still goes to the start of the line.
+  word at a time, so the page gets them — and a focused text bar keeps the arrow on
+  the caret's side too (`bar_shortcut` drops `GoBack`/`GoForward` where the page's
+  `shortcut_for` takes them), which is why `⌘-←` inside the URL bar still goes to
+  the start of the line even with the other browser chords live there (task: keep
+  keyboard shortcuts usable while the URL bar is focused).
+- **The wheel is damped and glides** (task: slower and smoother scrolling).
+  The tab turns a `ScrollEvent` into half the travel blitz would have made of
+  it — one notch nudges 10 CSS px, a flick moves lines rather than screens —
+  and *glides* that travel in: each event queues onto the tab's smooth
+  scroller, whose first slice rides with the event itself (≈40%, the page
+  feels attached to the wheel) and the rest eases out over the next frames on
+  a ~30 ms exponential (`runtime::WHEEL_TAU`), fed by the poll loop at ≤ one
+  slice per `runtime::WHEEL_STEP` and landing the remainder whole when a
+  frame takes longer than four τ. Successive events join the same glide, so a
+  spinning wheel flows and a reversal partly cancels; the slices are real
+  scrolls, so blitz's hovered scroll chain, the overscroll ceiling, and
+  `FromTab::ScrollState` (which the shell's scroll bar rides) all apply
+  unchanged. Keystroke scrolls — arrows, PageUp/PageDown, `window.scrollBy`
+  — are unaffected.
 - **`↑` / `↓` scroll the page a line at a time** — 40 CSS px per press
-  (`runtime::ARROW_SCROLL_PX`, twice the wheel's line unit and the step
-  `window.scrollBy(0, 40)` takes, so a few presses move a paragraph and a dozen
-  move a screen): the fine motion to PageUp/PageDown's screen, for putting one
+  (`runtime::ARROW_SCROLL_PX`, four times the damped wheel's line unit and the
+  step `window.scrollBy(0, 40)` takes, so a few presses move a paragraph and a
+  dozen move a screen): the fine motion to PageUp/PageDown's screen, for putting one
   exact line in view. blitz binds the arrows for editors only, so this is the tab's
   gesture too — and with a text control focused the caret answers instead and the
   document does not move at all, which is what a reader filling a form at the
@@ -1565,7 +1648,8 @@ Process/tab management (`src/tabs.rs`):
 - `Frame` → `slint::Image` from raw RGBA buffer (`slint::Image::from_rgba8_slab`/PixelBuffer API — verify name).
 - Keyboard focus routing: Slint focus on page area → forward keys; Ctrl-L focuses URL bar;
   Esc unfocuses; F12 / Ctrl-Shift-I toggle the DevTools panel (consumed by the shell, never sent
-  to the page; they act on the focused page, i.e. not while the URL bar holds focus);
+  to the page; they act on the focused page — and since the task *keyboard shortcuts stay
+  usable while the URL bar is focused* (next bullet) they fire from a focused bar too);
   Ctrl-Shift-K / Ctrl-Shift-Y open the Console / Network panes and **Ctrl-Shift-C** arms
   *inspect element* (opening the panel + Inspector pane if needed, toggling off when armed); the
   same chord with the picker armed disarms it. `Esc` also disarms the picker before it
@@ -1575,13 +1659,36 @@ Process/tab management (`src/tabs.rs`):
   blank tabs not worth reopening) before killing the process; the chord respawns at the
   address in the container it died in and focuses it. Deliberate deviation from the
   original Ctrl-Shift-T spec: that chord belongs to the Console pane. **Ctrl-Alt-H**
-  toggles the History menu (Ctrl-Shift-H is the user's *history* pane in DevTools). Both
+  toggles the ☰ History-&-settings menu (Ctrl-Shift-H is the user's *history*
+  pane in DevTools). Both
   chords resolve ahead of the plain-Ctrl table, both X11 spellings (letter and
   control-char) accepted, plain Ctrl-T (new tab) untouched. **Ctrl-Alt-R** (task:
   reader mode) toggles **reader view** on the active tab — letter spellings only,
   so plain Ctrl-R (reload, in both its spellings) is untouched; it is the same
   command as the 📄 toolbar button beside ＋, and the tab's `ReaderState` answer
   is what moves the button.
+- **Keyboard shortcuts survive a focused bar** (task: keyboard shortcuts such
+  as new tab and switching tabs by number stay usable while the top URL bar
+  is focused). A LineEdit swallows every keystroke it is given, and the URL
+  and find bars' `key-pressed` handlers used to swallow chords the browser
+  owns. Before eating one the bar now offers it to Rust — any modifier chord
+  plus the modifierless function-key chords (Slint sends F1…F12 as the
+  private-use range U+F704…U+F70F; plain Esc excluded) — through `chord(...)`
+  bound to the root's `url-chord` / `find-chord` and answered by
+  `app::App::bar_chord` over `keymap::bar_shortcut`: the one table
+  `shortcut_for` minus the keys the entry keeps. Consumed chords never reach
+  the entry's text. What the entry keeps: plain typing, caret motion, its own
+  editing chords (A/C/V/X/Y/Z are not in the table on either platform's
+  spelling — select-all, copy and paste mid-URL are untouched), Esc (whose
+  job here is closing the completion dropdown, `Shortcut::PageFocus`
+  excluded), and the history arrows — `⌘-←`/`⌘-→` stay caret-to-home on a Mac
+  bar because `bar_shortcut` drops `GoBack`/`GoForward` even though
+  `shortcut_for` claims them. Everything else fires exactly as over the page:
+  Ctrl-T new tab, the Alt-digit / ⌘-digit tab-number switches, Ctrl-Tab,
+  Ctrl-W, Ctrl-R, the zoom chords, Ctrl-F, F12 — one shared dispatch table
+  (`dispatch_page_shortcut`) behind both routes. Tests: the `bar_shortcut`
+  unit tests in `keymap` plus `tests/bar_shortcuts.rs` (chords driven through
+  the real root callbacks against live fake tabs).
 - **Text selection & copy/paste — the shell owns the session clipboard**: copy chords are
   never consumed (Ctrl-C/V/X/A always reach the tab — `keymap::clipboard_chords_always_reach_the_page`),
   every `FromTab::ClipboardText` (page Ctrl+C, editor copy/cut) is filed on the shell's
@@ -1615,6 +1722,14 @@ Process/tab management (`src/tabs.rs`):
   page (never a fetch, never a history entry), instead of silently becoming a search.
 - Container default from registry; per-container "remember last chosen container for new tabs"
   in `~/.local/share/ironsurf/ui.json` (best-effort).
+- **The settings menu is the ☰ panel** (task: settings menu): the three-lines button that
+  used to open only the browsing history is the browser's one settings area (its header
+  reads "History & settings"). The bottom item is the **scrolling-speed slider** —
+  0.2× … 3× in 0.1 steps, stamped as a percentage of the default wheel travel. Every
+  change persists at once to `ui.json` (`settings.scroll_speed`, absent = `1.0`), applies
+  browser-wide live (`ToTab::SetScrollSpeed` to each running tab — the tab multiplies its
+  default wheel damping, clamping nonsense back), and seeds fresh tabs at spawn, so a new
+  tab's wheel already turns at the chosen speed.
 - **Crashed tabs are loud, never silent**: child stderr is captured (bounded tail; `RUST_BACKTRACE=full`
   is set for children and the tab binary force-prints a backtrace on panic), the drain tick polls every
   child (`try_wait`), and a process that dies without `Closed` — or a send that fails (broken pipe, os

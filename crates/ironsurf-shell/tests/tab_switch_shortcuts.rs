@@ -1,7 +1,9 @@
-//! `Alt-1` … `Alt-9` switch to the N-th tab, and the mapping is **dynamic**:
+//! The digit chord — `Alt-1` … `Alt-9` off a Mac, `⌘1` … `⌘9` on one — switches
+//! to the N-th tab, and the mapping is **dynamic**:
 //! which tab a digit lands on is resolved against the live tab list on every
 //! press (see `keymap::tab_index_for_digit`), so closing a tab re-slots every
-//! remaining shortcut and `Alt-9` follows the end of the strip as it moves.
+//! remaining shortcut and the last digit follows the end of the strip as it
+//! moves.
 //! The tab strip paints the digit that reaches each tab today, which is the
 //! same mapping seen from the other side.
 //!
@@ -27,9 +29,21 @@ fn wait_for(what: &str, cond: impl Fn() -> bool) {
     }
 }
 
-/// One key press delivered as the page's `FocusScope` would deliver it.
-fn press(ui: &AppWindow, text: &str, ctrl: bool, alt: bool) {
-    ui.invoke_page_key(true, text.into(), ctrl, false, alt, false, false);
+/// One key press delivered as the page's `FocusScope` would deliver it. The
+/// digit chord is spelled with the platform's own key — `Alt-N` off a Mac, `⌘N`
+/// on one (`keymap::Chords::digits_on_alt`) — so a press marked as a digit
+/// chord lands on whichever of the two this binary reads, and on neither.
+fn press(ui: &AppWindow, text: &str, ctrl: bool, digit: bool) {
+    let on_alt = ironsurf_shell::keymap::Chords::CURRENT.digits_on_alt();
+    ui.invoke_page_key(
+        true,
+        text.into(),
+        ctrl,
+        false,
+        digit && on_alt,
+        digit && !on_alt,
+        false,
+    );
 }
 
 /// Ids of the tabs in the strip, in strip order.
@@ -41,7 +55,7 @@ fn tab_ids(ui: &AppWindow) -> Vec<i32> {
         .collect()
 }
 
-/// Alt-digits the strip shows, in strip order (empty = no chord reaches it).
+/// The digit chords the strip shows, in strip order (empty = no chord reaches it).
 fn badges(ui: &AppWindow) -> Vec<String> {
     let tabs = ui.get_tabs();
     (0..tabs.row_count())
@@ -51,7 +65,7 @@ fn badges(ui: &AppWindow) -> Vec<String> {
 }
 
 #[test]
-fn alt_digits_follow_the_tabs_as_they_open_and_close() {
+fn digit_chords_follow_the_tabs_as_they_open_and_close() {
     i_slint_backend_testing::init_no_event_loop();
 
     let dir = tempfile::tempdir().unwrap();
@@ -79,21 +93,22 @@ fn alt_digits_follow_the_tabs_as_they_open_and_close() {
     assert_eq!(ui.get_active_index(), 2, "a new tab activates itself");
     assert_eq!(badges(&ui), vec!["1", "2", "3"], "one digit per tab");
 
-    // Alt-N goes to the N-th tab.
+    // The digit chord goes to the N-th tab: Alt-1 off a Mac, ⌘1 on one.
     press(&ui, "1", false, true);
-    assert_eq!(ui.get_active_index(), 0, "Alt-1 → the first tab");
+    assert_eq!(ui.get_active_index(), 0, "the first tab's digit chord");
     press(&ui, "3", false, true);
-    assert_eq!(ui.get_active_index(), 2, "Alt-3 → the third tab");
+    assert_eq!(ui.get_active_index(), 2, "the third tab's digit chord");
     press(&ui, "2", false, true);
-    assert_eq!(ui.get_active_index(), 1, "Alt-2 → the second tab");
-    // Alt-9 reaches nothing while there are only three tabs: the active tab
-    // stays put rather than guessing.
+    assert_eq!(ui.get_active_index(), 1, "the second tab's digit chord");
+    // The digit past the end of the strip reaches nothing while there are only
+    // three tabs: the active tab stays put rather than guessing.
     press(&ui, "9", false, true);
-    assert_eq!(ui.get_active_index(), 1, "Alt-9 with 3 tabs does nothing");
-    // Unmodified digits and Ctrl-digits are nobody's tab chord.
+    assert_eq!(ui.get_active_index(), 1, "the digit past the last tab does nothing");
+    // Unmodified digits and Ctrl-digits are nobody's tab chord — and neither is
+    // the *other* platform's spelling of the digit chord.
     press(&ui, "1", false, false);
     press(&ui, "1", true, false);
-    assert_eq!(ui.get_active_index(), 1, "only the Alt form switches tabs");
+    assert_eq!(ui.get_active_index(), 1, "only the platform's own digit chord switches");
 
     // --- closing re-slots everything ---------------------------------------
     let before = tab_ids(&ui);

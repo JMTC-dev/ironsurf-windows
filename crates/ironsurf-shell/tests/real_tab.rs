@@ -30,6 +30,14 @@ fn real_tab_bin() -> Option<PathBuf> {
         .find(|c| c.is_file())
 }
 
+/// The navigation chord in the spelling this platform reads — `Alt-\u{2190}` / `Alt-\u{2192}`
+/// off a Mac, `\u{2318}-\u{2190}` / `\u{2318}-\u{2192}` on one (the same fold as the tab-number chords,
+/// `keymap::Chords::digits_on_alt`) — delivered as the page's `FocusScope` would.
+fn nav_chord(ui: &AppWindow, text: &str) {
+    let on_alt = ironsurf_shell::keymap::Chords::CURRENT.digits_on_alt();
+    ui.invoke_page_key(true, text.into(), false, false, on_alt, !on_alt, false);
+}
+
 fn wait_for(what: &str, app: &App, cond: impl Fn() -> bool) {
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
@@ -126,17 +134,16 @@ fn app_browses_with_the_real_tab_binary() {
         snap()[0].url.as_deref() == Some(page2.as_str())
     });
 
-    // The arrow chord, end to end through a real tab: `Alt-←` / `Alt-→` on this
-    // platform (macOS spells the same chord `⌘-←` / `⌘-→` — the one spelling
-    // `keymap::Chords` folds, tested in the keymap's own tests). Arrows reach the
-    // shell as Slint's private-use keysyms, and the tab answers the chord out of
-    // its own session history, exactly as it answered the toolbar buttons.
-    ui.invoke_page_key(true, "\u{F702}".into(), false, false, true, false, false);
-    wait_for("Alt-\u{2190} history back", &app, || {
+    // The arrow chord, end to end through a real tab. Arrows reach the shell as
+    // Slint's private-use keysyms and the tab answers the chord out of its own
+    // session history, exactly as it answered the toolbar buttons; `nav_chord`
+    // presses it in this platform's own spelling (`Alt-←` here, `⌘-←` on a Mac).
+    nav_chord(&ui, "\u{F702}");
+    wait_for("the back arrow chord", &app, || {
         snap()[0].url.as_deref() == Some(page1.as_str())
     });
-    ui.invoke_page_key(true, "\u{F703}".into(), false, false, true, false, false);
-    wait_for("Alt-\u{2192} history forward", &app, || {
+    nav_chord(&ui, "\u{F703}");
+    wait_for("the forward arrow chord", &app, || {
         snap()[0].url.as_deref() == Some(page2.as_str())
     });
     // Ctrl-\u{2190} is not the chord off a Mac (it moves a text caret a word at a

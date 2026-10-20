@@ -249,6 +249,54 @@ pub fn shortcut_for(text: &str, ctrl: bool, alt: bool, meta: bool) -> Option<Sho
     shortcut_on(Chords::CURRENT, text, ctrl, alt, meta)
 }
 
+/// The browser chords that stay live while the URL/find bar holds focus
+/// (task: keep keyboard shortcuts usable while the URL bar is focused).
+/// The bars keep everything local — plain typing, caret motion, and their own
+/// editing chords (Ctrl-A/C/V/X/Y/Z are not in [`shortcut_for`] at all, so
+/// select-all, copy and paste keep working mid-URL) — while the tabled
+/// browser chords fire as usual: Ctrl-T new tab, the tab-number digits,
+/// Ctrl-Tab, Ctrl-W, Ctrl-R, the zoom chords, Ctrl-F, F12, history and the
+/// menus. The one exception is Esc ([`Shortcut::PageFocus`]): inside a bar it
+/// belongs to the bar (it closes the completion dropdown), not to the page.
+pub fn bar_shortcut(text: &str, ctrl: bool, alt: bool, meta: bool) -> Option<Shortcut> {
+    bar_shortcut_on(Chords::CURRENT, text, ctrl, alt, meta)
+}
+
+/// [`bar_shortcut`] with the platform's chord spelling chosen by the caller
+/// (parity with [`shortcut_on`]).
+pub fn bar_shortcut_on(
+    chords: Chords,
+    text: &str,
+    ctrl: bool,
+    alt: bool,
+    meta: bool,
+) -> Option<Shortcut> {
+    match shortcut_on(chords, text, ctrl, alt, meta) {
+        // Esc belongs to the bar (completion dropdown); the history arrows
+        // belong to the caret — on macOS ⌘-← is “home”, and a bar that ate it
+        // would break the one promise the history chords make to text
+        // fields (see the history-arrow bullet in ARCHITECTURE.md).
+        Some(Shortcut::PageFocus) | Some(Shortcut::GoBack) | Some(Shortcut::GoForward) | None => {
+            None
+        }
+        Some(sc) => Some(sc),
+    }
+}
+
+/// Is the platform's chord key held *alone* — the shape every chord below
+/// insists on? Linux/Windows: Control without Meta. macOS: Command (which a
+/// backend may report in either flag, so either spelling alone counts) or the
+/// bare unix-Control habit, but never both at once — a press holding Ctrl
+/// *and* ⌘ is somebody else's chord (macOS test failures: Ctrl-⌘-W closed a
+/// tab it should have left alone).
+fn platform_key_alone(chords: Chords, ctrl: bool, meta: bool) -> bool {
+    if chords == Chords::Cmd {
+        (ctrl || meta) && !(ctrl && meta)
+    } else {
+        ctrl && !meta
+    }
+}
+
 /// [`shortcut_for`] with the platform's chord spelling chosen by the caller —
 /// `Chords::Cmd` is how the macOS chords get tested on a Linux box.
 pub fn shortcut_on(
@@ -258,6 +306,24 @@ pub fn shortcut_on(
     alt: bool,
     meta: bool,
 ) -> Option<Shortcut> {
+    // A bare mac modifier tap is an echo, not a chord:
+    // i-slint-backend-winit swaps the logical Control key for Super
+    // (`swap_cmd_ctrl` in its event_loop.rs), and i-slint-common's
+    // `key_codes.rs` reports Super as its *control character* `"\u{17}"` —
+    // which is precisely the Linux spelling of Ctrl+W. Without this guard a
+    // simple Ctrl tap closes a tab on macOS (and its swap-side Control code
+    // `"\u{11}"` — plus both right-hand forms — echoes off the same table).
+    // The Cmd spelling takes Command chords as plain letters, never as these
+    // bytes, so refusing them here costs nothing.
+    if chords == Chords::Cmd && matches!(text, "\u{11}" | "\u{16}" | "\u{17}" | "\u{18}") {
+        return None;
+    }
+    // Keep the raw press: the fold below deliberately blurs Ctrl and ⌘ on
+    // macOS, and two arms must tell them apart again — a press holding BOTH
+    // is somebody else's chord (Ctrl-⌘-W closes nothing on either platform,
+    // while bare Ctrl-W — the unix habit — and bare ⌘-W both do).
+    let raw_ctrl = ctrl;
+    let raw_meta = meta;
     // Fold the platform's chord key into `ctrl`. On macOS `meta` *is* that key
     // (`Chords::held`), so it must stop meaning "somebody else's chord" there.
     let ctrl = chords.held(ctrl, meta);
@@ -288,7 +354,7 @@ pub fn shortcut_on(
     // toggle reader view. Caught ahead of the plain-Ctrl letter chords below,
     // so plain Ctrl-`T` (new tab) and Ctrl-`R` (reload) are untouched; both
     // spellings X11 backends hand over (letter, control char) are accepted.
-    if ctrl && alt && !meta {
+    if alt && platform_key_alone(chords, raw_ctrl, raw_meta) {
         return match c {
             't' | 'T' | '\u{14}' => Some(Shortcut::ReopenClosedTab),
             'h' | 'H' => Some(Shortcut::HistoryMenu),
@@ -305,7 +371,11 @@ pub fn shortcut_on(
     // `Chords` has already folded Command into `ctrl`, which is why one expression
     // answers both spellings. It owns the history arrows here and the tab-number
     // chords below.
-    let chord = if chords.digits_on_alt() { alt && !ctrl && !meta } else { ctrl && !alt };
+    let chord = if chords.digits_on_alt() {
+        alt && !ctrl && !meta
+    } else {
+        !alt && platform_key_alone(chords, raw_ctrl, raw_meta)
+    };
     // History on the arrows — and only on the plain chord of the platform's own
     // key: `Ctrl-←` off a Mac and `⌥-←` on one keep moving a text caret a word at a
     // time, so those presses belong to the page.
@@ -326,7 +396,7 @@ pub fn shortcut_on(
             return Some(Shortcut::SelectTab(digit));
         }
     }
-    if !ctrl || alt || meta {
+    if alt || meta || !platform_key_alone(chords, raw_ctrl, raw_meta) {
         return None;
     }
     match c {
@@ -486,6 +556,53 @@ mod tests {
     }
 
     #[test]
+    fn ctrl_and_cmd_together_are_nobody_s_chord() {
+        // macOS-host test failures taught this one: with Command folded into
+        // the chord key, a press holding Ctrl *and* ⌘ used to fire the plain
+        // chord — Ctrl-⌘-W closed a tab, Ctrl-⌘-F searched, Ctrl-⌘-Alt-T
+        // reopened, Ctrl-⌘-- zoomed. They belong to somebody else now.
+        for text in ["w", "f", "i", "t", "r", "-", "=", "0"] {
+            assert_eq!(shortcut_on(Chords::Cmd, text, true, false, true), None, "Ctrl-Cmd-{text}");
+        }
+        assert_eq!(shortcut_on(Chords::Cmd, "t", true, true, true), None, "Ctrl-Cmd-Alt-T");
+        // Each key alone still chords — in whichever flag the backend
+        // reports Command, and bare unix Control keeps the habit alive.
+        for (ctrl, meta) in [(true, false), (false, true)] {
+            assert_eq!(shortcut_on(Chords::Cmd, "w", ctrl, false, meta), Some(Shortcut::CloseTab));
+        }
+        // And the same holds for the bar-facing table.
+        assert_eq!(bar_shortcut_on(Chords::Cmd, "w", true, false, true), None);
+        assert_eq!(bar_shortcut_on(Chords::Cmd, "w", false, false, true), Some(Shortcut::CloseTab));
+    }
+
+    /// macOS bug: pressing the Ctrl key closed tabs. Slint's winit backend
+    /// swaps the logical Control key for Super (`swap_cmd_ctrl`), and the key
+    /// table reports Super as its control character `"\u{17}"` — the very
+    /// byte the Linux table uses for Ctrl+W. A bare modifier tap must fire
+    /// nothing, whichever flags the backend reports the key under; Linux keeps
+    /// its Ctrl+W spelling untouched.
+    #[test]
+    fn mac_modifier_taps_echo_nothing_but_linux_ctrl_w_closes() {
+        for (text, ctrl, meta) in [
+            ("\u{17}", true, false),  // Ctrl — flag-folded backend
+            ("\u{17}", false, true),  // Ctrl — mac meta spelling
+            ("\u{17}", true, true),   // Ctrl — both-flag backend
+            ("\u{18}", true, false),  // right Ctrl
+            ("\u{11}", true, false),  // bare ⌘ (the swap-side Control code)
+            ("\u{16}", true, false),  // right ⌘
+        ] {
+            assert_eq!(shortcut_on(Chords::Cmd, text, ctrl, false, meta), None,
+                "modifier echo {text:?} ctrl={ctrl} meta={meta} fired a chord");
+            assert_eq!(bar_shortcut_on(Chords::Cmd, text, ctrl, false, meta), None);
+        }
+        // Off the Mac these bytes stay the ordinary Ctrl+W spelling…
+        assert_eq!(shortcut_on(Chords::Ctrl, "\u{17}", true, false, false), Some(Shortcut::CloseTab));
+        // …and the mac letters are untouched: ⌘-W still closes, as does the
+        // unix Ctrl-W habit.
+        assert_eq!(shortcut_on(Chords::Cmd, "w", true, false, false), Some(Shortcut::CloseTab));
+    }
+
+    #[test]
     fn mac_tab_digits_are_cmds_not_alts() {
         for d in '1'..='9' {
             let digit = d as u8 - b'0';
@@ -603,9 +720,24 @@ mod tests {
             shortcut_for("w", true, false, false),
             Some(Shortcut::CloseTab)
         );
+        // The control-character spellings are named, not trusted from the host:
+        // ETX-form Ctrl-W arrives as `\u{17}` on Linux/Windows, while on macOS
+        // that very byte is what a bare ⌘ tap reports (see the modifier-echo
+        // tests) and is therefore never a chord there. The mac form of the same
+        // chord — `⌘W` as a plain letter — is asserted below.
         assert_eq!(
-            shortcut_for("\u{17}", true, false, false),
+            shortcut_on(Chords::Ctrl, "\u{17}", true, false, false),
             Some(Shortcut::CloseTab)
+        );
+        assert_eq!(
+            shortcut_on(Chords::Cmd, "\u{17}", true, false, false),
+            None,
+            "on macOS that byte is a modifier tap, not Ctrl-W"
+        );
+        assert_eq!(
+            shortcut_for("w", true, false, false),
+            Some(Shortcut::CloseTab),
+            "the letter form is the one spelling macOS delivers"
         );
         assert_eq!(shortcut_for("r", true, false, false), Some(Shortcut::Reload));
         assert_eq!(shortcut_for("t", true, false, false), Some(Shortcut::NewTab));
@@ -737,10 +869,13 @@ mod tests {
         assert_eq!(shortcut_for("f", true, false, false), Some(Shortcut::Find));
         assert_eq!(shortcut_for("F", true, false, false), Some(Shortcut::Find));
         assert_eq!(shortcut_for("\u{06}", true, false, false), Some(Shortcut::Find));
-        // Bare `f` types into the page (and Alt/Meta-F stays with the WM).
+        // Bare `f` types into the page, and Alt/Meta-F stays with the WM —
+        // in the Ctrl spelling, which the host platform may well not be
+        // (macOS spells the very chord ⌘F, and there it *is* Find).
         assert_eq!(shortcut_for("f", false, false, false), None);
-        assert_eq!(shortcut_for("f", false, true, false), None);
-        assert_eq!(shortcut_for("f", false, false, true), None);
+        assert_eq!(shortcut_on(Chords::Ctrl, "f", false, true, false), None);
+        assert_eq!(shortcut_on(Chords::Ctrl, "f", false, false, true), None);
+        assert_eq!(shortcut_on(Chords::Cmd, "f", false, false, true), Some(Shortcut::Find));
     }
 
     #[test]
@@ -801,34 +936,43 @@ mod tests {
 
     #[test]
     fn alt_digit_chords_select_tabs_in_either_x11_spelling() {
+        // The X11 spelling puts the digits on Alt; name the spelling instead
+        // of trusting the host platform (macOS runs the very same table as
+        // ⌘-digits — asserted below).
         for d in '1'..='9' {
             let digit = d as u8 - b'0';
             // each digit resolves to itself, plain and meta-escaped (0x80 | d)
             assert_eq!(
-                shortcut_for(d.to_string().as_str(), false, true, false),
+                shortcut_on(Chords::Ctrl, d.to_string().as_str(), false, true, false),
                 Some(Shortcut::SelectTab(digit)),
                 "Alt-{d}"
             );
             let escaped = char::from_u32(0x80 + d as u32).unwrap();
             assert_eq!(
-                shortcut_for(escaped.to_string().as_str(), false, true, false),
+                shortcut_on(Chords::Ctrl, escaped.to_string().as_str(), false, true, false),
                 Some(Shortcut::SelectTab(digit)),
                 "Alt-{d} (meta-escaped)"
             );
+            // …and the Mac spelling resolves the very same digit.
+            assert_eq!(
+                shortcut_on(Chords::Cmd, d.to_string().as_str(), false, false, true),
+                Some(Shortcut::SelectTab(digit)),
+                "Cmd-{d}"
+            );
         }
-        assert_eq!(shortcut_for("!", false, true, false), Some(Shortcut::SelectTab(1)));
-        assert_eq!(shortcut_for("(", false, true, false), Some(Shortcut::SelectTab(8)));
+        assert_eq!(shortcut_on(Chords::Ctrl, "!", false, true, false), Some(Shortcut::SelectTab(1)));
+        assert_eq!(shortcut_on(Chords::Ctrl, "(", false, true, false), Some(Shortcut::SelectTab(8)));
         // Alt-0 is not a tab chord (and Ctrl-0 stays zoom reset).
-        assert_eq!(shortcut_for("0", false, true, false), None);
+        assert_eq!(shortcut_on(Chords::Ctrl, "0", false, true, false), None);
         // Bare digits and other modifier combos stay with the page / WM.
-        assert_eq!(shortcut_for("3", false, false, false), None);
-        assert_eq!(shortcut_for("3", true, false, false), None); // Ctrl-3: nobody's
-        assert_eq!(shortcut_for("3", true, true, false), None); // Ctrl-Alt-3
-        assert_eq!(shortcut_for("3", false, false, true), None); // Meta-3
-        assert_eq!(shortcut_for("c", false, true, false), None); // Alt-C
-        assert_eq!(shortcut_for("l", false, true, false), None); // Alt-L
+        assert_eq!(shortcut_on(Chords::Ctrl, "3", false, false, false), None);
+        assert_eq!(shortcut_on(Chords::Ctrl, "3", true, false, false), None); // Ctrl-3
+        assert_eq!(shortcut_on(Chords::Ctrl, "3", true, true, false), None); // Ctrl-Alt-3
+        assert_eq!(shortcut_on(Chords::Ctrl, "3", false, false, true), None); // Meta-3
+        assert_eq!(shortcut_on(Chords::Ctrl, "c", false, true, false), None); // Alt-C
+        assert_eq!(shortcut_on(Chords::Ctrl, "l", false, true, false), None); // Alt-L
         // Alt-Tab is still nobody's tab chord (the WM cycles windows).
-        assert_eq!(shortcut_for("\t", false, true, false), None);
+        assert_eq!(shortcut_on(Chords::Ctrl, "\t", false, true, false), None);
     }
 
     #[test]
@@ -899,6 +1043,56 @@ mod tests {
         assert_eq!(dom_key("Z"), ("Z".into(), "KeyZ".into()));
         assert_eq!(dom_key("7"), ("7".into(), "Digit7".into()));
         assert_eq!(dom_key(" "), (" ".into(), "Space".into()));
+    }
+
+    #[test]
+    fn the_url_bar_keeps_typing_and_loses_the_browser_chords_to_nobody() {
+        use super::*;
+        // The task: with the URL bar focused, Ctrl-T still makes a tab and the
+        // digits still switch tabs…
+        assert_eq!(bar_shortcut("t", true, false, false), Some(Shortcut::NewTab));
+        assert_eq!(
+            bar_shortcut_on(Chords::Ctrl, "2", false, true, false),
+            Some(Shortcut::SelectTab(2))
+        );
+        // …in whichever spelling the platform owns: the bar hands over ⌘2 on a
+        // Mac, where Option is a typing key and Option-2 is `™` — so that press
+        // must stay the entry's rather than jumping to a tab.
+        assert_eq!(
+            bar_shortcut_on(Chords::Cmd, "2", false, false, true),
+            Some(Shortcut::SelectTab(2))
+        );
+        assert_eq!(bar_shortcut_on(Chords::Cmd, "2", false, true, false), None);
+        assert_eq!(bar_shortcut("\t", true, false, false), Some(Shortcut::CycleTab));
+        assert_eq!(bar_shortcut("w", true, false, false), Some(Shortcut::CloseTab));
+        assert_eq!(bar_shortcut("r", true, false, false), Some(Shortcut::Reload));
+        assert_eq!(bar_shortcut("f", true, false, false), Some(Shortcut::Find));
+        // …the modifierless function chords work too (F12 = U+F70F, F6 = U+F709)…
+        assert_eq!(bar_shortcut("\u{F70F}", false, false, false), Some(Shortcut::ToggleDevTools));
+        assert_eq!(bar_shortcut("\u{F709}", false, false, false), Some(Shortcut::FocusUrl));
+        // …while plain typing, bare Enter/Tab and the entry's own editing chords
+        // belong to the LineEdit…
+        assert_eq!(bar_shortcut("a", false, false, false), None);
+        assert_eq!(bar_shortcut("\t", false, false, false), None);
+        assert_eq!(bar_shortcut("a", true, false, false), None); // Ctrl-A select-all
+        assert_eq!(bar_shortcut("c", true, false, false), None); // Ctrl-C copy
+        assert_eq!(bar_shortcut("v", true, false, false), None); // Ctrl-V paste
+        // …and Esc stays the bar's own (it closes the completion dropdown).
+        assert_eq!(bar_shortcut("\u{1b}", false, false, false), None);
+        // …and so do the history arrows, which the caret needs (macOS ⌘-← is
+        // “home”; Linux Ctrl-← was never a chord) — while the bar holds focus
+        // the entry moves, the shell does not navigate.
+        assert_eq!(bar_shortcut_on(Chords::Cmd, "\u{F702}", false, false, true), None);
+        assert_eq!(bar_shortcut_on(Chords::Cmd, "\u{F703}", false, false, true), None);
+        // macOS spells the same with ⌘.
+        assert_eq!(
+            bar_shortcut_on(Chords::Cmd, "t", false, false, true),
+            Some(Shortcut::NewTab)
+        );
+        assert_eq!(
+            bar_shortcut_on(Chords::Cmd, "3", false, false, true),
+            Some(Shortcut::SelectTab(3))
+        );
     }
 
     #[test]

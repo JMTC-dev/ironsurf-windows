@@ -163,7 +163,11 @@ fn the_bar_comes_up_with_the_scroll_and_hides_itself_a_few_seconds_later() {
 
     // Then the reader stops. After the hold, the bar is gone on its own — the
     // spinner heartbeat notices, no message from the tab is owed — while the
-    // page itself stays exactly where it was scrolled to.
+    // page itself stays exactly where it was scrolled to. Let the wheel's
+    // glide land first: `scrolled` pins the offset the page came to rest at,
+    // not a step of the glide (task: slower and smoother wheel).
+    std::thread::sleep(Duration::from_millis(400));
+    app.core().drain();
     let scrolled = snap()[0].scroll.y;
     let started = Instant::now();
     while Instant::now() - started < SCROLLBAR_HOLD + Duration::from_millis(500) {

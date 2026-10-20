@@ -444,6 +444,10 @@ pub fn internal_page_bytes(url: &Url) -> Option<Vec<u8>> {
         WELCOME_PAGE.replace("{url}", &shown)
     } else if page == ARCHIVE_PAGE {
         ARCHIVE_PAGE_HTML.replace("{status}", &archive_summary_html())
+    } else if page == HISTORY_PAGE {
+        HISTORY_PAGE_HTML
+            .replace("{status}", &history_status_html())
+            .replace("{rows}", &history_rows_html())
     } else {
         INTERNAL_NOT_FOUND
             .replace("{page}", &escape_html_text(&page))
@@ -455,6 +459,19 @@ pub fn internal_page_bytes(url: &Url) -> Option<Vec<u8>> {
 /// The internal page that drives the shell's **archive browsing server**.
 pub const ARCHIVE_PAGE: &str = "archive";
 
+/// The internal page that lists the **shared browsing history** — the visit log
+/// the ☰ settings panel used to hold. The rows belong to the shell (the log is
+/// at the data root, outside every container's sandbox), so the page renders
+/// the shell's last answer to [`ironsurf_common::FromTab::HistoryListRequest`]
+/// and asks again on every load; `?clear=1` (its own row) empties the log first.
+pub const HISTORY_PAGE: &str = "history";
+
+/// That page as an address: the string the settings drawer's **History** button
+/// opens and this module's own re-render returns to after `?clear=1`. Named
+/// once, in the IPC contract (`ironsurf_common::HISTORY_URL`), so the shell and
+/// the tab can never disagree about what the page is called.
+pub use ironsurf_common::HISTORY_URL;
+
 /// Where the shell's archive server keeps its own page (folder, host and port,
 /// editable). Duplicated from `ironsurf-shell`'s `archive_server::CONTROL_PATH`
 /// on purpose: the tab never links to the shell's code, only to its address.
@@ -464,6 +481,127 @@ pub const ARCHIVE_CONTROL_PATH: &str = "/ironsurf/serve";
 /// scheme accepts: `ironsurf://archive`, `ironsurf:///archive/`, …).
 pub fn is_archive_page(url: &Url) -> bool {
     url.scheme() == INTERNAL_SCHEME && internal_page_name(url) == ARCHIVE_PAGE
+}
+
+/// Whether a URL is the `ironsurf://history` page (any spelling the internal
+/// scheme accepts: `ironsurf://history`, `ironsurf:///history/`, …).
+pub fn is_history_page(url: &Url) -> bool {
+    url.scheme() == INTERNAL_SCHEME && internal_page_name(url) == HISTORY_PAGE
+}
+
+/// The visit list the shell answered with (see [`history_listing`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HistoryListing {
+    /// The newest visits, newest first (the shell caps the rows and reports the
+    /// whole log's size in `total`).
+    pub entries: Vec<ironsurf_common::HistoryVisit>,
+    /// Every visit in the shared log, rows shown or not.
+    pub total: usize,
+}
+
+/// What the shell answered the last `ironsurf://history` request with. `None`
+/// = no answer yet, which the page renders honestly as "asking the browser".
+pub fn history_listing() -> Option<HistoryListing> {
+    HISTORY_LISTING
+        .get_or_init(Mutex::default)
+        .lock()
+        .expect("history listing mutex poisoned")
+        .clone()
+}
+
+/// Record the shell's answer (the runtime calls this when
+/// [`ironsurf_common::ToTab::HistoryList`] lands) so the page can be rendered.
+pub fn set_history_listing(listing: Option<HistoryListing>) {
+    *HISTORY_LISTING
+        .get_or_init(Mutex::default)
+        .lock()
+        .expect("history listing mutex poisoned") = listing;
+}
+
+static HISTORY_LISTING: OnceLock<Mutex<Option<HistoryListing>>> = OnceLock::new();
+
+/// One line of the history page's status: the whole log is counted, the rows
+/// shown are admitted when the list was cut.
+fn history_status_html() -> String {
+    match history_listing() {
+        None => String::from(
+            "<p class=\"wait\">Asking the browser for the visit log&hellip; reload this page \n             if nothing appears.</p>",
+        ),
+        Some(listing) => {
+            let n = listing.total;
+            let shown = listing.entries.len();
+            if n == 0 {
+                String::from("<p class=\"wait\">No browsing history yet — visits land here as tabs navigate.</p>")
+            } else if shown < n {
+                format!(
+                    "<p>{n} visits shared by every container &mdash; the newest {shown} listed. \
+                     <a href=\"{HISTORY_URL}?clear=1\">Clear history</a> (all {n}, in every container).</p>"
+                )
+            } else {
+                format!(
+                    "<p>{n} visit{} shared by every container. \
+                     <a href=\"{HISTORY_URL}?clear=1\">Clear history</a>.</p>",
+                    if n == 1 { "" } else { "s" }
+                )
+            }
+        }
+    }
+}
+
+/// The visit list itself, newest first. Every byte of it is shell text — titles
+/// and URLs are data, never markup — so all of it is escaped.
+fn history_rows_html() -> String {
+    let Some(listing) = history_listing() else {
+        return String::from("<li class=\"wait\">One moment&hellip;</li>");
+    };
+    if listing.entries.is_empty() {
+        return String::from(
+            "<li class=\"none\">Nothing yet. Every page a tab loads is written to one log \
+             shared by all containers.</li>",
+        );
+    }
+    listing
+        .entries
+        .iter()
+        .map(|visit| {
+            let href = escape_html_text(&visit.url);
+            let title = visit
+                .title
+                .as_deref()
+                .map(str::trim)
+                .filter(|t| !t.is_empty())
+                .unwrap_or(&visit.url);
+            format!(
+                "<li><a href=\"{href}\">{title}</a> <span class=\"when\">{when}</span>\
+                 <br><code>{href}</code></li>",
+                title = escape_html_text(title),
+                when = format_unix_utc(visit.at),
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n    ")
+}
+
+/// Whole seconds since the Unix epoch as `YYYY-MM-DD HH:MM` in UTC — the tab
+/// has no calendar crate and a history list does not need a timezone database
+/// (a day-boundary in the local zone is not worth pulling `chrono` into the
+/// tab process for).
+pub fn format_unix_utc(secs: i64) -> String {
+    let days = secs.div_euclid(86_400);
+    let secs_of_day = secs.rem_euclid(86_400);
+    let (hour, minute) = (secs_of_day / 3600, secs_of_day % 3600 / 60);
+    // Days-from-civil, inverted (Howard Hinnant's algorithm): the epoch is day 0.
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097; // [0, 146096]
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365; // [0, 399]
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // [0, 365]
+    let mp = (5 * doy + 2) / 153; // [0, 11] (March = 0)
+    let d = doy - (153 * mp + 2) / 5 + 1; // [1, 31]
+    let m = if mp < 10 { mp + 3 } else { mp - 9 }; // [1, 12]
+    let y = if m <= 2 { y + 1 } else { y };
+    format!("{y:04}-{m:02}-{d:02} {hour:02}:{minute:02}")
 }
 
 /// The summary block on `ironsurf://archive`, from the shell's last answer.
@@ -623,6 +761,59 @@ const ARCHIVE_PAGE_HTML: &str = r#"<!doctype html>
      writes: one folder per visit, timestamped, holding the page as it was
      fetched. This page is built into the browser; the bytes it describes are
      served by the browser process, not fetched from anywhere.</p>
+</div>
+</body>
+</html>
+"#;
+
+/// The `ironsurf://history` page: the shared visit log, newest first. The log
+/// belongs to the **shell** (one `<data-root>/history.jsonl` for every
+/// container), so this page renders the answer to the request the tab made on
+/// the way in and asks again on every load — the same favour
+/// `ironsurf://archive` asks of its server. Self-contained like every internal
+/// page: inline styles, no scripts, no subresources.
+const HISTORY_PAGE_HTML: &str = r#"<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>ironsurf: history</title>
+<style>
+  body { margin: 0; background: #14161a; color: #e6e6e6;
+         font-family: monospace; line-height: 1.5; }
+  .wrap { max-width: 46em; margin: 0 auto; padding: 3em 1.5em; }
+  h1 { color: #8fce8f; margin: 0 0 0.2em 0; }
+  h2 { color: #8fce8f; font-size: 1.1em; margin: 2em 0 0.5em 0; }
+  .sub { color: #9aa0a6; margin: 0 0 2em 0; }
+  a { color: #8fce8f; }
+  code { background: #1f2227; padding: 0.1em 0.4em; border-radius: 3px; }
+  ul { padding-left: 1.2em; }
+  li { margin: 0 0 0.9em 0; }
+  .when { color: #9aa0a6; }
+  li code { font-size: 0.85em; color: #8a9199; background: none;
+            padding: 0; word-break: break-all; }
+  .wait { color: #9aa0a6; }
+  .none { color: #9aa0a6; list-style: none; margin-left: -1.2em; }
+  .foot { margin-top: 3em; color: #6b7178; font-size: 0.9em; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>History</h1>
+  <p class="sub">Every page this browser has visited, newest first &mdash; one log
+     shared by all containers, kept at the data root and never inside a
+     container&#39;s sandbox.</p>
+
+  <h2>State</h2>
+  {status}
+
+  <h2>Visits</h2>
+  <ul>
+    {rows}
+  </ul>
+
+  <p class="foot">The address bar&#39;s completions read the same log. Reloading
+     this page reads it again; <code>ironsurf://history?clear=1</code> empties it
+     for every container. This page is built into the browser.</p>
 </div>
 </body>
 </html>
@@ -2629,6 +2820,63 @@ pub fn fetch_document_report_shared(
     fetch_document_post_report_shared(url, None, policy, jar, cache, now, user_agent, report)
 }
 
+/// The main-document fetch on its own thread (task: faster, responsive
+/// loading): the `http(s)` bytes arrive on a worker thread and the outcome
+/// returns through the receiver, so the tab loop keeps ticking — painting,
+/// answering events, scrolling the page still on screen — while a slow host
+/// is mid-response, instead of freezing inside
+/// [`fetch_document_post_report_shared`] (which is exactly what this call
+/// replaces, and it runs it unchanged, only off-loop). The reporter runs on
+/// the worker and its [`NetEvent`]s are collected and returned with the
+/// result, so the tab emits them itself on arrival — document fetches still
+/// precede every subresource event, exactly as the synchronous path did.
+pub fn spawn_document_fetch_post_report_shared(
+    url: Url,
+    post: Option<MainDocPost>,
+    policy: NetPolicy,
+    jar: Arc<Mutex<CookieJar>>,
+    cache: Arc<Mutex<NetCache>>,
+    now: i64,
+    user_agent: SharedUserAgent,
+) -> Result<
+    std::sync::mpsc::Receiver<(Result<DocFetch, NetError>, Vec<NetEvent>)>,
+    NetError,
+> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let err_url = url.clone();
+    let spawned = std::thread::Builder::new()
+        .name("ironsurf-maindoc".to_owned())
+        .spawn(move || {
+            let events = Mutex::new(Vec::<NetEvent>::new());
+            let res = fetch_document_post_report_shared(
+                &url,
+                post.as_ref(),
+                policy,
+                &jar,
+                &cache,
+                now,
+                &user_agent,
+                Some(&|mut event: NetEvent| {
+                    event.initiator = Some("document".to_owned());
+                    events.lock().expect("doc net events mutex").push(event);
+                }),
+            );
+            let events = events
+                .lock()
+                .expect("doc net events mutex")
+                .drain(..)
+                .collect();
+            let _ = tx.send((res, events));
+        });
+    match spawned {
+        Ok(_) => Ok(rx),
+        Err(e) => Err(NetError::Transport {
+            url: err_url,
+            message: format!("cannot start document fetch thread: {e}"),
+        }),
+    }
+}
+
 #[allow(dead_code)] // quiet convenience wrapper (tests drive it; the runtime reports)
 fn fetch_document_with_worker(
     url: &Url,
@@ -3298,6 +3546,87 @@ mod tests {
         assert!(text.contains("cannot bind &lt;b&gt;127.0.0.1&lt;/b&gt;"));
         assert!(!text.contains("<b>"));
         set_archive_server_status(None);
+    }
+
+    // One history page is one global: the tab renders the shell's last answer
+    // out of a process-wide cell (every tab process has exactly one), so these
+    // checks share it in one test rather than racing each other from threads.
+    #[test]
+    fn the_history_page_renders_what_the_shell_answered() {
+        // ── The visits, newest first, one row each ───────────────────────────
+        set_history_listing(Some(HistoryListing {
+            entries: vec![
+                ironsurf_common::HistoryVisit {
+                    url: "https://example.org/two".into(),
+                    title: Some("Second <page>".into()),
+                    at: 1_700_000_200,
+                },
+                ironsurf_common::HistoryVisit {
+                    url: "https://example.org/one".into(),
+                    title: None,
+                    at: 1_700_000_100,
+                },
+            ],
+            total: 2,
+        }));
+        assert!(is_history_page(&url(HISTORY_URL)));
+        assert_eq!(internal_page_name(&url(HISTORY_URL)), HISTORY_PAGE);
+        let page = || {
+            String::from_utf8(internal_page_bytes(&url(HISTORY_URL)).expect("history"))
+                .expect("utf8")
+        };
+        let text = page();
+        assert!(text.contains("<title>ironsurf: history</title>"));
+        assert!(text.contains("<h1>History</h1>"));
+        assert!(text.contains("2 visits shared by every container"));
+        assert!(text.contains("href=\"https://example.org/two\""));
+        assert!(
+            text.find("example.org/two") < text.find("example.org/one"),
+            "the visit log reads newest first, as the settings drawer's list did"
+        );
+        assert_eq!(text.matches("<span class=\"when\">").count(), 2, "every row says when");
+        // A title is page data, so it is escaped; a visit without one is
+        // labelled with its own address rather than left blank.
+        assert!(text.contains("Second &lt;page&gt;"));
+        assert!(!text.contains("Second <page>"));
+        assert!(text.find(">https://example.org/one</a>").is_some());
+        // Clearing the log is a link back to this page with a query.
+        assert!(text.contains(&format!("href=\"{HISTORY_URL}?clear=1\"")));
+        // No scripts and no subresources, like every internal page.
+        assert!(!text.contains("<script"));
+        assert!(!text.contains("src="));
+
+        // ── No answer from the shell yet: it says so, and invents no rows ─────
+        set_history_listing(None);
+        let text = page();
+        assert!(text.contains("Asking the browser for the visit log"));
+        assert!(text.contains("<li class=\"wait\">One moment"));
+
+        // ── An empty log says so plainly, in the count and in the list ────────
+        set_history_listing(Some(HistoryListing { entries: vec![], total: 0 }));
+        let text = page();
+        assert!(text.contains("No browsing history yet"));
+        assert!(text.contains("Nothing yet."));
+        assert!(!text.contains("<li><a href="), "no rows to show");
+
+        // ── A list the shell cut short admits how much it left out ────────────
+        set_history_listing(Some(HistoryListing {
+            entries: vec![ironsurf_common::HistoryVisit {
+                url: "https://example.org/".into(),
+                title: Some("Example".into()),
+                at: 1_700_000_000,
+            }],
+            total: 9,
+        }));
+        let text = page();
+        assert!(text.contains("9 visits shared by every container"));
+        assert!(text.contains("the newest 1 listed"));
+
+        // The clear link comes back to this same page: the query says the row
+        // was Clear, it never turns the page into another page.
+        assert_eq!(internal_page_name(&url(&format!("{HISTORY_URL}?clear=1"))), HISTORY_PAGE);
+        assert!(is_history_page(&url(&format!("{HISTORY_URL}?clear=1"))));
+        set_history_listing(None);
     }
 
     #[test]

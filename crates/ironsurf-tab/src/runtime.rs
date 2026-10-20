@@ -121,11 +121,76 @@ const IDLE_TICK: Duration = Duration::from_millis(250);
 /// `RUNNING_POLL_INTERVAL` role of the JS-timer cap, for media.
 const MEDIA_TICK: Duration = Duration::from_millis(40);
 /// How far `↑` / `↓` take the document, CSS px — "a line", and the same step
-/// `window.scrollBy(0, 40)` takes. Twice the wheel's line unit (blitz multiplies
-/// one notch by 20 CSS px, `events/pointer.rs`), which is about two lines of body
-/// text at the default font size: enough to see that the page moved, small enough
-/// that a paragraph is a few presses and a screen is a dozen.
+/// `window.scrollBy(0, 40)` takes. Four times the wheel's damped line unit
+/// ([`WHEEL_SPEED`] on blitz's 20 CSS px notch, `events/pointer.rs`), which is
+/// about two lines of body text at the default font size: enough to see that
+/// the page moved, small enough that a paragraph is a few presses and a screen
+/// is a dozen.
 const ARROW_SCROLL_PX: f64 = 40.0;
+/// Wheel speed-up factor (task: slower and smoother wheel): the travel the
+/// document makes per wheel event, relative to what blitz would make of it
+/// (20 CSS px per notch, a raw pixel delta verbatim). Half turns one notch
+/// into a gentle 10 px nudge and a fast flick into lines, not screens.
+const WHEEL_SPEED: f64 = 0.5;
+/// The smooth scroller's cadence: the poll loop never sleeps past one slice
+/// interval while a glide is in flight, so at rest slices are fed at ~60 Hz.
+const WHEEL_STEP: Duration = Duration::from_millis(16);
+/// The glide's decay constant: a slice settles the fraction of what is still
+/// owed that `dt` of an exponential of this time constant covers — small
+/// quick slices on a fast machine, bigger rarer ones when a software repaint
+/// eats the frame, and the same ~3τ (~⅑ s) landing either way. The page is
+/// therefore *always* still moving with the first slice (40%+ of the travel)
+/// and at rest shortly after the last notch, whatever the paint costs.
+const WHEEL_TAU: Duration = Duration::from_millis(30);
+
+/// The tab-side smooth scroller's state (task: slower and smoother wheel):
+/// wheel travel — already damped by [`WHEEL_SPEED`] — queued here and gliding
+/// into the document one eased slice per [`WHEEL_STEP`] instead of teleporting.
+/// A main-document fetch in flight on the network worker (task: faster,
+/// responsive loading): the receiver delivers `(fetch result, DevTools
+/// events)` for the poll loop to adopt.
+struct PendingNavigation {
+    rx: mpsc::Receiver<(Result<netmod::DocFetch, netmod::NetError>, Vec<NetEvent>)>,
+    url: Url,
+    history: NavHistory,
+    started: Instant,
+}
+
+#[derive(Clone, Copy)]
+struct WheelGlide {
+    /// Travel still owed to the page, CSS px, winit convention (positive =
+    /// up, so the usual negative wheel-down delta glides the document down).
+    pending: (f64, f64),
+    /// When the last slice was fed — the slice size is the travel a window
+    /// this wide eases out, so the glide lands on wall-clock, not on how
+    /// many times the loop happened to turn.
+    last: Instant,
+    /// Earliest moment the next slice may be fed.
+    next: Instant,
+    /// Where the wheel was last turned — replayed with every slice so blitz
+    /// resolves the hovered scroll chain from the same hover state. `None`
+    /// until the first wheel event, which is also the only writer of
+    /// `pending`, so a running glide always has a place.
+    at: Option<PointerCoords>,
+    /// The same point in logical px — what [`Tab::report_cursor`] hit-tests.
+    over: (f32, f32),
+}
+
+/// One slice of the glide: what a window of `dt` settles under an
+/// exponential of [`WHEEL_TAU`], the last CSS px fed whole and a window of
+/// four τ (or more) just landing the rest — the glide terminates instead of
+/// asymptoting, and a starved scroller catches up instead of crawling.
+fn wheel_glide_step(remaining: f64, dt: Duration) -> f64 {
+    if remaining.abs() <= 1.0 || dt >= 4 * WHEEL_TAU {
+        return remaining;
+    }
+    // Never smaller than one cadence step: the first slice of a gesture has
+    // a `dt` of ~0 (the gesture armed the clock “now”), and a kick of ~40%
+    // is exactly what makes the page feel attached to the wheel.
+    let dt = dt.max(WHEEL_STEP).as_secs_f64();
+    let fraction = 1.0 - (-(dt / WHEEL_TAU.as_secs_f64())).exp();
+    remaining * fraction
+}
 
 // ---------------------------------------------------------------------------
 // CLI
@@ -577,6 +642,9 @@ pub struct Tab {
     zoom: f32,
     visible: bool,
     doc: Option<HtmlDocument>,
+    /// A main-document fetch still in flight on the network worker
+    /// (task: faster, responsive loading); `None` when nothing is fetching.
+    pending_nav: Option<PendingNavigation>,
     /// The container's cookie jar — the very same `Arc<Mutex<..>>` the
     /// Blitz provider mutates for subresources. One jar per container per
     /// tab: main-document `Set-Cookie`s reach subresource requests (and
@@ -692,6 +760,13 @@ pub struct Tab {
     /// `cursor_status`'s: the shell's overlay bar needs the numbers, a page
     /// that sits still needs no messages.
     scroll_report: Option<ScrollState>,
+    /// The wheel's glide queue ([`WheelGlide`]); fed by [`Tab::pump_wheel`]
+    /// (task: slower and smoother wheel).
+    wheel_glide: WheelGlide,
+    /// Wheel-travel multiplier from the settings menu's slider
+    /// (`ToTab::SetScrollSpeed`): the default damping ([`WHEEL_SPEED`])
+    /// scaled, folded into every queued glide. `WHEEL_SPEED` until told.
+    wheel_speed: f64,
     /// Popup blocker (task: block popups — a website opening new tabs without a
     /// user interaction). One shared cell: the `window.open` native answers
     /// through it synchronously, real input arms its engagement credit, and the
@@ -824,6 +899,17 @@ pub struct Tab {
     /// page emits [`FromTab::ArchiveServerStart`] and the shell's
     /// [`ToTab::ArchiveServerInfo`] is what the page shows.
     archive_page: Option<String>,
+    /// The `ironsurf://history` page this tab is sitting on, when it is one (the
+    /// URL as asked for, `?clear=1` included). The visit log is the shell's —
+    /// one `<data-root>/history.jsonl` shared by every container, outside every
+    /// sandbox — so rendering the page emits [`FromTab::HistoryListRequest`] and
+    /// the page shows the shell's answer to [`ToTab::HistoryList`].
+    history_page: Option<String>,
+    /// The listing the history page on screen was **rendered** from (`None` =
+    /// the "asking the browser" placeholder). An answer that differs from it is
+    /// worth a re-render; one that repeats it is not, which is what stops the
+    /// page from reloading itself forever.
+    history_rendered: Option<netmod::HistoryListing>,
     /// `true` while the live navigation is one the **user** asked for (typed in
     /// the shell's address bar, Reload). Page script clears it: only a
     /// user-chosen address may ask the shell to re-point the archive server or
@@ -1139,6 +1225,15 @@ impl Tab {
             hover_status: None,
             cursor_status: None,
             scroll_report: None,
+            pending_nav: None,
+            wheel_glide: WheelGlide {
+                pending: (0.0, 0.0),
+                last: Instant::now(),
+                next: Instant::now(),
+                at: None,
+                over: (0.0, 0.0),
+            },
+            wheel_speed: WHEEL_SPEED,
             pending_form: None,
             form_press: None,
             label_press: None,
@@ -1152,6 +1247,8 @@ impl Tab {
             media_enabled: args.media_enabled,
             media_next_pump: None,
             archive_page: None,
+            history_page: None,
+            history_rendered: None,
             nav_from_shell: false,
             net_events,
             console_events,
@@ -1391,7 +1488,7 @@ impl Tab {
             // becomes a history entry.)
             return self.run_javascript_url(&code);
         }
-        let url = match parse_input_url(raw) {
+        let mut url = match parse_input_url(raw) {
             Ok(url) => url,
             Err(err) => {
                 warn!("bad url {raw:?}: {err}");
@@ -1411,6 +1508,29 @@ impl Tab {
         // reply (`ToTab::ArchiveServerInfo`) is rendered by the next visit.
         if netmod::is_archive_page(&url) {
             self.ask_archive_server(&url);
+        }
+
+        // `ironsurf://history`: rendered locally like every other internal page,
+        // but from a log this process may not even read (it belongs to the
+        // shell), so ask for it now; the answer arrives as [`ToTab::HistoryList`]
+        // and a page that has nothing to show re-renders when it lands. What the
+        // fetch below will paint is the listing remembered *right now*.
+        if netmod::is_history_page(&url) {
+            let clear = url
+                .query_pairs()
+                .any(|(key, value)| key == "clear" && value != "0");
+            // The query is a one-shot instruction (the row clicked was "Clear
+            // history"), not part of the page's address: drop it, so the bar
+            // reads plain `ironsurf://history` and a **Reload** re-reads the log
+            // instead of clearing it a second time.
+            if clear {
+                url.set_query(None);
+            }
+            self.history_page = Some(url.as_str().to_string());
+            self.history_rendered = netmod::history_listing();
+            self.emit(FromTab::HistoryListRequest { clear });
+        } else {
+            self.history_page = None;
         }
 
         self.emit(FromTab::LoadingChanged { loading: true });
@@ -1437,6 +1557,40 @@ impl Tab {
             "fetching main document {url} (net policy {:?})",
             self_provider_policy(&self.provider)
         );
+        // Task: faster, responsive loading — an `http(s)` document must not
+        // stall the tab while its bytes cross the network: the fetch (the
+        // very exchange the synchronous path below performs) moves onto its
+        // own worker thread, and the loop keeps ticking — the page still on
+        // screen stays scrollable, clickable and animating, and other
+        // documents' subresources keep flowing — until the poll loop picks
+        // the result up and runs the same adoption tail a sync load had.
+        if matches!(url.scheme(), "http" | "https") {
+            let spawned = netmod::spawn_document_fetch_post_report_shared(
+                url.clone(),
+                post.cloned(),
+                self_provider_policy(&self.provider),
+                Arc::clone(&self.jar),
+                Arc::clone(&self.cache),
+                netmod::now_unix(),
+                Arc::clone(&self.user_agent),
+            );
+            match spawned {
+                Ok(rx) => {
+                    self.pending_nav = Some(PendingNavigation {
+                        rx,
+                        url,
+                        history,
+                        started,
+                    });
+                    return true;
+                }
+                Err(err) => {
+                    return self.finish_main_doc_fetch(&url, history, Err(err), started)
+                }
+            }
+        }
+        // Local schemes (`file:`/`data:`/`about:`/`ironsurf:`) answer
+        // instantly — their fetch is a read(), so it stays on-thread.
         // DevTools network reporting: the document fetch runs synchronously
         // on the tab thread, so its events (one per completed/failed request,
         // one per redirect hop) queue locally and ship right after the fetch
@@ -1464,6 +1618,21 @@ impl Tab {
         for event in doc_events.lock().expect("doc net events mutex").drain(..) {
             self.emit(FromTab::NetworkEvent { event });
         }
+        self.finish_main_doc_fetch(&url, history, fetch, started)
+    }
+
+    /// The adoption tail of a main-document fetch: the bytes (or the block
+    /// page) become the new document, scripts run, and the load bookkeeping
+    /// ships. Reached when an on-thread fetch returned (`file:` and friends)
+    /// or when the poll loop collected an `http(s)` worker result (task:
+    /// faster, responsive loading).
+    fn finish_main_doc_fetch(
+        &mut self,
+        url: &Url,
+        history: NavHistory,
+        fetch: Result<netmod::DocFetch, netmod::NetError>,
+        started: Instant,
+    ) -> bool {
         match fetch {
             Ok(mut doc_fetch) => {
                 debug!(
@@ -1560,6 +1729,61 @@ impl Tab {
                     }
                 }
             }
+        }
+    }
+
+    /// A main-document fetch that returned from the network worker: its
+    /// DevTools events ship first, then the document is adopted. The poll
+    /// loop calls this every cycle; while the bytes are still arriving the
+    /// `try_recv` is empty and this returns immediately (task: faster,
+    /// responsive loading).
+    fn drain_pending_navigation(&mut self) {
+        let arrived = match self.pending_nav.as_ref() {
+            None => return,
+            Some(p) => match p.rx.try_recv() {
+                Ok(v) => Some(v),
+                Err(mpsc::TryRecvError::Disconnected) => Some((
+                    Err(netmod::NetError::Transport {
+                        url: p.url.clone(),
+                        message: "document fetch worker died".to_owned(),
+                    }),
+                    Vec::new(),
+                )),
+                Err(mpsc::TryRecvError::Empty) => None,
+            },
+        };
+        let Some((res, events)) = arrived else { return };
+        let Some(p) = self.pending_nav.take() else { return };
+        for event in events {
+            self.emit(FromTab::NetworkEvent { event });
+        }
+        self.finish_main_doc_fetch(&p.url, p.history, res, p.started);
+    }
+
+    /// Drive a main-document fetch to completion (headless harness and
+    /// tests — places where no poll loop is turning). Returns false if the
+    /// navigation is still in flight when the timeout expires.
+    pub fn wait_for_navigation(&mut self, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        while self.pending_nav.is_some() {
+            self.drain_pending_navigation();
+            if self.pending_nav.is_some() {
+                if Instant::now() >= deadline {
+                    return false;
+                }
+                std::thread::sleep(Duration::from_millis(2));
+            }
+        }
+        true
+    }
+
+    /// While a main-document fetch is in flight, keep the poll tick short so
+    /// its result is adopted promptly (task: faster, responsive loading).
+    fn nav_poll_tick(&self, base: Duration) -> Duration {
+        if self.pending_nav.is_some() {
+            base.min(Duration::from_millis(16))
+        } else {
+            base
         }
     }
 
@@ -1684,6 +1908,10 @@ impl Tab {
         // offset with the next poll step whatever the old one had said (task:
         // scroll bar).
         self.scroll_report = None;
+        // …and an unfinished wheel glide belongs to the document it scrolled:
+        // the new page starts at its own top, not halfway down a gesture that
+        // was travelling through the old one (task: slower and smoother wheel).
+        self.wheel_glide.pending = (0.0, 0.0);
         // The previous document's players die with it (their widgets die with
         // its node tree; their decode threads end when the players drop).
         self.reset_media();
@@ -1733,6 +1961,17 @@ impl Tab {
             html.len(),
             parsed.elapsed().as_millis()
         );
+        // Task: faster, responsive loading — show content before scripts
+        // finish: the document is parsed, its CSS settled (stylesheets,
+        // webfonts) and laid out, so paint that first and the user sees the
+        // page while a script-heavy document is still coming alive — boa can
+        // spend seconds in `run_scripts`, and the pre-script frame is the
+        // difference between "loading" and "frozen". Anything a script then
+        // mutates queues a repaint through the Shell provider's
+        // invalidation, so the post-script state follows immediately after.
+        self.needs_paint = true;
+        self.last_paint = None;
+        self.maybe_repaint();
         // JavaScript runs on the settled DOM (ARCHITECTURE §JavaScript (Boa)).
         self.run_scripts(url);
         // Video (task: playback): every `<video>` gets its widget and its
@@ -2953,6 +3192,12 @@ impl Tab {
             false => 0.0,
         };
         let y = doc.viewport_scroll().y;
+        // Snap the top edge: a glide feeds its slices through f32-crunched
+        // engine deltas, so a document brought to the top can rest on a
+        // float residue (5.7e-14 observed) rather than on zero. Below a
+        // millionth of a CSS px *is* the top; the shell's scroll-bar test
+        // — and its readers — may say so.
+        let y = if y < 1e-6 { 0.0 } else { y };
         Some(ScrollState {
             y: y.clamp(0.0, range) as f32,
             range: range as f32,
@@ -2963,11 +3208,18 @@ impl Tab {
     /// Tell the shell what the page's scroll geometry is, but only when it
     /// moved ([`ScrollState::same_within`], half a CSS px): the overlay scroll
     /// bar the shell draws over the page needs the numbers to place its thumb,
-    /// and a page that sits still must not cost a message per poll tick. One
-    /// wheel notch moves the document ~20 px, so the gate never misses a scroll.
+    /// and a page that sits still must not cost a message per poll tick. Even
+    /// one damped wheel notch moves the document ~10 px (and the glide feeds
+    /// slices of ≥1 px), so the gate never misses a scroll.
     fn report_scroll_state(&mut self) {
         let Some(state) = self.viewport_scroll_state() else { return };
-        if self.scroll_report.is_some_and(|prev| prev.same_within(&state, 0.5)) {
+        // An edge reached is news even under the half-px gate: the shell may
+        // hold the last 0.4 px of a glide as "the" offset, and only the
+        // report of a parked 0.0 tells it the page came home.
+        let reached_edge = self.scroll_report.is_some_and(|prev| {
+            (state.y == 0.0 && prev.y != 0.0) || (state.y == state.range && prev.y != state.range)
+        });
+        if !reached_edge && self.scroll_report.is_some_and(|prev| prev.same_within(&state, 0.5)) {
             return;
         }
         self.scroll_report = Some(state);
@@ -3027,6 +3279,67 @@ impl Tab {
         } else {
             ARROW_SCROLL_PX
         });
+    }
+
+    // -- smooth wheel --------------------------------------------------------
+
+    /// Cap the poll sleep at the next slice of the wheel glide: while a glide
+    /// is in flight the loop must wake to feed it even when the page and the
+    /// shell are otherwise silent.
+    fn wheel_poll_tick(&self, base: Duration) -> Duration {
+        let (x, y) = self.wheel_glide.pending;
+        if x == 0.0 && y == 0.0 {
+            return base;
+        }
+        self.wheel_glide
+            .next
+            .saturating_duration_since(Instant::now())
+            .min(base)
+    }
+
+    /// Feed one eased slice of the queued wheel travel into the document:
+    /// the page *chases* the wheel instead of teleporting, and a stream of
+    /// events flows — each event adds to what is owed, each slice takes a
+    /// step toward it. A slice is an ordinary wheel event in pixel units,
+    /// so blitz's scroll-chain resolution and clamping are untouched; only
+    /// the step size is ours now. `force` runs the whole remainder at once
+    /// (tests and any caller that must know the final offset now); the poll
+    /// loop never forces.
+    fn pump_wheel(&mut self, force: bool) {
+        let (px, py) = self.wheel_glide.pending;
+        if px == 0.0 && py == 0.0 {
+            return;
+        }
+        let now = Instant::now();
+        if !force && now < self.wheel_glide.next {
+            return;
+        }
+        let dt = now.saturating_duration_since(self.wheel_glide.last);
+        self.wheel_glide.last = now;
+        self.wheel_glide.next = now + WHEEL_STEP;
+        let (cx, cy) = if force {
+            (px, py)
+        } else {
+            (wheel_glide_step(px, dt), wheel_glide_step(py, dt))
+        };
+        self.wheel_glide.pending = (px - cx, py - cy);
+        let Some(coords) = self.wheel_glide.at else {
+            self.wheel_glide.pending = (0.0, 0.0);
+            return;
+        };
+        let (ox, oy) = self.wheel_glide.over;
+        self.feed_ui_event(UiEvent::Wheel(BlitzWheelEvent {
+            delta: BlitzWheelDelta::Pixels(cx, cy),
+            coords,
+            buttons: self.mouse_buttons,
+            mods: KMods::empty(),
+            element: Point::default(),
+        }));
+        // The page moved under a stationary pointer: what sits under the
+        // cursor — and its cursor shape — is in question again, exactly as
+        // for the wheel event itself (`handle_input`).
+        self.report_cursor(ox, oy, false);
+        self.needs_paint = true;
     }
 
     // -- painting -----------------------------------------------------------
@@ -3707,6 +4020,25 @@ impl Tab {
                     }
                 }
             }
+            ToTab::HistoryList { ref entries, total, .. } => {
+                let fresh =
+                    netmod::HistoryListing { entries: entries.clone(), total };
+                // A page still showing the answer it asked with (`None`, or an
+                // older log) renders the new one in place — same session slot,
+                // so Back still steps over the history page once. An answer that
+                // repeats what is on screen changes nothing, and that is what
+                // keeps the reload after the request from looping.
+                let stale =
+                    self.history_page.is_some() && self.history_rendered.as_ref() != Some(&fresh);
+                info!("history page: {total} visit(s) in the shared log");
+                netmod::set_history_listing(Some(fresh));
+                if stale {
+                    // `?clear=1` (the page's "Clear history" link) is a one-shot:
+                    // the re-render asks for the plain page, or it would clear
+                    // the freshly emptied log again on every reload.
+                    self.navigate(netmod::HISTORY_URL, NavHistory::Session(self.history_index));
+                }
+            }
             ToTab::Clipboard { text } => {
                 // The shell pushes the session clipboard just before it
                 // relays Ctrl+V; blitz's editors read it back through
@@ -3770,6 +4102,17 @@ impl Tab {
             ToTab::InspectPickAt { x, y } => self.inspect_pick_at(x, y),
             ToTab::SetReader { enabled } => self.set_reader(enabled),
             ToTab::SetPopupPolicy { block, allowed } => self.set_popup_policy(block, allowed),
+            ToTab::SetScrollSpeed { speed } => {
+                // The settings menu's slider: a multiplier on the default
+                // damping (like zoom, the shell owns the policy — the tab
+                // only rejects nonsense and clamps hard).
+                self.wheel_speed = if speed.is_finite() && speed > 0.0 {
+                    WHEEL_SPEED * (speed as f64).clamp(0.1, 4.0)
+                } else {
+                    WHEEL_SPEED
+                };
+                info!("wheel speed → {speed:.2}× ({:.2} px per unit)", self.wheel_speed);
+            }
             ToTab::DialogResponse { dialog_id, .. } => {
                 // A reply with no modal open: it either raced the tab-side
                 // cancel (shell quit mid-dialog) or is stale — nothing to
@@ -4606,6 +4949,13 @@ impl Tab {
             text,
         };
         self.feed_ui_event(UiEvent::KeyDown(base.clone()));
+        // macOS: the delete key has to be named as an AppKit editing command as
+        // well, or the engine ignores it (see [`apple_keybinding`]).
+        if APPLE_KEYBINDINGS {
+            if let Some(command) = apple_keybinding(ev) {
+                self.feed_ui_event(UiEvent::AppleStandardKeybinding(command.into()));
+            }
+        }
         // Ctrl+A outside an editor selects all the text on screen (task:
         // select all). blitz's own Ctrl+A is editor-only (`node/text.rs`) and
         // ran on the feed above, so with a text control focused we stay out
@@ -4666,26 +5016,41 @@ impl Tab {
     /// arriving here need no sign surgery.
     ///
     /// The contract doesn't pin units, so: deltas with magnitude ≤ 3 are
-    /// treated as wheel notches (lines), everything else as CSS-px pixel
-    /// deltas.
+    /// treated as wheel notches — one line of content each, whatever the
+    /// zoom (blitz's 20 CSS px `Lines` unit, spelled out here because the
+    /// glide feeds everything as pixel deltas) — and everything else as
+    /// logical-px pixel deltas, divided by the zoom so the page moves the
+    /// same *visual* distance at every zoom.
+    ///
+    /// Slower and smoother (task): the travel is damped by [`WHEEL_SPEED`]
+    /// — scaled by the settings menu's scroll-speed slider, see
+    /// [`Tab::wheel_speed`] — and queued onto [`Tab::pump_wheel`] instead of
+    /// being applied whole —
+    /// the page glides to the new offset over a few frames, and a wheel in
+    /// motion keeps queueing onto the same glide. The first slice is fed with
+    /// the event, so a gesture never waits a frame to start moving.
     fn handle_scroll(&mut self, ev: &ScrollEvent) {
         let z = self.zoom() as f64;
-        let delta = if ev.delta_x.abs().max(ev.delta_y.abs()) <= 3.0 {
-            // Wheel notches scroll one line of content whatever the zoom.
-            BlitzWheelDelta::Lines(ev.delta_x as f64, ev.delta_y as f64)
+        let unit = if ev.delta_x.abs().max(ev.delta_y.abs()) <= 3.0 {
+            20.0 // one notch, CSS px — blitz's `Lines` unit, baked in
         } else {
-            // Pixel deltas are logical px; the page moves the same visual
-            // distance, which is delta/zoom in CSS px.
-            BlitzWheelDelta::Pixels(ev.delta_x as f64 / z, ev.delta_y as f64 / z)
+            1.0 / z // logical px → CSS px
         };
-        let ui = UiEvent::Wheel(BlitzWheelEvent {
-            delta,
-            coords: self.pointer_coords(ev.x, ev.y),
-            buttons: self.mouse_buttons,
-            mods: KMods::empty(),
-            element: Point::default(),
-        });
-        self.feed_ui_event(ui);
+        let glide = &mut self.wheel_glide;
+        if glide.pending == (0.0, 0.0) {
+            // A resting glide restarts its clock with the gesture, so the
+            // first slice is the kick, not the whole travel.
+            glide.last = Instant::now();
+        }
+        glide.pending = (
+            glide.pending.0 + f64::from(ev.delta_x) * unit * self.wheel_speed,
+            glide.pending.1 + f64::from(ev.delta_y) * unit * self.wheel_speed,
+        );
+        let coords = self.pointer_coords(ev.x, ev.y);
+        let glide = &mut self.wheel_glide;
+        glide.at = Some(coords);
+        glide.over = (ev.x, ev.y);
+        self.pump_wheel(false);
     }
 
     /// The single document-input funnel: everything below (7e Boa scripting,
@@ -6098,6 +6463,41 @@ fn is_action_chord(ev: &KeyEvent) -> bool {
     ev.mods.ctrl() && !ev.mods.meta()
 }
 
+/// The AppKit standard-keybinding command this key press stands for, or `None`
+/// when it is not an editing command.
+///
+/// Why the tab has to say it: blitz-dom's text-input key handling skips
+/// `Key::Backspace` on macOS outright — "On macOS this is handled by the apple
+/// standard keybindings" (`node/text.rs`) — and expects its embedder to send the
+/// `deleteBackward:`-style command instead. Blitz's own winit provider gets
+/// those from Cocoa; IronSurf's window is a Slint window, whose delete key
+/// arrives here as an ordinary key event. Without this the key did nothing at
+/// all in a page's `<input>` on a Mac (task: backspace no longer works on mac
+/// forms), while working on every other platform.
+///
+/// Only the deleting key is translated — it is the one the engine cfg's out.
+/// Arrows, Home/End, forward Delete and character input all reach blitz from
+/// the key event itself, and the page's own `keydown` is fired separately by
+/// [`Runtime::fire_js_key`], so nothing is dropped and nothing happens twice.
+pub fn apple_keybinding(ev: &KeyEvent) -> Option<&'static str> {
+    match ev.key.as_str() {
+        // The key labelled `delete` on an Apple keyboard *is* Backspace; with ⌥
+        // it deletes a word, matching the word-delete the other platforms get
+        // from the same chord.
+        "Backspace" => Some(if ev.mods.alt() {
+            "deleteWordBackward:"
+        } else {
+            "deleteBackward:"
+        }),
+        _ => None,
+    }
+}
+
+/// Whether this build must feed the AppKit commands at all: elsewhere blitz-dom
+/// handles `Key::Backspace` from the key event, so feeding the command too would
+/// delete twice.
+pub const APPLE_KEYBINDINGS: bool = cfg!(target_os = "macos");
+
 /// A freshly-synthesized editing chord (context-menu Paste) must carry the
 /// platform's action modifier exactly as blitz expects it.
 #[cfg(target_os = "macos")]
@@ -6503,6 +6903,10 @@ pub fn run(args: TabArgs) -> i32 {
         // Never sleep past the earliest JS timer deadline (task: real timers),
         // nor past the media cadence while a video is alive (task: playback).
         let tick = tab.media_poll_tick(tab.timer_poll_tick(tick));
+        // …nor past the next slice of a gliding wheel (task: slower and
+        // smoother wheel) — the glide is fed on its own clock, not on wakes.
+        let tick = tab.wheel_poll_tick(tick);
+        let tick = tab.nav_poll_tick(tick);
         poll_inputs(stdin_fd, wake_fd, tick);
         // Wake-ups from ShellProvider::request_redraw / the NetWaker.
         let woken = pipe.drain() > 0;
@@ -6527,6 +6931,10 @@ pub fn run(args: TabArgs) -> i32 {
         if !pending.borrow().is_empty() {
             stdin_frames = true;
         }
+
+        // 1b. A main-document fetch that finished while the rest of this
+        // cycle was handled (task: faster, responsive loading).
+        tab.drain_pending_navigation();
 
         // 2. Link clicks / form submits (NavigationProvider hook).
         if tab.drain_nav_hook() {
@@ -6575,6 +6983,11 @@ pub fn run(args: TabArgs) -> i32 {
         // every player, forward page events, and refresh the snapshots the
         // page's media properties read (task: playback).
         tab.pump_media();
+
+        // 2c′. The wheel glide: feed one eased slice of the travel the wheel
+        // events queued since the last slice (task: slower and smoother
+        // wheel); the pixels it earns are step 3's business.
+        tab.pump_wheel(false);
 
         // 3. Settle net completions / redraw requests and coalesce frames.
         //    Invisible tabs stay idle — repaints resume on SetVisible(true).
@@ -6986,6 +7399,135 @@ mod tests {
         Tab::new_headless(&args, pipe)
     }
 
+    /// Text the history page is showing (its `<body>`), for asserting the shell's
+    /// answer actually reached the screen.
+    fn body_text(tab: &mut Tab) -> String {
+        match tab.doc.as_mut().and_then(|doc| doc.query_selector("body").ok()) {
+            Some(Some(id)) => tab
+                .doc
+                .as_mut()
+                .and_then(|doc| doc.get_node(id))
+                .map(|n| n.text_content())
+                .unwrap_or_default(),
+            _ => String::new(),
+        }
+    }
+
+    fn visit(url: &str, title: &str) -> ironsurf_common::HistoryVisit {
+        ironsurf_common::HistoryVisit {
+            url: url.into(),
+            title: Some(title.into()),
+            at: 1_700_000_000,
+        }
+    }
+
+    /// The history page (task: `ironsurf://history`): rendered locally, but the
+    /// visit log is the shell's file, so navigating there remembers the page,
+    /// asks (the emit goes to the harness's null sink; the shell's own test
+    /// covers the wire), and shows the shell's answer when it lands — with the
+    /// page on screen re-rendering in place, so Back still steps over it once.
+    #[test]
+    fn the_history_page_shows_the_shell_answer_and_its_revisions() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut tab = form_tab(dir.path());
+        netmod::set_history_listing(None);
+
+        assert!(tab.navigate(netmod::HISTORY_URL, NavHistory::Fresh));
+        assert_eq!(tab.history_page.as_deref(), Some(netmod::HISTORY_URL));
+        assert!(
+            body_text(&mut tab).contains("Asking the browser for the visit log"),
+            "the page waits honestly, inventing neither rows nor a count"
+        );
+
+        // The shell answers: the listing lands on the screen that asked for it.
+        tab.handle_to_tab(ToTab::HistoryList {
+            tab_id: TabId(1),
+            entries: vec![visit("https://example.org/one", "One")],
+            total: 1,
+        });
+        let text = body_text(&mut tab);
+        assert!(text.contains("https://example.org/one"), "the visit is not on screen: {text}");
+        assert!(text.contains("One"), "the page's own title should head the row: {text}");
+
+        // The same answer again changes nothing on screen — which is what keeps
+        // the request/answer pair from reloading the page in a loop.
+        let before = text;
+        tab.handle_to_tab(ToTab::HistoryList {
+            tab_id: TabId(1),
+            entries: vec![visit("https://example.org/one", "One")],
+            total: 1,
+        });
+        assert_eq!(body_text(&mut tab), before);
+
+        // The log emptied under the page (Clear history in the settings drawer):
+        // the open page is told and redraws itself empty.
+        tab.handle_to_tab(ToTab::HistoryList { tab_id: TabId(1), entries: vec![], total: 0 });
+        let text = body_text(&mut tab);
+        assert!(text.contains("Nothing yet."), "the emptied log is not on screen: {text}");
+        assert!(!text.contains("example.org/one"));
+
+        // The page's own address is the plain one, query and all: a link to
+        // `?clear=1` empties the log and stays on `ironsurf://history`, so a
+        // later Reload re-reads the log instead of clearing it again.
+        assert!(tab.navigate(&format!("{}?clear=1", netmod::HISTORY_URL), NavHistory::Fresh));
+        assert_eq!(tab.history_page.as_deref(), Some(netmod::HISTORY_URL));
+        netmod::set_history_listing(None);
+    }
+
+    /// Task: faster, responsive loading — an `http(s)` main-document fetch
+    /// runs on the network worker, not on the tab thread: `navigate` returns
+    /// once the fetch is *in flight* (the page on screen stays alive and
+    /// interactive), and `wait_for_navigation` adopts the result — the very
+    /// `drain_pending_navigation` the poll loop runs between ticks. Local
+    /// schemes stay synchronous (their fetch is a read).
+    #[test]
+    fn an_http_document_loads_on_the_network_worker() {
+        use std::io::{Read, Write};
+        let dir = tempfile::tempdir().expect("tempdir");
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("loopback test server");
+        let port = listener.local_addr().expect("test addr").port();
+        let server = std::thread::spawn(move || {
+            for stream in listener.incoming().take(1) {
+                let mut s = match stream {
+                    Ok(s) => s,
+                    Err(_) => return,
+                };
+                let mut buf = [0u8; 2048];
+                let _ = s.read(&mut buf).ok();
+                let _ = s.write_all(
+                    b"HTTP/1.1 200 OK\r\ncontent-type: text/html\r\nconnection: close\r\n\r\n\
+                       <!doctype html><html><head><title>Worker page</title>\
+                       <style>body{margin:0;height:4000px}</style></head>\
+                       <body><p>served off-thread</p></body></html",
+                );
+            }
+        });
+        let mut tab = form_tab(dir.path());
+        tab.handle_to_tab(ToTab::Resize {
+            width: 800,
+            height: 600,
+            scale: 1.0,
+        });
+        let url = format!("http://127.0.0.1:{port}/served");
+        assert!(tab.navigate(&url, NavHistory::Fresh), "the navigation starts");
+        assert!(
+            tab.wait_for_navigation(std::time::Duration::from_secs(15)),
+            "the worker fetch completes"
+        );
+        tab.settle();
+        assert_eq!(
+            text_of(tab.document_mut().expect("doc"), "title").unwrap_or_default(),
+            "Worker page",
+            "the served document is the loaded one at {url}"
+        );
+        assert_eq!(
+            text_of(tab.document_mut().expect("doc"), "p").unwrap_or_default(),
+            "served off-thread",
+            "the served document is laid out and painted"
+        );
+        server.join().ok();
+    }
+
     /// A tab whose tab→shell frames land in a buffer the test can decode
     /// (`new_headless` sends them to a discarding sink).
     fn capturing_tab(dir: &std::path::Path) -> (Tab, Arc<std::sync::Mutex<Vec<u8>>>) {
@@ -7107,6 +7649,10 @@ mod tests {
             address: "http://127.0.0.1:1".into(), // deliberately dead: the *intent* is asserted
             error: None,
         });
+        // The hand-off is an `http(s)` navigation on the network worker
+        // (task: faster, responsive loading) — let it land (here: refuse) so
+        // its network events ship before the assertions read them.
+        tab.wait_for_navigation(std::time::Duration::from_secs(5));
         // The tab asked the server's own page: a fetch of
         // `<address>/ironsurf/serve` leaves this tab (the address itself is
         // dead here on purpose — only the intent is under test).
@@ -7811,14 +8357,17 @@ mod tests {
             NavHistory::Fresh,
         );
 
-        // Wheel down far enough that paragraph two sits in the viewport.
+        // Wheel down far enough that paragraph two sits in the viewport
+        // (the glide is landed with `pump_wheel(true)` — the test harness
+        // has no poll loop to feed it).
         tab.handle_to_tab(ptr(400.0, 300.0, PointerKind::Move));
         tab.handle_to_tab(ToTab::Scroll(ScrollEvent {
             x: 400.0,
             y: 300.0,
             delta_x: 0.0,
-            delta_y: -1300.0,
+            delta_y: -2600.0,
         }));
+        tab.pump_wheel(true);
         let y = scroll_y(&mut tab);
         assert!(y > 0.0, "the wheel scrolled the page down: scroll_y={y}");
 
@@ -7919,8 +8468,9 @@ mod tests {
                 height: 600,
                 scale: 1.0,
             });
-            // Wheel far down the page (logical px: the page moves delta/zoom CSS px),
-            // after winding the page back to the top from the previous zoom.
+            // Wheel far down the page (logical px: the page moves
+            // delta/zoom CSS px, half of that at the damped wheel), after
+            // winding the page back to the top from the previous zoom.
             tab.handle_to_tab(ptr(400.0 * zoom, 300.0 * zoom, PointerKind::Move));
             tab.handle_to_tab(ToTab::Scroll(ScrollEvent {
                 x: 400.0 * zoom,
@@ -7928,12 +8478,14 @@ mod tests {
                 delta_x: 0.0,
                 delta_y: 9000.0 * zoom,
             }));
+            tab.pump_wheel(true);
             tab.handle_to_tab(ToTab::Scroll(ScrollEvent {
                 x: 400.0 * zoom,
                 y: 300.0 * zoom,
                 delta_x: 0.0,
-                delta_y: -1500.0 * zoom,
+                delta_y: -3000.0 * zoom,
             }));
+            tab.pump_wheel(true);
             let y = scroll_y(&mut tab);
             assert!(y > 1400.0, "the page is scrolled down at zoom {zoom}: {y}");
 
@@ -8005,8 +8557,9 @@ mod tests {
             x: 400.0,
             y: 300.0,
             delta_x: 0.0,
-            delta_y: -1300.0,
+            delta_y: -2600.0,
         }));
+        tab.pump_wheel(true);
         assert!(scroll_y(&mut tab) > 1000.0, "the page is scrolled down");
 
         let doctype = tab.inspect_doctype.clone();
@@ -8085,6 +8638,7 @@ mod tests {
         // One huge wheel reaches the overscroll limit: half a viewport past
         // the bottom, no further.
         tab.handle_to_tab(wheel(-100000.0));
+        tab.pump_wheel(true);
         let y = scroll_y(&mut tab);
         assert!(
             (y - (base + 300.0)).abs() < 1.0,
@@ -8098,6 +8652,7 @@ mod tests {
             "the bottom of the page sits at the window's middle, not its edge: {y}"
         );
         tab.handle_to_tab(wheel(-1000.0));
+        tab.pump_wheel(true);
         assert_eq!(scroll_y(&mut tab), y, "there is nothing past the overscroll limit");
 
         // A page that fits the window never scrolls at all.
@@ -8109,6 +8664,7 @@ mod tests {
         );
         tab.handle_to_tab(ptr(400.0, 300.0, PointerKind::Move));
         tab.handle_to_tab(wheel(-5000.0));
+        tab.pump_wheel(true);
         assert_eq!(scroll_y(&mut tab), 0.0, "a page that fits the window does not scroll");
     }
 
@@ -8458,8 +9014,10 @@ mod tests {
     /// moves the document down (`scrollTop` grows), a positive one moves it up —
     /// and winit (hence Slint's `scroll-event`) produces deltas in that very
     /// convention, so the shell forwards them unchanged. Pinned here for both
-    /// delta flavours (pixel deltas, and `|d| <= 3` notches = 20 CSS px each),
-    /// plus the clamp at the top of the document.
+    /// delta flavours (pixel deltas, and `|d| <= 3` notches = 10 CSS px each
+    /// at the damped wheel), plus the clamp at the top of the document. The
+    /// glide is landed with `pump_wheel(true)` — where it stops and what it
+    /// travels is [`the_wheel_glides_instead_of_jumping`]'s business.
     #[test]
     fn wheel_down_scrolls_the_document_down_and_wheel_up_back_up() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -8494,25 +9052,193 @@ mod tests {
 
         assert_eq!(scroll_y(&mut tab), 0.0, "documents start at the top");
 
-        // Wheel down (negative pixel delta) → content moves up, scrollTop grows.
+        // Wheel down (negative pixel delta) → content moves up, scrollTop
+        // grows — by half the delta at the damped wheel.
         tab.handle_to_tab(wheel(-200.0));
+        tab.pump_wheel(true);
         tab.settle();
-        assert_eq!(scroll_y(&mut tab), 200.0, "wheel down scrolls down");
+        assert_eq!(scroll_y(&mut tab), 100.0, "wheel down scrolls down");
 
         // Wheel up (positive pixel delta) → back towards the top.
         tab.handle_to_tab(wheel(50.0));
+        tab.pump_wheel(true);
         tab.settle();
-        assert_eq!(scroll_y(&mut tab), 150.0, "wheel up scrolls up");
+        assert_eq!(scroll_y(&mut tab), 75.0, "wheel up scrolls up");
 
-        // A `|d| <= 3` delta is a wheel notch: 20 CSS px, same direction.
+        // A `|d| <= 3` delta is a wheel notch: 10 CSS px (half blitz's
+        // 20 px line unit), same direction.
         tab.handle_to_tab(wheel(-1.0));
+        tab.pump_wheel(true);
         tab.settle();
-        assert_eq!(scroll_y(&mut tab), 170.0, "one notch down = 20 px down");
+        assert_eq!(scroll_y(&mut tab), 85.0, "one notch down = 10 px down");
 
         // Clamped at the top (a positive notch at scroll 0 does not go negative).
         tab.handle_to_tab(wheel(1000.0));
+        tab.pump_wheel(true);
         tab.settle();
         assert_eq!(scroll_y(&mut tab), 0.0, "scrolling up clamps at the top");
+    }
+
+    /// Settings menu (task): the scroll-speed slider travels every tab's
+    /// wheel — `ToTab::SetScrollSpeed { speed }` multiplies the damped
+    /// travel (`2.0×` doubles it, `0.5×` halves it), and nonsense values
+    /// (`NaN`, zero, negative) fall back to the default damping.
+    #[test]
+    fn settings_scroll_speed_scales_the_wheel_travel() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let page = dir.path().join("tall.html");
+        std::fs::write(
+            &page,
+            "<!doctype html><meta charset=utf-8><style>body{margin:0;height:4000px}</style><p>tall</p>",
+        )
+        .expect("write");
+        let mut tab = form_tab(dir.path());
+        tab.handle_to_tab(ToTab::Resize {
+            width: 800,
+            height: 600,
+            scale: 1.0,
+        });
+        tab.navigate(
+            url::Url::from_file_path(&page).expect("url").as_str(),
+            NavHistory::Fresh,
+        );
+        tab.settle();
+        tab.handle_to_tab(ptr(100.0, 100.0, PointerKind::Move));
+        let wheel = |d: f32| {
+            ToTab::Scroll(ScrollEvent {
+                x: 100.0,
+                y: 100.0,
+                delta_x: 0.0,
+                delta_y: d,
+            })
+        };
+        let scroll_y = |tab: &mut Tab| tab.document_mut().expect("doc").viewport_scroll().y;
+        let at_top = |tab: &mut Tab| {
+            tab.handle_to_tab(wheel(10000.0));
+            tab.pump_wheel(true);
+            tab.settle();
+        };
+
+        // Default damping: a −200 px wheel travels 100 px (half the delta).
+        tab.handle_to_tab(wheel(-200.0));
+        tab.pump_wheel(true);
+        tab.settle();
+        assert_eq!(scroll_y(&mut tab), 100.0, "default travel is unchanged");
+
+        // The slider at 2×: the same turn travels twice as far.
+        tab.handle_to_tab(ToTab::SetScrollSpeed { speed: 2.0 });
+        at_top(&mut tab);
+        tab.handle_to_tab(wheel(-200.0));
+        tab.pump_wheel(true);
+        tab.settle();
+        assert_eq!(scroll_y(&mut tab), 200.0, "2× doubles the wheel travel");
+
+        // And at 50%: half as far.
+        tab.handle_to_tab(ToTab::SetScrollSpeed { speed: 0.5 });
+        at_top(&mut tab);
+        tab.handle_to_tab(wheel(-200.0));
+        tab.pump_wheel(true);
+        tab.settle();
+        assert_eq!(scroll_y(&mut tab), 50.0, "0.5× halves the wheel travel");
+
+        // Nonsense is not a speed: the default damping stands.
+        for junk in [f32::NAN, 0.0, -1.0] {
+            tab.handle_to_tab(ToTab::SetScrollSpeed { speed: junk });
+            at_top(&mut tab);
+            tab.handle_to_tab(wheel(-200.0));
+            tab.pump_wheel(true);
+            tab.settle();
+            assert_eq!(scroll_y(&mut tab), 100.0, "{junk} falls back to default");
+        }
+    }
+
+    /// Slower *and* smoother (task): one wheel event starts the page moving
+    /// with the event itself, but lands only part of its damped travel; the
+    /// rest follows over the next few [`WHEEL_STEP`]s, easing out. The poll
+    /// loop feeds those slices; this harness plays the loop's part.
+    #[test]
+    fn the_wheel_glides_instead_of_jumping() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let page = dir.path().join("glide.html");
+        std::fs::write(
+            &page,
+            "<!doctype html><meta charset=utf-8><style>body{margin:0;height:4000px}</style><p>tall</p>",
+        )
+        .expect("write");
+        let mut tab = form_tab(dir.path());
+        tab.handle_to_tab(ToTab::Resize {
+            width: 800,
+            height: 600,
+            scale: 1.0,
+        });
+        tab.navigate(
+            url::Url::from_file_path(&page).expect("url").as_str(),
+            NavHistory::Fresh,
+        );
+        tab.settle();
+        tab.handle_to_tab(ptr(100.0, 100.0, PointerKind::Move));
+        let scroll_y = |tab: &mut Tab| tab.document_mut().expect("doc").viewport_scroll().y;
+
+        tab.handle_to_tab(ToTab::Scroll(ScrollEvent {
+            x: 100.0,
+            y: 100.0,
+            delta_x: 0.0,
+            delta_y: -400.0,
+        }));
+        // The event itself moves the page — but not all the way: the kick
+        // slice is only a fraction of the damped travel, so a wheel event
+        // never teleports the document again.
+        let mid = scroll_y(&mut tab);
+        let total = WHEEL_SPEED * 400.0;
+        assert!(mid > 0.0, "the gesture moves with the event: {mid}");
+        assert!(
+            f64::from(mid) < total - 1.0,
+            "the first slice is part of the travel, not all of it: {mid} of {total}"
+        );
+
+        // The rest follows over the next slices — busy-pumping (cheap: only
+        // the pump, no layout read per turn) until the scroller falls
+        // silent — and the glide comes to rest on the damped travel, never
+        // past it. How many slices lie between kick and rest is a question
+        // for the machine's frame clock; that every slice is only a
+        // fraction of what remains is pinned by
+        // [`wheel_glide_slices_shrink_and_terminate`].
+        let start = Instant::now();
+        while start.elapsed() < Duration::from_millis(500) {
+            tab.pump_wheel(false);
+        }
+        let rest = scroll_y(&mut tab);
+        assert!(rest >= mid, "the glide never reverses: {mid} → {rest}");
+        assert!(
+            (f64::from(rest) - total).abs() < 0.5,
+            "the glide lands on the damped travel: {rest} vs {total}"
+        );
+    }
+
+    /// The glide's slice function: shrink-only, signed, and terminating —
+    /// the last CSS px is fed whole, so a glide always ends rather than
+    /// asymptoting into sub-pixel slices forever — and it lands on
+    /// wall-clock: a window of four τ or more just settles the rest.
+    #[test]
+    fn wheel_glide_slices_shrink_and_terminate() {
+        let mut remaining = 200.0_f64;
+        let mut fed = 0.0;
+        let mut steps = 0;
+        while remaining != 0.0 {
+            let slice = wheel_glide_step(remaining, WHEEL_STEP);
+            assert!(slice.abs() <= remaining.abs() && slice.signum() == remaining.signum());
+            remaining -= slice;
+            fed += slice;
+            steps += 1;
+            assert!(steps < 32, "the glide must terminate, sat at {remaining}");
+        }
+        assert!((fed - 200.0).abs() < 1e-9, "the slices sum to the travel: {fed}");
+        assert!(
+            steps as u64 * 16 <= 400,
+            "a 60 Hz glide comes to rest within a few frames: {steps} steps"
+        );
+        // A starved scroller (one slice after 200 ms of paint) lands the rest.
+        assert_eq!(wheel_glide_step(120.0, Duration::from_millis(200)), 120.0);
     }
 
     // -------------------------------------------------------------------
@@ -9352,6 +10078,7 @@ mod tests {
             })
         };
         tab.handle_to_tab(wheel(-100000.0));
+        tab.pump_wheel(true);
         tab.settle();
         let scrolled = scroll_y(&mut tab);
         tab.report_scroll_state();
@@ -9389,6 +10116,7 @@ mod tests {
 
         // Back to the top is a change like any other.
         tab.handle_to_tab(wheel(100000.0));
+        tab.pump_wheel(true);
         tab.settle();
         tab.report_scroll_state();
         let states = scroll_states(&sink);
@@ -9600,6 +10328,39 @@ mod tests {
             1,
             "nothing moved, so nothing was reported"
         );
+    }
+
+    #[test]
+    fn the_mac_delete_key_names_its_appkit_command() {
+        // The engine skips `Key::Backspace` on macOS and waits for the AppKit
+        // editing command from its embedder instead, so the tab names it —
+        // task: backspace no longer works on mac forms.
+        let press = |key: &str, mods: Modifiers| KeyEvent {
+            key: key.into(),
+            code: key.into(),
+            text: Some("\u{8}".into()),
+            repeat: false,
+            mods,
+        };
+        assert_eq!(
+            apple_keybinding(&press("Backspace", Modifiers::NONE)),
+            Some("deleteBackward:")
+        );
+        assert_eq!(
+            apple_keybinding(&press("Backspace", Modifiers::NONE.with_alt())),
+            Some("deleteWordBackward:"),
+            "⌥ + delete deletes a word, like the word-delete of every other platform"
+        );
+        // Forward delete, the caret keys and plain characters are not commands:
+        // they reach blitz from the key event, and naming them too would act twice.
+        assert_eq!(apple_keybinding(&press("Delete", Modifiers::NONE)), None);
+        assert_eq!(
+            apple_keybinding(&press("ArrowLeft", Modifiers::NONE.with_alt())),
+            None
+        );
+        assert_eq!(apple_keybinding(&press("a", Modifiers::NONE)), None);
+        // Only a Mac build feeds them at all.
+        assert_eq!(APPLE_KEYBINDINGS, cfg!(target_os = "macos"));
     }
 }
 
