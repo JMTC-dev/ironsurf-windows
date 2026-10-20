@@ -36,6 +36,14 @@ fn tab_count(ui: &AppWindow) -> usize {
     ui.get_tabs().row_count()
 }
 
+/// Which modifier the *digit* chords answer to on this platform: `Alt-1` …
+/// `Alt-9` off a Mac, `⌘1` … `⌘9` on one (`keymap::Chords::digits_on_alt`).
+/// A test that wants its tab chord must press the one this binary reads, and
+/// may as well say out loud that the other is somebody else's key.
+fn digits_on_alt() -> bool {
+    ironsurf_shell::keymap::Chords::CURRENT.digits_on_alt()
+}
+
 #[test]
 fn browser_chords_survive_a_focused_url_bar() {
     i_slint_backend_testing::init_no_event_loop();
@@ -65,11 +73,17 @@ fn browser_chords_survive_a_focused_url_bar() {
     });
     assert_eq!(ui.get_active_index(), 1, "a new tab activates itself");
 
-    // The number chords work from the bar too: Alt-1 back to the first tab.
-    assert!(ui.invoke_url_chord("1".into(), false, false, true, false));
-    assert_eq!(ui.get_active_index(), 0, "Alt-1 from the bar → the first tab");
-    assert!(ui.invoke_url_chord("2".into(), false, false, true, false));
-    assert_eq!(ui.get_active_index(), 1, "Alt-2 from the bar → the second tab");
+    // The number chords work from the bar too — spelled with the platform's own
+    // key, so `Alt-1` here on Linux and `⌘1` on a Mac.
+    let (alt, meta) = if digits_on_alt() { (true, false) } else { (false, true) };
+    assert!(ui.invoke_url_chord("1".into(), false, false, alt, meta));
+    assert_eq!(ui.get_active_index(), 0, "the first tab's digit chord from the bar");
+    assert!(ui.invoke_url_chord("2".into(), false, false, alt, meta));
+    assert_eq!(ui.get_active_index(), 1, "the second tab's digit chord from the bar");
+    assert!(
+        !ui.invoke_url_chord("1".into(), false, false, meta, alt),
+        "the other platform's spelling is not a tab chord on this one"
+    );
 
     // Ctrl-Tab cycles, again from the bar.
     assert!(ui.invoke_url_chord("\t".into(), true, false, false, false));
@@ -111,6 +125,6 @@ fn browser_chords_survive_a_focused_url_bar() {
         tab_count(&ui) == 2
     });
     assert!(!ui.invoke_find_chord("\u{1b}".into(), false, false, false, false));
-    assert!(ui.invoke_find_chord("1".into(), false, false, true, false));
-    assert_eq!(ui.get_active_index(), 0, "Alt-1 from the find bar switches tabs");
+    assert!(ui.invoke_find_chord("1".into(), false, false, alt, meta));
+    assert_eq!(ui.get_active_index(), 0, "the digit chord from the find bar switches tabs");
 }

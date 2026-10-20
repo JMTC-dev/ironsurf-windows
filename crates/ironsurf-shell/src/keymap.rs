@@ -1055,6 +1055,14 @@ mod tests {
             bar_shortcut_on(Chords::Ctrl, "2", false, true, false),
             Some(Shortcut::SelectTab(2))
         );
+        // …in whichever spelling the platform owns: the bar hands over ⌘2 on a
+        // Mac, where Option is a typing key and Option-2 is `™` — so that press
+        // must stay the entry's rather than jumping to a tab.
+        assert_eq!(
+            bar_shortcut_on(Chords::Cmd, "2", false, false, true),
+            Some(Shortcut::SelectTab(2))
+        );
+        assert_eq!(bar_shortcut_on(Chords::Cmd, "2", false, true, false), None);
         assert_eq!(bar_shortcut("\t", true, false, false), Some(Shortcut::CycleTab));
         assert_eq!(bar_shortcut("w", true, false, false), Some(Shortcut::CloseTab));
         assert_eq!(bar_shortcut("r", true, false, false), Some(Shortcut::Reload));
