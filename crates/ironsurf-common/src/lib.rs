@@ -42,6 +42,134 @@ pub struct Container {
     /// (written before this field existed) loading as `None`.
     #[serde(default)]
     pub user_agent: Option<String>,
+    /// Per-container **proxy** choice: the *name* of one of the user's
+    /// global [`ProxyDef`]s (shell settings, `ui.json` → `proxies`). The
+    /// shell resolves the name to its URL and pushes it to every tab of
+    /// this container as [`ToTab::SetProxy`]; `None` (or a name that no
+    /// longer matches a definition) = direct connections. Like
+    /// `user_agent`, `serde(default)` keeps legacy `containers.json`
+    /// loading.
+    #[serde(default)]
+    pub proxy: Option<String>,
+}
+
+/// A user-defined, **named proxy** (the global pool kept in the shell's
+/// settings — `ui.json` → `proxies`; a container selects one by name via
+/// [`Container::proxy`]). The URL is validated on entry by
+/// [`validate_proxy_url`]: a scheme from [`PROXY_SCHEMES`] plus a host.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProxyDef {
+    /// Menu label, unique among the definitions (the shell enforces).
+    pub name: String,
+    /// `socks5://` | `socks5h://` | `http://` | `https://` endpoint,
+    /// optionally with `user:pass@` credentials and `:port`.
+    pub url: String,
+}
+
+/// The proxy URL schemes IronSurf accepts (reqwest's `Proxy::all` covers
+/// all four; `socks5` resolves DNS locally, `socks5h` at the proxy).
+pub const PROXY_SCHEMES: [&str; 4] = ["socks5h", "socks5", "https", "http"];
+
+/// Upper bound on a proxy definition's display name (unicode chars).
+pub const MAX_PROXY_NAME_CHARS: usize = 64;
+
+/// Upper bound on a proxy URL (unicode chars) — credentials plus a long
+/// hostname stay well under this; beyond it the definition is a typo.
+pub const MAX_PROXY_URL_CHARS: usize = 512;
+
+/// Why a proxy URL was rejected (see [`validate_proxy_url`]). Hand-rolled
+/// `Display` — this crate deliberately carries no thiserror.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ProxyError {
+    EmptyUrl,
+    UnsupportedScheme,
+    MissingHost,
+    InvalidCharacters,
+    TooLong { length: usize, max: usize },
+}
+
+impl std::fmt::Display for ProxyError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ProxyError::EmptyUrl => write!(f, "proxy URL must not be empty"),
+            ProxyError::UnsupportedScheme => write!(
+                f,
+                "proxy URL must start with one of: socks5://, socks5h://, http://, https://"
+            ),
+            ProxyError::MissingHost => write!(f, "proxy URL must have a host"),
+            ProxyError::InvalidCharacters => {
+                write!(f, "proxy URL must not contain whitespace or control characters")
+            }
+            ProxyError::TooLong { length, max } => write!(
+                f,
+                "proxy URL too long: {length} chars (max {max})"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ProxyError {}
+
+/// Split `url` into (canonical scheme, remainder-after-`://`) when the
+/// scheme is one of [`PROXY_SCHEMES`] (matched case-insensitively).
+fn split_proxy_url(url: &str) -> Option<(&'static str, &str)> {
+    let lower = url.to_ascii_lowercase();
+    for scheme in PROXY_SCHEMES {
+        if lower.starts_with(&format!("{scheme}://")) {
+            return Some((scheme, &url[scheme.len() + 3..]));
+        }
+    }
+    None
+}
+
+/// The proxy scheme of `url` (`Some("socks5")` etc.) when it is a proxy
+/// URL IronSurf understands, `None` otherwise. Cheap and dependency-free
+/// (no DNS, no full URL parse) — the tab hands the string to reqwest, which
+/// does the real parsing.
+pub fn proxy_scheme(url: &str) -> Option<&'static str> {
+    split_proxy_url(url).map(|(scheme, _)| scheme)
+}
+
+/// The authority's host part of a proxy URL (`user:pass@` stripped, `:port`
+/// stripped, `[ipv6]` unwrapped). `None` when the URL has no scheme we
+/// support or no host at all (`socks5://:1080`).
+pub fn proxy_host(url: &str) -> Option<&str> {
+    let (_, rest) = split_proxy_url(url)?;
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or(rest);
+    let hostport = authority.rsplit('@').next().unwrap_or(authority);
+    let host = if let Some(bracketed) = hostport.strip_prefix('[') {
+        bracketed.split(']').next().unwrap_or("")
+    } else {
+        hostport.split(':').next().unwrap_or(hostport)
+    };
+    (!host.is_empty()).then_some(host)
+}
+
+/// Validate a proxy definition's URL and return it trimmed: scheme must be
+/// one of [`PROXY_SCHEMES`] (case-insensitive), the authority must carry a
+/// host, no whitespace or control characters may hide inside (a URL is one
+/// token), and at most [`MAX_PROXY_URL_CHARS`] characters. Everything else
+/// — reachability, credentials, port range — is reqwest's problem at the
+/// tab, which is what actually opens the socket.
+pub fn validate_proxy_url(input: &str) -> Result<String, ProxyError> {
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        return Err(ProxyError::EmptyUrl);
+    }
+    let length = trimmed.chars().count();
+    if length > MAX_PROXY_URL_CHARS {
+        return Err(ProxyError::TooLong { length, max: MAX_PROXY_URL_CHARS });
+    }
+    if trimmed.chars().any(|c| c.is_whitespace() || c.is_control()) {
+        return Err(ProxyError::InvalidCharacters);
+    }
+    if proxy_scheme(trimmed).is_none() {
+        return Err(ProxyError::UnsupportedScheme);
+    }
+    if proxy_host(trimmed).is_none() {
+        return Err(ProxyError::MissingHost);
+    }
+    Ok(trimmed.to_string())
 }
 
 /// One tab-to-shell message.
@@ -393,6 +521,21 @@ pub enum ToTab {
     /// default UA. It applies for the tab's lifetime (across navigations).
     SetUserAgent {
         user_agent: Option<String>,
+    },
+    /// Per-container **proxy** (the shell resolves the container's
+    /// [`Container::proxy`] definition name to its URL and re-sends it on
+    /// every tab spawn, on every definition edit, and whenever the user
+    /// re-selects or clears the choice).
+    ///
+    /// `Some(v)` = route **every** outbound request this tab makes from
+    /// now on through that proxy — a URL validated by
+    /// [`validate_proxy_url`] (`socks5://`, `socks5h://`, `http://` or
+    /// `https://`, optional `user:pass@` and `:port`); `None` (or a value
+    /// blank after trimming) = direct connections, the default. Applies
+    /// for the tab's lifetime (across navigations); nothing reloads — the
+    /// live document stands until its next request.
+    SetProxy {
+        proxy: Option<String>,
     },
     /// **Archive mode** master switch (the 💾 toolbar menu; global, not
     /// per-container). While `enabled`, the tab emits [`FromTab::ArchivedFetch`]
@@ -1595,6 +1738,7 @@ mod tests {
             color: "#ff5500".into(),
             is_default: true,
             user_agent: None,
+            proxy: None,
         });
         assert_eq!(ContainerId(1), ContainerId(1));
         assert_ne!(ContainerId(1), ContainerId(2));
@@ -1674,6 +1818,7 @@ mod tests {
                 color: "#00ff88".into(),
                 is_default: false,
                 user_agent: ua.clone(),
+                proxy: None,
             };
             frame_round_trip(container.clone());
             let json = serde_json::to_string(&container).expect("to json");
@@ -1692,6 +1837,149 @@ mod tests {
         let nul = r##"[{"id":1,"name":"personal","color":"#ff5500","is_default":true,"user_agent":null}]"##;
         let back: Vec<Container> = serde_json::from_str(nul).expect("null json");
         assert_eq!(back[0].user_agent, None);
+    }
+
+    /// The same contract for the proxy field: round-trips through both
+    /// codecs, and a `containers.json` written before `proxy` existed (or
+    /// with no proxy at all — plain `user_agent`-era files) still loads.
+    #[test]
+    fn container_proxy_field_round_trips_and_defaults() {
+        for proxy in [None, Some("work-socks".to_string()), Some("home ✨".to_string())] {
+            let container = Container {
+                id: ContainerId(4),
+                name: "lab".into(),
+                color: "#0088ff".into(),
+                is_default: false,
+                user_agent: None,
+                proxy: proxy.clone(),
+            };
+            frame_round_trip(container.clone());
+            let json = serde_json::to_string(&container).expect("to json");
+            let back: Container = serde_json::from_str(&json).expect("from json");
+            assert_eq!(back, container);
+        }
+
+        // Legacy files: written before `proxy` existed, in both the
+        // pre-UA and the UA-only layouts.
+        let legacy = r##"[{"id":1,"name":"personal","color":"#ff5500","is_default":true}]"##;
+        let back: Vec<Container> = serde_json::from_str(legacy).expect("legacy json");
+        assert_eq!(back[0].proxy, None);
+        let ua_only =
+            r##"[{"id":1,"name":"p","color":"#f00","is_default":true,"user_agent":"UA/1"}]"##;
+        let back: Vec<Container> = serde_json::from_str(ua_only).expect("ua-era json");
+        assert_eq!(back[0].proxy, None);
+    }
+
+    #[test]
+    fn set_proxy_message_round_trips() {
+        frame_round_trip(ToTab::SetProxy { proxy: None });
+        for url in [
+            "socks5://127.0.0.1:1080",
+            "socks5h://user:pa ss%20@proxy.example:1080",
+            "http://proxy.internal:3128",
+            "https://Secure.Proxy.example",
+        ] {
+            frame_round_trip(ToTab::SetProxy {
+                proxy: Some(url.to_string()),
+            });
+        }
+    }
+
+    #[test]
+    fn proxy_scheme_recognises_the_four_schemes() {
+        assert_eq!(proxy_scheme("socks5://h:1"), Some("socks5"));
+        assert_eq!(proxy_scheme("socks5h://h:1"), Some("socks5h"));
+        assert_eq!(proxy_scheme("http://h:1"), Some("http"));
+        assert_eq!(proxy_scheme("https://h:1"), Some("https"));
+        // Case-insensitive scheme, exact-match prefix.
+        assert_eq!(proxy_scheme("SOCKS5H://h"), Some("socks5h"));
+        assert_eq!(proxy_scheme("socks4://h"), None);
+        assert_eq!(proxy_scheme("socks5:h"), None);
+        assert_eq!(proxy_scheme("socks5h"), None);
+        assert_eq!(proxy_scheme("ftp://h"), None);
+        assert_eq!(proxy_scheme(""), None);
+        // "socks5h" must not be stolen by the "socks5" prefix.
+        assert_eq!(proxy_scheme("socks5h://x"), Some("socks5h"));
+    }
+
+    #[test]
+    fn proxy_host_strips_userinfo_and_port() {
+        assert_eq!(proxy_host("socks5://proxy.example:1080"), Some("proxy.example"));
+        assert_eq!(proxy_host("http://user:pass@proxy:3128"), Some("proxy"));
+        assert_eq!(proxy_host("https://[::1]:8443"), Some("::1"));
+        assert_eq!(proxy_host("socks5://127.0.0.1"), Some("127.0.0.1"));
+        // A path is not a host, and a bare scheme has none.
+        assert_eq!(proxy_host("http://proxy/pac"), Some("proxy"));
+        assert_eq!(proxy_host("socks5://:1080"), None, "port without host");
+        assert_eq!(proxy_host("socks5://"), None);
+        assert_eq!(proxy_host("http://@:1"), None);
+        assert_eq!(proxy_host("gopher://host"), None);
+    }
+
+    #[test]
+    fn validate_proxy_url_accepts_and_trims() {
+        assert_eq!(
+            validate_proxy_url("  socks5://127.0.0.1:1080 ").as_deref(),
+            Ok("socks5://127.0.0.1:1080")
+        );
+        assert_eq!(
+            validate_proxy_url("HTTPS://User:p@ss/proxy.example").as_deref(),
+            Ok("HTTPS://User:p@ss/proxy.example")
+        );
+    }
+
+    #[test]
+    fn validate_proxy_url_rejects_the_obvious() {
+        assert_eq!(validate_proxy_url(""), Err(ProxyError::EmptyUrl));
+        assert_eq!(validate_proxy_url("   \t"), Err(ProxyError::EmptyUrl));
+        assert_eq!(
+            validate_proxy_url("socks4://proxy:1080"),
+            Err(ProxyError::UnsupportedScheme)
+        );
+        assert_eq!(
+            validate_proxy_url("proxy.example:1080"),
+            Err(ProxyError::UnsupportedScheme)
+        );
+        assert_eq!(
+            validate_proxy_url("socks5://:1080"),
+            Err(ProxyError::MissingHost)
+        );
+        assert_eq!(
+            validate_proxy_url("http://proxy:3128 /x"),
+            Err(ProxyError::InvalidCharacters),
+            "whitespace anywhere is fatal"
+        );
+        assert_eq!(
+            validate_proxy_url("http://proxy\n:3128"),
+            Err(ProxyError::InvalidCharacters)
+        );
+        let long = format!("socks5://{}:1080", "a".repeat(MAX_PROXY_URL_CHARS));
+        assert_eq!(
+            validate_proxy_url(&long),
+            Err(ProxyError::TooLong {
+                length: long.chars().count(),
+                max: MAX_PROXY_URL_CHARS,
+            })
+        );
+        // The boundary itself passes.
+        let exact = format!(
+            "socks5://{}",
+            "a".repeat(MAX_PROXY_URL_CHARS - "socks5://".len())
+        );
+        assert_eq!(exact.chars().count(), MAX_PROXY_URL_CHARS);
+        assert!(validate_proxy_url(&exact).is_ok());
+    }
+
+    #[test]
+    fn proxy_def_round_trips() {
+        let def = ProxyDef {
+            name: "work-socks".into(),
+            url: "socks5h://proxy.corp:1080".into(),
+        };
+        frame_round_trip(def.clone());
+        let json = serde_json::to_string(&def).expect("to json");
+        let back: ProxyDef = serde_json::from_str(&json).expect("from json");
+        assert_eq!(back, def);
     }
 
     #[test]

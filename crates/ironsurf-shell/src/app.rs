@@ -38,6 +38,7 @@ use crate::state::{
 };
 use crate::tabs::{PumpedMessage, TabProc};
 use crate::uisettings::UiSettings;
+use crate::ProxyRow;
 use crate::{
     AppWindow, ContainerInfo, DownloadItem, MenuItem, SuggestItem, TabInfo,
 };
@@ -64,6 +65,34 @@ fn container_user_agent(store: &ironsurf_storage::Store, container: ContainerId)
         .container(container)
         .and_then(|c| c.user_agent.clone())
         .filter(|ua| !ua.trim().is_empty())
+}
+
+/// The stored **proxy definition name** of `container` (blank stored values
+/// are "no proxy", matching what `Store::set_container_proxy` writes).
+/// The name refers to a [`ironsurf_common::ProxyDef`] in the shell's
+/// settings — the container stores *which* proxy, not how to reach it
+/// (task: proxies). `None` = direct connections.
+fn container_proxy(store: &ironsurf_storage::Store, container: ContainerId) -> Option<String> {
+    store
+        .container(container)
+        .and_then(|c| c.proxy.clone())
+        .filter(|n| !n.trim().is_empty())
+}
+
+/// Resolve a container's stored definition *name* into the URL live tabs
+/// ride: the settings' definition with that exact name whose URL still
+/// validates (`validate_proxy_url` guards entry, but `ui.json` may hold
+/// hand-edited junk). Everything unresolved — no name, a definition deleted
+/// since, an invalid URL — means **direct**: a container never silently
+/// rides a route its user did not pick, and the stored name survives so
+/// re-adding the definition reconnects it.
+fn proxy_url_for(settings: &UiSettings, name: Option<&str>) -> Option<String> {
+    let name = name?;
+    settings
+        .proxies
+        .iter()
+        .find(|d| d.name == name)
+        .and_then(|d| ironsurf_common::validate_proxy_url(&d.url).ok())
 }
 
 /// Fixed palette — **keep in sync** with `palette-color()` in ui/ironsurf.slint.
@@ -785,6 +814,16 @@ impl Core {
                 extra.push("--user-agent".to_string());
                 extra.push(ua);
             }
+            // …and the container's proxy, resolved from the global pool
+            // (task: proxies) so the very first page load of a fresh tab
+            // already rides it; unresolved (none/deleted/junk) = no flag.
+            if let Some(url) = proxy_url_for(
+                &self.settings.borrow(),
+                container_proxy(&store, container).as_deref(),
+            ) {
+                extra.push("--proxy".to_string());
+                extra.push(url);
+            }
             // A fresh tab starts archiving from its very first fetch when
             // the 💾 mode is on (task: archive mode).
             if self.settings.borrow().archive_enabled {
@@ -850,6 +889,7 @@ impl Core {
         self.sync_ui();
         // A new tab activates: an open UA menu re-points to its container.
         self.ua_refresh_if_open();
+        self.proxy_refresh_if_open();
         // …and a new tab opens *in the address bar*: it takes focus with the
         // whole address highlighted exactly like F6 would, so the first
         // keystroke replaces it (task: new tabs focus the URL bar). The bar is
@@ -1109,6 +1149,7 @@ impl Core {
         // The UA menu (if open) follows the activation: the new tab's
         // container's value, rows, and error line replace the previous one's.
         self.ua_refresh_if_open();
+        self.proxy_refresh_if_open();
     }
 
     fn cycle_tab(&self) {
@@ -2527,6 +2568,7 @@ impl Core {
             // `archive_menu`).
             ui.set_us_menu_open(false);
             ui.set_ua_menu_open(false);
+            ui.set_proxy_menu_open(false);
             ui.set_archive_menu_open(false);
             ui.set_history_menu_open(false);
             ui.set_download_menu_open(false);
@@ -2574,6 +2616,14 @@ impl Core {
             if let Some(ua) = container_user_agent(&self.store.borrow(), cid) {
                 extra.push("--user-agent".to_string());
                 extra.push(ua);
+            }
+            // …and the destination container's proxy (task: proxies).
+            if let Some(url) = proxy_url_for(
+                &self.settings.borrow(),
+                container_proxy(&self.store.borrow(), cid).as_deref(),
+            ) {
+                extra.push("--proxy".to_string());
+                extra.push(url);
             }
             if self.settings.borrow().archive_enabled {
                 extra.push("--archive-mode".to_string());
@@ -2761,6 +2811,7 @@ impl Core {
             // their own open legs.
             ui.set_manager_open(false);
             ui.set_ua_menu_open(false);
+            ui.set_proxy_menu_open(false);
             ui.set_archive_menu_open(false);
             ui.set_history_menu_open(false);
             ui.set_download_menu_open(false);
@@ -2986,6 +3037,7 @@ impl Core {
             ui.set_history_menu_open(false);
             ui.set_download_menu_open(false);
             ui.set_save_menu_open(false);
+            ui.set_proxy_menu_open(false);
             ui.set_ua_error(SharedString::default());
             let current = container_user_agent(&self.store.borrow(), self.active_container());
             // Prefill the draft with exactly what the container holds (a
@@ -3080,6 +3132,238 @@ impl Core {
         }
     }
 
+    // ---- Proxy switcher (task: proxies) ------------------------------------
+
+    /// Push the menu's live state for the active tab's container: the
+    /// `proxy-current` label ("Direct" or the stored definition name — a
+    /// dangling name still shows, just with no highlighted row) and the
+    /// `proxy-rows` list (Direct first, then every global definition from
+    /// the settings, the container's pick marked active). Called on every
+    /// (re)open, after every mutation, and on every tab switch — like
+    /// [`Core::ua_state`].
+    fn proxy_state(&self, ui: &AppWindow) {
+        let name = container_proxy(&self.store.borrow(), self.active_container());
+        ui.set_proxy_current(
+            name.clone()
+                .unwrap_or_else(|| "Direct".to_string())
+                .as_str()
+                .into(),
+        );
+        let settings = self.settings.borrow();
+        let mut rows: Vec<ProxyRow> = Vec::with_capacity(settings.proxies.len() + 1);
+        rows.push(ProxyRow {
+            name: "Direct".into(),
+            url: SharedString::default(),
+            active: name.is_none(),
+        });
+        for d in &settings.proxies {
+            rows.push(ProxyRow {
+                name: d.name.as_str().into(),
+                url: d.url.as_str().into(),
+                active: name.as_deref() == Some(d.name.as_str()),
+            });
+        }
+        ui.set_proxy_rows(ModelRc::from(Rc::new(VecModel::from(rows))));
+    }
+
+    /// A tab switch moved the menu to another container: re-point rows and
+    /// current label (and drop the stale error line) — the UA menu's rule.
+    fn proxy_refresh_if_open(&self) {
+        if let Some(ui) = self.ui() {
+            if ui.get_proxy_menu_open() {
+                self.proxy_state(&ui);
+                ui.set_proxy_error(SharedString::default());
+            }
+        }
+    }
+
+    /// Open/close the proxy overlay. Opening re-reads the Store and the
+    /// settings for the active tab's container and closes every other
+    /// full-window overlay — none of them ever stack (see
+    /// [`Core::ua_menu`], whose pattern this mirrors exactly).
+    fn proxy_menu(&self, open: bool) {
+        let Some(ui) = self.ui() else { return };
+        debug!("proxy menu {}", if open { "opened" } else { "closed" });
+        if open {
+            ui.set_manager_open(false);
+            ui.set_us_menu_open(false);
+            ui.set_ua_menu_open(false);
+            ui.set_archive_menu_open(false);
+            ui.set_history_menu_open(false);
+            ui.set_download_menu_open(false);
+            ui.set_save_menu_open(false);
+            ui.set_proxy_error(SharedString::default());
+            self.proxy_state(&ui);
+        }
+        ui.set_proxy_menu_open(open);
+    }
+
+    /// The toolbar's "Proxy" button: flip the overlay.
+    fn toggle_proxy_menu(&self) {
+        let open = self.ui().is_some_and(|ui| ui.get_proxy_menu_open());
+        self.proxy_menu(!open);
+    }
+
+    /// A row was clicked: route the menu's container through that proxy
+    /// (row 0 = Direct). The *name* persists on the container in
+    /// `containers.json`; the container's live tabs get the resolved URL, so
+    /// every later request — documents, subresources, XHR, media, downloads
+    /// — rides it. Requests already in flight finish on the old route.
+    fn proxy_select(&self, idx: usize) {
+        let Some(ui) = self.ui() else { return };
+        let Some(row) = ui.get_proxy_rows().row_data(idx) else { return };
+        let name = if row.url.is_empty() {
+            None // the Direct row
+        } else {
+            Some(row.name.as_str())
+        };
+        let cid = self.active_container();
+        if let Err(err) = self.store.borrow_mut().set_container_proxy(cid, name) {
+            warn!("container {} rejected a proxy: {err}", cid.0);
+            ui.set_proxy_error(err.to_string().into());
+            return;
+        }
+        ui.set_proxy_error(SharedString::default());
+        let url = proxy_url_for(&self.settings.borrow(), name);
+        self.proxy_broadcast(cid, url);
+        self.proxy_state(&ui);
+        // The manager rows (when it is next opened, or already up behind)
+        // restate each container's proxy suffix.
+        self.sync_ui();
+    }
+
+    /// Push an already-resolved proxy URL (`None` = direct) onto every
+    /// **live** tab of one container only — tabs of other containers keep
+    /// their own route. Skips and quiet-fail exactly like
+    /// [`Core::ua_broadcast`].
+    fn proxy_broadcast(&self, container: ContainerId, url: Option<String>) {
+        let mut procs = self.procs.borrow_mut();
+        for p in procs.iter_mut() {
+            if p.tab.container != container || p.crashed || p.state.closed {
+                continue;
+            }
+            let msg = ToTab::SetProxy { proxy: url.clone() };
+            if let Err(err) = p.tab.send(msg) {
+                debug!("proxy not delivered to tab {}: {err}", p.tab.id);
+            }
+        }
+    }
+
+    /// After a **global** definition changed (added or deleted): re-resolve
+    /// every live tab's route. Deleting strands each container that picked
+    /// it (name kept, traffic direct); re-adding under the same name
+    /// reconnects them — one uniform pass over the live tabs keeps every
+    /// route honest without hunting for which containers referenced a name.
+    fn proxy_rebroadcast_all(&self) {
+        // Routes resolved once per container (registry + settings cloned
+        // out of their RefCells, since sending runs with `procs` borrowed
+        // mutably) — no live tab of a container is ever sent a stale route.
+        let settings = self.settings.borrow().clone();
+        let routes: Vec<(ContainerId, Option<String>)> = {
+            let store = self.store.borrow();
+            store
+                .containers()
+                .iter()
+                .map(|c| {
+                    (
+                        c.id,
+                        proxy_url_for(&settings, container_proxy(&store, c.id).as_deref()),
+                    )
+                })
+                .collect()
+        };
+        let mut procs = self.procs.borrow_mut();
+        for p in procs.iter_mut() {
+            if p.crashed || p.state.closed {
+                continue;
+            }
+            let Some((_, url)) = routes.iter().find(|(cid, _)| *cid == p.tab.container) else {
+                continue;
+            };
+            let msg = ToTab::SetProxy {
+                proxy: url.clone(),
+            };
+            if let Err(err) = p.tab.send(msg) {
+                debug!("proxy not delivered to tab {}: {err}", p.tab.id);
+            }
+        }
+    }
+
+    /// "Del" on a definition row: drop it from the global pool, persist the
+    /// settings, and re-resolve every live tab. Containers that had picked
+    /// it keep the stored name (a re-add under the same name reconnects
+    /// them) and ride direct in the meantime — the resolution rule, not a
+    /// rewrite of the registry. Row 0 (Direct) has no button and is
+    /// undeletable; an out-of-range index is ignored.
+    fn proxy_delete(&self, idx: usize) {
+        let Some(ui) = self.ui() else { return };
+        if idx == 0 {
+            return;
+        }
+        {
+            let mut settings = self.settings.borrow_mut();
+            if settings.proxies.len() + 1 != ui.get_proxy_rows().row_count() {
+                // Stale model (settings changed under the menu): re-push and
+                // make the user click again rather than delete a neighbour.
+                self.proxy_state(&ui);
+                return;
+            }
+            settings.proxies.remove(idx - 1);
+        }
+        self.save_settings();
+        ui.set_proxy_error(SharedString::default());
+        self.proxy_rebroadcast_all();
+        self.proxy_state(&ui);
+        self.sync_ui();
+    }
+
+    /// "Add" a global definition: name unique and bounded, URL validated by
+    /// [`ironsurf_common::validate_proxy_url`] (trimmed on success). A
+    /// rejection rides the one-line `proxy-error` with **both drafts kept**
+    /// (UA-menu style); success persists `ui.json`, clears the drafts, and
+    /// re-resolves the live tabs (a container whose dangling name just got
+    /// re-added rides the new URL from here).
+    fn proxy_add(&self) {
+        let Some(ui) = self.ui() else { return };
+        let name = ui.get_proxy_add_name().trim().to_string();
+        let reject = |ui: &AppWindow, msg: String| {
+            warn!("proxy definition rejected: {msg}");
+            ui.set_proxy_error(msg.into());
+        };
+        if name.is_empty() {
+            return reject(&ui, "proxy definitions need a name".to_string());
+        }
+        if name.chars().any(|c| c.is_control()) {
+            return reject(&ui, "proxy name must not contain control characters".to_string());
+        }
+        if name.chars().count() > ironsurf_common::MAX_PROXY_NAME_CHARS {
+            return reject(
+                &ui,
+                format!(
+                    "proxy name too long: max {} characters",
+                    ironsurf_common::MAX_PROXY_NAME_CHARS
+                ),
+            );
+        }
+        if self.settings.borrow().proxies.iter().any(|d| d.name == name) {
+            return reject(&ui, format!("a proxy named \"{name}\" is already defined"));
+        }
+        let url = match ironsurf_common::validate_proxy_url(ui.get_proxy_add_url().as_str()) {
+            Ok(url) => url,
+            Err(err) => return reject(&ui, err.to_string()),
+        };
+        self.settings
+            .borrow_mut()
+            .proxies
+            .push(ironsurf_common::ProxyDef { name, url });
+        self.save_settings();
+        ui.set_proxy_add_name(SharedString::default());
+        ui.set_proxy_add_url(SharedString::default());
+        ui.set_proxy_error(SharedString::default());
+        self.proxy_rebroadcast_all();
+        self.proxy_state(&ui);
+    }
+
     // ---- archive mode (task: archive mode) ---------------------------------
 
     /// The effective archive root as display text.
@@ -3130,6 +3414,7 @@ impl Core {
             ui.set_manager_open(false);
             ui.set_us_menu_open(false);
             ui.set_ua_menu_open(false);
+            ui.set_proxy_menu_open(false);
             ui.set_history_menu_open(false);
             ui.set_download_menu_open(false);
             ui.set_save_menu_open(false);
@@ -3168,6 +3453,7 @@ impl Core {
         ui.set_manager_open(false);
         ui.set_us_menu_open(false);
         ui.set_ua_menu_open(false);
+            ui.set_proxy_menu_open(false);
         ui.set_archive_menu_open(false);
         ui.set_history_menu_open(false);
         ui.set_download_menu_open(false);
@@ -3441,6 +3727,7 @@ impl Core {
             ui.set_manager_open(false);
             ui.set_us_menu_open(false);
             ui.set_ua_menu_open(false);
+            ui.set_proxy_menu_open(false);
             ui.set_history_menu_open(false);
             ui.set_archive_menu_open(false);
             ui.set_save_menu_open(false);
@@ -3750,6 +4037,7 @@ impl Core {
             ui.set_manager_open(false);
             ui.set_us_menu_open(false);
             ui.set_ua_menu_open(false);
+            ui.set_proxy_menu_open(false);
             ui.set_archive_menu_open(false);
             ui.set_download_menu_open(false);
             ui.set_save_menu_open(false);
@@ -4803,6 +5091,9 @@ impl Core {
                 name: c.name.clone().into(),
                 color: color_hex(&c.color),
                 isDefault: c.is_default,
+                // the chosen definition name ("" = direct) — the manager
+                // rows say which container rides which proxy (task: proxies)
+                proxy: c.proxy.clone().filter(|n| !n.trim().is_empty()).unwrap_or_default().into(),
             })
             .collect();
         ui.set_containers(ModelRc::from(Rc::new(VecModel::from(conts))));
@@ -5123,6 +5414,31 @@ impl Core {
         {
             let c = self.clone();
             ui.on_ua_apply_custom(move |text| c.ua_apply_custom(text.as_str()));
+        }
+
+        // Proxy switcher (task: proxies): the toolbar toggle, the scrim/✕
+        // close, the row picks (persist the definition name on the
+        // container, rebroadcast its URL to that container's live tabs),
+        // and the global definition editor (Add/Delete persist ui.json and
+        // re-resolve every live tab).
+        bind0!(on_toggle_proxy_menu, |c: &Rc<Core>| c.toggle_proxy_menu());
+        bind0!(on_close_proxy_menu, |c: &Rc<Core>| c.proxy_menu(false));
+        bind0!(on_proxy_add, |c: &Rc<Core>| c.proxy_add());
+        {
+            let c = self.clone();
+            ui.on_proxy_select(move |idx| {
+                if idx >= 0 {
+                    c.proxy_select(idx as usize);
+                }
+            });
+        }
+        {
+            let c = self.clone();
+            ui.on_proxy_delete(move |idx| {
+                if idx > 0 {
+                    c.proxy_delete(idx as usize);
+                }
+            });
         }
 
         // Archive mode (task: archive mode): the 💾 toolbar toggle, the

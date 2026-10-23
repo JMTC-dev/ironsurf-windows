@@ -114,6 +114,17 @@ pub struct Container {
     pub is_default: bool,
     #[serde(default)]
     pub user_agent: Option<String>,  // per-container UA override; None = engine default
+    #[serde(default)]
+    pub proxy: Option<String>,  // per-container proxy: the **name** of a global ProxyDef
+                                // (shell ui.json → proxies); None or a dangling name = direct
+}
+
+/// A user-defined, named proxy in the shell's global pool (`ui.json` → `proxies`);
+/// containers select one by `name`. URL validated on entry (`validate_proxy_url`):
+/// scheme from `PROXY_SCHEMES` (socks5, socks5h, http, https) plus a host.
+pub struct ProxyDef {
+    pub name: String,  // unique among the definitions (the shell enforces)
+    pub url: String,   // e.g. socks5://user:pass@host:1080
 }
 
 /// One tab-to-shell message.
@@ -264,6 +275,14 @@ pub enum ToTab {
     // User-Agent on every subsequent request; None = the tab's built-in
     // default. The shell re-sends it on every tab spawn and on every switch.
     SetUserAgent { user_agent: Option<String> },
+    // per-container **proxy**: the shell resolves the container's stored ProxyDef name
+    // to its URL and sends that URL — Some(v) = every subsequent request rides proxy v
+    // (reqwest all-scheme: socks5/socks5h/http/https); None (or blank) = direct again.
+    // Sent at spawn (as `--proxy <url>`, so the first page load already rides it), on
+    // every per-container switch, and to **all** live tabs when a definition is added
+    // or deleted (a deleted definition re-resolves its containers to direct; the
+    // stored name survives). Applies from the next request; no reload.
+    SetProxy { proxy: Option<String> },
     // popup blocking (task: block popups): `block` = refuse every window a user
     // gesture did not authorize (the tab's own default when nobody ever sends
     // this); `allowed` = **document origins** whose popups are never blocked,
@@ -1496,6 +1515,29 @@ UI (`crates/ironsurf-shell/ui/ironsurf.slint`):
   of other containers never receive it), and spawn/respawn of a UA container's tab
   appends `--user-agent <ua>` to that spawn alone (per-spawn args; the first page load
   already sends it).
+- **Proxy switcher** (top-bar "Proxy" button, right of "UA", task: proxies): the same
+  right-docked overlay Rectangle, and it joins the never-stack set — each other
+  overlay's open closes it and vice versa. Targets the **active tab's container**: rows
+  are "Direct" first, then one row per global definition (`ui.json → proxies`,
+  `Vec<ProxyDef>` in `UiSettings`), the container's pick highlighted; the footer edits
+  the **global** pool (name + URL LineEdits, Add; a per-row Del on each definition).
+  A pick stores the definition **name** on the container
+  (`Store::set_container_proxy`, same validation contract as the UA: control chars /
+  > `MAX_PROXY_NAME_CHARS` rejected as a one-line `StoreError` with nothing written)
+  and broadcasts `ToTab::SetProxy` with the **resolved URL** to that container's live
+  tabs only. Resolution rule: name → settings definition → URL that still passes
+  `validate_proxy_url`; anything unresolved (none, deleted definition, hand-edited
+  junk URL) means **direct**, and the stored name survives so re-adding the definition
+  reconnects. Add/Delete validate (`validate_proxy_url`; unique, bounded name), persist
+  `ui.json`, and re-resolve **every** live tab (a uniform pass — deleting strands,
+  re-adding reconnects); a rejected Add shows the one-line error with both drafts
+  kept. Inside the tab the route is one process-wide cell (`netmod::set_process_proxy`);
+  reqwest binds proxies to *clients*, so the swap rebuilds the shared `FetchWorker`'s
+  two clients (Arc-cheap; in-flight requests finish on the old route) and every later
+  request — documents, subresources, form POSTs, redirect hops, XHR/fetch, media,
+  downloads — rides it. Spawn/respawn of a proxied container's tab appends
+  `--proxy <url>` to that spawn alone, and manager rows show each container's chosen
+  definition name ("" = direct).
 - **Popup blocker** (top-bar ⛔ + Ctrl-Alt-`P`, task: block popups): the tab blocks on the shell's
   behalf and reports every refusal, so all the shell adds is a notice and two levers, both per tab.
   ⛔ sits in the toolbar (right of ＋) **pressed while the active tab blocks** — pressing it lowers

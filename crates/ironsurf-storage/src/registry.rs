@@ -2,7 +2,9 @@
 //! optional per-container User-Agent, the global userscript list
 //! (`userscripts.json`), and the top-level [`Store`].
 
-use ironsurf_common::{Container, ContainerId, Userscript, MAX_USER_AGENT_CHARS};
+use ironsurf_common::{
+    Container, ContainerId, Userscript, MAX_PROXY_NAME_CHARS, MAX_USER_AGENT_CHARS,
+};
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -31,6 +33,10 @@ pub enum StoreError {
     UserAgentTooLong { length: usize, max: usize },
     #[error("user agent must not contain control characters")]
     InvalidUserAgent,
+    #[error("proxy name too long: {length} chars (max {max})")]
+    ProxyNameTooLong { length: usize, max: usize },
+    #[error("proxy name must not contain control characters")]
+    InvalidProxyName,
     #[error("no such userscript: {0}")]
     NoSuchUserscript(u64),
     #[error("local storage quota exceeded for origin {origin} (max {max} bytes)")]
@@ -129,6 +135,7 @@ impl Store {
                 color: DEFAULT_COLOR.to_string(),
                 is_default: true,
                 user_agent: None,
+                proxy: None,
             });
             store.default_id = id;
             store.save()?;
@@ -177,6 +184,7 @@ impl Store {
             color,
             is_default: false,
             user_agent: None,
+            proxy: None,
         });
         self.save()?;
         Ok(id)
@@ -258,6 +266,56 @@ impl Store {
             .find(|c| c.id == id)
             .ok_or(StoreError::NoSuchContainer(id))?;
         container.user_agent = user_agent;
+        self.save()
+    }
+
+    /// Set the per-container **proxy** choice for `id` (persisted in
+    /// `containers.json`, like [`Store::set_container_user_agent`]).
+    ///
+    /// The stored value is the *name* of one of the user's global proxy
+    /// definitions (the definitions themselves live in the shell's
+    /// `ui.json` settings); the shell resolves it to a URL and ships it as
+    /// [`ironsurf_common::ToTab::SetProxy`]. `Some(v)` is stored trimmed;
+    /// an all-blank `v` stores `None`, and `None` stores `None` — both
+    /// mean "direct connections". A name is not resolved here: deleting a
+    /// definition must not rewrite every container, and a dangling name
+    /// resolves to direct by the shell's rule. Validation happens before
+    /// any mutation — a rejected call leaves the container and
+    /// `containers.json` untouched: control characters are
+    /// [`StoreError::InvalidProxyName`], more than
+    /// [`MAX_PROXY_NAME_CHARS`] chars is [`StoreError::ProxyNameTooLong`].
+    pub fn set_container_proxy(
+        &mut self,
+        id: ContainerId,
+        name: Option<&str>,
+    ) -> Result<(), StoreError> {
+        let proxy = match name {
+            Some(v) => {
+                if v.chars().any(|c| c.is_control()) {
+                    return Err(StoreError::InvalidProxyName);
+                }
+                let trimmed = v.trim();
+                if trimmed.is_empty() {
+                    None
+                } else {
+                    let length = trimmed.chars().count();
+                    if length > MAX_PROXY_NAME_CHARS {
+                        return Err(StoreError::ProxyNameTooLong {
+                            length,
+                            max: MAX_PROXY_NAME_CHARS,
+                        });
+                    }
+                    Some(trimmed.to_string())
+                }
+            }
+            None => None,
+        };
+        let container = self
+            .containers
+            .iter_mut()
+            .find(|c| c.id == id)
+            .ok_or(StoreError::NoSuchContainer(id))?;
+        container.proxy = proxy;
         self.save()
     }
 

@@ -347,6 +347,77 @@ pub fn read_user_agent(user_agent: &SharedUserAgent) -> String {
         .clone()
 }
 
+// ---------------------------------------------------------------------------
+// Per-container proxy (task: proxies)
+
+/// The proxy every outbound request of this tab rides, in a process-wide
+/// cell. The tab process IS the container (ARCHITECTURE §Design overview),
+/// so — exactly like [`shared_worker`] — there is one per process and no
+/// ambiguity about which tab it belongs to: the `--proxy` spawn flag seeds
+/// it, `ToTab::SetProxy` replaces it, and every later request (documents,
+/// subresources, form POSTs, redirect hops, XHR/`fetch`, workers, media,
+/// downloads) rides it. `None` = direct connections. Writing the cell
+/// rebuilds the shared [`FetchWorker`]'s clients — reqwest 0.13 binds a
+/// proxy to the *client*, not the request, and a client is an `Arc` clone,
+/// so the swap lands on every holder of the shared worker instantly.
+pub type SharedProxy = Arc<Mutex<Option<reqwest::Proxy>>>;
+
+static PROCESS_PROXY: OnceLock<SharedProxy> = OnceLock::new();
+
+/// This tab process's proxy cell (born empty: direct, the default).
+#[must_use]
+pub fn process_proxy() -> SharedProxy {
+    PROCESS_PROXY
+        .get_or_init(|| Arc::new(Mutex::new(None)))
+        .clone()
+}
+
+/// Resolve a `ToTab::SetProxy` value (and the `--proxy` flag) into reqwest's
+/// proxy shape: `None` or a value blank after trimming is `None` (direct);
+/// anything else becomes an **all-scheme** proxy (`socks5://`, `socks5h://`,
+/// `http://`, `https://` — the set [`ironsurf_common::validate_proxy_url`]
+/// guards everywhere else too — an entry a hand-fed `--proxy` never saw).
+/// Err is a URL that gate rejects (unknown scheme, missing host, whitespace
+/// inside, too long) or one reqwest itself cannot parse: callers log it and
+/// stay direct.
+pub fn resolve_proxy(value: Option<&str>) -> Result<Option<reqwest::Proxy>, String> {
+    let Some(raw) = value else { return Ok(None) };
+    if raw.trim().is_empty() {
+        return Ok(None);
+    }
+    // The contract's own gate first: reqwest 0.13 parses *any* URL into a
+    // Proxy (empty hosts included) and only ignores schemes it does not
+    // speak much later — validate_proxy_url is what turns socks4, gopher,
+    // `socks5://` or a typo into a loud Err instead of a silently ignored
+    // (i.e. direct) route. The trimmed URL is what reqwest then parses.
+    let trimmed = ironsurf_common::validate_proxy_url(raw)
+        .map_err(|e| format!("invalid proxy {raw:?}: {e}"))?;
+    reqwest::Proxy::all(&trimmed)
+        .map(Some)
+        .map_err(|e| format!("invalid proxy {trimmed:?}: {e}"))
+}
+
+/// Seed or replace the process proxy from a raw value: the cell records it
+/// and the shared fetch worker rebuilds its clients, so every fetch started
+/// after this call rides the new route. The error text is worth logging (a
+/// rejected proxy leaves the previous route in place).
+pub fn set_process_proxy(value: Option<&str>) -> Result<(), String> {
+    let proxy = resolve_proxy(value)?;
+    *process_proxy()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = proxy.clone();
+    shared_worker().set_proxy(proxy);
+    Ok(())
+}
+
+/// The proxy the next request rides (poison-tolerant; `None` = direct).
+pub fn current_proxy() -> Option<reqwest::Proxy> {
+    process_proxy()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone()
+}
+
 /// Read a `file:` URL from disk (same path semantics as blitz-net: `url.path()`).
 pub fn read_file_url(url: &Url) -> Result<Vec<u8>, String> {
     if url.scheme() != "file" {
@@ -1103,12 +1174,18 @@ pub fn decode_base64(input: &str) -> Option<Vec<u8>> {
 // ---------------------------------------------------------------------------
 // Worker-thread fetcher (blocking reqwest/rustls on spawned threads)
 
-/// Owns the container's blocking `reqwest` (rustls) client and runs GETs on
+/// Owns the container's blocking `reqwest` (rustls) clients and runs GETs on
 /// freshly-spawned worker threads, feeding `Box<dyn NetHandler>` callbacks.
+/// The clients live behind mutexes so [`FetchWorker::set_proxy`] can swap
+/// the container's route at runtime: reqwest binds proxies to clients, and
+/// handing out an `Arc`-cheap clone per fetch is how the swap reaches every
+/// fetcher without rebuilding anything else.
 pub struct FetchWorker {
-    client: reqwest::blocking::Client,
+    client: Mutex<reqwest::blocking::Client>,
     /// Same transport, redirects left to the caller (the managed cookie path).
-    redirect_manual: reqwest::blocking::Client,
+    redirect_manual: Mutex<reqwest::blocking::Client>,
+    /// The launch timeout, kept so a proxy swap rebuilds identical clients.
+    timeout: std::time::Duration,
 }
 
 impl FetchWorker {
@@ -1122,46 +1199,71 @@ impl FetchWorker {
     }
 
     fn built(timeout: std::time::Duration) -> Self {
-        let client = reqwest::blocking::Client::builder()
-            .use_rustls_tls()
-            .redirect(reqwest::redirect::Policy::limited(10))
-            .timeout(timeout)
-            .pool_max_idle_per_host(16)
-            .connect_timeout(std::time::Duration::from_secs(10))
-            .tcp_nodelay(true)
-            // HTTP/2 keep-alive + adaptive flow control (multiplexed tabs).
-            .http2_keep_alive_interval(std::time::Duration::from_secs(30))
-            .http2_keep_alive_timeout(std::time::Duration::from_secs(10))
-            .http2_adaptive_window(true)
-            .build()
-            .expect("reqwest client");
-        // Managed fetches follow redirects themselves: reqwest's automatic
-        // policy would replay the first hop's `Cookie` header verbatim and
-        // only expose the final hop's `Set-Cookie`s, silently breaking the
-        // per-origin cookie rules. Manual policy hands us every hop.
-        let redirect_manual = reqwest::blocking::Client::builder()
-            .use_rustls_tls()
-            .redirect(reqwest::redirect::Policy::none())
-            .timeout(timeout)
-            .pool_max_idle_per_host(16)
-            .connect_timeout(std::time::Duration::from_secs(10))
-            .tcp_nodelay(true)
-            .build()
-            .expect("reqwest manual-redirect client");
+        let (client, redirect_manual) = Self::clients(timeout, None);
         FetchWorker {
-            client,
-            redirect_manual,
+            client: Mutex::new(client),
+            redirect_manual: Mutex::new(redirect_manual),
+            timeout,
         }
     }
 
-    pub fn client(&self) -> &reqwest::blocking::Client {
-        &self.client
+    /// Build the pair of clients for one route: `proxy = None` is direct,
+    /// `Some(p)` sends both through `p` (the same route serves passthrough
+    /// and managed traffic — a container's traffic does not split). The
+    /// auto client follows redirects; the manual one hands every hop back to
+    /// the managed cookie path, which replays per-hop `Cookie` headers and
+    /// captures per-hop `Set-Cookie`s — reqwest's automatic policy would
+    /// blindly replay the first hop's jar header and show only the final
+    /// hop's responses.
+    fn clients(
+        timeout: std::time::Duration,
+        proxy: Option<&reqwest::Proxy>,
+    ) -> (reqwest::blocking::Client, reqwest::blocking::Client) {
+        let build = |auto: bool| {
+            let mut builder = reqwest::blocking::Client::builder()
+                .use_rustls_tls()
+                .redirect(if auto {
+                    reqwest::redirect::Policy::limited(10)
+                } else {
+                    reqwest::redirect::Policy::none()
+                })
+                .timeout(timeout)
+                .pool_max_idle_per_host(16)
+                .connect_timeout(std::time::Duration::from_secs(10))
+                .tcp_nodelay(true);
+            if auto {
+                // HTTP/2 keep-alive + adaptive flow control (multiplexed tabs).
+                builder = builder
+                    .http2_keep_alive_interval(std::time::Duration::from_secs(30))
+                    .http2_keep_alive_timeout(std::time::Duration::from_secs(10))
+                    .http2_adaptive_window(true);
+            }
+            if let Some(proxy) = proxy {
+                builder = builder.proxy(proxy.clone());
+            }
+            builder.build().expect("reqwest client")
+        };
+        (build(true), build(false))
+    }
+
+    /// Swap the container's proxy: both clients are rebuilt on the spot, so
+    /// every `client()`/`managed_client()` taken afterwards rides the new
+    /// route (requests already in flight finish on the old one, exactly
+    /// like a tab that had the page half-loaded when the switch flipped).
+    pub fn set_proxy(&self, proxy: Option<reqwest::Proxy>) {
+        let (auto, manual) = Self::clients(self.timeout, proxy.as_ref());
+        *self.client.lock().unwrap_or_else(|p| p.into_inner()) = auto;
+        *self.redirect_manual.lock().unwrap_or_else(|p| p.into_inner()) = manual;
+    }
+
+    pub fn client(&self) -> reqwest::blocking::Client {
+        self.client.lock().unwrap_or_else(|p| p.into_inner()).clone()
     }
 
     /// The client managed cookie fetches must use (3xx responses come back
     /// to us instead of being followed blindly).
-    pub fn managed_client(&self) -> &reqwest::blocking::Client {
-        &self.redirect_manual
+    pub fn managed_client(&self) -> reqwest::blocking::Client {
+        self.redirect_manual.lock().unwrap_or_else(|p| p.into_inner()).clone()
     }
 
 }
@@ -1430,12 +1532,17 @@ pub struct MainDocPost {
 
 /// Build the request line: GET, or POST with the form body (and its
 /// `Content-Type`) riding along.
+///
+/// The clients this builds on are the container's current route (they are
+/// swapped wholesale by [`FetchWorker::set_proxy`] when the proxy changes),
+/// so both the passthrough path and the managed hop loop — documents, POSTs
+/// and redirects — ride it without per-request plumbing.
 fn build_request(
     client: &reqwest::blocking::Client,
     url: &Url,
     post: Option<&MainDocPost>,
 ) -> reqwest::blocking::RequestBuilder {
-    match post {
+    let req = match post {
         Some(body) => {
             let req = client.post(url.as_str()).body(body.body.clone());
             match &body.content_type {
@@ -1444,7 +1551,8 @@ fn build_request(
             }
         }
         None => client.get(url.as_str()),
-    }
+    };
+    req
 }
 
 /// Plain (`Passthrough`) HTTP fetch (GET, or a form `POST` with `post`):
@@ -2333,7 +2441,7 @@ impl BlitzNetProvider {
                 let mut jar: &Mutex<CookieJar> = &jar;
                 let cache: &Mutex<NetCache> = &cache;
                 managed_http_fetch_report(
-                    worker.managed_client(),
+                    &worker.managed_client(),
                     &url,
                     &mut jar,
                     &cache,
@@ -2346,7 +2454,7 @@ impl BlitzNetProvider {
                 )
             } else {
                 plain_http_fetch_report(
-                    worker.client(),
+                    &worker.client(),
                     &url,
                     Some(&request.headers),
                     None,
@@ -2991,7 +3099,7 @@ where
     match plan_document(policy, url) {
         // Non-http scheme that still reached here (unknown scheme): refuse.
         Plan::Pass => {
-            plain_http_fetch_report(worker.client(), url, None, post, &user_agent, report)
+            plain_http_fetch_report(&worker.client(), url, None, post, &user_agent, report)
                 .map(doc_fetch_from)
                 .map_err(|message| NetError::Transport {
                     url: url.clone(),
@@ -2999,7 +3107,7 @@ where
                 })
         }
         Plan::Fetch(target) => managed_http_fetch_report(
-            worker.managed_client(),
+            &worker.managed_client(),
             &target,
             jar,
             cache,
@@ -3026,7 +3134,7 @@ where
             let started = std::time::Instant::now();
             let method = if post.is_some() { "POST" } else { "GET" };
             match managed_http_fetch_report(
-                worker.managed_client(),
+                &worker.managed_client(),
                 &https,
                 jar,
                 cache,
@@ -4123,7 +4231,7 @@ mod tests {
     /// must be on the later hops' requests, and vice versa.
     fn fetch(path: &str, port: u16, jar: &mut CookieJar, cache: &NetCache) -> FetchOutcome {
         managed_http_fetch(
-            worker_for_test().managed_client(),
+            &worker_for_test().managed_client(),
             &get(&format!("http://127.0.0.1:{port}{path}")),
             jar,
             cache,
@@ -4213,7 +4321,7 @@ mod tests {
         ]);
         let mut jar = CookieJar::new();
         let out = managed_http_fetch(
-            worker_for_test().managed_client(),
+            &worker_for_test().managed_client(),
             &get(&format!("http://localhost:{port}/cross")),
             &mut jar,
             &test_cache("cross"),
@@ -4302,7 +4410,7 @@ mod tests {
                     let mut jar: &Mutex<CookieJar> = &jar;
                     let cache: &Mutex<NetCache> = &cache;
                     let outcome = managed_http_fetch_report(
-                        worker_for_test().managed_client(),
+                        &worker_for_test().managed_client(),
                         &get(&format!("http://127.0.0.1:{port}{path}")),
                         &mut jar,
                         &cache,
@@ -4456,7 +4564,7 @@ mod tests {
         let report = |event: NetEvent| events.lock().expect("events").push(event);
 
         let first = managed_http_fetch_report(
-            client,
+            &client,
             &url,
             &mut jar,
             &cache,
@@ -4471,7 +4579,7 @@ mod tests {
         assert!(!first.from_cache, "the first fetch has no entry to serve");
 
         let second = managed_http_fetch_report(
-            client,
+            &client,
             &url,
             &mut jar,
             &cache,
@@ -4524,7 +4632,7 @@ mod tests {
             let client = worker_for_test().managed_client();
             for round in 1..=2 {
                 let outcome =
-                    managed_http_fetch(client, &url, &mut jar, &cache, now_unix(), None, None, true)
+                    managed_http_fetch(&client, &url, &mut jar, &cache, now_unix(), None, None, true)
                         .unwrap_or_else(|e| panic!("{path} round {round}: {e}"));
                 assert!(
                     !outcome.from_cache,
@@ -4851,4 +4959,64 @@ mod user_agent_tests {
         assert_eq!(read_user_agent(&cell), USER_AGENT);
     }
 
+}
+
+#[cfg(test)]
+mod proxy_tests {
+    use super::*;
+
+    #[test]
+    fn resolve_proxy_blank_means_direct() {
+        assert!(resolve_proxy(None).unwrap().is_none());
+        assert!(resolve_proxy(Some("")).unwrap().is_none());
+        assert!(
+            resolve_proxy(Some("   \t ")).unwrap().is_none(),
+            "blank after trim is the contract's 'back to direct'"
+        );
+    }
+
+    #[test]
+    fn resolve_proxy_parses_the_four_schemes() {
+        // reqwest 0.13 gives Proxy no url getter, so proof is "parsed Ok" —
+        // and every scheme the contract's validate_proxy_url admits must
+        // survive here too, or the setting would strand traffic direct.
+        for url in [
+            "socks5://127.0.0.1:1080",
+            "socks5h://proxy.example",
+            "http://user:pass@proxy.internal:3128",
+            "https://[::1]:8443",
+        ] {
+            assert!(
+                resolve_proxy(Some(url)).unwrap().is_some(),
+                "{url} must resolve"
+            );
+        }
+        // Surrounding blanks are stripped before parsing.
+        assert!(resolve_proxy(Some("  socks5://h:1080 ")).unwrap().is_some());
+        // The contract and the resolver must agree on the scheme list.
+        for url in [
+            "socks5://h:1", "socks5h://h:1", "http://h:1", "https://h:1",
+        ] {
+            assert!(ironsurf_common::validate_proxy_url(url).is_ok());
+            assert!(resolve_proxy(Some(url)).unwrap().is_some(), "{url}");
+        }
+    }
+
+    #[test]
+    fn resolve_proxy_rejects_what_reqwest_rejects() {
+        // No scheme, a scheme reqwest never speaks, and a broken URL all
+        // come back as Err — the runtime logs them and stays direct.
+        assert!(resolve_proxy(Some("proxy:1080")).is_err());
+        assert!(resolve_proxy(Some("gopher://proxy:1080")).is_err());
+        assert!(resolve_proxy(Some("socks5://")).is_err());
+    }
+
+    #[test]
+    fn an_invalid_write_leaves_the_cell_untouched() {
+        // The cell is process-wide and starts direct; a rejected seed must
+        // not disturb whatever it held (here: still direct).
+        assert!(current_proxy().is_none(), "tests start direct");
+        assert!(set_process_proxy(Some("gopher://proxy")).is_err());
+        assert!(current_proxy().is_none(), "a rejected write changes nothing");
+    }
 }

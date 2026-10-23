@@ -215,6 +215,15 @@ pub struct TabArgs {
     /// `None` (flag absent, or blank after trim) = the built-in default
     /// [`netmod::USER_AGENT`].
     pub user_agent: Option<String>,
+    /// Initial **proxy override** (`--proxy <URL>`): every request the tab
+    /// makes rides that proxy until a `ToTab::SetProxy` replaces it. The
+    /// shell resolves the container's definition name to its URL and
+    /// appends this to that spawn alone, so the very first page load of a
+    /// fresh tab already goes out through it. `None` (flag absent, or blank
+    /// after trim) = direct connections. A value reqwest cannot parse is a
+    /// fatal startup error — the flag came from settings the shell already
+    /// validated, so a bad one means the invocation itself is broken.
+    pub proxy: Option<String>,
     /// Archive mode master switch at spawn (`--archive-mode`, present = on):
     /// the shell passes it when its 💾 toggle is on, so a fresh tab archives
     /// from its first fetch; `ToTab::SetArchiveMode` moves it afterwards.
@@ -232,6 +241,7 @@ impl TabArgs {
         let mut no_sandbox = false;
         let mut no_media = false;
         let mut user_agent = None;
+        let mut proxy = None;
         let mut archive_mode = false;
 
         let mut it = args.iter().skip(1);
@@ -253,6 +263,7 @@ impl TabArgs {
                 "--no-sandbox" => no_sandbox = true,
                 "--no-media" => no_media = true,
                 "--user-agent" => user_agent = Some(value("user-agent")?),
+                "--proxy" => proxy = Some(value("proxy")?),
                 "--archive-mode" => archive_mode = true,
                 // Verbosity flags: the level itself is read from argv by
                 // `logging::level_from_args` in `run`; they are accepted here so
@@ -288,6 +299,12 @@ impl TabArgs {
             no_sandbox,
             media_enabled: !no_media,
             user_agent,
+            // Fail fast (before the sandbox, before the first fetch) on a
+            // proxy the tab could never speak — same resolve as runtime.
+            proxy: match netmod::resolve_proxy(proxy.as_deref()) {
+                Ok(_) => proxy,
+                Err(err) => return Err(err.into()),
+            },
             archive_mode,
         })
     }
@@ -1148,6 +1165,17 @@ impl Tab {
         // The effective UA first: the provider (subresources) and the tab
         // (documents, media, JS) share this one cell from birth.
         let user_agent = netmod::new_user_agent(args.user_agent.as_deref());
+        // …and the container's proxy, before any request can leave: every
+        // fetch builder in netmod reads this one process cell at send time
+        // (task: proxies). `--proxy` was already resolved in TabArgs::parse,
+        // so this only ever writes; absent/blank keeps the born-direct cell.
+        if let Some(url) = args.proxy.as_deref().filter(|u| !u.trim().is_empty()) {
+            if let Err(err) = netmod::set_process_proxy(Some(url)) {
+                warn!("proxy not applied ({err}); connecting direct");
+            } else {
+                info!("proxy → {url}");
+            }
+        }
         let archive = crate::archive::ArchiveState::shared(args.archive_mode);
         let provider = Arc::new(
             BlitzNetProvider::new(args.net_policy, store.cookie_jar(), store.cache())
@@ -4075,6 +4103,26 @@ impl Tab {
                     .user_agent
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner()) = effective;
+            }
+            ToTab::SetProxy { proxy } => {
+                // The container's proxy moved (re-selected, cleared, or one
+                // of the shell's definitions edited). From this point every
+                // request — documents, subresources, form POSTs, redirect
+                // hops, XHR/fetch, media, downloads — rides the new proxy;
+                // `None` (or blank) means direct again. A URL reqwest won't
+                // parse is a contract break at the shell boundary: warn,
+                // stay on the previous proxy rather than silently sending
+                // authenticated traffic direct. Nothing reloads — the live
+                // document stands until its next request.
+                match netmod::set_process_proxy(proxy.as_deref()) {
+                    Ok(()) => {
+                        match proxy.as_deref().map(str::trim).filter(|u| !u.is_empty()) {
+                            Some(u) => info!("proxy → {u}"),
+                            None => info!("proxy → direct"),
+                        }
+                    }
+                    Err(err) => warn!("{err}; keeping the current proxy"),
+                }
             }
             ToTab::SetArchiveMode { enabled } => {
                 // The 💾 toggle: from here on (or off), every successful
@@ -7318,6 +7366,7 @@ mod tests {
             no_sandbox: true,
             media_enabled: true,
             user_agent: None,
+            proxy: None,
             archive_mode: false,
         };
         let pipe = Arc::new(SelfPipe::new().expect("pipe"));
@@ -7393,6 +7442,7 @@ mod tests {
             no_sandbox: true,
             media_enabled: true,
             user_agent: None,
+            proxy: None,
             archive_mode: false,
         };
         let pipe = Arc::new(SelfPipe::new().expect("pipe"));
@@ -8928,6 +8978,7 @@ mod tests {
             no_sandbox: true,
             media_enabled: true,
             user_agent: None,
+            proxy: None,
             archive_mode: false,
         };
         let pipe = Arc::new(SelfPipe::new().expect("pipe"));
@@ -9328,6 +9379,7 @@ mod tests {
             no_sandbox: true,
             media_enabled: false,
             user_agent: None,
+            proxy: None,
             archive_mode: false,
         };
         let pipe = Arc::new(SelfPipe::new().expect("pipe"));

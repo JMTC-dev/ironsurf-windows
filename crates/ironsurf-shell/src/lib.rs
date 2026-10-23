@@ -62,6 +62,15 @@ pub mod uisettings {
         /// again at the wheel.
         #[serde(default)]
         pub scroll_speed: Option<f32>,
+        /// The global pool of named **proxy definitions** (task: proxies),
+        /// edited in the container manager and picked per container via
+        /// [`ironsurf_common::Container::proxy`] (which stores a definition
+        /// *name*). Validated on entry by
+        /// [`ironsurf_common::validate_proxy_url`]; the file may still hold
+        /// junk from a hand edit — resolution treats a junk definition the
+        /// same as a missing one (direct).
+        #[serde(default)]
+        pub proxies: Vec<ironsurf_common::ProxyDef>,
     }
 
     /// What the archive server serves and from where (see
