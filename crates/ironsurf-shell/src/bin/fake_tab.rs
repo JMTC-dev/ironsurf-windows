@@ -62,6 +62,13 @@ fn main() {
     // echoes on the status line as `ua:<value>` (`ua:default` for `None`).
     let mut expect_user_agent = false;
     let mut current_ua: Option<String> = None;
+    // Proxy harness (task: proxies): `--proxy` is this fake tab's initial
+    // route (exactly how the real tab seeds its process proxy cell), and
+    // with `--expect-proxy` every current value — the launch one and each
+    // inbound ToTab::SetProxy — echoes on the status line as
+    // `proxy:<url>` (`proxy:direct` for `None`).
+    let mut expect_proxy = false;
+    let mut current_proxy: Option<String> = None;
     // Archive-mode harness (task: archive mode): `--archive-mode` is the
     // spawn-time switch (exactly how the real tab seeds its archive sink),
     // and with `--expect-archive-mode` every current value — the launch one
@@ -126,6 +133,7 @@ fn main() {
             // seeded this tab and rebroadcast every mutation.
             "--expect-userscripts" => expect_userscripts = true,
             "--expect-user-agent" => expect_user_agent = true,
+            "--expect-proxy" => expect_proxy = true,
             "--archive-mode" => current_archive = true,
             "--expect-popup-policy" => expect_popup_policy = true,
             "--popup-blocked" => popup_blocked = true,
@@ -138,6 +146,14 @@ fn main() {
                 let v = v.trim().to_string();
                 if !v.is_empty() {
                     current_ua = Some(v);
+                }
+            }
+            // the shell spawns a proxied container's tabs with the resolved
+            // URL; mirror the real tab: blank/absent ⇒ direct.
+            "--proxy" => {
+                let v = value("proxy").trim().to_string();
+                if !v.is_empty() {
+                    current_proxy = Some(v);
                 }
             }
             _ => {} // tolerate the real tab's flags
@@ -170,6 +186,16 @@ fn main() {
             text: Some(format!(
                 "ua:{}",
                 current_ua.clone().unwrap_or_else(|| "default".into())
+            )),
+        });
+    }
+    // …and the launch proxy likewise (task: proxies): the spawn path
+    // delivered the container's resolved URL before the first paint.
+    if expect_proxy {
+        emit(FromTab::StatusText {
+            text: Some(format!(
+                "proxy:{}",
+                current_proxy.clone().unwrap_or_else(|| "direct".into())
             )),
         });
     }
@@ -454,6 +480,23 @@ fn main() {
                         text: Some(format!(
                             "ua:{}",
                             current_ua.clone().unwrap_or_else(|| "default".into())
+                        )),
+                    });
+                }
+            }
+            // The proxy wire (task: proxies): replace the current route and
+            // — with `--expect-proxy` — echo it on the status line,
+            // `proxy:direct` for `None`. Nothing reloads for this; neither
+            // does the fake.
+            ToTab::SetProxy { proxy } => {
+                current_proxy = proxy
+                    .map(|v| v.trim().to_string())
+                    .filter(|v| !v.is_empty());
+                if expect_proxy {
+                    emit(FromTab::StatusText {
+                        text: Some(format!(
+                            "proxy:{}",
+                            current_proxy.clone().unwrap_or_else(|| "direct".into())
                         )),
                     });
                 }

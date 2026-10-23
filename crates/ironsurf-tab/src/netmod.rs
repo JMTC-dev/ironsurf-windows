@@ -347,6 +347,196 @@ pub fn read_user_agent(user_agent: &SharedUserAgent) -> String {
         .clone()
 }
 
+// ---------------------------------------------------------------------------
+// Per-container proxy (task: proxies)
+
+/// The proxy every outbound request of this tab rides, in a process-wide
+/// cell. The tab process IS the container (ARCHITECTURE §Design overview),
+/// so — exactly like [`shared_worker`] — there is one per process and no
+/// ambiguity about which tab it belongs to: the `--proxy` spawn flag seeds
+/// it, `ToTab::SetProxy` replaces it, and every later request (documents,
+/// subresources, form POSTs, redirect hops, XHR/`fetch`, workers, media,
+/// downloads) rides it. `None` = direct connections. Writing the cell
+/// rebuilds the shared [`FetchWorker`]'s clients — reqwest 0.13 binds a
+/// proxy to the *client*, not the request, and a client is an `Arc` clone,
+/// so the swap lands on every holder of the shared worker instantly.
+pub type SharedProxy = Arc<Mutex<Option<ProxyRoute>>>;
+
+/// One proxied route: reqwest's proxy **plus the URL it was built from**.
+/// reqwest 0.13 gives `Proxy` no url getter, so the cell remembers the
+/// address itself — failure messages ([`attribute_send_error`]) name the
+/// proxy that broke, not just the site whose socket was never opened.
+#[derive(Clone, Debug)]
+pub struct ProxyRoute {
+    /// The trimmed URL the route was resolved from.
+    pub url: String,
+    /// The reqwest proxy this route swaps the shared clients onto.
+    pub proxy: reqwest::Proxy,
+}
+
+static PROCESS_PROXY: OnceLock<SharedProxy> = OnceLock::new();
+
+/// This tab process's proxy cell (born empty: direct, the default).
+#[must_use]
+pub fn process_proxy() -> SharedProxy {
+    PROCESS_PROXY
+        .get_or_init(|| Arc::new(Mutex::new(None)))
+        .clone()
+}
+
+/// Resolve a `ToTab::SetProxy` value (and the `--proxy` flag) into reqwest's
+/// proxy shape: `None` or a value blank after trimming is `None` (direct);
+/// anything else becomes an **all-scheme** proxy (`socks5://`, `socks5h://`,
+/// `http://`, `https://` — the set [`ironsurf_common::validate_proxy_url`]
+/// guards everywhere else too — an entry a hand-fed `--proxy` never saw).
+/// Err is a URL that gate rejects (unknown scheme, missing host, whitespace
+/// inside, too long) or one reqwest itself cannot parse: callers log it and
+/// stay direct.
+pub fn resolve_proxy(value: Option<&str>) -> Result<Option<reqwest::Proxy>, String> {
+    resolve_proxy_route(value).map(|route| route.map(|r| r.proxy))
+}
+
+/// The sibling of `resolve_proxy` that also keeps the trimmed URL: the
+/// route cell needs the address for failure messages, reqwest's `Proxy`
+/// keeps no copy of it.
+fn resolve_proxy_route(value: Option<&str>) -> Result<Option<ProxyRoute>, String> {
+    let Some(raw) = value else { return Ok(None) };
+    if raw.trim().is_empty() {
+        return Ok(None);
+    }
+    // The contract's own gate first: reqwest 0.13 parses *any* URL into a
+    // Proxy (empty hosts included) and only ignores schemes it does not
+    // speak much later — validate_proxy_url is what turns socks4, gopher,
+    // `socks5://` or a typo into a loud Err instead of a silently ignored
+    // (i.e. direct) route. The trimmed URL is what reqwest then parses.
+    let trimmed = ironsurf_common::validate_proxy_url(raw)
+        .map_err(|e| format!("invalid proxy {raw:?}: {e}"))?;
+    let proxy = reqwest::Proxy::all(&trimmed)
+        .map_err(|e| format!("invalid proxy {trimmed:?}: {e}"))?;
+    Ok(Some(ProxyRoute { url: trimmed, proxy }))
+}
+
+/// Seed or replace the process proxy from a raw value: the cell records it
+/// and the shared fetch worker rebuilds its clients, so every fetch started
+/// after this call rides the new route. The error text is worth logging (a
+/// rejected proxy leaves the previous route in place).
+pub fn set_process_proxy(value: Option<&str>) -> Result<(), String> {
+    let route = resolve_proxy_route(value)?;
+    *process_proxy()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = route.clone();
+    shared_worker().set_proxy(route.map(|r| r.proxy));
+    Ok(())
+}
+
+/// The proxy the next request rides (poison-tolerant; `None` = direct).
+pub fn current_proxy() -> Option<reqwest::Proxy> {
+    current_proxy_route().map(|r| r.proxy)
+}
+
+/// The URL of the proxy this tab routes through (`None` = direct). While
+/// this is `Some`, every TCP connection a request opens goes **to the
+/// proxy**, which is exactly what [`attribute_send_error`] leans on.
+pub fn current_proxy_url() -> Option<String> {
+    current_proxy_route().map(|r| r.url)
+}
+
+fn current_proxy_route() -> Option<ProxyRoute> {
+    process_proxy()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone()
+}
+
+/// The prefix every proxy-attributed transport failure carries. It marks
+/// the message for [`NetError::error_page`] (which renders
+/// [`proxy_error_page`] instead of only restating a line) and keeps the
+/// status-line text self-explanatory on its own.
+pub const PROXY_FAIL_MARK: &str = "proxy failure: ";
+
+/// The whole error chain, lowercased — reqwest buries the OS error several
+/// sources deep (`Connection refused`, `timed out`, tunnel refusals), and
+/// attribution reads all of it.
+fn error_chain_lower(e: &(dyn std::error::Error + 'static)) -> String {
+    let mut chain = e.to_string().to_lowercase();
+    let mut source = e.source();
+    while let Some(err) = source {
+        chain.push(' ');
+        chain.push_str(&err.to_string().to_lowercase());
+        source = err.source();
+    }
+    chain
+}
+
+/// Describe a reqwest send failure as a **proxy failure** when this tab
+/// routes through one.
+///
+/// With a proxy set, the only socket a request opens is *to the proxy*:
+/// the origin is resolved there (socks5h), connected there, and CONNECTed
+/// through there. So while [`current_proxy_url`] is `Some`, connect
+/// failures and timeouts are the proxy's failure — but reqwest cannot say
+/// so itself (its message names the site's URL), and a dead proxy would
+/// otherwise read exactly like a dead website. Returns `None` when the
+/// route is direct or the failure is not one a proxy causes (it happened
+/// after a response started, or is a builder-level error). The text names
+/// the proxy address and says the site was never contacted.
+pub fn attribute_send_error(e: &reqwest::Error) -> Option<String> {
+    let proxy = current_proxy_url()?;
+    let chain = error_chain_lower(e);
+    let what = if e.is_timeout()
+        || chain.contains("timed out")
+        || chain.contains("timeout")
+    {
+        "timed out — the proxy did not answer in time. Check that it is \
+         still up and reachable."
+    } else if !e.is_connect() {
+        return None;
+    } else if chain.contains("connection refused") {
+        "refused the connection — nothing is listening at the proxy's \
+         address and port. Check that the proxy process is running."
+    } else if chain.contains("proxy") || chain.contains("tunnel") || chain.contains("407") {
+        "rejected the request — it is reachable but will not forward it \
+         (authentication, TLS, or access rules)."
+    } else if chain.contains("failed to lookup")
+        || chain.contains("dns")
+        || chain.contains("name or service")
+    {
+        "cannot be reached — its hostname does not resolve. Check the \
+         address."
+    } else {
+        "could not be reached. Check its address and port."
+    };
+    Some(format!(
+        "{PROXY_FAIL_MARK}{proxy} {what} The site itself was never contacted; \
+         Settings (☰) → Proxy can switch this container back to Direct."
+    ))
+}
+
+/// Minimal HTML error page for navigations where the **proxy** is the
+/// blamed cause: the container routes through it, it failed, and the site
+/// was never reached.
+/// Rendered by [`NetError::error_page`] for any transport message carrying
+/// [`PROXY_FAIL_MARK`].
+pub fn proxy_error_page(request_url: &Url, message: &str) -> String {
+    format!(
+        r#"<!doctype html>
+<html>
+  <head><meta charset="utf-8"><title>Proxy failure</title></head>
+  <body style="font-family: monospace; margin: 2em">
+    <h1>⚠ Proxy failure</h1>
+    <p><code>{url}</code> was not loaded: this container routes through a
+    proxy, and the proxy failed. The site itself was never contacted.</p>
+    <p><small>{detail}</small></p>
+    <p><small>Pick Direct or another definition in Settings (☰) → Proxy —
+    the choice applies to this container only.</small></p>
+  </body>
+</html>
+"#,
+        url = request_url.as_str(),
+        detail = message.strip_prefix(PROXY_FAIL_MARK).unwrap_or(message),
+    )
+}
+
 /// Read a `file:` URL from disk (same path semantics as blitz-net: `url.path()`).
 pub fn read_file_url(url: &Url) -> Result<Vec<u8>, String> {
     if url.scheme() != "file" {
@@ -1103,12 +1293,18 @@ pub fn decode_base64(input: &str) -> Option<Vec<u8>> {
 // ---------------------------------------------------------------------------
 // Worker-thread fetcher (blocking reqwest/rustls on spawned threads)
 
-/// Owns the container's blocking `reqwest` (rustls) client and runs GETs on
+/// Owns the container's blocking `reqwest` (rustls) clients and runs GETs on
 /// freshly-spawned worker threads, feeding `Box<dyn NetHandler>` callbacks.
+/// The clients live behind mutexes so [`FetchWorker::set_proxy`] can swap
+/// the container's route at runtime: reqwest binds proxies to clients, and
+/// handing out an `Arc`-cheap clone per fetch is how the swap reaches every
+/// fetcher without rebuilding anything else.
 pub struct FetchWorker {
-    client: reqwest::blocking::Client,
+    client: Mutex<reqwest::blocking::Client>,
     /// Same transport, redirects left to the caller (the managed cookie path).
-    redirect_manual: reqwest::blocking::Client,
+    redirect_manual: Mutex<reqwest::blocking::Client>,
+    /// The launch timeout, kept so a proxy swap rebuilds identical clients.
+    timeout: std::time::Duration,
 }
 
 impl FetchWorker {
@@ -1122,46 +1318,71 @@ impl FetchWorker {
     }
 
     fn built(timeout: std::time::Duration) -> Self {
-        let client = reqwest::blocking::Client::builder()
-            .use_rustls_tls()
-            .redirect(reqwest::redirect::Policy::limited(10))
-            .timeout(timeout)
-            .pool_max_idle_per_host(16)
-            .connect_timeout(std::time::Duration::from_secs(10))
-            .tcp_nodelay(true)
-            // HTTP/2 keep-alive + adaptive flow control (multiplexed tabs).
-            .http2_keep_alive_interval(std::time::Duration::from_secs(30))
-            .http2_keep_alive_timeout(std::time::Duration::from_secs(10))
-            .http2_adaptive_window(true)
-            .build()
-            .expect("reqwest client");
-        // Managed fetches follow redirects themselves: reqwest's automatic
-        // policy would replay the first hop's `Cookie` header verbatim and
-        // only expose the final hop's `Set-Cookie`s, silently breaking the
-        // per-origin cookie rules. Manual policy hands us every hop.
-        let redirect_manual = reqwest::blocking::Client::builder()
-            .use_rustls_tls()
-            .redirect(reqwest::redirect::Policy::none())
-            .timeout(timeout)
-            .pool_max_idle_per_host(16)
-            .connect_timeout(std::time::Duration::from_secs(10))
-            .tcp_nodelay(true)
-            .build()
-            .expect("reqwest manual-redirect client");
+        let (client, redirect_manual) = Self::clients(timeout, None);
         FetchWorker {
-            client,
-            redirect_manual,
+            client: Mutex::new(client),
+            redirect_manual: Mutex::new(redirect_manual),
+            timeout,
         }
     }
 
-    pub fn client(&self) -> &reqwest::blocking::Client {
-        &self.client
+    /// Build the pair of clients for one route: `proxy = None` is direct,
+    /// `Some(p)` sends both through `p` (the same route serves passthrough
+    /// and managed traffic — a container's traffic does not split). The
+    /// auto client follows redirects; the manual one hands every hop back to
+    /// the managed cookie path, which replays per-hop `Cookie` headers and
+    /// captures per-hop `Set-Cookie`s — reqwest's automatic policy would
+    /// blindly replay the first hop's jar header and show only the final
+    /// hop's responses.
+    fn clients(
+        timeout: std::time::Duration,
+        proxy: Option<&reqwest::Proxy>,
+    ) -> (reqwest::blocking::Client, reqwest::blocking::Client) {
+        let build = |auto: bool| {
+            let mut builder = reqwest::blocking::Client::builder()
+                .use_rustls_tls()
+                .redirect(if auto {
+                    reqwest::redirect::Policy::limited(10)
+                } else {
+                    reqwest::redirect::Policy::none()
+                })
+                .timeout(timeout)
+                .pool_max_idle_per_host(16)
+                .connect_timeout(std::time::Duration::from_secs(10))
+                .tcp_nodelay(true);
+            if auto {
+                // HTTP/2 keep-alive + adaptive flow control (multiplexed tabs).
+                builder = builder
+                    .http2_keep_alive_interval(std::time::Duration::from_secs(30))
+                    .http2_keep_alive_timeout(std::time::Duration::from_secs(10))
+                    .http2_adaptive_window(true);
+            }
+            if let Some(proxy) = proxy {
+                builder = builder.proxy(proxy.clone());
+            }
+            builder.build().expect("reqwest client")
+        };
+        (build(true), build(false))
+    }
+
+    /// Swap the container's proxy: both clients are rebuilt on the spot, so
+    /// every `client()`/`managed_client()` taken afterwards rides the new
+    /// route (requests already in flight finish on the old one, exactly
+    /// like a tab that had the page half-loaded when the switch flipped).
+    pub fn set_proxy(&self, proxy: Option<reqwest::Proxy>) {
+        let (auto, manual) = Self::clients(self.timeout, proxy.as_ref());
+        *self.client.lock().unwrap_or_else(|p| p.into_inner()) = auto;
+        *self.redirect_manual.lock().unwrap_or_else(|p| p.into_inner()) = manual;
+    }
+
+    pub fn client(&self) -> reqwest::blocking::Client {
+        self.client.lock().unwrap_or_else(|p| p.into_inner()).clone()
     }
 
     /// The client managed cookie fetches must use (3xx responses come back
     /// to us instead of being followed blindly).
-    pub fn managed_client(&self) -> &reqwest::blocking::Client {
-        &self.redirect_manual
+    pub fn managed_client(&self) -> reqwest::blocking::Client {
+        self.redirect_manual.lock().unwrap_or_else(|p| p.into_inner()).clone()
     }
 
 }
@@ -1430,12 +1651,17 @@ pub struct MainDocPost {
 
 /// Build the request line: GET, or POST with the form body (and its
 /// `Content-Type`) riding along.
+///
+/// The clients this builds on are the container's current route (they are
+/// swapped wholesale by [`FetchWorker::set_proxy`] when the proxy changes),
+/// so both the passthrough path and the managed hop loop — documents, POSTs
+/// and redirects — ride it without per-request plumbing.
 fn build_request(
     client: &reqwest::blocking::Client,
     url: &Url,
     post: Option<&MainDocPost>,
 ) -> reqwest::blocking::RequestBuilder {
-    match post {
+    let req = match post {
         Some(body) => {
             let req = client.post(url.as_str()).body(body.body.clone());
             match &body.content_type {
@@ -1444,7 +1670,8 @@ fn build_request(
             }
         }
         None => client.get(url.as_str()),
-    }
+    };
+    req
 }
 
 /// Plain (`Passthrough`) HTTP fetch (GET, or a form `POST` with `post`):
@@ -1481,7 +1708,11 @@ pub fn plain_http_fetch_report(
     }
     let response = req.send().map_err(|e| {
         warn!("passthrough {verb} {url} failed: {e}");
-        let message = format!("fetch {url}: {e}");
+        // While the tab rides a proxy, a connect/timeout failure is the
+        // proxy's — the socket that refused or stalled was the proxy's,
+        // and reqwest's own text would blame the site (attribution reads
+        // the route cell, not the client). Otherwise: the plain wording.
+        let message = attribute_send_error(&e).unwrap_or_else(|| format!("fetch {url}: {e}"));
         if let Some(report) = report {
             report(net_failed(verb, url, elapsed_ms(started), message.clone()));
         }
@@ -1572,7 +1803,10 @@ where
         req = req.body(body.to_vec());
     }
     let response = req.send().map_err(|e| {
-        let message = format!("fetch {url}: {e}");
+        // Proxy attribution: see the passthrough fetcher — a page's XHR/
+        // fetch() against a dead proxy fails with the proxy named, not a
+        // message that reads like the API host is down.
+        let message = attribute_send_error(&e).unwrap_or_else(|| format!("fetch {url}: {e}"));
         warn!("xhr {verb} {url} failed: {e}");
         if let Some(report) = report {
             report(net_failed(&verb, url, elapsed_ms(started), message.clone()));
@@ -1913,7 +2147,9 @@ where
         let hop_start = std::time::Instant::now();
         let response = req.send().map_err(|e| {
             warn!("{verb} {current} failed: {e}");
-            let message = format!("fetch {current}: {e}");
+            // Proxy attribution on every hop (redirect chains included):
+            // see the passthrough fetcher.
+            let message = attribute_send_error(&e).unwrap_or_else(|| format!("fetch {current}: {e}"));
             if let Some(report) = report {
                 report(net_failed(
                     verb,
@@ -2333,7 +2569,7 @@ impl BlitzNetProvider {
                 let mut jar: &Mutex<CookieJar> = &jar;
                 let cache: &Mutex<NetCache> = &cache;
                 managed_http_fetch_report(
-                    worker.managed_client(),
+                    &worker.managed_client(),
                     &url,
                     &mut jar,
                     &cache,
@@ -2346,7 +2582,7 @@ impl BlitzNetProvider {
                 )
             } else {
                 plain_http_fetch_report(
-                    worker.client(),
+                    &worker.client(),
                     &url,
                     Some(&request.headers),
                     None,
@@ -2672,7 +2908,9 @@ impl fmt::Display for NetError {
 impl std::error::Error for NetError {}
 
 impl NetError {
-    /// Error-page HTML for this failure, if we render one (only Blocked).
+    /// Error-page HTML for this failure, if we render one: Blocked, and
+    /// any transport failure the proxy is to blame for (message carrying
+    /// [`PROXY_FAIL_MARK`] — see [`attribute_send_error`]).
     pub fn error_page(&self) -> Option<String> {
         match self {
             NetError::Blocked {
@@ -2680,6 +2918,11 @@ impl NetError {
                 https,
                 reason,
             } => Some(blocked_error_page(request, https, reason)),
+            NetError::Transport { url, message }
+                if message.starts_with(PROXY_FAIL_MARK) =>
+            {
+                Some(proxy_error_page(url, message))
+            }
             _ => None,
         }
     }
@@ -2991,7 +3234,7 @@ where
     match plan_document(policy, url) {
         // Non-http scheme that still reached here (unknown scheme): refuse.
         Plan::Pass => {
-            plain_http_fetch_report(worker.client(), url, None, post, &user_agent, report)
+            plain_http_fetch_report(&worker.client(), url, None, post, &user_agent, report)
                 .map(doc_fetch_from)
                 .map_err(|message| NetError::Transport {
                     url: url.clone(),
@@ -2999,7 +3242,7 @@ where
                 })
         }
         Plan::Fetch(target) => managed_http_fetch_report(
-            worker.managed_client(),
+            &worker.managed_client(),
             &target,
             jar,
             cache,
@@ -3026,7 +3269,7 @@ where
             let started = std::time::Instant::now();
             let method = if post.is_some() { "POST" } else { "GET" };
             match managed_http_fetch_report(
-                worker.managed_client(),
+                &worker.managed_client(),
                 &https,
                 jar,
                 cache,
@@ -4123,7 +4366,7 @@ mod tests {
     /// must be on the later hops' requests, and vice versa.
     fn fetch(path: &str, port: u16, jar: &mut CookieJar, cache: &NetCache) -> FetchOutcome {
         managed_http_fetch(
-            worker_for_test().managed_client(),
+            &worker_for_test().managed_client(),
             &get(&format!("http://127.0.0.1:{port}{path}")),
             jar,
             cache,
@@ -4213,7 +4456,7 @@ mod tests {
         ]);
         let mut jar = CookieJar::new();
         let out = managed_http_fetch(
-            worker_for_test().managed_client(),
+            &worker_for_test().managed_client(),
             &get(&format!("http://localhost:{port}/cross")),
             &mut jar,
             &test_cache("cross"),
@@ -4302,7 +4545,7 @@ mod tests {
                     let mut jar: &Mutex<CookieJar> = &jar;
                     let cache: &Mutex<NetCache> = &cache;
                     let outcome = managed_http_fetch_report(
-                        worker_for_test().managed_client(),
+                        &worker_for_test().managed_client(),
                         &get(&format!("http://127.0.0.1:{port}{path}")),
                         &mut jar,
                         &cache,
@@ -4456,7 +4699,7 @@ mod tests {
         let report = |event: NetEvent| events.lock().expect("events").push(event);
 
         let first = managed_http_fetch_report(
-            client,
+            &client,
             &url,
             &mut jar,
             &cache,
@@ -4471,7 +4714,7 @@ mod tests {
         assert!(!first.from_cache, "the first fetch has no entry to serve");
 
         let second = managed_http_fetch_report(
-            client,
+            &client,
             &url,
             &mut jar,
             &cache,
@@ -4524,7 +4767,7 @@ mod tests {
             let client = worker_for_test().managed_client();
             for round in 1..=2 {
                 let outcome =
-                    managed_http_fetch(client, &url, &mut jar, &cache, now_unix(), None, None, true)
+                    managed_http_fetch(&client, &url, &mut jar, &cache, now_unix(), None, None, true)
                         .unwrap_or_else(|e| panic!("{path} round {round}: {e}"));
                 assert!(
                     !outcome.from_cache,
@@ -4851,4 +5094,145 @@ mod user_agent_tests {
         assert_eq!(read_user_agent(&cell), USER_AGENT);
     }
 
+}
+
+#[cfg(test)]
+mod proxy_tests {
+    use super::*;
+
+    #[test]
+    fn resolve_proxy_blank_means_direct() {
+        assert!(resolve_proxy(None).unwrap().is_none());
+        assert!(resolve_proxy(Some("")).unwrap().is_none());
+        assert!(
+            resolve_proxy(Some("   \t ")).unwrap().is_none(),
+            "blank after trim is the contract's 'back to direct'"
+        );
+    }
+
+    #[test]
+    fn resolve_proxy_parses_the_four_schemes() {
+        // reqwest 0.13 gives Proxy no url getter, so proof is "parsed Ok" —
+        // and every scheme the contract's validate_proxy_url admits must
+        // survive here too, or the setting would strand traffic direct.
+        for url in [
+            "socks5://127.0.0.1:1080",
+            "socks5h://proxy.example",
+            "http://user:pass@proxy.internal:3128",
+            "https://[::1]:8443",
+        ] {
+            assert!(
+                resolve_proxy(Some(url)).unwrap().is_some(),
+                "{url} must resolve"
+            );
+        }
+        // Surrounding blanks are stripped before parsing.
+        assert!(resolve_proxy(Some("  socks5://h:1080 ")).unwrap().is_some());
+        // The contract and the resolver must agree on the scheme list.
+        for url in [
+            "socks5://h:1", "socks5h://h:1", "http://h:1", "https://h:1",
+        ] {
+            assert!(ironsurf_common::validate_proxy_url(url).is_ok());
+            assert!(resolve_proxy(Some(url)).unwrap().is_some(), "{url}");
+        }
+    }
+
+    #[test]
+    fn resolve_proxy_rejects_what_reqwest_rejects() {
+        // No scheme, a scheme reqwest never speaks, and a broken URL all
+        // come back as Err — the runtime logs them and stays direct.
+        assert!(resolve_proxy(Some("proxy:1080")).is_err());
+        assert!(resolve_proxy(Some("gopher://proxy:1080")).is_err());
+        assert!(resolve_proxy(Some("socks5://")).is_err());
+    }
+
+    #[test]
+    fn an_invalid_write_leaves_the_cell_untouched() {
+        // The cell is process-wide and starts direct; a rejected seed must
+        // not disturb whatever it held (here: still direct). The lock
+        // serialises every proxy_tests member that touches the cell —
+        // the suite runs one process, and a half-set route would let a
+        // concurrent fetch read someone else's route.
+        let _serial = PROXY_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        assert!(current_proxy().is_none(), "tests start direct");
+        assert!(set_process_proxy(Some("gopher://proxy")).is_err());
+        assert!(current_proxy().is_none(), "a rejected write changes nothing");
+    }
+
+    /// Serialises the members of this module that write the process-wide
+    /// route cell (the rest fetch direct and must not glimpse a proxy).
+    static PROXY_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    /// End-to-end attribution over real sockets: a refused proxy, a proxy
+    /// that accepts and never answers, and the direct control that must
+    /// keep blaming the site. One test, sequential phases: the route cell
+    /// is process-wide.
+    #[test]
+    fn proxy_failures_are_blamed_on_the_proxy() {
+        let _serial = PROXY_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let dead = "http://127.0.0.1:1"; // nothing ever listens on port 1
+        let site = Url::parse("http://127.0.0.1:9/").expect("loopback site url");
+
+        // ---- control: direct, refused is the site's own failure ----------
+        let worker = FetchWorker::with_timeout(std::time::Duration::from_secs(5));
+        let err = plain_http_fetch_report(&worker.client(), &site, None, None, "ua", None)
+            .expect_err("port 9 refuses a direct connection");
+        assert!(
+            !err.contains(PROXY_FAIL_MARK),
+            "direct must not blame a proxy: {err}"
+        );
+        let net = NetError::Transport {
+            url: site.clone(),
+            message: err.clone(),
+        };
+        assert!(net.error_page().is_none(), "direct transport failures stay pageless: {err}");
+
+        // ---- a refused proxy becomes the proxy's failure ------------------
+        set_process_proxy(Some(dead)).expect("dead proxy resolves");
+        worker.set_proxy(current_proxy());
+        let err = plain_http_fetch_report(&worker.client(), &site, None, None, "ua", None)
+            .expect_err("the dead proxy refuses");
+        assert!(
+            err.starts_with(PROXY_FAIL_MARK),
+            "a refused proxy connection must read as a proxy failure: {err}"
+        );
+        assert!(err.contains(dead), "the message names the proxy: {err}");
+        assert!(err.to_lowercase().contains("refused"), "says what happened: {err}");
+        assert!(
+            err.contains("never contacted"),
+            "says the site was not at fault: {err}"
+        );
+        let net = NetError::Transport {
+            url: site.clone(),
+            message: err.clone(),
+        };
+        let page = net.error_page().expect("proxy failures render an error page");
+        assert!(page.contains("Proxy failure") && page.contains(&site.to_string()));
+
+        // ---- a proxy that accepts and never answers reads as a timeout ---
+        let blackhole = std::net::TcpListener::bind("127.0.0.1:0").expect("blackhole");
+        let blackhole_url = format!("http://{}/", blackhole.local_addr().expect("addr"));
+        std::thread::spawn(move || {
+            // Accept the connection and then say nothing forever: the
+            // client's overall timeout is what ends the request.
+            let _accepted = blackhole.accept();
+            std::thread::sleep(std::time::Duration::from_secs(30));
+        });
+        set_process_proxy(Some(&blackhole_url)).expect("blackhole proxy resolves");
+        worker.set_proxy(current_proxy());
+        let err = plain_http_fetch_report(&worker.client(), &site, None, None, "ua", None)
+            .expect_err("the blackhole proxy never answers");
+        assert!(
+            err.starts_with(PROXY_FAIL_MARK),
+            "a proxy timeout must read as a proxy failure: {err}"
+        );
+        assert!(err.to_lowercase().contains("timed out"), "says what happened: {err}");
+
+        // ---- back to direct: the cell, not just the message ---------------
+        set_process_proxy(None).expect("direct");
+        assert!(current_proxy_url().is_none());
+        let err = plain_http_fetch_report(&worker.client(), &site, None, None, "ua", None)
+            .expect_err("still refused");
+        assert!(!err.contains(PROXY_FAIL_MARK), "direct again: {err}");
+    }
 }
