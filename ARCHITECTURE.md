@@ -1515,12 +1515,16 @@ UI (`crates/ironsurf-shell/ui/ironsurf.slint`):
   of other containers never receive it), and spawn/respawn of a UA container's tab
   appends `--user-agent <ua>` to that spawn alone (per-spawn args; the first page load
   already sends it).
-- **Proxy switcher** (top-bar "Proxy" button, right of "UA", task: proxies): the same
-  right-docked overlay Rectangle, and it joins the never-stack set — each other
-  overlay's open closes it and vice versa. Targets the **active tab's container**: rows
-  are "Direct" first, then one row per global definition (`ui.json → proxies`,
-  `Vec<ProxyDef>` in `UiSettings`), the container's pick highlighted; the footer edits
-  the **global** pool (name + URL LineEdits, Add; a per-row Del on each definition).
+- **Proxy section** (inside the **settings drawer** (☰) below the history and
+  scrolling settings — deliberately *no* toolbar button of its own, task:
+  proxies): the drawer is already in the never-stack set, and opening it
+  re-pushes this section's state (rows, current label, error cleared); a tab
+  switch re-points it at the new container's choice while the drawer stays
+  open. Targets the **active tab's container**: rows are "Direct" first,
+  then one row per global definition (`ui.json → proxies`, `Vec<ProxyDef>`
+  in `UiSettings`), the container's pick highlighted; below them the
+  **global** pool is edited (name + URL LineEdits, Add; a per-row Del on
+  each definition).
   A pick stores the definition **name** on the container
   (`Store::set_container_proxy`, same validation contract as the UA: control chars /
   > `MAX_PROXY_NAME_CHARS` rejected as a one-line `StoreError` with nothing written)
@@ -1771,7 +1775,10 @@ Process/tab management (`src/tabs.rs`):
   change persists at once to `ui.json` (`settings.scroll_speed`, absent = `1.0`), applies
   browser-wide live (`ToTab::SetScrollSpeed` to each running tab — the tab multiplies its
   default wheel damping, clamping nonsense back), and seeds fresh tabs at spawn, so a new
-  tab's wheel already turns at the chosen speed.
+  tab's wheel already turns at the chosen speed. Below it sits the **proxy** section
+  (task: proxies) — the per-container route picker and the global definition editor —
+  which lives here rather than behind a toolbar button of its own; see the
+  proxy-section bullet above for its contract.
 - **Crashed tabs are loud, never silent**: child stderr is captured (bounded tail; `RUST_BACKTRACE=full`
   is set for children and the tab binary force-prints a backtrace on panic), the drain tick polls every
   child (`try_wait`), and a process that dies without `Closed` — or a send that fails (broken pipe, os

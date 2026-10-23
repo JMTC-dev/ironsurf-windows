@@ -4,8 +4,10 @@
 //! (`--expect-proxy`) echoes its *current* route on the status line — the
 //! launch `--proxy` at startup and every inbound `ToTab::SetProxy` afterwards
 //! (`proxy:<url>`, `proxy:direct` for `None`) — so the whole flow is
-//! assertable over the real pipe: the toolbar "Proxy" button toggles the
-//! overlay and none of the full-window overlays ever stack; a definition pick
+//! assertable over the real pipe: the proxy section lives in the settings
+//! drawer (☰ — no toolbar button of its own), the drawer never stacks with
+//! the other full-window overlays, and opening it re-pushes the proxy
+//! state; a definition pick
 //! persists the **name** to the Store and broadcasts the **resolved URL** to
 //! the container's own tabs only (two containers, isolation proven per tab);
 //! deleting a definition strands its containers (name kept, traffic direct)
@@ -105,32 +107,32 @@ fn proxy_menu_switches_proxies_per_container() {
         core.tab_snapshot().first().is_some_and(|s| s.ready) && status(&ui) == "proxy:direct"
     });
 
-    // ── The toolbar "Proxy" button toggles the overlay ───────────────────────
-    assert!(!ui.get_proxy_menu_open());
-    ui.invoke_toggle_proxy_menu();
-    assert!(ui.get_proxy_menu_open());
+    // ── The settings drawer (☰) hosts the proxy section ──────────────────────────────
+    assert!(!ui.get_history_menu_open());
+    ui.invoke_toggle_history_menu();
+    assert!(ui.get_history_menu_open());
     let rows = proxy_rows(&ui);
     assert_eq!(rows.len(), 3, "Direct + the two seeded definitions");
     assert_eq!(rows[0], ("Direct".to_string(), String::new(), true));
     assert_eq!(rows[1], ("socks".to_string(), SOCKS_URL.to_string(), false));
     assert_eq!(rows[2], ("web".to_string(), WEB_URL.to_string(), false));
     assert_eq!(ui.get_proxy_current().as_str(), "Direct");
-    ui.invoke_toggle_proxy_menu();
-    assert!(!ui.get_proxy_menu_open());
-    ui.invoke_toggle_proxy_menu();
+    ui.invoke_toggle_history_menu();
+    assert!(!ui.get_history_menu_open());
+    ui.invoke_toggle_history_menu();
 
     // ── The full-window overlays never stack: each open closes the others ────
     ui.invoke_open_manager();
     assert!(ui.get_manager_open());
-    assert!(!ui.get_proxy_menu_open(), "the manager closes the proxy menu");
+    assert!(!ui.get_history_menu_open(), "the manager closes the settings drawer");
     ui.invoke_toggle_ua_menu();
     assert!(ui.get_ua_menu_open());
     assert!(!ui.get_manager_open(), "the UA menu closes the manager");
-    ui.invoke_toggle_proxy_menu();
-    assert!(ui.get_proxy_menu_open());
+    ui.invoke_toggle_history_menu();
+    assert!(ui.get_history_menu_open());
     assert!(
         !ui.get_manager_open() && !ui.get_ua_menu_open(),
-        "opening the proxy menu closes both the UA menu and the manager"
+        "opening the settings drawer closes both the UA menu and the manager"
     );
 
     // ── Open a tab in container 2; the (still open) menu follows the tab ─────
@@ -139,7 +141,7 @@ fn proxy_menu_switches_proxies_per_container() {
         pump();
         core.tab_snapshot().len() == 2 && core.tab_snapshot()[1].ready
     });
-    assert!(ui.get_proxy_menu_open(), "the menu survives the tab switch");
+    assert!(ui.get_history_menu_open(), "the drawer survives the tab switch");
     assert!(proxy_rows(&ui)[0].2, "container 2 has no proxy yet");
     assert_eq!(ui.get_proxy_current().as_str(), "Direct");
 
@@ -249,8 +251,8 @@ fn proxy_menu_switches_proxies_per_container() {
     pump();
     assert_eq!(status(&ui), format!("proxy:{new_url}"), "nothing was rebroadcast");
 
-    ui.invoke_close_proxy_menu();
-    assert!(!ui.get_proxy_menu_open(), "the scrim/✕ closes it too");
+    ui.invoke_close_history_menu();
+    assert!(!ui.get_history_menu_open(), "the scrim/✕ closes the drawer too");
 
     app.shutdown();
 }

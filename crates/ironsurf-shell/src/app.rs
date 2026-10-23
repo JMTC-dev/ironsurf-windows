@@ -2568,7 +2568,6 @@ impl Core {
             // `archive_menu`).
             ui.set_us_menu_open(false);
             ui.set_ua_menu_open(false);
-            ui.set_proxy_menu_open(false);
             ui.set_archive_menu_open(false);
             ui.set_history_menu_open(false);
             ui.set_download_menu_open(false);
@@ -2811,7 +2810,6 @@ impl Core {
             // their own open legs.
             ui.set_manager_open(false);
             ui.set_ua_menu_open(false);
-            ui.set_proxy_menu_open(false);
             ui.set_archive_menu_open(false);
             ui.set_history_menu_open(false);
             ui.set_download_menu_open(false);
@@ -3037,7 +3035,6 @@ impl Core {
             ui.set_history_menu_open(false);
             ui.set_download_menu_open(false);
             ui.set_save_menu_open(false);
-            ui.set_proxy_menu_open(false);
             ui.set_ua_error(SharedString::default());
             let current = container_user_agent(&self.store.borrow(), self.active_container());
             // Prefill the draft with exactly what the container holds (a
@@ -3166,42 +3163,17 @@ impl Core {
         ui.set_proxy_rows(ModelRc::from(Rc::new(VecModel::from(rows))));
     }
 
-    /// A tab switch moved the menu to another container: re-point rows and
-    /// current label (and drop the stale error line) — the UA menu's rule.
+    /// A tab switch moved the drawer's proxy section to another container:
+    /// re-point rows and current label (and drop the stale error line) —
+    /// the UA menu's rule, now gated on the settings drawer being open
+    /// since that is where the section lives.
     fn proxy_refresh_if_open(&self) {
         if let Some(ui) = self.ui() {
-            if ui.get_proxy_menu_open() {
+            if ui.get_history_menu_open() {
                 self.proxy_state(&ui);
                 ui.set_proxy_error(SharedString::default());
             }
         }
-    }
-
-    /// Open/close the proxy overlay. Opening re-reads the Store and the
-    /// settings for the active tab's container and closes every other
-    /// full-window overlay — none of them ever stack (see
-    /// [`Core::ua_menu`], whose pattern this mirrors exactly).
-    fn proxy_menu(&self, open: bool) {
-        let Some(ui) = self.ui() else { return };
-        debug!("proxy menu {}", if open { "opened" } else { "closed" });
-        if open {
-            ui.set_manager_open(false);
-            ui.set_us_menu_open(false);
-            ui.set_ua_menu_open(false);
-            ui.set_archive_menu_open(false);
-            ui.set_history_menu_open(false);
-            ui.set_download_menu_open(false);
-            ui.set_save_menu_open(false);
-            ui.set_proxy_error(SharedString::default());
-            self.proxy_state(&ui);
-        }
-        ui.set_proxy_menu_open(open);
-    }
-
-    /// The toolbar's "Proxy" button: flip the overlay.
-    fn toggle_proxy_menu(&self) {
-        let open = self.ui().is_some_and(|ui| ui.get_proxy_menu_open());
-        self.proxy_menu(!open);
     }
 
     /// A row was clicked: route the menu's container through that proxy
@@ -3414,7 +3386,6 @@ impl Core {
             ui.set_manager_open(false);
             ui.set_us_menu_open(false);
             ui.set_ua_menu_open(false);
-            ui.set_proxy_menu_open(false);
             ui.set_history_menu_open(false);
             ui.set_download_menu_open(false);
             ui.set_save_menu_open(false);
@@ -3453,7 +3424,6 @@ impl Core {
         ui.set_manager_open(false);
         ui.set_us_menu_open(false);
         ui.set_ua_menu_open(false);
-            ui.set_proxy_menu_open(false);
         ui.set_archive_menu_open(false);
         ui.set_history_menu_open(false);
         ui.set_download_menu_open(false);
@@ -3727,7 +3697,6 @@ impl Core {
             ui.set_manager_open(false);
             ui.set_us_menu_open(false);
             ui.set_ua_menu_open(false);
-            ui.set_proxy_menu_open(false);
             ui.set_history_menu_open(false);
             ui.set_archive_menu_open(false);
             ui.set_save_menu_open(false);
@@ -4037,11 +4006,15 @@ impl Core {
             ui.set_manager_open(false);
             ui.set_us_menu_open(false);
             ui.set_ua_menu_open(false);
-            ui.set_proxy_menu_open(false);
             ui.set_archive_menu_open(false);
             ui.set_download_menu_open(false);
             ui.set_save_menu_open(false);
             self.history_state(&ui);
+            // The drawer also hosts the proxy section (task: proxies):
+            // re-point it at the active tab's container and drop any
+            // stale one-line error from a previous visit.
+            ui.set_proxy_error(SharedString::default());
+            self.proxy_state(&ui);
         }
         ui.set_history_menu_open(open);
     }
@@ -5421,8 +5394,6 @@ impl Core {
         // container, rebroadcast its URL to that container's live tabs),
         // and the global definition editor (Add/Delete persist ui.json and
         // re-resolve every live tab).
-        bind0!(on_toggle_proxy_menu, |c: &Rc<Core>| c.toggle_proxy_menu());
-        bind0!(on_close_proxy_menu, |c: &Rc<Core>| c.proxy_menu(false));
         bind0!(on_proxy_add, |c: &Rc<Core>| c.proxy_add());
         {
             let c = self.clone();

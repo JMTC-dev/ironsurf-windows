@@ -846,17 +846,17 @@ export component AppWindow inherits Window {
     // rejected Apply keeps the draft while `ua-error` says why)
     in-out property <string> ua-custom: "";
 
-    // Proxy switcher + definition editor (task: proxies): toggled by the
-    // "Proxy" toolbar button, scoped to the *active tab's container* exactly
-    // like the UA menu. `proxy-rows` is Direct first, then one row per
-    // global definition (settings `ui.json → proxies`); clicking a row
-    // stores the choice (a definition **name**) on the container and
-    // rebroadcasts `ToTab::SetProxy` with the resolved URL. `proxy-current`
-    // is the display label ("Direct" or a name); `proxy-error` is the
-    // one-line rejection of a bad definition (the Add drafts survive, UA-
-    // menu style). Definitions are **global**: every container may pick the
-    // same one, and deleting/editing one re-resolves every container.
-    in property <bool> proxy-menu-open: false;
+    // Proxy pickers + definition editor (task: proxies): **no toolbar
+    // button of its own** — this state renders inside the settings drawer
+    // (☰), scoped to the *active tab's container* exactly like the UA menu.
+    // `proxy-rows` is Direct first, then one row per global definition
+    // (settings `ui.json → proxies`); clicking a row stores the choice (a
+    // definition **name**) on the container and rebroadcasts
+    // `ToTab::SetProxy` with the resolved URL. `proxy-current` is the
+    // display label ("Direct" or a name); `proxy-error` is the one-line
+    // rejection of a bad definition (the Add drafts survive, UA-menu
+    // style). Definitions are **global**: every container may pick the same
+    // one, and deleting/editing one re-resolves every container.
     in property <[ProxyRow]> proxy-rows;
     in property <string> proxy-current: "";
     in property <string> proxy-error: "";
@@ -1027,14 +1027,13 @@ export component AppWindow inherits Window {
     // the custom-UA LineEdit → Apply (its current text, blank = default).
     callback ua-apply-custom(text: string);
 
-    // Proxy-menu intents (task: proxies; indices are rows of `proxy-rows`,
-    // row 0 = Direct). Selecting persists the definition **name** on the
-    // container through the Store and rebroadcasts the resolved URL to that
-    // container's live tabs only; add/delete change the global pool, save
-    // the settings, and re-resolve every live tab (a container whose
-    // definition vanished goes direct, its stored name kept as typed).
-    callback toggle-proxy-menu();
-    callback close-proxy-menu();
+    // Proxy intents (task: proxies; the settings drawer's proxy section;
+    // indices are rows of `proxy-rows`, row 0 = Direct). Selecting persists
+    // the definition **name** on the container through the Store and
+    // rebroadcasts the resolved URL to that container's live tabs only;
+    // add/delete change the global pool, save the settings, and re-resolve
+    // every live tab (a container whose definition vanished goes direct,
+    // its stored name kept as typed).
     callback proxy-select(idx: int);
     callback proxy-delete(idx: int);
     callback proxy-add();
@@ -1194,11 +1193,6 @@ export component AppWindow inherits Window {
                 // User-Agent switcher (task: per-container UA) — same house
                 // pattern as the "</>" button directly to its left.
                 MiniButton { label: "UA"; clicked => { root.toggle-ua-menu(); } }
-
-                // proxy switcher (task: proxies) — same house pattern as the
-                // UA button to its left; opens the per-container picker plus
-                // the global definition editor.
-                MiniButton { label: "Proxy"; clicked => { root.toggle-proxy-menu(); } }
 
                 // archive mode (task: archive mode) — same house pattern
                 // again; the glyph doubles as the on/off state hint in the
@@ -2374,123 +2368,6 @@ export component AppWindow inherits Window {
     }
 
     // ------------------------------------------------------------------------
-    // Proxy switcher overlay (task: proxies)
-    //
-    // The same right-docked Rectangle as the UA menu above (never a
-    // PopupWindow: LinuxKMS has none), opened by the "Proxy" toolbar button
-    // and never stacked — Rust closes it when any other menu opens and
-    // closes the others when this one opens. The top half picks the route
-    // for the *active tab's container* (Direct, then one row per global
-    // definition); the bottom half edits the **global** pool: a container
-    // stores only the definition *name*, so deleting one here sends every
-    // container that picked it back to direct (the stored name survives —
-    // re-adding it later reconnects them), and Add widens the pick list
-    // without touching any container.
-    // ------------------------------------------------------------------------
-    Rectangle {
-        x: 0; y: 0;
-        width: root.width; height: root.height;
-        visible: root.proxy-menu-open;
-        background: #00000099;
-        proxy-scrim := TouchArea { clicked => { root.close-proxy-menu(); } }
-
-        proxy-panel := Rectangle {
-            TouchArea {} // swallow clicks over the panel
-            x: root.width - self.width;
-            width: Math.min(460px, root.width);
-            height: root.height;
-            background: #1e1e1e;
-
-            VerticalLayout {
-                padding: 12px;
-                spacing: 6px;
-
-                HorizontalLayout {
-                    spacing: 8px;
-                    height: 26px;
-                    Text { text: "Proxy"; color: #f0f0f0; font-weight: 600; vertical-alignment: center; }
-                    Rectangle { horizontal-stretch: 1; }
-                    MiniButton { label: "×"; clicked => { root.close-proxy-menu(); } }
-                }
-
-                // the container's live route ("Direct" or the definition
-                // name), re-pushed after every mutation
-                Text {
-                    text: "Current: " + root.proxy-current;
-                    color: #a8b8c8;
-                    wrap: word-wrap;
-                }
-
-                // one-line rejection of a bad definition (drafts survive)
-                Text {
-                    visible: root.proxy-error != "";
-                    text: root.proxy-error;
-                    color: #ef5350;
-                    wrap: word-wrap;
-                }
-
-                for p[i] in root.proxy-rows: Rectangle {
-                    height: 26px;
-                    width: parent.width;
-                    // same z-order rule as the UA rows: background and the
-                    // row-wide TouchArea are declared before the content, so
-                    // the Del button (declared last) still gets its clicks.
-                    pbg := Rectangle {
-                        background: p.active ? #3a3a3a : pta.has-hover ? #2c2c2c : #262626;
-                        border-radius: 4px;
-                    }
-                    pta := TouchArea {
-                        clicked => { root.proxy-select(i); }
-                    }
-                    Text {
-                        x: 10px;
-                        max-width: parent.width - 80px;
-                        height: parent.height;
-                        text: p.name + (p.url != "" ? "  —  " + p.url : "") + (p.active ? "  ✓" : "");
-                        color: p.active ? #f0f0f0 : #c8c8c8;
-                        font-weight: p.active ? 600 : 400;
-                        vertical-alignment: center;
-                        overflow: elide;
-                    }
-                    MiniButton {
-                        visible: p.url != "";
-                        x: parent.width - 66px;
-                        y: 1px;
-                        label: "Del";
-                        clicked => { root.proxy-delete(i); }
-                    }
-                }
-
-                Rectangle { vertical-stretch: 1; }
-
-                // ---- footer: the global definition pool ---------------------
-                Text { text: "Definitions (global)"; color: #f0f0f0; }
-                HorizontalLayout {
-                    height: 28px;
-                    spacing: 6px;
-                    LineEdit {
-                        horizontal-stretch: 2;
-                        text <=> root.proxy-add-name;
-                        placeholder-text: "name";
-                    }
-                    LineEdit {
-                        horizontal-stretch: 3;
-                        text <=> root.proxy-add-url;
-                        placeholder-text: "socks5://host:1080";
-                        accepted => { root.proxy-add(); }
-                    }
-                    MiniButton { label: "Add"; clicked => { root.proxy-add(); } }
-                }
-                Text {
-                    text: "Proxies are defined once, globally, and picked per container above; the choice is stored on the container, sent to its live tabs, and used for that container's new tabs. Schemes: socks5://, socks5h://, http://, https:// — user:pass@ and :port allowed.";
-                    color: #888888;
-                    wrap: word-wrap;
-                }
-            }
-        }
-    }
-
-    // ------------------------------------------------------------------------
     // Archive-mode overlay (task: archive mode)
     //
     // The same right-docked Rectangle as the other three menus (never a
@@ -2581,6 +2458,12 @@ export component AppWindow inherits Window {
     // (`ironsurf://history`), which the History button opens in a new tab, so
     // this panel only counts the shared log and offers the two buttons.
     // Clear empties the whole shared log at once, from every container.
+    // Below the history and scrolling settings sits the **proxy** section
+    // (task: proxies) — the per-container route picker and the global
+    // definition editor, moved here from a toolbar button of its own so the
+    // top bar does not carry one more control. Opening the drawer re-pushes
+    // that section's state, and a tab switch re-points it at the new
+    // container's choice (the UA menu's rule).
     // ------------------------------------------------------------------------
     Rectangle {
         x: 0; y: 0;
@@ -2660,6 +2543,90 @@ export component AppWindow inherits Window {
                         value: root.scroll-speed;
                         changed(v) => { root.scroll-speed-set(v); }
                     }
+                }
+
+                // ---- Proxy (task: proxies) --------------------------------
+                // The per-container route picker and the **global**
+                // definition editor, housed here so the top bar needs no
+                // button of its own. The rows target the *active tab's
+                // container* (the UA menu's scoping rule): row 0 is
+                // Direct, the rest are the global definitions, the
+                // container's pick marked. A click stores the definition
+                // **name** on the container and sends the resolved URL to
+                // its live tabs; Del/Add edit the global pool and
+                // re-resolve every live tab (a deleted definition strands
+                // its containers — direct, name kept; re-adding it under
+                // the same name reconnects them).
+                Rectangle { height: 1px; background: #3a3a3a; }
+                HorizontalLayout {
+                    spacing: 8px;
+                    height: 24px;
+                    Text { text: "Proxy"; color: #f0f0f0; vertical-alignment: center; }
+                    Rectangle { horizontal-stretch: 1; }
+                    Text {
+                        text: "Current: " + root.proxy-current;
+                        color: #a8b8c8;
+                        vertical-alignment: center;
+                    }
+                }
+                // one-line rejection of a bad definition (drafts survive)
+                Text {
+                    visible: root.proxy-error != "";
+                    text: root.proxy-error;
+                    color: #ef5350;
+                    wrap: word-wrap;
+                }
+                for p[i] in root.proxy-rows: Rectangle {
+                    height: 26px;
+                    width: parent.width;
+                    // same z-order rule as the UA rows: background and the
+                    // row-wide TouchArea are declared before the content, so
+                    // the Del button (declared last) still gets its clicks.
+                    pbg := Rectangle {
+                        background: p.active ? #3a3a3a : pta.has-hover ? #2c2c2c : #262626;
+                        border-radius: 4px;
+                    }
+                    pta := TouchArea {
+                        clicked => { root.proxy-select(i); }
+                    }
+                    Text {
+                        x: 10px;
+                        max-width: parent.width - 80px;
+                        height: parent.height;
+                        text: p.name + (p.url != "" ? "  —  " + p.url : "") + (p.active ? "  ✓" : "");
+                        color: p.active ? #f0f0f0 : #c8c8c8;
+                        font-weight: p.active ? 600 : 400;
+                        vertical-alignment: center;
+                        overflow: elide;
+                    }
+                    MiniButton {
+                        visible: p.url != "";
+                        x: parent.width - 66px;
+                        y: 1px;
+                        label: "Del";
+                        clicked => { root.proxy-delete(i); }
+                    }
+                }
+                HorizontalLayout {
+                    height: 28px;
+                    spacing: 6px;
+                    LineEdit {
+                        horizontal-stretch: 2;
+                        text <=> root.proxy-add-name;
+                        placeholder-text: "name";
+                    }
+                    LineEdit {
+                        horizontal-stretch: 3;
+                        text <=> root.proxy-add-url;
+                        placeholder-text: "socks5://host:1080";
+                        accepted => { root.proxy-add(); }
+                    }
+                    MiniButton { label: "Add"; clicked => { root.proxy-add(); } }
+                }
+                Text {
+                    text: "Proxies are defined once, globally, and picked per container above — the container of the tab on screen. The choice is stored on the container, sent to its live tabs, and used for that container's new tabs. Schemes: socks5://, socks5h://, http://, https:// — user:pass@ and :port allowed.";
+                    color: #888888;
+                    wrap: word-wrap;
                 }
             }
         }
