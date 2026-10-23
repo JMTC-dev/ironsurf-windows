@@ -1541,7 +1541,19 @@ UI (`crates/ironsurf-shell/ui/ironsurf.slint`):
   request — documents, subresources, form POSTs, redirect hops, XHR/fetch, media,
   downloads — rides it. Spawn/respawn of a proxied container's tab appends
   `--proxy <url>` to that spawn alone, and manager rows show each container's chosen
-  definition name ("" = direct).
+  definition name ("" = direct). **Proxy-specific connection errors**: while the route
+  cell holds a proxy, the only socket a request opens is *to the proxy*, so connect
+  failures and timeouts there are classified from the reqwest error chain
+  (`attribute_send_error`) into refused / timed out / tunnel-rejected / unreachable
+  messages marked `proxy failure: ` that name the proxy URL and state the site was
+  never contacted — applied at every `send` site (documents, redirect hops, XHR/`fetch`,
+  subresources), so DevTools events and page-visible errors read the same way; a
+  marked transport failure also renders a **proxy error page**
+  (`NetError::error_page` → `proxy_error_page`, next to the Blocked page) advising
+  Direct or another definition from Settings (☰) → Proxy. Direct failures keep the
+  old wording, and reqwest itself never distinguishes proxy from site — the route
+  cell (which remembers the proxy URL, reqwest `Proxy` keeps no copy) is what makes
+  the attribution possible.
 - **Popup blocker** (top-bar ⛔ + Ctrl-Alt-`P`, task: block popups): the tab blocks on the shell's
   behalf and reports every refusal, so all the shell adds is a notice and two levers, both per tab.
   ⛔ sits in the toolbar (right of ＋) **pressed while the active tab blocks** — pressing it lowers
