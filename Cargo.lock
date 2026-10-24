@@ -3755,6 +3755,7 @@ dependencies = [
  "libc",
  "tempfile",
  "thiserror 2.0.20",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -3765,6 +3766,7 @@ dependencies = [
  "chrono",
  "i-slint-backend-testing",
  "ironsurf-common",
+ "ironsurf-sandbox",
  "ironsurf-storage",
  "libc",
  "serde",

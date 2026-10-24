@@ -17,6 +17,12 @@
 //! * `1`   — a setup/pre-flight error (bad args, forbidden file missing);
 //! * `10`  — Landlock was enforced but at least one expectation FAILED
 //!   (printed on stderr).
+//!
+//! On Windows "enforced" means the probe reached Low integrity, and the
+//! forbidden-file expectation becomes *unwritable* (Low integrity is
+//! no-write-up only: reads are confined by an AppContainer, stage 2 — the
+//! probe reports them as a note). Windows also checks that the probe can
+//! neither start a child process nor allocate executable memory.
 
 use std::fs;
 use std::io::Write;
@@ -34,6 +40,9 @@ struct Args {
     forbidden: Vec<PathBuf>,
     ro: Vec<PathBuf>,
     read: Vec<PathBuf>,
+    /// Files that exist before sandboxing inside a writable dir and must stay
+    /// writable (a profile's `cookies.json` from an earlier run).
+    rewrite: Vec<PathBuf>,
     no_landlock: bool,
 }
 
@@ -52,6 +61,7 @@ fn parse_args() -> Result<Args, String> {
             "--forbidden" => a.forbidden.push(next("FILE")?),
             "--ro" => a.ro.push(next("DIR")?),
             "--read" => a.read.push(next("FILE")?),
+            "--rewrite" => a.rewrite.push(next("FILE")?),
             "--no-landlock" => a.no_landlock = true,
             "--help" | "-h" => {
                 println!(
@@ -147,18 +157,26 @@ fn main() -> ExitCode {
         return ExitCode::from(EXIT_VIOLATION);
     }
 
-    if !status.landlock_active {
+    #[cfg(not(windows))]
+    let enforced = status.landlock_active;
+    #[cfg(windows)]
+    let enforced = status.low_integrity;
+    if !enforced {
+        #[cfg(not(windows))]
         println!("NOT-ENFORCED: landlock_active=false (this kernel/container has no usable Landlock)");
+        #[cfg(windows)]
+        println!("NOT-ENFORCED: low_integrity=false");
         for n in &status.notes {
             println!("NOT-ENFORCED: {n}");
         }
-        eprintln!("sbox-probe: Landlock not enforced — reporting graceful-degradation path");
+        eprintln!("sbox-probe: sandbox not enforced — reporting graceful-degradation path");
         return ExitCode::from(EXIT_NOT_ENFORCED);
     }
 
     // Post-sandbox expectations.
     let mut failed = 0usize;
 
+    #[cfg(not(windows))]
     for f in &args.forbidden {
         match fs::read(f) {
             Err(e) => eprintln!("  ok: reading forbidden {} denied ({e})", f.display()),
@@ -167,6 +185,10 @@ fn main() -> ExitCode {
                 failed += 1;
             }
         }
+    }
+    #[cfg(windows)]
+    {
+        failed += windows_expectations(&args);
     }
     for f in &args.read {
         match fs::read(f) {
@@ -190,6 +212,15 @@ fn main() -> ExitCode {
             }
         }
     }
+    for f in &args.rewrite {
+        match fs::OpenOptions::new().append(true).open(f).and_then(|mut h| h.write_all(b" ")) {
+            Ok(()) => eprintln!("  ok: rewrote pre-existing {}", f.display()),
+            Err(e) => {
+                eprintln!("  FAIL: rewriting pre-existing {} denied ({e})", f.display());
+                failed += 1;
+            }
+        }
+    }
 
     if failed == 0 {
         eprintln!("sbox-probe: all expectations hold — sandbox enforced");
@@ -198,4 +229,74 @@ fn main() -> ExitCode {
         eprintln!("sbox-probe: {failed} expectation(s) FAILED");
         ExitCode::from(EXIT_VIOLATION)
     }
+}
+
+/// The Windows expectations beyond the shared writable-dir check; returns
+/// how many failed.
+#[cfg(windows)]
+fn windows_expectations(args: &Args) -> usize {
+    use windows_sys::Win32::System::Memory::{
+        VirtualAlloc, VirtualFree, MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_EXECUTE_READWRITE,
+    };
+
+    let mut failed = 0usize;
+    for f in &args.forbidden {
+        // Low integrity is no-write-up only — reads are stage 2 (AppContainer).
+        match fs::read(f) {
+            Ok(_) => eprintln!(
+                "  note: reading {} still works (reads are confined by an AppContainer, stage 2)",
+                f.display()
+            ),
+            Err(e) => eprintln!("  note: reading {} denied ({e})", f.display()),
+        }
+        match fs::OpenOptions::new().append(true).open(f) {
+            Err(e) => eprintln!("  ok: writing forbidden {} denied ({e})", f.display()),
+            Ok(_) => {
+                eprintln!("  FAIL: writing forbidden {} unexpectedly SUCCEEDED", f.display());
+                failed += 1;
+            }
+        }
+        if let Some(dir) = f.parent() {
+            let escape = dir.join(format!("sbox-probe-escape-{}", std::process::id()));
+            match fs::File::create(&escape) {
+                Err(e) => eprintln!("  ok: creating {} denied ({e})", escape.display()),
+                Ok(_) => {
+                    let _ = fs::remove_file(&escape);
+                    eprintln!("  FAIL: creating {} unexpectedly SUCCEEDED", escape.display());
+                    failed += 1;
+                }
+            }
+        }
+    }
+
+    let me = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("sbox-probe.exe"));
+    match std::process::Command::new(&me)
+        .arg("--help")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+    {
+        Err(e) => eprintln!("  ok: starting a child process denied ({e})"),
+        Ok(_) => {
+            eprintln!("  FAIL: starting a child process unexpectedly SUCCEEDED");
+            failed += 1;
+        }
+    }
+
+    // SAFETY: a plain allocation request; freed below if it succeeds.
+    let page = unsafe {
+        VirtualAlloc(std::ptr::null(), 4096, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE)
+    };
+    if page.is_null() {
+        eprintln!(
+            "  ok: executable memory denied (dynamic code prohibited: {})",
+            std::io::Error::last_os_error()
+        );
+    } else {
+        // SAFETY: the page we were just given.
+        unsafe { VirtualFree(page, 0, MEM_RELEASE) };
+        eprintln!("  FAIL: allocating executable memory unexpectedly SUCCEEDED");
+        failed += 1;
+    }
+    failed
 }

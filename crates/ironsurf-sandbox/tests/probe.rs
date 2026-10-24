@@ -131,6 +131,9 @@ fn probe_enforces_or_reports_missing_landlock() {
     }
 }
 
+// rlimits + no_new_privs are the Unix fallback; Windows has neither (its
+// sandbox has no Landlock to switch off — see `windows_probe_enforces`).
+#[cfg(unix)]
 #[test]
 fn graceful_degradation_notes_are_exercised_even_with_landlock() {
     // --no-landlock requests zero Landlock rules: whatever the kernel, `apply`
@@ -150,6 +153,36 @@ fn graceful_degradation_notes_are_exercised_even_with_landlock() {
         stdout_of(&out)
     );
     assert_graceful_notes(&stdout_of(&out));
+}
+
+/// Windows always has what stage 1 needs (integrity levels and mitigation
+/// policies), so nothing short of full enforcement passes: the probe must
+/// reach Low integrity, keep its profile writable, and be refused writes
+/// outside it, child processes and executable memory.
+#[cfg(windows)]
+#[test]
+fn windows_probe_enforces() {
+    let fx = Fixture::new();
+    // A file that exists before sandboxing, inside the writable profile:
+    // labelling must reach existing contents too, not only new ones.
+    let cookies = fx.writable().join("cookies.json");
+    fs::write(&cookies, b"{}").unwrap();
+    let mut cmd = probe();
+    probe_args(&mut cmd, &fx);
+    cmd.arg("--rewrite").arg(&cookies);
+    let out = cmd.output().expect("spawn sbox-probe");
+    let (so, se) = (stdout_of(&out), stderr_of(&out));
+    assert_eq!(out.status.code(), Some(EXIT_OK), "stderr:\n{se}\nstdout:\n{so}");
+    for expected in [
+        "ok: writing forbidden",
+        "ok: creating",
+        "ok: starting a child process denied",
+        "ok: executable memory denied",
+        "under writable",
+        "ok: rewrote pre-existing",
+    ] {
+        assert!(se.contains(expected), "missing {expected:?} in:\n{se}");
+    }
 }
 
 #[test]

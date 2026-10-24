@@ -9,7 +9,7 @@
 use std::io::{BufReader, IsTerminal, Read};
 use std::path::Path;
 use std::process::{Child, ChildStdin, Command, ExitStatus, Stdio};
-use std::sync::atomic::{AtomicI8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI8, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -17,6 +17,7 @@ use std::thread;
 use ironsurf_common::logging::{self, Level};
 use ironsurf_common::{debug, error, info, trace, warn};
 use ironsurf_common::{read_frame, write_frame, ContainerId, FromTab, TabId, ToTab};
+use ironsurf_sandbox::Containment;
 
 /// How the shell wires a tab child's **stderr**.
 ///
@@ -77,6 +78,13 @@ pub struct TabProc {
     child: Child,
     stdin: Option<Mutex<ChildStdin>>,
     stderr_tail: Arc<Mutex<String>>,
+    /// The reader threads reached the end of the child's stdout / stderr (an
+    /// inherited stderr has nothing to drain and starts done).
+    stdout_done: Arc<AtomicBool>,
+    stderr_done: Arc<AtomicBool>,
+    /// The child's process container (Windows: its job object). Held for the
+    /// child's whole life and dropped after it is reaped (field order).
+    _containment: Containment,
 }
 
 /// Envelope tagging each message with the tab it came from.
@@ -126,16 +134,32 @@ impl TabProc {
             bin.display(),
             if inherit { "inherited" } else { "captured" }
         );
-        let mut child = cmd.spawn().map_err(|err| {
-            error!("cannot spawn {} for tab {id}: {err}", bin.display());
-            err
-        })?;
-        info!("tab {id} spawned in container {container} (stderr {})", if inherit { "inherited" } else { "captured" });
+        // Windows: started suspended inside its own job (killed with the
+        // shell; with the sandbox on also one process, a memory cap, no
+        // desktop/clipboard), then resumed. Elsewhere a plain spawn — the tab
+        // confines itself either way.
+        let sandboxed = !extra_args.contains(&"--no-sandbox");
+        let (mut child, containment) = ironsurf_sandbox::spawn_contained(&mut cmd, sandboxed)
+            .map_err(|err| {
+                error!("cannot spawn {} for tab {id}: {err}", bin.display());
+                err
+            })?;
+        for note in &containment.notes {
+            warn!("tab {id} containment: {note}");
+        }
+        info!(
+            "tab {id} spawned in container {container} (stderr {}{})",
+            if inherit { "inherited" } else { "captured" },
+            if containment.is_contained() { ", job-contained" } else { "" }
+        );
 
         let stderr_tail = Arc::new(Mutex::new(String::new()));
+        let stderr_done = Arc::new(AtomicBool::new(true));
         if !inherit {
             if let Some(pipe) = child.stderr.take() {
+                stderr_done.store(false, Ordering::Release);
                 let buf = Arc::clone(&stderr_tail);
+                let done = Arc::clone(&stderr_done);
                 thread::spawn(move || {
                     let mut reader = BufReader::new(pipe);
                     let mut chunk = [0u8; 8 * 1024];
@@ -145,6 +169,7 @@ impl TabProc {
                             Ok(n) => append_stderr_tail(&buf, &chunk[..n]),
                         }
                     }
+                    done.store(true, Ordering::Release);
                 });
             }
         }
@@ -152,6 +177,8 @@ impl TabProc {
         let stdin = child.stdin.take().expect("piped stdin");
         let stdout = child.stdout.take().expect("piped stdout");
         let tx = sink.clone();
+        let stdout_done = Arc::new(AtomicBool::new(false));
+        let done = Arc::clone(&stdout_done);
         thread::spawn(move || {
             let mut reader = BufReader::new(stdout);
             let mut messages = 0u64;
@@ -159,6 +186,7 @@ impl TabProc {
                 messages += 1;
                 if tx.send((id, msg)).is_err() {
                     debug!("tab {id} pump stopped: the UI is gone (after {messages} messages)");
+                    done.store(true, Ordering::Release);
                     return;
                 }
             }
@@ -166,9 +194,19 @@ impl TabProc {
             // reaps it) or it died — `Core::check_crashes` notices via
             // `try_wait_status` and surfaces the crash in the UI.
             debug!("tab {id} message stream ended after {messages} messages");
+            done.store(true, Ordering::Release);
         });
 
-        Ok(TabProc { id, container, child, stdin: Some(Mutex::new(stdin)), stderr_tail })
+        Ok(TabProc {
+            id,
+            container,
+            child,
+            stdin: Some(Mutex::new(stdin)),
+            stderr_tail,
+            stdout_done,
+            stderr_done,
+            _containment: containment,
+        })
     }
 
     /// Send one command to the tab.
@@ -193,6 +231,13 @@ impl TabProc {
             }
             _ => None,
         }
+    }
+
+    /// Both of the child's output streams have ended: every message it sent
+    /// is in the pump's queue and its stderr tail is complete — what
+    /// `Core::check_crashes` waits for before reporting a dead child.
+    pub fn output_drained(&self) -> bool {
+        self.stdout_done.load(Ordering::Acquire) && self.stderr_done.load(Ordering::Acquire)
     }
 
     /// The captured tail of the child's stderr (panic message + backtrace on

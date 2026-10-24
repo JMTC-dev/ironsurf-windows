@@ -14,12 +14,20 @@
 //! rlimits + no_new_privs, and the reasons are recorded in
 //! [`SandboxStatus::notes`].
 //!
+//! Windows has its own stack (see `src/windows.rs`): the tab drops itself to
+//! Low integrity behind process mitigation policies, and the shell starts
+//! every tab inside a job object ([`spawn_contained`]).
+//!
 //! The `sbox-probe` bin target (see `src/bin/sbox_probe.rs`) applies a real
 //! sandbox in-process and verifies the expected allow/deny outcomes; the
 //! integration test in `tests/probe.rs` spawns it.
 
 use std::path::PathBuf;
+use std::process::{Child, Command};
 use thiserror::Error;
+
+#[cfg(windows)]
+mod windows;
 
 /// Errors from the parts of sandbox setup that cannot degrade to "nothing".
 ///
@@ -100,6 +108,11 @@ pub struct SandboxStatus {
     pub landlock_active: bool,
     /// At least one `RLIMIT_*` was applied.
     pub rlimits_applied: bool,
+    /// Windows: the process dropped to Low integrity — it can no longer write
+    /// anywhere but the Low-labelled `writable_rw` dirs.
+    pub low_integrity: bool,
+    /// Windows: the process mitigation policies that took (short names).
+    pub mitigations: Vec<&'static str>,
     /// Human-readable log of what was applied and what degraded (and why).
     pub notes: Vec<String>,
 }
@@ -107,7 +120,55 @@ pub struct SandboxStatus {
 impl SandboxStatus {
     /// True if any enforcement layer is active.
     pub fn is_restricted(&self) -> bool {
-        self.landlock_active || self.rlimits_applied
+        self.landlock_active
+            || self.rlimits_applied
+            || self.low_integrity
+            || !self.mitigations.is_empty()
+    }
+}
+
+/// What [`spawn_contained`] put around a tab child. Keep it alive exactly as
+/// long as the child: on Windows dropping it closes the job, which kills the
+/// tab (and the OS does the same if the shell itself dies).
+#[derive(Debug, Default)]
+pub struct Containment {
+    #[cfg(windows)]
+    job: Option<std::os::windows::io::OwnedHandle>,
+    /// What degraded, and why (empty when everything applied).
+    pub notes: Vec<String>,
+}
+
+impl Containment {
+    /// Is the child inside a job object (Windows)? Elsewhere tabs confine
+    /// themselves in [`apply`] and there is nothing to hold.
+    pub fn is_contained(&self) -> bool {
+        #[cfg(windows)]
+        {
+            self.job.is_some()
+        }
+        #[cfg(not(windows))]
+        {
+            false
+        }
+    }
+}
+
+/// Spawn a tab child inside the platform's process container.
+///
+/// On Windows the child is created suspended, joins its own job object —
+/// killed with the shell, and with `restrict`: one process, a memory cap, no
+/// desktop or clipboard — and only then resumes, so not one instruction of it
+/// runs outside the job. A job that cannot be set up degrades to a note; the
+/// child still runs. Elsewhere this is a plain `spawn`.
+pub fn spawn_contained(cmd: &mut Command, restrict: bool) -> std::io::Result<(Child, Containment)> {
+    #[cfg(windows)]
+    {
+        windows::spawn_contained(cmd, restrict)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = restrict;
+        Ok((cmd.spawn()?, Containment::default()))
     }
 }
 
@@ -191,14 +252,24 @@ pub fn apply(policy: &SandboxPolicy) -> Result<SandboxStatus, SandboxError> {
         landlock_active,
         rlimits_applied,
         notes,
+        ..SandboxStatus::default()
     })
 }
 
 // ---------------------------------------------------------------------------
-// Non-Linux fallback
+// Windows: Low integrity + mitigation policies (src/windows.rs)
 // ---------------------------------------------------------------------------
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(windows)]
+pub fn apply(policy: &SandboxPolicy) -> Result<SandboxStatus, SandboxError> {
+    Ok(windows::apply(policy))
+}
+
+// ---------------------------------------------------------------------------
+// Fallback (macOS and anything else)
+// ---------------------------------------------------------------------------
+
+#[cfg(not(any(target_os = "linux", windows)))]
 pub fn apply(policy: &SandboxPolicy) -> Result<SandboxStatus, SandboxError> {
     let mut notes: Vec<String> = Vec::new();
     // prctl/Landlock are Linux-only; apply rlimits where libc has them.
@@ -209,9 +280,9 @@ pub fn apply(policy: &SandboxPolicy) -> Result<SandboxStatus, SandboxError> {
         if rlimits_applied { "" } else { "no-" }
     ));
     Ok(SandboxStatus {
-        landlock_active: false,
         rlimits_applied,
         notes,
+        ..SandboxStatus::default()
     })
 }
 
@@ -353,7 +424,7 @@ fn apply_rlimits(policy: &SandboxPolicy, notes: &mut Vec<String>) -> bool {
     applied
 }
 
-#[cfg(not(unix))]
+#[cfg(not(any(unix, windows)))]
 fn apply_rlimits(_policy: &SandboxPolicy, _notes: &mut Vec<String>) -> bool {
     false
 }

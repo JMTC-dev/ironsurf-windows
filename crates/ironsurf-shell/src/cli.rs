@@ -70,6 +70,24 @@ ENVIRONMENT:
                           (e.g. linuxkms/femtovg, winit/software)
 ";
 
+/// Windows: a double-clicked `ironsurf.exe` (a console program) gets a console
+/// window of its own, which the browser has no use for — let it go (tabs then
+/// start without one either, see `ironsurf_sandbox::spawn_contained`). Run from
+/// a terminal, the console is shared with the terminal's shell and stays, so
+/// the log lines still reach it.
+#[cfg(windows)]
+fn release_own_console() {
+    use windows_sys::Win32::System::Console::{FreeConsole, GetConsoleProcessList};
+    let mut attached = [0u32; 2];
+    // SAFETY: a two-entry buffer; the result is how many processes share
+    // this console (0 = none).
+    let count = unsafe { GetConsoleProcessList(attached.as_mut_ptr(), attached.len() as u32) };
+    if count == 1 {
+        // SAFETY: detaching only this process from a console nobody else uses.
+        unsafe { FreeConsole() };
+    }
+}
+
 /// `-h`/`--help` anywhere in the arguments (first match, like every flag here).
 pub fn wants_help(args: &[String]) -> bool {
     args.iter().any(|a| a == "-h" || a == "--help")
@@ -85,6 +103,8 @@ pub fn run(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         print!("{USAGE}");
         return Ok(());
     }
+    #[cfg(windows)]
+    release_own_console();
     let flag = |f: &str| args.iter().any(|a| a == f);
     let smoke = flag("--smoke");
     // `-u`/`--url` picks the start page; validated up front so a bare

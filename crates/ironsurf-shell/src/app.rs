@@ -177,6 +177,10 @@ struct Proc {
     /// a broken pipe. The tab stays in the strip showing its last frame;
     /// `state.error` carries the “has crashed” status-line message.
     crashed: bool,
+    /// When the drain tick first found the child exited, and whether its
+    /// output had ended by a previous tick (see `check_crashes`).
+    exit_noticed: Option<Instant>,
+    output_settled: bool,
     /// DevTools panel open for *this* tab (F12 / Ctrl-`I`). Per tab, like the
     /// zoom factor: switching tabs switches the panel to the new tab's feed,
     /// and a freshly opened tab starts closed.
@@ -851,6 +855,8 @@ impl Core {
                         zoom: 1.0,
                         scroll_moved: None,
                         crashed: false,
+                        exit_noticed: None,
+                        output_settled: false,
                         devtools_open: false,
                         inspect_stream: false,
                         inspector: None,
@@ -2657,6 +2663,8 @@ impl Core {
                         zoom,
                         scroll_moved: None,
                         crashed: false,
+                        exit_noticed: None,
+                        output_settled: false,
                         devtools_open,
                         inspect_stream: false,
                         inspector: None,
@@ -4952,6 +4960,18 @@ impl Core {
                     continue;
                 }
                 if let Some(status) = p.tab.try_wait_status() {
+                    // Reported once the dead child's output has ended — its
+                    // last messages queued, its backtrace captured — and only
+                    // on a tick after that was first seen, so those messages
+                    // are applied *before* the crash pins the status line
+                    // (applied after, a late `loading` would clear it). A
+                    // stream that never ends holds the report back at most
+                    // `CRASH_REPORT_GRACE`.
+                    let noticed = *p.exit_noticed.get_or_insert_with(Instant::now);
+                    if !p.output_settled && noticed.elapsed() < CRASH_REPORT_GRACE {
+                        p.output_settled = p.tab.output_drained();
+                        continue;
+                    }
                     note_tab_crash(p, format_args!("the process exited ({status}) without closing cleanly"));
                     victims.push(p.tab.id);
                     crashed = true;
@@ -5686,6 +5706,11 @@ pub fn image_from_rgba(width: u32, height: u32, rgba: &[u8]) -> Option<Image> {
 /// positions it cannot hit-test in time, and the click at the end of the swipe
 /// waits behind all of them.
 pub const MOVE_INTERVAL: Duration = Duration::from_millis(33);
+
+/// The longest a dead tab's crash report waits for its output streams to
+/// end (see `Core::check_crashes`) — normally they end at once with the
+/// process.
+const CRASH_REPORT_GRACE: Duration = Duration::from_secs(2);
 
 /// May a hover move be forwarded now? `last` is when the previous one went out
 /// (`None` = none sent yet, so the first always passes).

@@ -6,6 +6,8 @@ edition = "2021"
 [dependencies]
 ironsurf-common = { path = "../ironsurf-common" }
 ironsurf-storage = { path = "../ironsurf-storage" }
+# Spawning tabs inside their process container (a job object on Windows).
+ironsurf-sandbox = { path = "../ironsurf-sandbox" }
 slint = { workspace = true }
 chrono = "0.4"
 serde = { workspace = true }
@@ -16,10 +18,11 @@ url = { workspace = true }
 # (x11rb over libxcb + libxcb-xfixes), no GPU, no display-server toolkit.
 arboard = "3"
 
-# Windows: `WSAPoll` for the archive server's serve loop (no `poll()` there);
-# the same 0.61 the graph already locks.
+# Windows: `WSAPoll` for the archive server's serve loop (no `poll()` there),
+# and letting go of a console opened just for a double-clicked shell; the
+# same 0.61 the graph already locks.
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61", features = ["Win32_Networking_WinSock"] }
+windows-sys = { version = "0.61", features = ["Win32_Networking_WinSock", "Win32_System_Console"] }
 
 [build-dependencies]
 slint-build = "1"
