@@ -44,10 +44,18 @@ pub fn default_archive_root() -> PathBuf {
 /// `2026-09-17T07:20:48+10:00` (`chrono` formats the offset exactly like
 /// that). Taken once per tab spawn, so subsequent tab generations land in
 /// their own folder.
+///
+/// Windows forbids `:` in file names, so there every colon becomes `-`
+/// (`2026-09-17T07-20-48+10-00`): same digits, same sort order.
 pub fn visit_dir_name() -> String {
-    chrono::Local::now()
+    let name = chrono::Local::now()
         .format("%Y-%m-%dT%H:%M:%S%:z")
-        .to_string()
+        .to_string();
+    if cfg!(windows) {
+        name.replace(':', "-")
+    } else {
+        name
+    }
 }
 
 /// Percent-decode UTF-8 `%XX` escapes; malformed escapes pass through
@@ -116,7 +124,7 @@ pub fn archive_relative_path(raw_url: &str, is_document: bool) -> Option<PathBuf
         Some(port) => format!("{host}:{port}"),
         None => host.to_owned(),
     };
-    let mut rel = PathBuf::from(authority);
+    let mut rel = PathBuf::from(fs_safe_name(&authority));
     // `url.query()` is Some("") for a bare trailing `?`, which still names a
     // file (`<name>?`) distinct from the same URL with no query at all.
     let query = url.query().map(|q| sanitize_query(q));
@@ -145,9 +153,49 @@ pub fn archive_relative_path(raw_url: &str, is_document: bool) -> Option<PathBuf
         segs[last].push_str(&q);
     }
     for seg in segs {
-        rel.push(clamp_name(&seg));
+        rel.push(clamp_name(&fs_safe_name(&seg)));
     }
     Some(rel)
+}
+
+/// One path component as this platform's file system will take it.
+///
+/// Unix takes every name built above. Windows refuses `< > : " | ? *` (the
+/// `host:port` folder, every `?query` name, `/wiki/Special:Search`), the DOS
+/// device names (`CON`, `NUL`, `COM1`… with or without an extension) and a
+/// trailing `.` or space. There those characters — and `%` itself, so two
+/// different wire names never meet on disk — are percent-escaped
+/// (`?q=1` → `%3Fq=1`) and a device name gains a leading `_`. The archive
+/// server serves whatever names are on disk, so nothing else changes.
+pub fn fs_safe_name(name: &str) -> String {
+    if !cfg!(windows) {
+        return name.to_owned();
+    }
+    let mut out = String::with_capacity(name.len());
+    for c in name.chars() {
+        match c {
+            '<' | '>' | ':' | '"' | '|' | '?' | '*' | '%' => {
+                out.push_str(&format!("%{:02X}", c as u32))
+            }
+            c => out.push(c),
+        }
+    }
+    if let Some(last) = out.pop() {
+        if matches!(last, '.' | ' ') {
+            out.push_str(&format!("%{:02X}", last as u32));
+        } else {
+            out.push(last);
+        }
+    }
+    let stem = out.split('.').next().unwrap_or_default().trim_end().to_ascii_uppercase();
+    let device = matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL")
+        || (stem.len() == 4
+            && (stem.starts_with("COM") || stem.starts_with("LPT"))
+            && matches!(stem.as_bytes()[3], b'1'..=b'9'));
+    if device {
+        out.insert(0, '_');
+    }
+    out
 }
 
 /// Longest file-system component we ever emit (Linux `NAME_MAX`). A query
@@ -202,8 +250,39 @@ pub fn write_archived(root: &Path, visit: &str, rel: &Path, bytes: &[u8]) -> std
 mod tests {
     use super::*;
 
+    /// The archive path for `url`, read back in wire spelling: on Windows the
+    /// file-system escapes ([`fs_safe_name`], which escapes `%` too, so this
+    /// is exact) are undone, and one expectation serves every platform. The
+    /// escaping itself has its own test below.
     fn rel(url: &str, is_document: bool) -> PathBuf {
-        archive_relative_path(url, is_document).expect("archivable url")
+        let path = archive_relative_path(url, is_document).expect("archivable url");
+        if cfg!(windows) {
+            path.iter().map(|c| decode_percent(&c.to_string_lossy())).collect()
+        } else {
+            path
+        }
+    }
+
+    #[test]
+    fn names_are_escaped_where_the_file_system_refuses_them() {
+        let url = "http://127.0.0.1:8000/wiki/Special:Search?q=a*b";
+        let path = archive_relative_path(url, false).unwrap();
+        if cfg!(windows) {
+            assert_eq!(path, Path::new("127.0.0.1%3A8000/wiki/Special%3ASearch%3Fq=a%2Ab"));
+            assert_eq!(fs_safe_name("CON"), "_CON");
+            assert_eq!(fs_safe_name("nul.txt"), "_nul.txt");
+            assert_eq!(fs_safe_name("com1.js"), "_com1.js");
+            assert_eq!(fs_safe_name("console.js"), "console.js");
+            assert_eq!(fs_safe_name("100%.html"), "100%25.html");
+            assert_eq!(fs_safe_name("dots."), "dots%2E");
+            // …and the escaped path is one Windows actually creates.
+            let root = std::env::temp_dir().join(format!("ironsurf-archive-names-{}", std::process::id()));
+            write_archived(&root, "v", &path, b"x").expect("Windows takes the escaped path");
+            let _ = std::fs::remove_dir_all(&root);
+        } else {
+            assert_eq!(path, Path::new("127.0.0.1:8000/wiki/Special:Search?q=a*b"));
+            assert_eq!(fs_safe_name("CON"), "CON");
+        }
     }
 
     #[test]
@@ -376,14 +455,19 @@ mod tests {
         assert!(name.len() >= 25, "{name}");
         let (naive, _) = name.split_once('T').expect("T separator");
         assert_eq!(naive.len(), 10, "{name}");
+        // Windows spells every colon as `-` (file names cannot hold `:`).
+        let sep = if cfg!(windows) { '-' } else { ':' };
         let tail = name.split_once('T').unwrap().1;
-        let (clock, zone) = match tail.split_once(['+', '-']) {
-            Some((clock, zone)) => (clock, Some(zone)),
-            None => (tail, None),
-        };
-        assert!(clock.bytes().all(|b| b.is_ascii_digit() || b == b':') && clock.len() == 8, "{name}");
-        if let Some(zone) = zone {
-            assert!(zone.len() == 5 || zone.ends_with(":00"), "{name}");
+        let (clock, zone) = (&tail[..8], &tail[8..]);
+        assert!(
+            clock.bytes().all(|b| b.is_ascii_digit() || b == sep as u8)
+                && clock.as_bytes()[2] == sep as u8,
+            "{name}"
+        );
+        assert!(zone.starts_with(['+', '-']) && zone.len() == 6, "{name}");
+        assert_eq!(zone.as_bytes()[3], sep as u8, "{name}");
+        if cfg!(windows) {
+            assert!(!name.contains(':'), "{name}");
         }
     }
 
@@ -391,9 +475,10 @@ mod tests {
     fn write_archived_stays_inside_the_visit_folder() {
         let root = std::env::temp_dir().join(format!("ironsurf-archive-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
-        write_archived(&root, "2026-09-17T07:20:48+10:00", Path::new("example.com/index.html"), b"<html>")
+        // A colon-free visit name: valid on every platform (Windows' shape).
+        write_archived(&root, "2026-09-17T07-20-48+10-00", Path::new("example.com/index.html"), b"<html>")
             .expect("write index");
-        let written = root.join("2026-09-17T07:20:48+10:00").join("example.com/index.html");
+        let written = root.join("2026-09-17T07-20-48+10-00").join("example.com/index.html");
         assert_eq!(std::fs::read(&written).unwrap(), b"<html>");
         // a hostile relative path (however it got built) is refused, and
         // nothing outside the visit folder is touched.

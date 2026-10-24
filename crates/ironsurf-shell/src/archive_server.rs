@@ -211,6 +211,15 @@ pub fn normalize_root(raw: &str) -> Result<PathBuf, String> {
     if expanded.is_empty() {
         return Err("folder must not be empty".to_string());
     }
+    // `/srv/archive/` and `C:\archive\` name the same folder as without the
+    // separator — and a Windows extended-length path (`\\?\C:\…`) refuses a
+    // stray `/` outright. A root (`/`, `C:\`) keeps its own.
+    let trimmed = expanded.trim_end_matches(['/', '\\']);
+    let expanded = if trimmed.is_empty() || trimmed.ends_with(':') {
+        expanded.clone()
+    } else {
+        trimmed.to_string()
+    };
     let path = PathBuf::from(&expanded);
     if !path.is_absolute() {
         return Err(format!("folder must be an absolute path: {expanded}"));
@@ -524,9 +533,12 @@ pub fn parse_request_head(head: &str) -> Option<(String, String, String)> {
         Some((p, q)) => (p.to_string(), q.to_string()),
         None => (target.to_string(), String::new()),
     };
-    // The path is decoded percent-only; the query is handed over raw and
-    // decoded by whoever parses it as a form.
-    Some((method, percent_decode(&path), query))
+    // Both are handed over raw. The path is decoded exactly once, segment by
+    // segment, by `resolve_inside` — decoding it here as well decoded every
+    // name twice (`a%253Fb` named the file `a?b`, not `a%3Fb`) and let an
+    // encoded `%2F` become a separator before the segment split; the query
+    // is decoded by whoever parses it as a form.
+    Some((method, path, query))
 }
 
 // ---------------------------------------------------------------------------
@@ -1995,6 +2007,16 @@ mod tests {
         dir.canonicalize().unwrap_or(dir)
     }
 
+    /// A visit folder name as `archive::visit_dir_name` spells it on this
+    /// platform (Windows file names cannot hold `:`).
+    fn visit_name(stamp: &str) -> String {
+        if cfg!(windows) {
+            stamp.replace(':', "-")
+        } else {
+            stamp.to_owned()
+        }
+    }
+
     fn page(root: PathBuf) -> PageState {
         PageState {
             spec: Spec {
@@ -2019,14 +2041,16 @@ mod tests {
             b"<!DOCTYPE html><html><title>archived</title></html>",
         )
         .unwrap();
-        std::fs::write(root.join("feed?q=1"), b"<?xml version=\"1.0\"?><rss/>").unwrap();
+        // As the archive names it on this platform (`feed%3Fq=1` on Windows).
+        let feed = crate::archive::fs_safe_name("feed?q=1");
+        std::fs::write(root.join(&feed), b"<?xml version=\"1.0\"?><rss/>").unwrap();
         std::fs::write(root.join("blob"), [0u8, 1, 2, 3, 255, 254]).unwrap();
         std::fs::write(root.join("plain"), b"  \n a page that is not markup").unwrap();
 
         let state = page(root);
         let html = route_request("GET", "/example.com", "", &state);
         assert_eq!(html.content_type, "text/html; charset=utf-8");
-        let xml = route_request("GET", "/feed%3Fq=1", "", &state);
+        let xml = route_request("GET", &format!("/{}", percent_encode_path(&feed)), "", &state);
         assert_eq!(xml.content_type, "text/xml; charset=utf-8");
         let binary = route_request("GET", "/blob", "", &state);
         assert_eq!(binary.content_type, "application/octet-stream");
@@ -2083,7 +2107,9 @@ mod tests {
     #[test]
     fn the_front_page_lists_the_sites_under_every_visit() {
         let root = sandbox("timeline");
-        let (early, late) = ("2026-01-01T09:00:00+00:00", "2026-01-02T10:00:00+00:00");
+        let early = visit_name("2026-01-01T09:00:00+00:00");
+        let late = visit_name("2026-01-02T10:00:00+00:00");
+        let latest = visit_name("2026-01-03T11:00:00+00:00");
         std::fs::create_dir_all(root.join(format!("{early}/example.com"))).unwrap();
         std::fs::create_dir_all(root.join(format!("{late}/dev.example"))).unwrap();
         std::fs::write(
@@ -2092,32 +2118,23 @@ mod tests {
         )
         .unwrap();
         std::fs::write(root.join(format!("{late}/loose.txt")), b"loose").unwrap();
-        std::fs::create_dir_all(root.join("2026-01-03T11:00:00+00:00")).unwrap();
+        std::fs::create_dir_all(root.join(&latest)).unwrap();
+        // `2026-01-01T09%3A00%3A00%2B00%3A00` on Unix.
+        let (early, late, latest) =
+            (percent_encode_path(&early), percent_encode_path(&late), percent_encode_path(&latest));
 
         let resp = route_request("GET", "/", "", &page(root));
         assert_eq!(resp.status, 200);
         let html = String::from_utf8_lossy(&resp.body).into_owned();
         // Each site is linked straight through its visit folder — the href is
         // what serves the archived `index.html` without a click per timestamp.
-        assert!(
-            html.contains("href=\"2026-01-01T09%3A00%3A00%2B00%3A00/example.com/\""),
-            "{html}"
-        );
+        assert!(html.contains(&format!("href=\"{early}/example.com/\"")), "{html}");
         assert!(html.contains(">example.com/</a>"), "displayed with a trailing slash");
-        assert!(
-            html.contains("href=\"2026-01-02T10%3A00%3A00%2B00%3A00/dev.example/\""),
-            "{html}"
-        );
-        assert!(html.contains("href=\"2026-01-02T10%3A00%3A00%2B00%3A00/loose.txt\""), "stray files too");
+        assert!(html.contains(&format!("href=\"{late}/dev.example/\"")), "{html}");
+        assert!(html.contains(&format!("href=\"{late}/loose.txt\"")), "stray files too");
         // The visits stay a timeline: earlier visit (and its sites) first.
-        assert!(
-            html.find("2026-01-01T09%3A00%3A00%2B00%3A00").unwrap()
-                < html.find("2026-01-02T10%3A00%3A00%2B00%3A00").unwrap()
-        );
-        assert!(
-            html.find("2026-01-02T10%3A00%3A00%2B00%3A00").unwrap()
-                < html.find("2026-01-03T11%3A00%3A00%2B00%3A00").unwrap()
-        );
+        assert!(html.find(&early).unwrap() < html.find(&late).unwrap());
+        assert!(html.find(&late).unwrap() < html.find(&latest).unwrap());
         assert!(html.contains("no sites saved here"), "an empty visit says so");
     }
 
@@ -2131,7 +2148,8 @@ mod tests {
         let outer = sandbox("timeline-outside");
         std::fs::create_dir_all(outer.join("secret-site")).unwrap();
         let root = sandbox("timeline-link");
-        std::fs::create_dir_all(root.join("2026-01-01T09:00:00+00:00/example.com")).unwrap();
+        std::fs::create_dir_all(root.join(visit_name("2026-01-01T09:00:00+00:00")).join("example.com"))
+            .unwrap();
         #[cfg(unix)]
         std::os::unix::fs::symlink(&outer, root.join("2026-01-04T12:00:00+00:00")).unwrap();
 
@@ -2237,9 +2255,10 @@ mod tests {
     #[test]
     fn files_are_served_with_a_guessed_type() {
         let root = sandbox("files");
-        std::fs::create_dir_all(root.join("2026-01-01T00:00:00+00:00/example.com")).unwrap();
+        let visit = visit_name("2026-01-01T00:00:00+00:00");
+        std::fs::create_dir_all(root.join(format!("{visit}/example.com"))).unwrap();
         std::fs::write(
-            root.join("2026-01-01T00:00:00+00:00/example.com/index.html"),
+            root.join(format!("{visit}/example.com/index.html")),
             b"<html>archived</html>",
         )
         .unwrap();
@@ -2252,8 +2271,8 @@ mod tests {
         assert_eq!(resp.body, b"body{color:red}");
 
         // A directory whose `index.html` exists is that page, not a listing.
-        let resp = route_request("GET", "/2026-01-01T00:00:00+00:00/example.com/", "", &state);
-        assert_eq!(resp.status, 200, "root {} exists {} body {}", root.display(), root.join("2026-01-01T00:00:00+00:00/example.com/index.html").exists(), String::from_utf8_lossy(&resp.body));
+        let resp = route_request("GET", &format!("/{visit}/example.com/"), "", &state);
+        assert_eq!(resp.status, 200, "root {} exists {} body {}", root.display(), root.join(format!("{visit}/example.com/index.html")).exists(), String::from_utf8_lossy(&resp.body));
         assert_eq!(resp.body, b"<html>archived</html>");
     }
 
@@ -2334,7 +2353,8 @@ mod tests {
     fn request_lines_are_parsed_and_junk_is_not() {
         let (method, path, query) = parse_request_head("GET /a%20b/c?x=1 HTTP/1.1\r\nHost: x\r\n\r\n")
             .expect("request");
-        assert_eq!((method.as_str(), path.as_str(), query.as_str()), ("GET", "/a b/c", "x=1"));
+        // Raw: the path is decoded once, per segment, when it is resolved.
+        assert_eq!((method.as_str(), path.as_str(), query.as_str()), ("GET", "/a%20b/c", "x=1"));
         assert!(parse_request_head("CONNECT evil:443 HTTP/1.1\r\n\r\n").is_none());
         assert!(parse_request_head("GET absolute.example/ HTTP/1.1\r\n\r\n").is_none());
         assert!(parse_request_head("Not a request\r\n\r\n").is_none());
@@ -2511,9 +2531,11 @@ mod tests {
     #[test]
     fn a_live_server_browses_the_folder_and_never_escalates() {
         let root = sandbox("live");
-        std::fs::create_dir_all(root.join("visit/127.0.0.1:1234")).unwrap();
+        // A `host:port` folder as the archive names it here (`%3A` on Windows).
+        let host = crate::archive::fs_safe_name("127.0.0.1:1234");
+        std::fs::create_dir_all(root.join("visit").join(&host)).unwrap();
         std::fs::write(
-            root.join("visit/127.0.0.1:1234/index.html"),
+            root.join("visit").join(&host).join("index.html"),
             b"<html><title>archived visit</title></html>",
         )
         .unwrap();
@@ -2534,7 +2556,10 @@ mod tests {
         assert!(reply.ends_with("# notes"), "{reply}");
 
         // A directory holding an `index.html` is that page, not a listing.
-        let reply = talk(serve_addr, "GET /visit/127.0.0.1:1234/ HTTP/1.1\r\n\r\n");
+        let reply = talk(
+            serve_addr,
+            &format!("GET /visit/{}/ HTTP/1.1\r\n\r\n", percent_encode_path(&host)),
+        );
         assert!(reply.contains("archived visit"), "{reply}");
 
         // The root lists the archive and links to the control page, which

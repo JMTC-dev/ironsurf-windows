@@ -12,6 +12,9 @@
 //!                                                   names the file)
 //! ```
 //!
+//! (On Windows, `:` and `?` are percent-escaped on disk — `127.0.0.1%3A<port>`,
+//! `%3Fq=asdf` — see `archive::fs_safe_name`.)
+//!
 //! Skipped (like `tests/real_tab.rs`) when the tab binary is not built.
 
 use std::io::{Read, Write};
@@ -21,6 +24,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use ironsurf_shell::app::App;
+use ironsurf_shell::archive::fs_safe_name;
 use ironsurf_shell::AppWindow;
 
 fn real_tab_bin() -> Option<PathBuf> {
@@ -110,6 +114,8 @@ fn real_tab_archives_a_site_into_the_tree() {
 
     // The document must be on disk as the host's `index.html` (the host
     // segment carries the explicit port), under exactly one timestamp dir.
+    // Names as this platform's file system takes them (`%3A` on Windows).
+    let host = fs_safe_name(&format!("127.0.0.1:{port}"));
     let body = {
         let deadline = Instant::now() + Duration::from_secs(15);
         loop {
@@ -118,7 +124,7 @@ fn real_tab_archives_a_site_into_the_tree() {
                 .map(|rd| rd.filter_map(|e| e.ok()).map(|e| e.path()).collect::<Vec<_>>())
                 .unwrap_or_default();
             if visits.len() == 1 && visits[0].is_dir() {
-                let index = visits[0].join(format!("127.0.0.1:{port}/index.html"));
+                let index = visits[0].join(&host).join("index.html");
                 if let Ok(bytes) = std::fs::read(&index) {
                     break (visits[0].clone(), bytes);
                 }
@@ -135,7 +141,7 @@ fn real_tab_archives_a_site_into_the_tree() {
     // The `<link>` stylesheet travels the subresource path (spawn_http) and
     // keeps its URL path under the same host segment.
     let css_deadline = Instant::now() + Duration::from_secs(15);
-    let css = visit.join(format!("127.0.0.1:{port}/style.css"));
+    let css = visit.join(&host).join("style.css");
     loop {
         core.drain();
         if std::fs::read(&css).is_ok() {
@@ -150,7 +156,7 @@ fn real_tab_archives_a_site_into_the_tree() {
     // `?q=asdf` inside the `html/` folder of the same host segment (the task:
     // not just `index.html` — the query belongs to the path too).
     ui.invoke_navigate(format!("{site}html/?q=asdf").into());
-    let query_file = visit.join(format!("127.0.0.1:{port}/html/?q=asdf"));
+    let query_file = visit.join(&host).join("html").join(fs_safe_name("?q=asdf"));
     let query_deadline = Instant::now() + Duration::from_secs(15);
     loop {
         core.drain();

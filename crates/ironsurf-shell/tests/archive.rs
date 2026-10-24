@@ -20,6 +20,7 @@ use std::time::{Duration, Instant};
 
 use ironsurf_shell::AppWindow;
 use ironsurf_shell::app::App;
+use ironsurf_shell::archive::fs_safe_name;
 use ironsurf_shell::uisettings::UiSettings;
 
 fn wait_for(what: &str, cond: impl Fn() -> bool) {
@@ -149,15 +150,19 @@ fn archive_mode_toggles_persists_and_writes_the_tree() {
     assert!(name.contains('T') && name.len() >= 20, "visit folder {name}");
     assert_eq!(entries(&root), vec![name.clone()]);
     // the subresource keeps its path, the query riding on the file name…
-    assert_eq!(read(&landed.join("example.com/js/app.js?v=2")), b"ARCHIVE-APP");
+    // (as the file system takes it: `app.js%3Fv=2` on Windows)
+    assert_eq!(
+        read(&landed.join("example.com/js").join(fs_safe_name("app.js?v=2"))),
+        b"ARCHIVE-APP"
+    );
     // …and so does a query document: `/html/?q=asdf` is the file `?q=asdf`
     // inside `html/`, next to the front page rather than on top of it.
     assert_eq!(
-        read(&landed.join("example.com/html/?q=asdf")),
+        read(&landed.join("example.com/html").join(fs_safe_name("?q=asdf"))),
         b"ARCHIVE-QUERY-PAGE"
     );
     // …and the local file never lands anywhere under the archive root.
-    let walk = |root: &Path| -> Vec<String> {
+    let walk = |root: &Path| -> Vec<PathBuf> {
         let mut out = Vec::new();
         let mut stack = vec![root.to_path_buf()];
         while let Some(d) = stack.pop() {
@@ -166,19 +171,22 @@ fn archive_mode_toggles_persists_and_writes_the_tree() {
                 if p.is_dir() {
                     stack.push(p);
                 } else {
-                    out.push(p.strip_prefix(root).unwrap().display().to_string());
+                    out.push(p.strip_prefix(root).unwrap().to_path_buf());
                 }
             }
         }
         out.sort();
         out
     };
+    // Compared as paths, names as the file system takes them (Windows joins
+    // with `\` and escapes the `?`).
+    let site = Path::new(&name).join("example.com");
     assert_eq!(
         walk(&root),
         vec![
-            format!("{name}/example.com/html/?q=asdf"),
-            format!("{name}/example.com/index.html"),
-            format!("{name}/example.com/js/app.js?v=2"),
+            site.join("html").join(fs_safe_name("?q=asdf")),
+            site.join("index.html"),
+            site.join("js").join(fs_safe_name("app.js?v=2")),
         ],
         "exactly the three web files, the file: asset dropped"
     );

@@ -36,10 +36,21 @@ fn wait_for(what: &str, app: &App, cond: impl Fn() -> bool) {
 /// An archived visit: the folder layout archive mode writes (timestamp dir /
 /// host dir / index.html) plus a plain file at the root.
 fn fixture(root: &Path) {
-    let visit = root.join("2026-01-01T00:00:00+00:00").join("example.com");
+    let visit = root.join(visit_name()).join("example.com");
     std::fs::create_dir_all(&visit).unwrap();
     std::fs::write(visit.join("index.html"), b"<html><title>Archived visit</title></html>").unwrap();
     std::fs::write(root.join("README.txt"), b"the archive\n").unwrap();
+}
+
+/// The fixture's visit folder, spelled as archive mode names it on this
+/// platform (Windows file names cannot hold `:`).
+fn visit_name() -> String {
+    let stamp = "2026-01-01T00:00:00+00:00";
+    if cfg!(windows) {
+        stamp.replace(':', "-")
+    } else {
+        stamp.to_owned()
+    }
 }
 
 /// One HTTP exchange over a fresh connection (the server closes after each).
@@ -125,11 +136,12 @@ fn ironsurf_archive_starts_the_server_and_serves_the_folder() {
     let reply = get(addr, "/README.txt");
     assert!(reply.starts_with("HTTP/1.1 200 OK"), "{reply}");
     assert!(reply.ends_with("the archive\n"), "{reply}");
-    let reply = get(addr, "/2026-01-01T00:00:00%2B00:00/example.com/");
+    let visit = visit_name();
+    let reply = get(addr, &format!("/{}/example.com/", visit.replace('+', "%2B")));
     if reply.starts_with("HTTP/1.1 404") {
         // The `+` of an ISO8601 offset is a literal, not a space — but be
         // tolerant about how the visit folder was spelled on the way in.
-        let alt = get(addr, "/2026-01-01T00:00:00+00:00/example.com/");
+        let alt = get(addr, &format!("/{visit}/example.com/"));
         assert!(alt.contains("Archived visit"), "{alt}");
     } else {
         assert!(reply.contains("Archived visit"), "{reply}");
@@ -139,8 +151,9 @@ fn ironsurf_archive_starts_the_server_and_serves_the_folder() {
     // folder is linked directly, no click per timestamp needed to reach it.
     let reply = get(addr, "/");
     assert!(reply.starts_with("HTTP/1.1 200 OK"), "{reply}");
+    let href = ironsurf_shell::archive_server::percent_encode_path(&visit);
     assert!(
-        reply.contains("2026-01-01T00%3A00%3A00%2B00%3A00/example.com/"),
+        reply.contains(&format!("{href}/example.com/")),
         "the saved site is linked straight off the front page: {reply}"
     );
 

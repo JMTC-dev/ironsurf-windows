@@ -398,9 +398,20 @@ mod tests {
         }
     }
 
+    /// An absolute path in this platform's spelling: the Unix fixtures below
+    /// gain a drive on Windows (`/home/ada` → `C:/home/ada`), where a path
+    /// without one is not absolute.
+    fn abs(path: &str) -> &'static str {
+        if cfg!(windows) {
+            Box::leak(format!("C:{path}").into_boxed_str())
+        } else {
+            Box::leak(path.to_owned().into_boxed_str())
+        }
+    }
+
     fn home_env() -> Vec<(&'static str, Option<&'static str>)> {
         vec![
-            ("HOME", Some("/home/ada")),
+            ("HOME", Some(abs("/home/ada"))),
             ("XDG_DOWNLOAD_DIR", None),
             ("IRONSURF_DOWNLOAD_DIR", None),
         ]
@@ -411,12 +422,12 @@ mod tests {
         let e = env(&home_env());
         assert_eq!(
             download_root_with(None, &e),
-            PathBuf::from("/home/ada/Downloads"),
+            PathBuf::from(abs("/home/ada/Downloads")),
             "the built-in is the folder the OS itself uses"
         );
         assert_ne!(
             download_root_with(None, &e),
-            PathBuf::from("/home/ada/Downloads/ironsurf-tabs"),
+            PathBuf::from(abs("/home/ada/Downloads/ironsurf-tabs")),
             "…and never the archive's directory (its own subfolder inside)"
         );
     }
@@ -424,34 +435,34 @@ mod tests {
     #[test]
     fn an_env_var_only_wins_when_absolute() {
         let mut pairs = home_env();
-        pairs.push(("IRONSURF_DOWNLOAD_DIR", Some("/mnt/nas/saves")));
-        assert_eq!(download_root_with(None, &env(&pairs)), PathBuf::from("/mnt/nas/saves"));
+        pairs.push(("IRONSURF_DOWNLOAD_DIR", Some(abs("/mnt/nas/saves"))));
+        assert_eq!(download_root_with(None, &env(&pairs)), PathBuf::from(abs("/mnt/nas/saves")));
         let mut pairs = home_env();
         pairs.push(("IRONSURF_DOWNLOAD_DIR", Some("relative/thing")));
         assert_eq!(
             download_root_with(None, &env(&pairs)),
-            PathBuf::from("/home/ada/Downloads"),
+            PathBuf::from(abs("/home/ada/Downloads")),
             "a relative override says nothing about where the disk is"
         );
         let mut pairs = home_env();
-        pairs.push(("XDG_DOWNLOAD_DIR", Some("/mnt/xdg")));
-        assert_eq!(download_root_with(None, &env(&pairs)), PathBuf::from("/mnt/xdg"));
+        pairs.push(("XDG_DOWNLOAD_DIR", Some(abs("/mnt/xdg"))));
+        assert_eq!(download_root_with(None, &env(&pairs)), PathBuf::from(abs("/mnt/xdg")));
     }
 
     #[test]
     fn a_setting_outranks_the_env_and_a_blank_one_reverts() {
         let mut pairs = home_env();
-        pairs.push(("IRONSURF_DOWNLOAD_DIR", Some("/mnt/nas/saves")));
+        pairs.push(("IRONSURF_DOWNLOAD_DIR", Some(abs("/mnt/nas/saves"))));
         let e = env(&pairs);
-        assert_eq!(download_root_with(Some("/tmp/dl"), &e), PathBuf::from("/tmp/dl"));
+        assert_eq!(download_root_with(Some(abs("/tmp/dl")), &e), PathBuf::from(abs("/tmp/dl")));
         assert_eq!(
             download_root_with(Some("   "), &e),
-            PathBuf::from("/mnt/nas/saves"),
+            PathBuf::from(abs("/mnt/nas/saves")),
             "a blank setting reverts to the default"
         );
         assert_eq!(
             download_root_with(Some("relative/x"), &e),
-            PathBuf::from("/mnt/nas/saves"),
+            PathBuf::from(abs("/mnt/nas/saves")),
             "a relative setting is rejected against the live default"
         );
     }
@@ -461,10 +472,11 @@ mod tests {
         let e = env(&home_env());
         assert_eq!(
             absolute("~/Downloads/saves", &e),
-            Some(PathBuf::from("/home/ada/Downloads/saves"))
+            Some(PathBuf::from(abs("/home/ada/Downloads/saves")))
         );
-        assert_eq!(expand_tilde_with("~/x", &e), "/home/ada/x");
-        assert_eq!(expand_tilde_with("~", &e), "/home/ada");
+        // Compared as paths: Windows joins `~/x` with its own separator.
+        assert_eq!(PathBuf::from(expand_tilde_with("~/x", &e)), PathBuf::from(abs("/home/ada/x")));
+        assert_eq!(PathBuf::from(expand_tilde_with("~", &e)), PathBuf::from(abs("/home/ada")));
         assert_eq!(expand_tilde_with("./x", &e), "./x", "only ~ and ~/ expand");
     }
 

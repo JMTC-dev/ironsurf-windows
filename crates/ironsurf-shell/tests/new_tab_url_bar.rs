@@ -143,13 +143,13 @@ fn a_new_tab_opens_with_the_url_bar_focused_and_selected() {
 
     // A click in the page hands focus (and the bar) back to the tab: the
     // abandoned draft stops shielding the address bar from the tab's URL.
+    // Waited for, not pumped a fixed number of times: the URL is the one the
+    // freshly spawned tab announces, and a process start is not instant
+    // everywhere (Windows' is slower) — a draft that is never dropped still
+    // fails, on the deadline.
     click_page(&ui);
-    for _ in 0..5 {
+    wait_for("clicking the page drops the draft", || {
         pump();
-    }
-    assert_eq!(
-        ui.get_url_text().as_str(),
-        "ironsurf://welcome",
-        "clicking the page drops the draft"
-    );
+        ui.get_url_text().as_str() == "ironsurf://welcome"
+    });
 }
