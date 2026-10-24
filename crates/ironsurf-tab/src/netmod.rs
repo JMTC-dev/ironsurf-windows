@@ -421,12 +421,22 @@ fn resolve_proxy_route(value: Option<&str>) -> Result<Option<ProxyRoute>, String
 /// after this call rides the new route. The error text is worth logging (a
 /// rejected proxy leaves the previous route in place).
 pub fn set_process_proxy(value: Option<&str>) -> Result<(), String> {
+    let route = set_route_cell(value)?;
+    shared_worker().set_proxy(route.map(|r| r.proxy));
+    Ok(())
+}
+
+/// The route cell alone — what [`current_proxy_url`] and
+/// [`attribute_send_error`] read — without rerouting [`shared_worker`].
+/// Tests that drive a *private* worker through a dead proxy use this:
+/// rerouting the process-wide worker would hang every other test in the
+/// binary that fetches through it meanwhile (a worker's `fetch`, a script).
+fn set_route_cell(value: Option<&str>) -> Result<Option<ProxyRoute>, String> {
     let route = resolve_proxy_route(value)?;
     *process_proxy()
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner()) = route.clone();
-    shared_worker().set_proxy(route.map(|r| r.proxy));
-    Ok(())
+    Ok(route)
 }
 
 /// The proxy the next request rides (poison-tolerant; `None` = direct).
@@ -468,6 +478,24 @@ fn error_chain_lower(e: &(dyn std::error::Error + 'static)) -> String {
     chain
 }
 
+/// Did the OS refuse the connection? Asked of the `io::Error` kind buried in
+/// the chain, not its text: Linux says "Connection refused", Windows "…the
+/// target machine actively refused it" — in English, that is; the message is
+/// localized, the kind is not.
+fn connection_refused(e: &(dyn std::error::Error + 'static)) -> bool {
+    let mut source = Some(e);
+    while let Some(err) = source {
+        if err
+            .downcast_ref::<io::Error>()
+            .is_some_and(|io| io.kind() == io::ErrorKind::ConnectionRefused)
+        {
+            return true;
+        }
+        source = err.source();
+    }
+    false
+}
+
 /// Describe a reqwest send failure as a **proxy failure** when this tab
 /// routes through one.
 ///
@@ -491,7 +519,7 @@ pub fn attribute_send_error(e: &reqwest::Error) -> Option<String> {
          still up and reachable."
     } else if !e.is_connect() {
         return None;
-    } else if chain.contains("connection refused") {
+    } else if connection_refused(e) || chain.contains("connection refused") {
         "refused the connection — nothing is listening at the proxy's \
          address and port. Check that the proxy process is running."
     } else if chain.contains("proxy") || chain.contains("tunnel") || chain.contains("407") {
@@ -542,7 +570,13 @@ pub fn read_file_url(url: &Url) -> Result<Vec<u8>, String> {
     if url.scheme() != "file" {
         return Err(format!("not a file: URL: {url}"));
     }
-    std::fs::read(url.path()).map_err(|e| format!("read {}: {e}", url.as_str()))
+    // `to_file_path` percent-decodes (`my%20page.html`) and knows the
+    // platform's spelling: `file:///C:/x` is `C:\x` on Windows, where the raw
+    // `url.path()` (`/C:/x`) is no path at all.
+    let path = url
+        .to_file_path()
+        .map_err(|()| format!("read {}: not a local file path", url.as_str()))?;
+    std::fs::read(&path).map_err(|e| format!("read {}: {e}", url.as_str()))
 }
 
 /// The browser's internal scheme. `ironsurf://…` URLs are **always** answered
@@ -2546,10 +2580,10 @@ impl BlitzNetProvider {
             // loads: settle it and get out of the way.
             if signal.as_ref().is_some_and(|s| s.aborted()) {
                 trace!("subresource {url} was aborted before it fetched");
+                deliver(None, String::new(), Vec::new());
                 if let Some(waker) = waker {
                     waker.wake(doc_id);
                 }
-                deliver(None, String::new(), Vec::new());
                 return;
             }
             // Every settled request lands in the tab loop's DevTools queue
@@ -2590,11 +2624,8 @@ impl BlitzNetProvider {
                     Some(&report),
                 )
             };
-            // Same as upstream blitz-net: wake the doc thread even on error,
-            // and drop the handler when the fetch failed (no error path).
-            if let Some(waker) = waker {
-                waker.wake(doc_id);
-            }
+            // Drop the handler when the fetch failed (no error path); the doc
+            // thread is woken below, once the outcome has landed.
             let aborted = signal.as_ref().is_some_and(|s| s.aborted());
             match outcome {
                 Ok(o) if !aborted && o.status < 400 => {
@@ -2630,6 +2661,12 @@ impl BlitzNetProvider {
                     warn!("subresource {url} failed: {message}");
                     deliver(None, String::new(), Vec::new())
                 }
+            }
+            // Same as upstream blitz-net: wake the doc thread even on error —
+            // but only now, once the outcome has landed, so the loop cannot
+            // drain the wake and settle before there is anything to apply.
+            if let Some(waker) = waker {
+                waker.wake(doc_id);
             }
         });
         // Queued, not spawned: however many subresources this page declares,
@@ -4287,10 +4324,24 @@ mod tests {
             .or_else(|_| TcpListener::bind(("127.0.0.1", 0)))
             .expect("bind loopback");
         let port = listener.local_addr().expect("addr").port();
-        let routes: Vec<(String, Route)> = routes
-            .into_iter()
-            .map(|(p, r)| (p.to_string(), r))
-            .collect();
+        let routes: Arc<Vec<(String, Route)>> = Arc::new(
+            routes
+                .into_iter()
+                .map(|(p, r)| (p.to_string(), r))
+                .collect(),
+        );
+        // `[::]` is dual-stack on Linux, but IPv6-only on Windows (where
+        // IPV6_V6ONLY defaults on): there `127.0.0.1` gets the same port of
+        // its own. On a dual-stack socket this second bind finds the port
+        // taken, and the one listener serves both families.
+        let mut listeners = vec![listener];
+        if listeners[0].local_addr().is_ok_and(|a| a.is_ipv6()) {
+            if let Ok(v4) = TcpListener::bind(("127.0.0.1", port)) {
+                listeners.push(v4);
+            }
+        }
+        for listener in listeners {
+        let routes = Arc::clone(&routes);
         std::thread::spawn(move || {
             for stream in listener.incoming() {
                 let Ok(mut stream) = stream else { continue };
@@ -4349,6 +4400,7 @@ mod tests {
                 let _ = stream.flush();
             }
         });
+        }
         port
     }
 
@@ -5188,7 +5240,10 @@ mod proxy_tests {
         assert!(net.error_page().is_none(), "direct transport failures stay pageless: {err}");
 
         // ---- a refused proxy becomes the proxy's failure ------------------
-        set_process_proxy(Some(dead)).expect("dead proxy resolves");
+        // The cell only (`set_route_cell`): this test fetches through its
+        // own `worker`, and rerouting the process-wide one would stall every
+        // concurrent test fetching through it for the whole blackhole phase.
+        set_route_cell(Some(dead)).expect("dead proxy resolves");
         worker.set_proxy(current_proxy());
         let err = plain_http_fetch_report(&worker.client(), &site, None, None, "ua", None)
             .expect_err("the dead proxy refuses");
@@ -5218,7 +5273,7 @@ mod proxy_tests {
             let _accepted = blackhole.accept();
             std::thread::sleep(std::time::Duration::from_secs(30));
         });
-        set_process_proxy(Some(&blackhole_url)).expect("blackhole proxy resolves");
+        set_route_cell(Some(&blackhole_url)).expect("blackhole proxy resolves");
         worker.set_proxy(current_proxy());
         let err = plain_http_fetch_report(&worker.client(), &site, None, None, "ua", None)
             .expect_err("the blackhole proxy never answers");
@@ -5229,7 +5284,7 @@ mod proxy_tests {
         assert!(err.to_lowercase().contains("timed out"), "says what happened: {err}");
 
         // ---- back to direct: the cell, not just the message ---------------
-        set_process_proxy(None).expect("direct");
+        set_route_cell(None).expect("direct");
         assert!(current_proxy_url().is_none());
         let err = plain_http_fetch_report(&worker.client(), &site, None, None, "ua", None)
             .expect_err("still refused");

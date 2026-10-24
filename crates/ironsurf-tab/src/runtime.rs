@@ -61,7 +61,7 @@ use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::mpsc;
 use std::sync::{
-    atomic::{AtomicUsize, Ordering},
+    atomic::{AtomicBool, AtomicUsize, Ordering},
     Arc, Mutex,
 };
 #[cfg(windows)]
@@ -470,6 +470,13 @@ impl SelfPipe {
 /// the title slot is reset at the start of every navigation.
 struct ShellHook {
     pipe: Arc<SelfPipe>,
+    /// Blitz asked for a repaint: a resource it fetched (stylesheet, image,
+    /// font) was queued for the document, or the DOM, scroll or input state
+    /// changed. Consumed by [`Tab::settle`] into `needs_paint` — the wake
+    /// alone only got the loop to *apply* the change, never to paint it, so
+    /// a stylesheet landing after the first frame stayed invisible until the
+    /// next mouse move.
+    redraw: AtomicBool,
     title: Mutex<Option<String>>,
     /// Session clipboard *into* the editors (blitz asks `get_clipboard_text`
     /// on Ctrl+V; the shell pushes contents with `ToTab::Clipboard` right
@@ -483,6 +490,7 @@ struct ShellHook {
 
 impl ShellProvider for ShellHook {
     fn request_redraw(&self) {
+        self.redraw.store(true, Ordering::Release);
         self.pipe.wake();
     }
     fn set_window_title(&self, title: String) {
@@ -563,8 +571,12 @@ fn apply_sandbox(args: &TabArgs) {
     );
     match ironsurf_sandbox::apply(&policy) {
         Ok(status) => info!(
-            "sandbox applied: landlock={} rlimits={} notes={:?}",
-            status.landlock_active, status.rlimits_applied, status.notes
+            "sandbox applied: landlock={} rlimits={} low-integrity={} mitigations={:?} notes={:?}",
+            status.landlock_active,
+            status.rlimits_applied,
+            status.low_integrity,
+            status.mitigations,
+            status.notes
         ),
         // Sandboxing must never abort the tab (contract): degrade loudly.
         Err(err) => error!("sandbox failed (degraded, continuing): {err}"),
@@ -1277,6 +1289,7 @@ impl Tab {
             provider,
             shell: Arc::new(ShellHook {
                 pipe: Arc::clone(&pipe),
+                redraw: AtomicBool::new(false),
                 title: Mutex::new(None),
                 clipboard: Mutex::new(String::new()),
                 copied: Mutex::new(None),
@@ -2124,6 +2137,11 @@ impl Tab {
             }
             doc.handle_messages();
             doc.resolve(now);
+        }
+        // Whatever blitz asked to have redrawn — typically the resources the
+        // `handle_messages` above just applied — is owed a frame.
+        if self.shell.redraw.swap(false, Ordering::AcqRel) {
+            self.needs_paint = true;
         }
         // A stylesheet that arrived in this settle has its `load` event owed
         // to the page (blitz applies the sheet but never dispatches the DOM

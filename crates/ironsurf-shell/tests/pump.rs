@@ -94,7 +94,12 @@ fn crashed_tab_reports_exit_status_and_backtrace() {
             Err(err) => break err,
         }
     };
-    assert_eq!(err.raw_os_error(), Some(32), "expected EPIPE (broken pipe), got {err}");
+    // EPIPE on Unix; Windows says ERROR_NO_DATA (232) — both a BrokenPipe.
+    assert_eq!(
+        err.kind(),
+        std::io::ErrorKind::BrokenPipe,
+        "expected a broken pipe, got {err}"
+    );
 
     // 2. The crash poll `Core::check_crashes` runs every drain tick.
     let status = loop {
