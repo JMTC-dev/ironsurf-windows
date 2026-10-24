@@ -15,7 +15,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        os: [ubuntu-latest, macos-latest, windows-latest]
 
     steps:
       - name: Check out repository
@@ -49,10 +49,12 @@ jobs:
         # per tab, the tab host. Prove it exists and answers before packaging.
         shell: bash
         run: |
-          test -x target/release/ironsurf
-          ./target/release/ironsurf --version
-          ./target/release/ironsurf --help >/dev/null
-          ./target/release/ironsurf tab --help >/dev/null
+          exe=target/release/ironsurf
+          if [ "${{ runner.os }}" = "Windows" ]; then exe="$exe.exe"; fi
+          test -x "$exe"
+          "./$exe" --version
+          "./$exe" --help >/dev/null
+          "./$exe" tab --help >/dev/null
 
       - name: Prepare artifact name
         id: artifact
@@ -61,12 +63,15 @@ jobs:
           os_name="${{ runner.os }}"
           if [ "$os_name" = "Linux" ]; then
             artifact_name="ironsurf-linux-x86_64"
+          elif [ "$os_name" = "Windows" ]; then
+            artifact_name="ironsurf-windows-x86_64"
           else
             artifact_name="ironsurf-macos-arm64"
           fi
           echo "name=$artifact_name" >> "$GITHUB_OUTPUT"
 
       - name: Package binary
+        if: runner.os != 'Windows'
         shell: bash
         run: |
           mkdir -p dist
@@ -74,7 +79,18 @@ jobs:
           chmod +x dist/${{ steps.artifact.outputs.name }}
           tar -czf dist/${{ steps.artifact.outputs.name }}.tar.gz -C dist ${{ steps.artifact.outputs.name }}
 
+      # Windows ships a zip holding `ironsurf.exe` (the name the tab host
+      # re-executes is whatever the file is called, so it stays `ironsurf`).
+      - name: Package binary (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Compress-Archive -Path target/release/ironsurf.exe -DestinationPath "dist/${{ steps.artifact.outputs.name }}.zip"
+
       - name: Upload release asset
         uses: softprops/action-gh-release@v2
         with:
-          files: dist/*.tar.gz
+          files: |
+            dist/*.tar.gz
+            dist/*.zip

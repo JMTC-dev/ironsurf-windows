@@ -42,6 +42,53 @@ still a separate OS process per tab, only now it is a copy of the same binary.
 Full prerequisite list, why each package is needed, and troubleshooting:
 `docs/BUILD_DEBIAN.md`.
 
+## Building (Windows)
+
+Windows 10/11 x64 with [rustup](https://rustup.rs) (the default MSVC toolchain)
+and the Visual Studio Build Tools' *Desktop development with C++* workload:
+
+```powershell
+cargo build --release --workspace
+.\target\release\ironsurf.exe
+```
+
+It is the same single `ironsurf.exe` (shell + per-tab host). Double-clicked it
+opens just the browser window; run from a terminal it keeps the console, so
+`--log debug --tab-stderr` works as on Linux.
+
+- **Smart App Control** blocks unsigned programs it has no reputation for —
+  including every build script cargo compiles (`os error 4551`) and an
+  unsigned downloaded `ironsurf.exe`. Building or running IronSurf needs it
+  off (Windows Security → App & browser control).
+- **Data** lives in `%USERPROFILE%\.local\share\ironsurf` (or
+  `IRONSURF_DATA_DIR`); downloads and the archive default to
+  `%USERPROFILE%\Downloads`.
+- **Archive mode** spells names Windows can store: the timestamp folder uses
+  `-` for `:` (`2026-09-17T07-20-48+10-00`), and `: ? * < > | " %` inside
+  archived names are percent-escaped (`127.0.0.1%3A8000`, `search%3Fq=x`).
+
+### The tab sandbox on Windows
+
+Every tab starts **suspended inside its own job object** and only then runs:
+the job kills it with the shell, allows no second process, caps its memory
+(4 GiB committed) and keeps it off the desktop and clipboard. Before it
+touches any web content the tab then locks itself down:
+
+- **Low integrity** — no writes anywhere but its own container profile
+  (labelled Low on first use), not to the user's files, the registry or
+  other processes;
+- **mitigation policies** — no dynamic code (ACG: Boa is an interpreter, so
+  nothing in a tab ever needs executable memory), no child processes, no
+  extension-point DLLs, no remote or Low-labelled DLLs, strict handle checks,
+  system fonts only for GDI.
+
+Not covered yet: Low integrity does not stop *reads*, and every tab shares
+the Low label, so one container's tab could write into another's profile.
+Both need an AppContainer per container (it can only be chosen when the
+process is created). `--no-sandbox` turns the tab half off;
+`IRONSURF_SANDBOX_SKIP=no-dynamic-code,low-integrity,…` leaves single layers
+off while debugging.
+
 ## Debugging (stderr diagnostics)
 
 Everything the browser knows goes to **stderr** — never stdout, which is the
