@@ -1,21 +1,43 @@
 name: Release
 
+# Two ways in, one result: every platform's binary, built here, attached to
+# one release with a SHA256SUMS.txt.
+#
+# - By hand (Actions → Release → Run workflow), with a tag: the binaries go
+#   to the release carrying that tag — a new *draft* if there is none, so
+#   nothing is public until it is published (the tag is created then). An
+#   existing release (draft or not) has its files replaced. GitHub runs no
+#   workflows for draft releases themselves, so this is the way to fill one.
+# - Creating a published release (not a draft) builds and attaches to it.
 on:
   release:
     types: [created]
   workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag, e.g. v0.1.0-windows.2 (a draft is created if none has it)"
+        required: true
+        type: string
 
 permissions:
   contents: write
 
 jobs:
-  build-and-upload:
+  build:
     name: Build ${{ matrix.os }} binary
     runs-on: ${{ matrix.os }}
     strategy:
-      fail-fast: false
+      # One release holds every platform: a failed build stops the publish job
+      # anyway, so there is no point finishing the others.
+      fail-fast: true
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        include:
+          - os: ubuntu-latest
+            artifact: ironsurf-linux-x86_64
+          - os: macos-latest
+            artifact: ironsurf-macos-arm64
+          - os: windows-latest
+            artifact: ironsurf-windows-x86_64
 
     steps:
       - name: Check out repository
@@ -56,28 +78,14 @@ jobs:
           "./$exe" --help >/dev/null
           "./$exe" tab --help >/dev/null
 
-      - name: Prepare artifact name
-        id: artifact
-        shell: bash
-        run: |
-          os_name="${{ runner.os }}"
-          if [ "$os_name" = "Linux" ]; then
-            artifact_name="ironsurf-linux-x86_64"
-          elif [ "$os_name" = "Windows" ]; then
-            artifact_name="ironsurf-windows-x86_64"
-          else
-            artifact_name="ironsurf-macos-arm64"
-          fi
-          echo "name=$artifact_name" >> "$GITHUB_OUTPUT"
-
       - name: Package binary
         if: runner.os != 'Windows'
         shell: bash
         run: |
-          mkdir -p dist
-          cp target/release/ironsurf dist/${{ steps.artifact.outputs.name }}
-          chmod +x dist/${{ steps.artifact.outputs.name }}
-          tar -czf dist/${{ steps.artifact.outputs.name }}.tar.gz -C dist ${{ steps.artifact.outputs.name }}
+          mkdir -p staging out
+          cp target/release/ironsurf "staging/${{ matrix.artifact }}"
+          chmod +x "staging/${{ matrix.artifact }}"
+          tar -czf "out/${{ matrix.artifact }}.tar.gz" -C staging "${{ matrix.artifact }}"
 
       # Windows ships a zip holding `ironsurf.exe` (the name the tab host
       # re-executes is whatever the file is called, so it stays `ironsurf`).
@@ -85,12 +93,45 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          New-Item -ItemType Directory -Force dist | Out-Null
-          Compress-Archive -Path target/release/ironsurf.exe -DestinationPath "dist/${{ steps.artifact.outputs.name }}.zip"
+          New-Item -ItemType Directory -Force out | Out-Null
+          Compress-Archive -Path target/release/ironsurf.exe -DestinationPath "out/${{ matrix.artifact }}.zip"
 
-      - name: Upload release asset
-        uses: softprops/action-gh-release@v2
+      - name: Hand the archive to the publish job
+        uses: actions/upload-artifact@v4
         with:
-          files: |
-            dist/*.tar.gz
-            dist/*.zip
+          name: ${{ matrix.artifact }}
+          path: out/*
+          if-no-files-found: error
+
+  publish:
+    name: Attach to the release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Collect the archives
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Checksums
+        working-directory: dist
+        run: sha256sum * | tee SHA256SUMS.txt
+
+      - name: Attach (or draft) the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.event_name == 'release' && github.event.release.tag_name || inputs.tag }}
+        run: |
+          case "$TAG" in
+            ""|*[[:space:]]*) echo "::error::not a usable tag: '$TAG'"; exit 1 ;;
+          esac
+          # `gh release view` finds drafts too (their tag does not exist yet).
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$TAG" dist/* --repo "$GITHUB_REPOSITORY" --clobber
+            echo "Attached to the existing release $TAG."
+          else
+            gh release create "$TAG" dist/* --repo "$GITHUB_REPOSITORY" \
+              --draft --target "$GITHUB_SHA" --title "$TAG" --generate-notes
+            echo "Created the draft release $TAG — review and publish it."
+          fi
