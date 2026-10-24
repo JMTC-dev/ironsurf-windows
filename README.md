@@ -1,5 +1,13 @@
 # IronSurf - A Browser Built in Rust
 
+> **Windows edition.** This fork of [h4sh5/ironsurf](https://github.com/h4sh5/ironsurf)
+> adds native Windows support — the same single `ironsurf.exe` — and a per-tab
+> Windows sandbox (job objects, Low integrity, mitigation policies). See
+> [Building (Windows)](#building-windows) and
+> [the tab sandbox on Windows](#the-tab-sandbox-on-windows); builds are on the
+> [Releases](https://github.com/JMTC-dev/ironsurf-windows/releases) page.
+> Everything else is h4sh's IronSurf, described below.
+
 This is a browser I am building using AI Agents. Almost none of the code is hand-written (altho this README.md does contain human writtten content).
 
 Components: Boa for JS, Stylo for CSS, Blitz for HTML DOM. Slint for the UI.
