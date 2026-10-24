@@ -32,7 +32,6 @@
 use std::error::Error;
 use std::fs;
 use std::io::Write;
-use std::os::fd::RawFd;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -45,7 +44,7 @@ use kurbo::{Affine, Rect, Size};
 use peniko::{Color, Fill};
 use ironsurf_common::ToTab;
 
-use crate::runtime::{NavHistory, SelfPipe, Tab, TabArgs};
+use crate::runtime::{poll_inputs, NavHistory, SelfPipe, Tab, TabArgs};
 
 /// Poll sleep inside the `--wait` window: wake-ups are delivered
 /// immediately, this only bounds how long a quiet page is waited out.
@@ -300,7 +299,8 @@ pub fn run(args: &[String]) -> Result<(), Box<dyn Error>> {
         let slice = remaining
             .min(POLL_SLICE)
             .min(tab.timer_sleep_hint().unwrap_or(remaining));
-        poll_wake(pipe.read_fd(), slice);
+        // The self-pipe alone: no shell is on the other end of stdin.
+        poll_inputs(&pipe, false, slice);
         pipe.drain();
         tab.headless_pump();
     }
@@ -940,18 +940,6 @@ fn dump_input_state(doc: &blitz_html::HtmlDocument) {
     if let Some(body) = doc.find_body_node() {
         walk(doc, body.id);
     }
-}
-
-/// Poll the wake pipe for up to `tick`; true when a wake-up was pending.
-fn poll_wake(wake_fd: RawFd, tick: Duration) -> bool {
-    let mut pfd = libc::pollfd {
-        fd: wake_fd,
-        events: libc::POLLIN,
-        revents: 0,
-    };
-    // SAFETY: one valid pollfd entry.
-    let ready = unsafe { libc::poll(&mut pfd, 1, tick.as_millis() as i32) };
-    ready > 0
 }
 
 /// Render the document into a fresh `vello_cpu` RGBA8 buffer at the full

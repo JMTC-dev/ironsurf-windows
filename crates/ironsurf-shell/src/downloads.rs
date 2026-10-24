@@ -80,7 +80,7 @@ fn download_root_with(
     }
     // The built-in: `~/Downloads`, or `./Downloads` when `HOME` is unset (the
     // shell is a GUI process; `HOME` is set for every real session).
-    let home = env("HOME")
+    let home = ironsurf_common::home_dir_with(&env)
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("."));
     home.join("Downloads")
@@ -104,12 +104,12 @@ pub fn expand_tilde(raw: &str) -> String {
 /// [`expand_tilde`] with `$HOME` handed in (see [`download_root_with`]).
 fn expand_tilde_with(raw: &str, env: impl Fn(&str) -> Option<OsString>) -> String {
     if raw == "~" {
-        return env("HOME")
+        return ironsurf_common::home_dir_with(&env)
             .map(|home| PathBuf::from(home).display().to_string())
             .unwrap_or_else(|| raw.to_owned());
     }
     if let Some(rest) = raw.strip_prefix("~/") {
-        if let Some(home) = env("HOME") {
+        if let Some(home) = ironsurf_common::home_dir_with(&env) {
             let mut path = PathBuf::from(home);
             path.push(rest);
             return path.display().to_string();

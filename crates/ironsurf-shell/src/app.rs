@@ -5497,12 +5497,12 @@ impl Core {
 /// accepts the shell spelling; anything else passes through untouched).
 fn expand_tilde(raw: &str) -> String {
     if raw == "~" {
-        return std::env::var_os("HOME")
+        return ironsurf_common::home_dir()
             .map(|home| PathBuf::from(home).display().to_string())
             .unwrap_or_else(|| raw.to_owned());
     }
     if let Some(rest) = raw.strip_prefix("~/") {
-        if let Some(home) = std::env::var_os("HOME") {
+        if let Some(home) = ironsurf_common::home_dir() {
             let mut path = PathBuf::from(home);
             path.push(rest);
             return path.display().to_string();

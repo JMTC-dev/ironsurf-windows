@@ -33,7 +33,7 @@ pub const ARCHIVE_SUBDIR: &str = "ironsurf-tabs";
 /// `./Downloads/ironsurf-tabs` when `HOME` is unset — the shell is a GUI
 /// process, `HOME` is set for every real session).
 pub fn default_archive_root() -> PathBuf {
-    let home = std::env::var_os("HOME")
+    let home = ironsurf_common::home_dir()
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("."));
     home.join("Downloads").join(ARCHIVE_SUBDIR)

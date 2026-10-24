@@ -5,7 +5,22 @@
 
 pub mod logging;
 
+use std::ffi::OsString;
+
 use serde::{Deserialize, Serialize};
+
+/// The user's home folder: `$HOME`, else — on Windows, where `HOME` is rarely
+/// set — `%USERPROFILE%`. `None` when neither is set (callers fall back to
+/// `.` as they always did).
+pub fn home_dir() -> Option<OsString> {
+    home_dir_with(|name| std::env::var_os(name))
+}
+
+/// [`home_dir`] with the environment handed in, for callers that test
+/// without mutating the process environment.
+pub fn home_dir_with(env: impl Fn(&str) -> Option<OsString>) -> Option<OsString> {
+    env("HOME").or_else(|| if cfg!(windows) { env("USERPROFILE") } else { None })
+}
 
 /// Identifier of a container (isolated session).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]

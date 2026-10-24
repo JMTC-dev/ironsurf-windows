@@ -3773,6 +3773,7 @@ dependencies = [
  "slint-build",
  "tempfile",
  "url",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

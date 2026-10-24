@@ -53,7 +53,9 @@ use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::error::Error;
 use std::io::{self, BufWriter, Read, StdoutLock, Write};
+#[cfg(unix)]
 use std::os::fd::AsRawFd;
+#[cfg(unix)]
 use std::os::fd::RawFd;
 use std::path::PathBuf;
 use std::rc::Rc;
@@ -62,6 +64,8 @@ use std::sync::{
     atomic::{AtomicUsize, Ordering},
     Arc, Mutex,
 };
+#[cfg(windows)]
+use std::sync::{Condvar, MutexGuard};
 use std::time::{Duration, Instant};
 
 use anyrender::{render_to_buffer, PaintScene};
@@ -316,14 +320,18 @@ impl TabArgs {
 /// Non-blocking pipe; every wake-up is one byte. The read end joins the
 /// `poll()` set, the write end is shared with the Blitz hooks (all of which
 /// are `Send + Sync` and may fire on net-worker threads).
+#[cfg(unix)]
 pub struct SelfPipe {
     read_fd: RawFd,
     write_fd: RawFd,
 }
 // Raw file descriptors we own; writes are single non-blocking `write()` calls.
+#[cfg(unix)]
 unsafe impl Send for SelfPipe {}
+#[cfg(unix)]
 unsafe impl Sync for SelfPipe {}
 
+#[cfg(unix)]
 impl SelfPipe {
     pub fn new() -> io::Result<Self> {
         let mut fds = [0 as RawFd; 2];
@@ -399,6 +407,58 @@ impl SelfPipe {
             }
             total += n as usize;
         }
+    }
+}
+
+/// Windows has no `poll()` over anonymous pipes, so the "pipe" is a wake-up
+/// counter behind a condvar. Stdin cannot be made non-blocking there either:
+/// a reader thread ([`prepare_stdin`]) moves its bytes into the very same
+/// lock, so one wait in [`poll_inputs`] covers both sources without a lost
+/// wake-up between them.
+#[cfg(windows)]
+pub struct SelfPipe {
+    state: Mutex<PipeState>,
+    ready: Condvar,
+}
+
+#[cfg(windows)]
+#[derive(Default)]
+struct PipeState {
+    /// Wake-ups since the last [`SelfPipe::drain`] (one per `wake()`).
+    wakes: usize,
+    /// Bytes the stdin reader pulled off the pipe, not yet taken by
+    /// [`read_stdin_bytes`].
+    stdin: Vec<u8>,
+    /// The shell closed stdin (or reading it failed — see `stdin_err`).
+    stdin_eof: bool,
+    /// The read error that ended the reader, handed out once.
+    stdin_err: Option<io::Error>,
+}
+
+#[cfg(windows)]
+impl SelfPipe {
+    pub fn new() -> io::Result<Self> {
+        Ok(SelfPipe {
+            state: Mutex::new(PipeState::default()),
+            ready: Condvar::new(),
+        })
+    }
+
+    /// Poke the loop.
+    pub fn wake(&self) {
+        let mut state = self.lock();
+        state.wakes = state.wakes.saturating_add(1);
+        self.ready.notify_all();
+    }
+
+    /// Clear all pending wake-ups; returns how many were pending (the loop
+    /// uses "something woke us" as the resolve/paint trigger).
+    pub fn drain(&self) -> usize {
+        std::mem::take(&mut self.lock().wakes)
+    }
+
+    fn lock(&self) -> MutexGuard<'_, PipeState> {
+        self.state.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 }
 
@@ -1031,7 +1091,6 @@ impl DialogHost {
             message: message.to_owned(),
             default: default.map(str::to_owned),
         });
-        let stdin_fd = io::stdin().as_raw_fd();
         loop {
             if self.out.borrow().broken {
                 warn!("stdout broke while dialog #{id} was open — answering it cancelled");
@@ -1040,11 +1099,11 @@ impl DialogHost {
             // Sleep until the shell speaks (stdin), something wakes the loop,
             // or the tick passes — no repainting meanwhile: the shell owns
             // the screen while its modal dialog is up.
-            poll_inputs(stdin_fd, self.pipe.read_fd(), DIALOG_POLL_TICK);
+            poll_inputs(&self.pipe, true, DIALOG_POLL_TICK);
             self.pipe.drain();
             let frames = {
                 let mut pending = self.pending.borrow_mut();
-                match read_stdin_bytes(stdin_fd, &mut pending) {
+                match read_stdin_bytes(&self.pipe, &mut pending) {
                     Ok(true) => {
                         // The shell closed the pipe (window quit, crash): a
                         // cancelled dialog beats a hung tab.
@@ -6648,7 +6707,8 @@ pub enum NavHistory {
 
 /// Mark stdin non-blocking: the loop only reads when `poll()` says readable,
 /// partial frames accumulate in `pending` and can never park the loop.
-fn set_stdin_nonblocking() -> io::Result<()> {
+#[cfg(unix)]
+fn prepare_stdin(_pipe: &Arc<SelfPipe>) -> io::Result<()> {
     let fd = io::stdin().as_raw_fd();
     // SAFETY: F_GETFL/F_SETFL on a valid descriptor.
     unsafe {
@@ -6660,6 +6720,42 @@ fn set_stdin_nonblocking() -> io::Result<()> {
             return Err(io::Error::last_os_error());
         }
     }
+    Ok(())
+}
+
+/// Windows stdin (an anonymous pipe from the shell) can be neither polled nor
+/// made non-blocking: a reader thread blocks on it instead and hands every
+/// chunk to the loop through `pipe` (see [`SelfPipe`]), so the loop itself
+/// still never parks on a partial frame.
+#[cfg(windows)]
+fn prepare_stdin(pipe: &Arc<SelfPipe>) -> io::Result<()> {
+    let pipe = Arc::clone(pipe);
+    std::thread::Builder::new()
+        .name("ironsurf-stdin".to_string())
+        .spawn(move || {
+            let mut stdin = io::stdin().lock();
+            let mut chunk = vec![0u8; 64 * 1024];
+            loop {
+                let read = stdin.read(&mut chunk);
+                let mut state = pipe.lock();
+                match read {
+                    Ok(0) => state.stdin_eof = true,
+                    Ok(n) => state.stdin.extend_from_slice(&chunk[..n]),
+                    Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
+                    // The shell's end went away: same as a clean EOF.
+                    Err(err) if err.kind() == io::ErrorKind::BrokenPipe => state.stdin_eof = true,
+                    Err(err) => {
+                        state.stdin_err = Some(err);
+                        state.stdin_eof = true;
+                    }
+                }
+                let done = state.stdin_eof;
+                pipe.ready.notify_all();
+                if done {
+                    return;
+                }
+            }
+        })?;
     Ok(())
 }
 
@@ -6683,7 +6779,9 @@ impl Read for CursorReader<'_> {
 /// Pull everything currently available on non-blocking stdin into `pending`.
 /// `Ok(true)` = EOF (the shell closed the pipe). Shared by the poll loop
 /// ([`drain_stdin`]) and the modal dialog pump ([`DialogHost::ask`]).
-fn read_stdin_bytes(fd: RawFd, pending: &mut Vec<u8>) -> io::Result<bool> {
+#[cfg(unix)]
+fn read_stdin_bytes(_pipe: &SelfPipe, pending: &mut Vec<u8>) -> io::Result<bool> {
+    let fd = io::stdin().as_raw_fd();
     let mut chunk = [0u8; 64 * 1024];
     loop {
         // SAFETY: read into a valid buffer from stdin.
@@ -6705,6 +6803,18 @@ fn read_stdin_bytes(fd: RawFd, pending: &mut Vec<u8>) -> io::Result<bool> {
         }
         return Err(err);
     }
+}
+
+/// Windows: take what the stdin reader thread has queued on `pipe` (see
+/// [`prepare_stdin`]); EOF and a read error surface exactly as above.
+#[cfg(windows)]
+fn read_stdin_bytes(pipe: &SelfPipe, pending: &mut Vec<u8>) -> io::Result<bool> {
+    let mut state = pipe.lock();
+    pending.append(&mut state.stdin);
+    if let Some(err) = state.stdin_err.take() {
+        return Err(err);
+    }
+    Ok(state.stdin_eof)
 }
 
 /// Decode every complete `ToTab` frame currently sitting in `pending`
@@ -6746,10 +6856,9 @@ fn decode_stdin_frames(pending: &mut Vec<u8>) -> io::Result<Vec<ToTab>> {
 /// read off the pipe before anything this tick pulled in — and the batch is
 /// then dispatched with superseded hover moves dropped (see [`coalesce_moves`]).
 fn drain_stdin(tab: &mut Tab, pending: &RefCell<Vec<u8>>) -> io::Result<Option<i32>> {
-    let fd = io::stdin().as_raw_fd();
     let eof = {
         let mut pending = pending.borrow_mut();
-        read_stdin_bytes(fd, &mut pending)?
+        read_stdin_bytes(&tab.pipe, &mut pending)?
     };
     let mut batch: Vec<ToTab> = Vec::new();
     batch.extend(tab.dialog.take_deferred());
@@ -6861,8 +6970,12 @@ mod input_shaping_tests {
     }
 }
 
-/// Poll `[stdin, self-pipe]` until readable or `tick` elapses.
-fn poll_inputs(stdin_fd: RawFd, wake_fd: RawFd, tick: Duration) -> bool {
+/// Poll `[stdin, self-pipe]` until readable or `tick` elapses (`with_stdin`
+/// false = the self-pipe alone: the headless harness, which has no shell).
+#[cfg(unix)]
+pub(crate) fn poll_inputs(pipe: &SelfPipe, with_stdin: bool, tick: Duration) -> bool {
+    // A negative fd is skipped by poll().
+    let stdin_fd = if with_stdin { io::stdin().as_raw_fd() } else { -1 };
     let mut pfd = [
         libc::pollfd {
             fd: stdin_fd,
@@ -6870,7 +6983,7 @@ fn poll_inputs(stdin_fd: RawFd, wake_fd: RawFd, tick: Duration) -> bool {
             revents: 0,
         },
         libc::pollfd {
-            fd: wake_fd,
+            fd: pipe.read_fd(),
             events: libc::POLLIN,
             revents: 0,
         },
@@ -6878,6 +6991,30 @@ fn poll_inputs(stdin_fd: RawFd, wake_fd: RawFd, tick: Duration) -> bool {
     // SAFETY: two valid pollfd entries.
     let ready = unsafe { libc::poll(pfd.as_mut_ptr(), 2, tick.as_millis() as i32) };
     ready > 0
+}
+
+/// Windows: wait on the [`SelfPipe`] condvar until a wake-up (or, with
+/// `with_stdin`, stdin bytes / EOF from the reader thread) is pending, or
+/// `tick` elapses.
+#[cfg(windows)]
+pub(crate) fn poll_inputs(pipe: &SelfPipe, with_stdin: bool, tick: Duration) -> bool {
+    let deadline = Instant::now() + tick;
+    let mut state = pipe.lock();
+    loop {
+        let stdin_ready = with_stdin
+            && (!state.stdin.is_empty() || state.stdin_eof || state.stdin_err.is_some());
+        if state.wakes > 0 || stdin_ready {
+            return true;
+        }
+        let now = Instant::now();
+        if now >= deadline {
+            return false;
+        }
+        state = match pipe.ready.wait_timeout(state, deadline - now) {
+            Ok((state, _)) => state,
+            Err(poisoned) => poisoned.into_inner().0,
+        };
+    }
 }
 
 /// Run the tab loop; returns the process exit code.
@@ -6919,7 +7056,7 @@ pub fn run(args: TabArgs) -> i32 {
     };
     let mut tab = Tab::new(&args, Arc::clone(&pipe));
 
-    if set_stdin_nonblocking().is_err() {
+    if prepare_stdin(&pipe).is_err() {
         // A blocking stdin would deadlock the poll loop; without a usable
         // descriptor we cannot speak IPC anyway — degrade by exiting.
         error!("stdin non-blocking failed: cannot run the poll loop");
@@ -6935,8 +7072,6 @@ pub fn run(args: TabArgs) -> i32 {
     let start = args.url.clone();
     tab.navigate(&start, NavHistory::Fresh);
 
-    let stdin_fd = io::stdin().as_raw_fd();
-    let wake_fd = pipe.read_fd();
     // The stdin byte buffer lives on the tab (the modal dialog pump reads
     // through the very same one).
     let pending = Rc::clone(&tab.stdin_pending);
@@ -6955,7 +7090,7 @@ pub fn run(args: TabArgs) -> i32 {
         // smoother wheel) — the glide is fed on its own clock, not on wakes.
         let tick = tab.wheel_poll_tick(tick);
         let tick = tab.nav_poll_tick(tick);
-        poll_inputs(stdin_fd, wake_fd, tick);
+        poll_inputs(&pipe, true, tick);
         // Wake-ups from ShellProvider::request_redraw / the NetWaker.
         let woken = pipe.drain() > 0;
         let mut stdin_frames = false;
@@ -7281,9 +7416,9 @@ mod tests {
         pipe.wake();
         pipe.wake();
         // Data is pending: poll(0) must report readable immediately.
-        assert!(poll_inputs(-1, pipe.read_fd(), Duration::from_millis(0)));
+        assert!(poll_inputs(&pipe, false, Duration::from_millis(0)));
         pipe.drain();
-        assert!(!poll_inputs(-1, pipe.read_fd(), Duration::from_millis(0)));
+        assert!(!poll_inputs(&pipe, false, Duration::from_millis(0)));
     }
 
     // ------------------------------------------------------------------

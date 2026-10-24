@@ -105,12 +105,13 @@ pub(crate) fn now_unix() -> i64 {
         .unwrap_or(0)
 }
 
-/// `$IRONSURF_DATA_DIR` if set, else `~/.local/share/ironsurf`.
+/// `$IRONSURF_DATA_DIR` if set, else `~/.local/share/ironsurf` (`~` is
+/// `%USERPROFILE%` on Windows, see [`ironsurf_common::home_dir`]).
 pub fn default_data_root() -> PathBuf {
     if let Ok(dir) = std::env::var("IRONSURF_DATA_DIR") {
         return PathBuf::from(dir);
     }
-    let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
+    let home = ironsurf_common::home_dir().unwrap_or_else(|| ".".into());
     Path::new(&home)
         .join(".local")
         .join("share")

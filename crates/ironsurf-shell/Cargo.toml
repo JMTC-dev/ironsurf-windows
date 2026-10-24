@@ -16,6 +16,11 @@ url = { workspace = true }
 # (x11rb over libxcb + libxcb-xfixes), no GPU, no display-server toolkit.
 arboard = "3"
 
+# Windows: `WSAPoll` for the archive server's serve loop (no `poll()` there);
+# the same 0.61 the graph already locks.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Networking_WinSock"] }
+
 [build-dependencies]
 slint-build = "1"
 

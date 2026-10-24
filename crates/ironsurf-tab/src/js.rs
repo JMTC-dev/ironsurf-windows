@@ -3008,6 +3008,21 @@ fn register_dom_natives(context: &mut Context) {
                     "NotFoundError: the reference node is not a child of this node",
                 ));
             }
+            if reference == child {
+                // DOM pre-insert: "if referenceChild is node, set referenceChild
+                // to node's next sibling". blitz detaches the node before it
+                // looks for the anchor, so inserting a node before itself
+                // (example.com's `body.prepend(body.firstChild)`) panicked.
+                let next = mutator.doc.get_node(node_id(parent)).and_then(|p| {
+                    let at = p.index_of_child(node_id(child))?;
+                    p.children.get(at + 1).copied()
+                });
+                match next {
+                    Some(next) => mutator.insert_nodes_before(next, &[node_id(child)]),
+                    None => mutator.append_children(node_id(parent), &[node_id(child)]),
+                }
+                return Ok(());
+            }
             mutator.insert_nodes_before(node_id(reference), &[node_id(child)]);
             Ok(())
         });

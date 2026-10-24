@@ -42,7 +42,10 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
-use std::os::fd::AsRawFd;
+#[cfg(unix)]
+use std::os::fd::{AsRawFd, RawFd as RawSock};
+#[cfg(windows)]
+use std::os::windows::io::{AsRawSocket, RawSocket as RawSock};
 
 use ironsurf_common::{debug, error};
 use serde::{Deserialize, Serialize};
@@ -225,12 +228,12 @@ pub fn normalize_root(raw: &str) -> Result<PathBuf, String> {
 /// `~` and `~/…` expanded against `$HOME` (left alone when `HOME` is unset).
 pub fn expand_tilde(raw: &str) -> String {
     if raw == "~" {
-        return std::env::var_os("HOME")
+        return ironsurf_common::home_dir()
             .map(|home| PathBuf::from(home).display().to_string())
             .unwrap_or_else(|| raw.to_owned());
     }
     if let Some(rest) = raw.strip_prefix("~/") {
-        if let Some(home) = std::env::var_os("HOME") {
+        if let Some(home) = ironsurf_common::home_dir() {
             let mut path = PathBuf::from(home);
             path.push(rest);
             return path.display().to_string();
@@ -1393,38 +1396,61 @@ fn send_event(events: Sender<ServeEvent>, event: ServeEvent) {
     let _ = events.send(event);
 }
 
-/// `poll()` one fd for readability (`-1` = none, never ready).
-pub fn fd_readable(fd: i32, timeout: Duration) -> bool {
-    let mut pfd = libc::pollfd {
-        fd,
-        events: libc::POLLIN,
-        revents: 0,
-    };
-    if fd < 0 {
-        // Nothing to watch: sleep out the timeout so the loop stays idle.
-        let millis = timeout.as_millis().min(i32::MAX as u128) as libc::c_int;
-        unsafe { libc::poll(std::ptr::null_mut(), 0, millis) };
-        return false;
-    }
-    let millis = timeout.as_millis().min(i32::MAX as u128) as libc::c_int;
-    let ready = unsafe { libc::poll(&mut pfd, 1, millis) };
-    ready > 0 && (pfd.revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR)) != 0
+/// The OS handle of a socket, as [`readable`] watches it.
+#[cfg(unix)]
+fn raw_sock(sock: &impl AsRawFd) -> RawSock {
+    sock.as_raw_fd()
 }
 
-/// `poll()` two fds (the listener and the self-pipe) for readability.
-fn any_readable(first: i32, second: i32, timeout: Duration) -> bool {
-    let mut pfds = [
-        libc::pollfd { fd: first, events: libc::POLLIN, revents: 0 },
-        libc::pollfd { fd: second, events: libc::POLLIN, revents: 0 },
-    ];
+/// The OS handle of a socket, as [`readable`] watches it.
+#[cfg(windows)]
+fn raw_sock(sock: &impl AsRawSocket) -> RawSock {
+    sock.as_raw_socket()
+}
+
+/// `poll()` sockets for readability (`None` = an empty slot, never ready).
+/// With nothing to watch, sleep out the timeout so the loop stays idle.
+#[cfg(unix)]
+fn readable(socks: &[Option<RawSock>], timeout: Duration) -> bool {
+    // A negative fd is skipped by poll() (and never reports revents).
+    let mut pfds: Vec<libc::pollfd> = socks
+        .iter()
+        .map(|sock| libc::pollfd { fd: sock.unwrap_or(-1), events: libc::POLLIN, revents: 0 })
+        .collect();
     let millis = timeout.as_millis().min(i32::MAX as u128) as libc::c_int;
-    let ready = unsafe { libc::poll(pfds.as_mut_ptr(), 2, millis) };
+    let ready = unsafe { libc::poll(pfds.as_mut_ptr(), pfds.len() as libc::nfds_t, millis) };
     if ready <= 0 {
         return false;
     }
     pfds.iter()
         .filter(|p| p.fd >= 0)
         .any(|p| (p.revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR)) != 0)
+}
+
+/// Windows: the same over `WSAPoll` (std has already run `WSAStartup` by the
+/// time a listener exists). Empty slots are left out — `WSAPoll` has no
+/// "ignore this entry" fd — and with nothing left it just sleeps.
+#[cfg(windows)]
+fn readable(socks: &[Option<RawSock>], timeout: Duration) -> bool {
+    use windows_sys::Win32::Networking::WinSock::{
+        WSAPoll, POLLERR, POLLHUP, POLLIN, WSAPOLLFD,
+    };
+    let mut pfds: Vec<WSAPOLLFD> = socks
+        .iter()
+        .flatten()
+        .map(|&sock| WSAPOLLFD { fd: sock as usize, events: POLLIN, revents: 0 })
+        .collect();
+    if pfds.is_empty() {
+        thread::sleep(timeout);
+        return false;
+    }
+    let millis = timeout.as_millis().min(i32::MAX as u128) as i32;
+    // SAFETY: `pfds` is a valid, exclusively borrowed array of `len` entries.
+    let ready = unsafe { WSAPoll(pfds.as_mut_ptr(), pfds.len() as u32, millis) };
+    if ready <= 0 {
+        return false;
+    }
+    pfds.iter().any(|p| (p.revents & (POLLIN | POLLHUP | POLLERR)) != 0)
 }
 
 /// Serve one listener until its generation is retired (see [`serve_loop`]).
@@ -1455,19 +1481,19 @@ fn serve_loop(
     generation: u64,
     events: Sender<ServeEvent>,
 ) {
-    let listener_fd = listener.as_raw_fd();
+    let listener_sock = raw_sock(&listener);
     // Our end of the self-pipe: never read (the wake-up *is* the connection
     // and the subsequent EOF), never closed until the thread exits.
     let wake_end = TcpStream::connect(hub.wake).ok();
-    let wake_fd = wake_end.as_ref().map(|s| s.as_raw_fd()).unwrap_or(-1);
+    let wake_sock = wake_end.as_ref().map(raw_sock);
     loop {
         if hub.generation() != generation {
             break;
         }
-        if !any_readable(listener_fd, wake_fd, Duration::from_secs(1)) {
+        if !readable(&[Some(listener_sock), wake_sock], Duration::from_secs(1)) {
             continue;
         }
-        if wake_fd >= 0 && fd_readable(wake_fd, Duration::ZERO) {
+        if wake_sock.is_some() && readable(&[wake_sock], Duration::ZERO) {
             // The nudge woke us: re-check the generation, keep watching.
             continue;
         }
